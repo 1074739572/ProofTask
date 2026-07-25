@@ -66,10 +66,19 @@ Screen {
 }
 
 .bubble-assistant {
+    height: auto;
     margin: 1 0 1 0;
-    padding: 0 1;
+    padding: 1 1;
     background: $boost;
     border-left: thick $accent;
+}
+
+.bubble-error {
+    height: auto;
+    color: $error;
+    margin: 1 0;
+    padding: 0 1;
+    border-left: thick $error;
 }
 
 .bubble-system {
@@ -155,27 +164,6 @@ Screen {
     width: 100%;
     height: 1;
     margin: 0 0 1 0;
-}
-
-#answer-dock {
-    display: none;
-    height: auto;
-    max-height: 12;
-    border: solid $success;
-    background: $boost;
-    padding: 0 1;
-}
-
-#answer-title {
-    height: 1;
-    color: $success;
-    text-style: bold;
-}
-
-#answer-content {
-    height: auto;
-    max-height: 9;
-    overflow-y: auto;
 }
 
 #footer-stack {

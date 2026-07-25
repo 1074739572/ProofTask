@@ -14,7 +14,7 @@ from harness.rag.selection import (
     load_selection,
     set_scope,
 )
-from harness.rag.sources import format_docs_list, list_indexed_sources
+from harness.rag.sources import list_indexed_sources
 from harness.ui.terminal_menu import is_interactive_tty, select_from_list
 
 _SCOPE_ALL_HINTS = (
@@ -39,8 +39,14 @@ _LIST_DOCS_HINTS = (
     "文档列表",
     "列出文档",
     "现在有什么文档",
+    "有什么文件",
+    "有哪些文件",
+    "本地文件",
+    "上传了什么",
     "list docs",
+    "list files",
     "what documents",
+    "what files",
 )
 
 
@@ -57,6 +63,8 @@ def _has_index() -> bool:
 
 def _index_ready() -> tuple[bool, str]:
     """File mode does not auto-rebuild index after /rag reset — user must /rag index."""
+    from harness.rag.corpus import format_files_list
+
     if _has_index():
         from harness.rag.bootstrap import index_refresh_reason
 
@@ -64,12 +72,16 @@ def _index_ready() -> tuple[bool, str]:
         if reason:
             return False, (
                 f"索引已过期：{reason}。\n"
-                "请先 /rag index files，再提问。"
+                "请先 /rag index files，再提问。\n\n"
+                f"{format_files_list()}"
             )
         return True, ""
     return False, (
-        "索引为空（可能刚执行过 /rag reset）。\n"
-        "请先 /rag index files，再提问。"
+        "索引为空（可能刚执行过 /rag reset，或还没建过索引）。\n"
+        "本地上传的文件还在 files/ 里 —— 先确认列表，再构建索引：\n"
+        "  /rag files\n"
+        "  /rag index files\n\n"
+        f"{format_files_list()}"
     )
 
 
@@ -143,7 +155,9 @@ def _maybe_handle_scope_intent(query: str) -> str | None:
     low = query.strip().lower()
     compact = query.strip().replace(" ", "")
     if any(h in compact or h in low for h in _LIST_DOCS_HINTS):
-        return format_docs_list()
+        from harness.rag.corpus import format_files_list
+
+        return format_files_list()
     if any(h in compact or h in low for h in _SCOPE_ALL_HINTS):
         set_scope(SCOPE_ALL)
         return format_file_mode_banner()
@@ -174,4 +188,8 @@ def handle_file_mode_turn(query: str) -> str:
     if get_scope() == SCOPE_SELECTED and not load_selection():
         return "指定文档列表为空。请说「指定文档」或「搜全部」。"
 
+    # Visible retrieval cue (TUI step / CLI muted) before LLM answer.
+    from harness.ui.renderer import renderer
+
+    renderer.muted(f"检索中 · {format_selection_summary()}")
     return answer_question(text)

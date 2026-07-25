@@ -42,6 +42,62 @@
       "label": "通义千问 Max",
       "api_model": "qwen-max",
       "context_window": 32000
+    },
+    {
+      "id": "gpt-5.6-terra",
+      "provider": "necodex",
+      "label": "NeCodeX GPT-5.6 Terra (推荐)",
+      "api_model": "gpt-5.6-terra",
+      "context_window": 1000000
+    },
+    {
+      "id": "gpt-5.6-luna",
+      "provider": "necodex",
+      "label": "NeCodeX GPT-5.6 Luna (省额度)",
+      "api_model": "gpt-5.6-luna",
+      "context_window": 1000000
+    },
+    {
+      "id": "gpt-5.6-sol",
+      "provider": "necodex",
+      "label": "NeCodeX GPT-5.6 Sol (高规格)",
+      "api_model": "gpt-5.6-sol",
+      "context_window": 1000000
+    },
+    {
+      "id": "gpt-5.5",
+      "provider": "necodex",
+      "label": "NeCodeX GPT-5.5 (兼容旧设定)",
+      "api_model": "gpt-5.5",
+      "context_window": 1000000
+    },
+    {
+      "id": "claude-opus-4-8",
+      "provider": "necodex",
+      "label": "NeCodeX Claude Opus 4.8",
+      "api_model": "claude-opus-4-8",
+      "context_window": 200000
+    },
+    {
+      "id": "claude-opus-4-7",
+      "provider": "necodex",
+      "label": "NeCodeX Claude Opus 4.7",
+      "api_model": "claude-opus-4-7",
+      "context_window": 200000
+    },
+    {
+      "id": "claude-opus-4-6",
+      "provider": "necodex",
+      "label": "NeCodeX Claude Opus 4.6",
+      "api_model": "claude-opus-4-6",
+      "context_window": 200000
+    },
+    {
+      "id": "grok-build-console",
+      "provider": "necodex",
+      "label": "NeCodeX Grok Build Console (编程)",
+      "api_model": "grok-build-console",
+      "context_window": 200000
     }
   ]
 }

@@ -17,5 +17,11 @@
     "type": "openai",
     "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
     "api_key_env": "DASHSCOPE_API_KEY"
+  },
+  "necodex": {
+    "label": "NeCodeX",
+    "type": "openai",
+    "base_url": "https://fast.sbbbbbbbbb.xyz/v1",
+    "api_key_env": "NECODEX_API_KEY"
   }
 }

@@ -476,6 +476,7 @@ def chunk_pdf(source: str, path, *, asset_dir) -> list[Chunk]:
         describe_image,
         ocr_dpi,
         ocr_language,
+        pdf_extract_images,
         pdf_ocr_mode,
         should_render_pdf_pages,
         transcribe_scanned_page,
@@ -561,6 +562,8 @@ def chunk_pdf(source: str, path, *, asset_dir) -> list[Chunk]:
                     chunk_index += 1
 
             caption = _page_caption(page_text)
+            if not pdf_extract_images():
+                continue
             page_images = page.get_images(full=True)
             # Charts in generated PDFs are commonly vector drawings. Detect and
             # render their regions even on mixed pages that also contain logos

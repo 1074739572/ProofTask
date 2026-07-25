@@ -111,10 +111,12 @@ def _help_md() -> str:
 | `/mode` | Pick mode (or click 🧭) |
 | `/mode <id>` | Switch mode (`direct` / `plan` / `orchestrate` / `file` / `grill`) |
 | `/mode grill` | Builtin grill-me: ask → clarify → confirm → execute |
-| `/rag` | RAG help |
-| `/rag index [path]` | Build or refresh document index |
-| `/rag docs` / `/rag select 1,3` | List or select document scope |
-| `/rag ask <question>` | One-shot document Q&A |
+| `/rag` | 本地 files/ 清单 + 索引状态 |
+| `/rag files` | 看上传了哪些文件（已索引/未索引） |
+| `/rag docs` / `/rag select 1,3` | 已索引文档列表 / 设检索范围 |
+| `/rag pick` | 交互多选文档（Space 勾选） |
+| `/rag index [path]` | 构建或刷新索引 |
+| `/rag ask <question>` | 一次性文档问答 |
 | `/resume` | List sessions + picker |
 | `/resume <N>` | Switch to session N |
 | `/resume project` | Inject thesis state.json |
@@ -128,7 +130,7 @@ def _help_md() -> str:
 | `/classic` | Rich CLI hint |
 | `/quit` | Exit (Ctrl+Q) |
 
-**Composer:** Enter = send · Shift+Enter = newline · Esc = stop · Ctrl+C does not quit (use terminal copy / Ctrl+Shift+C)
+**Composer:** Enter = send · Shift+Enter = newline · Esc = stop · Ctrl+C = copy last answer to OS clipboard · Ctrl+V = paste · Quit = Ctrl+Q
 
 **Layout:** top = usage · middle = chat · under chat = model/mode/status · bottom = input
 """
@@ -354,6 +356,19 @@ def _handle_mode(app: HarnessApp, query: str) -> None:
     from harness.modes.registry import format_mode_catalog
     from harness.ui.mode_picker import menu_entries
 
+    def _apply_mode_result(msg: str) -> None:
+        """Show mode change in chat; file/grill banners are multi-line answers."""
+        app.refresh_meta_bar()
+        app.chat_append("step", f"mode → {get_mode()}")
+        body = (msg or "").strip()
+        if not body:
+            return
+        # File / grill enter banners must be assistant bubbles, not status-only —
+        # otherwise users miss "直接提问即可" and think RAG never runs.
+        if get_mode() in ("file", "grill") or "\n" in body:
+            app.chat_append("assistant", body)
+        app.tui_set_status(body.splitlines()[0][:120])
+
     parts = query.strip().split(maxsplit=1)
     if len(parts) > 1:
         arg = parts[1].strip()
@@ -361,10 +376,7 @@ def _handle_mode(app: HarnessApp, query: str) -> None:
             app.chat_append("assistant", format_mode_catalog())
             return
         if arg.lower() not in ("list", "pick", "picker"):
-            msg = set_mode(arg)
-            app.refresh_meta_bar()
-            app.chat_append("step", f"mode → {get_mode()}")
-            app.tui_set_status(msg)
+            _apply_mode_result(set_mode(arg))
             return
 
     labels, mode_ids, cursor = menu_entries()
@@ -376,10 +388,7 @@ def _handle_mode(app: HarnessApp, query: str) -> None:
         if not mode_id:
             app.tui_set_status(format_mode_status())
             return
-        msg = set_mode(mode_id)
-        app.refresh_meta_bar()
-        app.chat_append("step", f"mode → {get_mode()}")
-        app.tui_set_status(msg)
+        _apply_mode_result(set_mode(mode_id))
 
     app.open_inline_picker(
         "Select mode",

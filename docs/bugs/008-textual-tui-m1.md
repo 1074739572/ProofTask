@@ -37,7 +37,8 @@
 
 ## 固定信息区
 
-- 最终答案同时进入聊天历史和 `#answer-dock`，当前轮可一直看到，无需滚动找回
+- **回答只在 Chat 时间线里**：用户消息、工具卡、助手回答、API 错误同一滚动区，可回看历史
+- 已去掉独立 `#answer-dock`（原先 max-height 过短，读长文不舒服，也和 Chat 割裂）
 - `#progress-strip` 显示理解目标 → 当前工具 → 回答的简短阶段
 - 后台命令通过 `BackgroundEvent` 进入 `#background-tray`，展示运行与完成状态；
   启动消息不再用绕过 TUI 的裸 `print`
@@ -51,6 +52,8 @@
 - Ctrl+↑ / Ctrl+↓ 浏览本次 TUI 的输入历史
 - `/usage [today|week|month|year]` 可直接在 TUI 查看 token 与缓存统计
 - 原有 Enter 发送、Shift+Enter 换行、Ctrl+Enter 发送、Esc 停止保持不变
+- **粘贴**：Ctrl+V / Ctrl+Shift+V 读取**系统剪贴板**（Win32，64 位句柄安全；失败再试 PowerShell / tk）。即使焦点在 Chat 区也会路由到输入框。注意：Textual 开启鼠标模式后，**右键不会粘贴**（会被当成鼠标事件）——请用 Ctrl+V。
+- **API 错误**：失败以红色 `bubble-error` 出现在 Chat 时间线（不再伪装成绿色终答栏）
 
 ## 打断 / 退出（X1 · B2 · U1）
 
@@ -58,7 +61,10 @@
 |----|------|
 | 退出 TUI | `request_cancel` + 吞掉 console 输出；等当前轮结束后再退 |
 | 主按钮 | 空闲 **发送** / 忙碌 **停止**（Enter / Ctrl+Enter 同；Esc = 停止） |
-| Ctrl+C | **不退出**（吞掉 Textual help_quit）；复制用终端拖选 / Ctrl+Shift+C；退出用 Ctrl+Q |
+| Ctrl+C | **复制**到系统剪贴板（有选区复制选区；否则复制最近回答；**不退出**） |
+| Ctrl+Shift+C / Ctrl+Shift+Y | 强制复制 Chat 里最近一条助手回答（Y 备用：WT 可能抢走 Ctrl+Shift+C） |
+| Ctrl+V | 从系统剪贴板粘贴到输入框 |
+| 退出 | Ctrl+Q |
 | 输入区 | **TextArea** 多行：Enter 发送；Shift+Enter 换行；Ctrl+↑/↓ 历史；高度约 3–8 行 |
 | 停止效果 | 回滚本轮 history + 撕掉 `turn-live` 气泡 + 输入框预填原问题 |
 | 终端复位 | 启动前 / 退出后 / `atexit` 清鼠标上报与 alt-screen（防 `^[[<…M` 花屏） |

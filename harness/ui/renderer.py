@@ -53,6 +53,9 @@ class _ShutdownSink:
     def push_final(self, text: str) -> None:
         return None
 
+    def push_error(self, text: str) -> None:
+        return None
+
     def push_warn(self, text: str) -> None:
         return None
 
@@ -117,7 +120,7 @@ class Renderer:
     def error(self, message: str) -> None:
         bridge = _tui_bridge()
         if bridge is not None:
-            bridge.push_warn(message)
+            bridge.push_error(message)
             return
         self._write(message, style=theme.ERROR)
 
@@ -142,6 +145,15 @@ class Renderer:
             return
         bridge = _tui_bridge()
         if bridge is not None:
+            from harness.providers.errors import is_error_assistant_text
+
+            if is_error_assistant_text(text):
+                # Strip the history marker so the dock shows a clean error card.
+                clean = text.lstrip()
+                if clean.startswith("[Error]"):
+                    clean = clean[len("[Error]") :].lstrip(" :")
+                bridge.push_error(clean or text)
+                return
             bridge.push_final(text)
             return
         if _RICH and _console is not None:

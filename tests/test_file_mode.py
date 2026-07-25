@@ -150,7 +150,7 @@ def test_tui_file_mode_bypasses_agent_loop(monkeypatch):
     monkeypatch.setattr(file_mode_mod, "handle_file_mode_turn", lambda query: "grounded answer")
     monkeypatch.setattr(registry_mod, "touch_session_title_from_query", lambda query: None)
     monkeypatch.setattr(session_mod.renderer, "user", lambda text: None)
-    monkeypatch.setattr(session_mod.renderer, "plain", rendered.append)
+    monkeypatch.setattr(session_mod.renderer, "assistant", rendered.append)
     monkeypatch.setattr(
         session_mod,
         "agent_loop",

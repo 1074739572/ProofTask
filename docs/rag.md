@@ -83,12 +83,15 @@ python main.py rag status
 与 **direct**（普通 Agent）相对：进文件模式后，**每条普通消息都走「检索 → 回答」**，不再进 coding agent loop。
 
 ```text
-/rag index files          # 先有索引
-/mode file                # 默认搜索全部已索引文档
-技术路线是什么？          # 直接问，自动 RAG
-/rag select 1,3           # 可选：按 /rag docs 编号限定范围
-搜全部                    # 恢复全部范围
-/mode direct              # 退出，回到普通对话
+/rag                     # 总览：本地 files/ 有哪些、是否已索引
+/rag files               # 只看本地上传（✓已索引 / ·未索引 / ↻需刷新）
+/rag index files         # 有未索引或过期时先建索引
+/mode file               # 默认搜索全部已索引文档
+技术路线是什么？         # 直接问，自动 RAG
+/rag select 1,3          # 可选：按 /rag docs 编号限定范围
+/rag pick                # TUI/终端交互多选（Space 勾选，Enter 保存）
+搜全部                   # 恢复全部范围
+/mode direct             # 退出，回到普通对话
 ```
 
 | 模式 | 行为 |
@@ -97,7 +100,7 @@ python main.py rag status
 | `file` | 句句 grounded 问答；范围 = 指定文档或全部 |
 | `plan` / `orchestrate` | 原有规划 / 编排 |
 
-Classic 提示符在文件模式下为 `[model|file] >`；Textual TUI 使用同一条 file-mode 短路，不进入 coding agent loop。索引文件变化时会提示先执行 `/rag index files`。
+Classic 提示符在文件模式下为 `[model|file] >`；Textual TUI 使用同一条 file-mode 短路，不进入 coding agent loop。提问时会先显示「检索中 / 命中 N 条」，最终回答走 assistant 气泡（含来源引用），不会被误渲染成灰色 step 行。索引为空或文件变化时，提问会先列出本地 `files/` 并提示 `/rag index files`（不会静默漏检）。
 
 ### 选文档提问（仍可用 `/rag ask`）
 

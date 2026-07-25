@@ -74,7 +74,7 @@ def _help_text() -> str:
   /clear session            new session id; keep state.json
   /import-transcript [path] [full|merge]
   /transcripts             list .transcripts backups
-  /rag [status|index|add|docs|pick|select|ask]  RAG corpus + Q&A on selected docs
+  /rag [files|docs|pick|select|index|add|ask|status|help]  RAG corpus + Q&A
   /banner [style|demo]     preview welcome art (classic|emoji|typewriter|shadow3d)
   /help                    this message
   q, exit                  quit"""
@@ -187,6 +187,14 @@ def bootstrap_cli_session(
     bootstrap_results = bootstrap_mcp_servers()
     for line in mcp_bootstrap_warnings(bootstrap_results):
         renderer.warn(line)
+    try:
+        from harness.providers.netcheck import proxy_health_warning
+
+        warn = proxy_health_warning()
+        if warn:
+            renderer.warn(warn)
+    except Exception:
+        pass
     if start_cron:
         threading.Thread(
             target=cron_autorun_loop, args=(history, context), daemon=True
@@ -340,8 +348,9 @@ def run_cli() -> None:
         # File mode: every normal message is document Q&A (RAG → answer).
         # Slash commands above still work; exit with /mode direct.
         if is_file_mode() or get_mode() == "file":
+            # Same path as TUI: always RAG → assistant answer (not plain dump).
             renderer.user(query)
-            renderer.plain(handle_file_mode_turn(query))
+            renderer.assistant(handle_file_mode_turn(query))
             print()
             continue
 

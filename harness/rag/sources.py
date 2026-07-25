@@ -42,10 +42,17 @@ def format_docs_list() -> str:
     rows = list_indexed_sources()
     if not rows:
         return (
-            "No indexed documents.\n"
-            "Add files under files/ then run: /rag index files"
+            "尚无已索引文档。\n"
+            "先看本地文件: /rag files\n"
+            "再构建索引:   /rag index files"
         )
-    lines = ["Indexed documents (use numbers with /rag select or /rag pick):"]
+    from harness.rag.selection import format_selection_summary
+
+    lines = [
+        format_selection_summary(),
+        "",
+        "已索引文档（编号用于 /rag select）:",
+    ]
     for row in rows:
         mark = "[x]" if row["selected"] else "[ ]"
         lines.append(
@@ -53,5 +60,6 @@ def format_docs_list() -> str:
             f"({row.get('child_chunks', 0)} child chunks, {row.get('chars', 0)} chars)"
         )
     lines.append("")
-    lines.append("Select: /rag pick  |  /rag select 1,3  |  /rag select all  |  /rag select clear")
+    lines.append("选范围: /rag pick  |  /rag select 1,3  |  /rag select all  |  /rag select clear")
+    lines.append("看本地上传(含未索引): /rag files")
     return "\n".join(lines)

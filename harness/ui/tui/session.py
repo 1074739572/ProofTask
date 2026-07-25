@@ -30,11 +30,17 @@ def run_agent_turn(history: list, context: dict, query: str) -> dict:
     from harness.rag.file_mode import handle_file_mode_turn, is_file_mode
 
     if is_file_mode():
+        # File mode bypasses the agent loop: retrieve → grounded answer.
+        # Must use renderer.assistant (push_final), not plain (push_step):
+        # plain would split the answer into muted step lines and never mark
+        # an assistant bubble, so it looks like "no document search happened".
         touch_session_title_from_query(query)
         renderer.user(query)
-        renderer.plain(handle_file_mode_turn(query))
+        BRIDGE.push_status("检索文档中…")
+        answer = handle_file_mode_turn(query)
+        renderer.assistant(answer)
         BRIDGE.seal_turn_bubbles()
-        BRIDGE.push_status("Ready")
+        BRIDGE.push_status("Ready · file")
         BRIDGE.set_busy(False)
         BRIDGE.refresh_usage()
         return {

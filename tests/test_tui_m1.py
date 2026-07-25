@@ -80,6 +80,7 @@ class TuiImportTests(unittest.TestCase):
 
         tools: list[ToolEvent] = []
         finals: list[str] = []
+        errors: list[str] = []
 
         class FakeApp:
             def call_from_thread(self, fn, *args):
@@ -90,6 +91,9 @@ class TuiImportTests(unittest.TestCase):
 
             def tui_set_answer(self, text: str) -> None:
                 finals.append(text)
+
+            def tui_set_error(self, text: str) -> None:
+                errors.append(text)
 
             def tui_set_status(self, text: str) -> None:
                 pass
@@ -112,11 +116,26 @@ class TuiImportTests(unittest.TestCase):
         try:
             renderer.tool_start("bash", {"command": "echo hi"})
             renderer.assistant("# Hello\n\nworld")
+            renderer.assistant("[Error] AuthenticationError: bad key")
+            renderer.error("Connection failed")
             self.assertTrue(any(event.name == "bash" for event in tools))
             self.assertTrue(any("Hello" in f for f in finals))
+            self.assertTrue(any("bad key" in e for e in errors))
+            self.assertTrue(any("Connection failed" in e for e in errors))
+            self.assertFalse(any("[Error]" in f for f in finals))
         finally:
             BRIDGE.unbind()
             set_tui_active(False)
+
+    def test_composer_keeps_paste_binding(self):
+        from textual.widgets import TextArea
+
+        from harness.ui.tui.app import ComposerTextArea
+
+        actions = {b.action for b in ComposerTextArea.BINDINGS}
+        self.assertIn("composer_paste", actions)
+        # Parent paste/copy still present via splat.
+        self.assertTrue(any(b.action == "paste" for b in TextArea.BINDINGS))
 
     def test_slash_rag_routes_to_background_command(self):
         from harness.ui.tui.commands import dispatch_slash
@@ -400,21 +419,48 @@ class TuiShutdownSinkTests(unittest.TestCase):
         self.assertTrue(hasattr(HarnessApp, "tui_seal_turn_bubbles"))
         self.assertTrue(hasattr(HarnessApp, "action_quit_app"))
         self.assertTrue(hasattr(HarnessApp, "reload_session_view"))
-        self.assertTrue(hasattr(HarnessApp, "action_swallow_ctrl_c"))
+        self.assertTrue(hasattr(HarnessApp, "action_copy_selection"))
+        self.assertTrue(hasattr(HarnessApp, "action_copy_last_answer"))
         self.assertTrue(hasattr(HarnessApp, "action_submit_or_stop"))
 
-    def test_bindings_swallow_ctrl_c_and_ctrl_enter(self):
+    def test_bindings_copy_ctrl_c_and_ctrl_enter(self):
         from harness.ui.tui.app import ComposerTextArea, HarnessApp
 
-        keys = {b.key: b.action for b in HarnessApp.BINDINGS}
-        self.assertEqual(keys.get("ctrl+c"), "swallow_ctrl_c")
-        self.assertEqual(keys.get("ctrl+enter"), "submit_or_stop")
-        self.assertEqual(keys.get("escape"), "interrupt")
-        self.assertNotEqual(keys.get("ctrl+c"), "interrupt")
+        def _actions_for(bindings, needle: str) -> set[str]:
+            found: set[str] = set()
+            for binding in bindings:
+                keys = {part.strip() for part in (binding.key or "").split(",")}
+                if needle in keys:
+                    found.add(binding.action)
+            return found
 
-        composer_keys = {b.key: b.action for b in ComposerTextArea.BINDINGS}
-        self.assertEqual(composer_keys.get("enter"), "composer_submit")
-        self.assertEqual(composer_keys.get("shift+enter"), "composer_newline")
+        self.assertIn("copy_selection", _actions_for(HarnessApp.BINDINGS, "ctrl+c"))
+        self.assertIn("copy_last_answer", _actions_for(HarnessApp.BINDINGS, "ctrl+shift+c"))
+        self.assertIn("copy_last_answer", _actions_for(HarnessApp.BINDINGS, "ctrl+shift+y"))
+        self.assertIn("submit_or_stop", _actions_for(HarnessApp.BINDINGS, "ctrl+enter"))
+        self.assertIn("interrupt", _actions_for(HarnessApp.BINDINGS, "escape"))
+        self.assertNotIn("interrupt", _actions_for(HarnessApp.BINDINGS, "ctrl+c"))
+        self.assertNotIn("swallow_ctrl_c", _actions_for(HarnessApp.BINDINGS, "ctrl+c"))
+
+        self.assertIn("composer_copy", _actions_for(ComposerTextArea.BINDINGS, "ctrl+c"))
+        self.assertIn("composer_submit", _actions_for(ComposerTextArea.BINDINGS, "enter"))
+        self.assertIn("composer_newline", _actions_for(ComposerTextArea.BINDINGS, "shift+enter"))
+        # Default TextArea copy binding must be stripped (OS clipboard path only).
+        self.assertNotIn("copy", _actions_for(ComposerTextArea.BINDINGS, "ctrl+c"))
+
+    def test_copy_last_answer_writes_os_clipboard(self):
+        from harness.ui.tui.app import HarnessApp
+        from harness.ui.tui.clipboard import read_os_clipboard, write_os_clipboard
+
+        marker = "HARNESS_TUI_COPY_ANSWER_555"
+        write_os_clipboard("before-copy-marker")
+        app = HarnessApp([], {})
+        app._last_assistant_text = marker
+        statuses: list[str] = []
+        app.tui_set_status = statuses.append  # type: ignore[method-assign]
+        app.action_copy_last_answer()
+        self.assertEqual(read_os_clipboard(), marker)
+        self.assertTrue(any("已复制" in s for s in statuses))
 
 
 class TuiInlineInteractionTests(unittest.TestCase):
@@ -458,7 +504,18 @@ class TuiInlineInteractionTests(unittest.TestCase):
 
                 app.tui_set_answer("Done")
                 await pilot.pause()
-                self.assertTrue(app.query_one("#answer-dock", Vertical).display)
+                stream = app.query_one("#chat-stream", Vertical)
+                assistant_bubbles = [
+                    child
+                    for child in stream.children
+                    if "bubble-assistant" in getattr(child, "classes", [])
+                ]
+                self.assertTrue(assistant_bubbles)
+                # Separate sticky answer dock is gone — Chat is the only answer surface.
+                from textual.css.query import NoMatches
+
+                with self.assertRaises(NoMatches):
+                    app.query_one("#answer-dock")
 
         try:
             asyncio.run(scenario())

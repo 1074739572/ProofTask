@@ -58,6 +58,12 @@ class TuiBridge:
             return
         self._call("tui_set_answer", text)
 
+    def push_error(self, text: str) -> None:
+        """Surface an API / turn failure as a dedicated error panel + chat bubble."""
+        if not (text or "").strip():
+            return
+        self._call("tui_set_error", text)
+
     def push_status(self, text: str) -> None:
         self._call("tui_set_status", text)
 
@@ -154,6 +160,36 @@ class TuiBridge:
         if response.decision == "cancel":
             return None
         return response.allowed
+
+    def ask_doc_multi_select(self, rows: list[dict]) -> list[str] | None:
+        """Block the worker while the inline multi-select doc picker is open.
+
+        Returns selected source names, empty list (= search all), or None if cancelled.
+        """
+        app = self.app
+        if app is None:
+            return None
+
+        done = threading.Event()
+        box: dict[str, list[str] | None] = {"value": None}
+
+        def _on_done(selected: list[str] | None) -> None:
+            box["value"] = selected
+            done.set()
+
+        def _show() -> None:
+            show = getattr(app, "tui_open_doc_multi_picker", None)
+            if show is None:
+                _on_done(None)
+                return
+            show(rows, _on_done)
+
+        try:
+            app.call_from_thread(_show)
+        except Exception:
+            return None
+        done.wait(timeout=600)
+        return box["value"]
 
 
 BRIDGE = TuiBridge()

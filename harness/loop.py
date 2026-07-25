@@ -162,12 +162,18 @@ def agent_loop(
                 messages[:] = reactive_compact(messages)
                 state.has_attempted_reactive_compact = True
                 continue
-            messages.append(
-                {
-                    "role": "assistant",
-                    "content": [{"type": "text", "text": f"[Error] {type(exc).__name__}: {exc}"}],
-                }
-            )
+            from harness.providers.errors import format_api_error
+
+            formatted = format_api_error(exc)
+            error_msg = {
+                "role": "assistant",
+                "content": [{"type": "text", "text": f"[Error] {formatted}"}],
+                # Prevent print_turn_assistants from re-emitting via assistant().
+                "_ui_final_printed": True,
+            }
+            messages.append(error_msg)
+            # TUI: sticky error dock; classic CLI: styled error line.
+            renderer.error(formatted)
             return _finish(False)
 
         if is_cancelled():

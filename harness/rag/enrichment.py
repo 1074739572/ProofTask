@@ -39,6 +39,20 @@ def should_render_pdf_pages() -> bool:
     )
 
 
+def pdf_extract_images() -> bool:
+    """Whether PDF ingestion should extract embedded / vector images.
+
+    Bulk text knowledge-base imports can set ``HARNESS_RAG_PDF_EXTRACT_IMAGES=0``
+    to skip image assets (text + tables still index). Default is on.
+    """
+    return os.getenv("HARNESS_RAG_PDF_EXTRACT_IMAGES", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
 def pdf_ocr_mode() -> str:
     """Resolve scanned-page OCR mode with compatibility for the old boolean."""
     configured = os.getenv("HARNESS_RAG_PDF_OCR_MODE", "").strip().lower()

@@ -5,7 +5,7 @@ from __future__ import annotations
 import time
 
 from harness.rag.selection import load_selection, set_selection
-from harness.rag.sources import list_indexed_sources
+from harness.rag.sources import format_docs_list, list_indexed_sources
 from harness.ui.terminal_menu import drain_stdin, is_interactive_tty, read_menu_key
 
 try:
@@ -85,24 +85,55 @@ def _read_key_with_space() -> str:
     return key
 
 
+def _run_tui_doc_picker() -> str:
+    """Block on the Textual multi-select panel (worker-thread safe)."""
+    from harness.ui.tui.bridge import BRIDGE
+
+    rows = list_indexed_sources()
+    if not rows:
+        return (
+            "尚无已索引文档。\n"
+            "先 /rag files 查看本地上传，再 /rag index files。"
+        )
+    chosen = BRIDGE.ask_doc_multi_select(rows)
+    if chosen is None:
+        return "Selection unchanged."
+    set_selection(chosen)
+    if not chosen:
+        return "Selection cleared — 将搜索全部已索引文档。"
+    lines = ["Saved selection:"]
+    lines.extend(f"  - {name}" for name in chosen)
+    return "\n".join(lines)
+
+
 def run_doc_picker() -> str:
     rows = list_indexed_sources()
     if not rows:
         return (
-            "No indexed documents.\n"
-            "Add files under files/ then run: /rag index files"
+            "尚无已索引文档。\n"
+            "先 /rag files 查看本地上传，再 /rag index files。"
         )
+
+    try:
+        from harness.ui.tui.mode import is_tui_active
+
+        if is_tui_active():
+            return _run_tui_doc_picker()
+    except Exception:
+        pass
+
     if not is_interactive_tty():
         return (
-            "Document picker needs an interactive terminal.\n"
-            "Use: /rag docs  then  /rag select 1,3"
+            "当前无法打开交互多选。\n"
+            f"{format_docs_list()}\n\n"
+            "请用: /rag select 1,3"
         )
 
     selected_names = set(load_selection())
     labels, sources, checked = _labels_and_sources(rows, selected_names)
     index = 0
     hint = "↑↓ move · Space toggle · Enter save · Esc cancel"
-    title = "Select documents for /rag ask"
+    title = "Select documents for file-mode /rag ask"
 
     drain_stdin()
 

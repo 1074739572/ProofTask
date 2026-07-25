@@ -119,6 +119,18 @@ def answer_question(
 
     context = build_context(hits)
 
+    # Surface that retrieval actually ran (especially important in TUI file mode).
+    try:
+        from harness.ui.renderer import renderer
+
+        preview = ", ".join(
+            _short_source(h.get("source", "")) for h in hits[:3] if h.get("source")
+        )
+        extra = f" · {preview}" if preview else ""
+        renderer.muted(f"命中 {len(hits)} 条摘录{extra}")
+    except Exception:
+        pass
+
     if not _llm_enabled():
         return f"检索到 {len(hits)} 条：\n\n{context}"
 

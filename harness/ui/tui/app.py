@@ -28,16 +28,38 @@ from harness.ui.tui.widgets import MetaChip, ToolCard
 _CSS_PATH = Path(__file__).with_name("theme.tcss")
 _TURN_LIVE = "turn-live"
 _COMPOSER_PLACEHOLDER = (
-    "Ask…  Enter send · Shift+Enter newline · Esc stop · Ctrl+Q quit"
+    "Ask…  Enter send · Shift+Enter newline · Ctrl+C copy · Ctrl+V paste · Esc stop · Ctrl+Q quit"
 )
+
+
+def _textarea_bindings_without_copy() -> list[Binding]:
+    """Drop TextArea's default Ctrl+C so our OS-clipboard copy wins."""
+    out: list[Binding] = []
+    for binding in TextArea.BINDINGS:
+        keys = {part.strip() for part in (binding.key or "").split(",")}
+        if keys & {"ctrl+c", "super+c", "ctrl+insert"}:
+            continue
+        out.append(binding)
+    return out
 
 
 class ComposerTextArea(TextArea):
     """Chat composer: Enter sends; Shift+Enter inserts a newline."""
 
+    # Keep undo/nav bindings; replace copy/paste with OS clipboard paths.
     BINDINGS = [
+        *_textarea_bindings_without_copy(),
         Binding("enter", "composer_submit", "Send", show=False, priority=True),
         Binding("shift+enter", "composer_newline", "Newline", show=False, priority=True),
+        # Selection-only: no selection → SkipAction → App.copy_selection (last answer).
+        Binding(
+            "ctrl+c,ctrl+insert,super+c",
+            "composer_copy",
+            "Copy",
+            show=False,
+            priority=True,
+        ),
+        Binding("ctrl+v,ctrl+shift+v,super+v", "composer_paste", "Paste", show=False, priority=True),
         Binding("ctrl+up", "composer_history_previous", "Previous", show=False),
         Binding("ctrl+down", "composer_history_next", "Next", show=False),
     ]
@@ -49,6 +71,81 @@ class ComposerTextArea(TextArea):
 
     def action_composer_newline(self) -> None:
         self.insert("\n")
+
+    def action_composer_paste(self) -> None:
+        """Paste OS clipboard when Textual's in-app clipboard is empty (Windows)."""
+        self.action_paste()
+
+    def action_composer_copy(self) -> None:
+        self.action_copy()
+
+    def action_copy(self) -> None:
+        """Copy selected composer text to the OS clipboard; else defer to App."""
+        from textual.actions import SkipAction
+
+        from harness.ui.tui.clipboard import write_os_clipboard
+
+        selected = (self.selected_text or "").replace("\x00", "")
+        if not selected:
+            # Empty selection: App.copy_selection copies last answer (or draft).
+            raise SkipAction()
+        if not write_os_clipboard(selected):
+            raise SkipAction()
+        # Sync Textual's in-app buffer only — do NOT emit OSC 52 (conflicts on WT).
+        try:
+            self.app._clipboard = selected  # noqa: SLF001
+        except Exception:
+            pass
+        if hasattr(self.app, "tui_set_status"):
+            self.app.tui_set_status("已复制选区到剪贴板")  # type: ignore[attr-defined]
+
+    def _clipboard_text(self) -> str:
+        from harness.ui.tui.clipboard import read_os_clipboard
+
+        text = self.app.clipboard or ""
+        if not text:
+            text = read_os_clipboard()
+        return (text or "").replace("\x00", "")
+
+    def _insert_paste_text(self, text: str) -> None:
+        if not text:
+            return
+        # Prefer the selection-aware path; fall back to plain insert.
+        try:
+            result = self._replace_via_keyboard(text, *self.selection)
+        except Exception:
+            result = None
+        if result is not None:
+            self.move_cursor(result.end_location)
+        else:
+            try:
+                self.insert(text)
+            except Exception:
+                # Last resort: replace whole document.
+                self.text = (self.text or "") + text
+        self.focus()
+
+    def action_paste(self) -> None:
+        if self.read_only:
+            return
+        text = self._clipboard_text()
+        if not text:
+            return
+        # Do NOT call copy_to_clipboard here — OSC 52 can confuse Windows Terminal
+        # and re-enter paste handling. Keep OS clipboard as the source of truth.
+        self._insert_paste_text(text)
+
+    async def _on_paste(self, event) -> None:
+        """Bracketed paste from the terminal (right-click / WT paste when focused)."""
+        if self.read_only:
+            return
+        pasted = event.text or ""
+        if not pasted:
+            # Some hosts fire Paste with empty payload — fall back to OS clipboard.
+            pasted = self._clipboard_text()
+        self._insert_paste_text(pasted)
+        event.stop()
+        event.prevent_default()
 
     def action_composer_history_previous(self) -> None:
         app = self.app
@@ -68,11 +165,22 @@ class HarnessApp(App[None]):
     CSS_PATH = _CSS_PATH
     BINDINGS = [
         Binding("escape", "interrupt", "Stop", show=True, priority=True),
-        # K3: swallow Textual's default help_quit so Ctrl+C does not exit.
-        Binding("ctrl+c", "swallow_ctrl_c", show=False, priority=True),
+        # Ctrl+C: copy selection / last answer to OS clipboard (never quit).
+        Binding("ctrl+c,ctrl+insert", "copy_selection", "Copy", show=False, priority=True),
+        # Ctrl+Shift+C / Ctrl+Shift+Y: always copy the latest assistant answer.
+        # (WT may steal Ctrl+Shift+C when it has a selection — Y is a reliable fallback.)
+        Binding(
+            "ctrl+shift+c,ctrl+shift+y",
+            "copy_last_answer",
+            "Copy answer",
+            show=True,
+            priority=True,
+        ),
         Binding("ctrl+q", "quit_app", "Quit", show=True),
         # Also allow Ctrl+Enter as send (same as Enter).
         Binding("ctrl+enter", "submit_or_stop", "Send", show=True, priority=True),
+        # App-level paste: works even when Chat scroll has focus, not the composer.
+        Binding("ctrl+v,ctrl+shift+v", "paste_to_composer", "Paste", show=False, priority=True),
     ]
 
     def __init__(self, history: list, context: dict, *, model_name: str = "") -> None:
@@ -85,6 +193,10 @@ class HarnessApp(App[None]):
         self._pick_ids: list[str] = []
         self._pick_callback: Callable[[str | None], None] | None = None
         self._picking = False
+        self._doc_multi_picking = False
+        self._doc_multi_callback: Callable[[list[str] | None], None] | None = None
+        self._doc_multi_sources: list[str] = []
+        self._doc_multi_checked: dict[str, bool] = {}
         self._exit_when_idle = False
         self._live_turn = False
         self._permission_request: PermissionRequest | None = None
@@ -99,6 +211,7 @@ class HarnessApp(App[None]):
         self._last_step_text = ""
         self._last_step_widget: Static | None = None
         self._last_step_count = 0
+        self._last_assistant_text = ""
         self._input_history: list[str] = []
         self._input_history_index = 0
 
@@ -106,9 +219,6 @@ class HarnessApp(App[None]):
         yield Label("", id="usage-bar")
         with VerticalScroll(id="chat-pane"):
             yield Vertical(id="chat-stream")
-        with Vertical(id="answer-dock"):
-            yield Label("最终答案", id="answer-title")
-            yield Markdown("", id="answer-content")
         with Vertical(id="footer-stack"):
             with Horizontal(id="meta-bar"):
                 yield MetaChip("", id="meta-model", chip="model")
@@ -122,7 +232,7 @@ class HarnessApp(App[None]):
             with Vertical(id="pick-panel"):
                 yield Label("", id="pick-title")
                 yield OptionList(id="pick-list")
-                yield Label("↑↓ move · Enter confirm · Esc close", id="pick-hint")
+                yield Label("↑↓ · Space 勾选 · Enter 确认 · Esc 取消", id="pick-hint")
             with Vertical(id="interaction-panel"):
                 yield Label("", id="interaction-title")
                 yield Static("", id="interaction-detail", markup=False)
@@ -151,7 +261,6 @@ class HarnessApp(App[None]):
         chat.border_title = "Chat"
         self.close_inline_picker(notify=False)
         self._hide_permission_panel(notify=False)
-        self.query_one("#answer-dock", Vertical).display = False
         self.query_one("#background-tray", Vertical).display = False
         self.query_one("#command-hints", Static).display = False
         self.query_one("#progress-strip", Static).update("○ 等待任务")
@@ -164,6 +273,17 @@ class HarnessApp(App[None]):
         md_status = (self.context.get("project_instructions_status") or "").strip()
         if md_status:
             self.tui_set_status(md_status)
+        try:
+            from harness.providers.netcheck import proxy_health_warning
+
+            warn = proxy_health_warning()
+            if warn:
+                BRIDGE.push_warn(warn)
+                self.tui_set_status("代理未启动 — API 会失败")
+                self._network_health = "net ⚠"
+                self._refresh_runtime_chips()
+        except Exception:
+            pass
 
     def on_unmount(self) -> None:
         begin_tui_shutdown()
@@ -324,7 +444,13 @@ class HarnessApp(App[None]):
             self._last_step_widget = None
             self._last_step_count = 0
         if kind == "assistant":
+            self._last_assistant_text = body
             stream.mount(Markdown(body, classes=f"bubble-assistant{extra}"))
+        elif kind == "error":
+            # Keep API failures plain-text so HTML/JSON dumps stay readable.
+            stream.mount(
+                Static(f"⚠ {body}", classes=f"bubble-error{extra}", markup=False)
+            )
         elif kind == "user":
             stream.mount(Static(f"🧑 {body}", classes=f"bubble-user{extra}", markup=False))
         elif kind == "system":
@@ -346,7 +472,6 @@ class HarnessApp(App[None]):
         self._tool_cards.clear()
         self._last_tool_card = None
         self._last_tool_signature = None
-        self._clear_answer_dock()
 
     def tui_seal_turn_bubbles(self) -> None:
         """Keep bubbles but drop live tag so a later interrupt won't tear them."""
@@ -520,7 +645,6 @@ class HarnessApp(App[None]):
         self._tool_health = "tool —"
         self._network_health = "net —"
         self._refresh_runtime_chips()
-        self._clear_answer_dock()
         self.query_one("#progress-strip", Static).update("● 理解目标  →  ○ 执行  →  ○ 回答")
         if model:
             self._model_name = model
@@ -550,24 +674,31 @@ class HarnessApp(App[None]):
                 self._last_step_count = 1
 
     def tui_set_answer(self, text: str) -> None:
+        """Append the model answer into Chat history (no separate dock)."""
         self.chat_append("assistant", text)
         try:
-            dock = self.query_one("#answer-dock", Vertical)
-            dock.display = True
-            self.query_one("#answer-content", Markdown).update(text)
             self.query_one("#progress-strip", Static).update("✓ 理解目标  →  ✓ 执行  →  ✓ 回答")
+        except Exception:
+            pass
+
+    def tui_set_error(self, text: str) -> None:
+        """Show an API/turn failure inline in Chat (same scroll timeline as answers)."""
+        body = (text or "").strip()
+        if not body:
+            return
+        self.chat_append("error", f"API 错误\n{body}")
+        try:
+            self.query_one("#progress-strip", Static).update(
+                "✗ API 调用失败 — 检查密钥 / 模型 / 网络"
+            )
+            self.tui_set_status(f"Error: {body.splitlines()[0][:120]}")
+            self._network_health = "net ⚠"
+            self._refresh_runtime_chips()
         except Exception:
             pass
 
     def tui_append_assistant(self, text: str) -> None:
         self.tui_set_answer(text)
-
-    def _clear_answer_dock(self) -> None:
-        try:
-            self.query_one("#answer-content", Markdown).update("")
-            self.query_one("#answer-dock", Vertical).display = False
-        except Exception:
-            pass
 
     def tui_tool_event(self, event: ToolEvent) -> None:
         signature = (event.name, event.summary)
@@ -695,6 +826,8 @@ class HarnessApp(App[None]):
     ) -> None:
         if len(labels) != len(item_ids):
             raise ValueError("labels and item_ids must be the same length")
+        self._doc_multi_picking = False
+        self._doc_multi_callback = None
         self._pick_ids = list(item_ids)
         self._pick_callback = on_pick
         self._picking = True
@@ -702,6 +835,10 @@ class HarnessApp(App[None]):
         panel = self.query_one("#pick-panel", Vertical)
         panel.display = True
         self.query_one("#pick-title", Label).update(title)
+        try:
+            self.query_one("#pick-hint", Label).update("↑↓ move · Enter confirm · Esc close")
+        except Exception:
+            pass
 
         ol = self.query_one("#pick-list", OptionList)
         ol.clear_options()
@@ -712,7 +849,76 @@ class HarnessApp(App[None]):
         ol.focus()
         self.tui_set_status(f"{title} — ↑↓ Enter · Esc")
 
+    def tui_open_doc_multi_picker(
+        self,
+        rows: list[dict],
+        on_done: Callable[[list[str] | None], None] | None = None,
+    ) -> None:
+        """Multi-select indexed docs for /rag pick (Space toggle, Enter save)."""
+        sources = [str(row.get("source") or "") for row in rows if row.get("source")]
+        if not sources:
+            if on_done is not None:
+                on_done(None)
+            return
+        self._pick_callback = None
+        self._pick_ids = []
+        self._doc_multi_picking = True
+        self._doc_multi_callback = on_done
+        self._doc_multi_sources = sources
+        self._doc_multi_checked = {
+            str(row["source"]): bool(row.get("selected"))
+            for row in rows
+            if row.get("source")
+        }
+        self._picking = True
+
+        panel = self.query_one("#pick-panel", Vertical)
+        panel.display = True
+        self.query_one("#pick-title", Label).update("选择检索文档（可多选）")
+        try:
+            self.query_one("#pick-hint", Label).update(
+                "↑↓ 移动 · Space 勾选/取消 · Enter 保存 · Esc 取消"
+            )
+        except Exception:
+            pass
+        self._refresh_doc_multi_options(highlight=0)
+        self.tui_set_status("文档多选 — Space 勾选 · Enter 保存 · Esc 取消")
+
+    def _refresh_doc_multi_options(self, *, highlight: int | None = None) -> None:
+        ol = self.query_one("#pick-list", OptionList)
+        current = ol.highlighted if highlight is None else highlight
+        ol.clear_options()
+        for source in self._doc_multi_sources:
+            mark = "[x]" if self._doc_multi_checked.get(source) else "[ ]"
+            ol.add_option(Option(f"{mark} {source}", id=source))
+        if self._doc_multi_sources:
+            ol.highlighted = max(0, min(current or 0, len(self._doc_multi_sources) - 1))
+        ol.focus()
+
+    def _close_doc_multi_picker(self, selected: list[str] | None) -> None:
+        was = self._doc_multi_picking
+        cb = self._doc_multi_callback
+        self._doc_multi_picking = False
+        self._doc_multi_callback = None
+        self._doc_multi_sources = []
+        self._doc_multi_checked = {}
+        self._picking = False
+        try:
+            panel = self.query_one("#pick-panel", Vertical)
+            panel.display = False
+            ol = self.query_one("#pick-list", OptionList)
+            ol.clear_options()
+        except Exception:
+            pass
+        if was and cb is not None:
+            cb(selected)
+        self._focus_composer()
+
     def close_inline_picker(self, *, notify: bool = True, selected: str | None = None) -> None:
+        if self._doc_multi_picking:
+            # Esc / interrupt while multi-selecting → cancel.
+            self._close_doc_multi_picker(None)
+            return
         was = self._picking
         cb = self._pick_callback
         self._picking = False
@@ -733,6 +939,17 @@ class HarnessApp(App[None]):
         if not self._picking or event.option_list.id != "pick-list":
             return
         event.stop()
+        if self._doc_multi_picking:
+            chosen = [
+                source
+                for source in self._doc_multi_sources
+                if self._doc_multi_checked.get(source)
+            ]
+            self._close_doc_multi_picker(chosen)
+            self.tui_set_status(
+                f"已选择 {len(chosen)} 个文档" if chosen else "已设为全部文档"
+            )
+            return
         option_id = event.option.id
         if option_id is None:
             idx = event.option_index
@@ -740,6 +957,25 @@ class HarnessApp(App[None]):
         else:
             picked = str(option_id)
         self.close_inline_picker(notify=True, selected=picked)
+
+    def on_key(self, event) -> None:
+        """Space toggles checked state while the RAG multi-select panel is open."""
+        if not self._doc_multi_picking:
+            return
+        if event.key != "space":
+            return
+        try:
+            ol = self.query_one("#pick-list", OptionList)
+        except Exception:
+            return
+        idx = ol.highlighted
+        if idx is None or not (0 <= idx < len(self._doc_multi_sources)):
+            return
+        source = self._doc_multi_sources[idx]
+        self._doc_multi_checked[source] = not self._doc_multi_checked.get(source, False)
+        self._refresh_doc_multi_options(highlight=idx)
+        event.stop()
+        event.prevent_default()
 
     # --- Send / Stop / Quit ---
 
@@ -753,11 +989,124 @@ class HarnessApp(App[None]):
             return
         self.exit()
 
-    def action_swallow_ctrl_c(self) -> None:
-        """K3: do not quit / interrupt on Ctrl+C — tip for terminal copy."""
+    def _copy_text_to_os(self, text: str, *, ok_status: str) -> bool:
+        from harness.ui.tui.clipboard import write_os_clipboard
+
+        payload = (text or "").replace("\x00", "")
+        if not payload.strip():
+            return False
+        if not write_os_clipboard(payload):
+            self.tui_set_status("复制失败 — 系统剪贴板不可写")
+            return False
+        # Keep Textual's in-app paste buffer, but skip OSC 52 (Windows Terminal fights it).
+        try:
+            self._clipboard = payload
+        except Exception:
+            pass
+        self.tui_set_status(ok_status)
+        return True
+
+    def _latest_assistant_text(self) -> str:
+        """Prefer cached bubble text; then live Chat widget; then session history."""
+        cached = (self._last_assistant_text or "").strip()
+        if cached:
+            return self._last_assistant_text
+        try:
+            stream = self._chat_stream()
+            for child in reversed(list(stream.children)):
+                classes = getattr(child, "classes", ()) or ()
+                if "bubble-assistant" not in classes:
+                    continue
+                # Markdown widgets expose .source in recent Textual versions.
+                source = getattr(child, "source", None)
+                if isinstance(source, str) and source.strip():
+                    self._last_assistant_text = source
+                    return source
+                # Static-like fallbacks.
+                for attr in ("_renderable", "renderable"):
+                    value = getattr(child, attr, None)
+                    if isinstance(value, str) and value.strip():
+                        self._last_assistant_text = value
+                        return value
+        except Exception:
+            pass
+        try:
+            from harness.ui.final_answer import assistant_text_blocks
+
+            for msg in reversed(self.history or []):
+                if msg.get("role") != "assistant":
+                    continue
+                texts = assistant_text_blocks(msg.get("content"))
+                joined = "\n\n".join(t for t in texts if (t or "").strip())
+                if joined.strip():
+                    self._last_assistant_text = joined
+                    return joined
+        except Exception:
+            pass
+        return ""
+
+    def action_copy_selection(self) -> None:
+        """Ctrl+C: copy composer selection, else latest answer; never quit."""
+        focused = self.focused
+        if isinstance(focused, ComposerTextArea):
+            selected = focused.selected_text or ""
+            if selected:
+                self._copy_text_to_os(selected, ok_status="已复制选区到剪贴板")
+                return
+            # No selection in composer — fall through to last answer.
+        text = self._latest_assistant_text()
+        if text:
+            self._copy_text_to_os(text, ok_status="已复制最近回答到剪贴板")
+            return
+        composer_text = ""
+        try:
+            composer_text = self._composer().text or ""
+        except Exception:
+            pass
+        if composer_text.strip():
+            self._copy_text_to_os(composer_text, ok_status="已复制输入框到剪贴板")
+            return
         self.tui_set_status(
-            "Copy: select or Ctrl+Shift+C · Stop: Esc · Quit: Ctrl+Q"
+            "无可复制内容 · Ctrl+Shift+Y 复制回答 · Paste: Ctrl+V · Quit: Ctrl+Q"
         )
+
+    def action_copy_last_answer(self) -> None:
+        """Ctrl+Shift+C/Y: always copy the latest assistant answer."""
+        text = self._latest_assistant_text()
+        if not text:
+            self.tui_set_status("还没有可复制的回答")
+            return
+        self._copy_text_to_os(text, ok_status="已复制最近回答到剪贴板")
+
+    def action_paste_to_composer(self) -> None:
+        """App-level Ctrl+V — focus composer and paste OS clipboard."""
+        if self._picking or self._permission_request is not None:
+            return
+        try:
+            composer = self._composer()
+            composer.focus()
+            composer.action_paste()
+        except Exception:
+            pass
+
+    async def on_paste(self, event) -> None:
+        """If Chat/scroll has focus, still route terminal paste into the composer."""
+        if self._picking or self._permission_request is not None:
+            return
+        focused = self.focused
+        if isinstance(focused, ComposerTextArea):
+            return  # ComposerTextArea._on_paste handles it
+        try:
+            composer = self._composer()
+            composer.focus()
+            text = event.text or ""
+            if not text:
+                text = composer._clipboard_text()
+            composer._insert_paste_text(text)
+            event.stop()
+            event.prevent_default()
+        except Exception:
+            pass
 
     def action_submit_or_stop(self) -> None:
         """Enter / Ctrl+Enter — send when idle, stop when busy."""
@@ -903,8 +1252,10 @@ class HarnessApp(App[None]):
 
                 self.call_from_thread(_prefill)
         except Exception as exc:
+            from harness.providers.errors import format_api_error
+
             BRIDGE.trim_turn_bubbles()
-            BRIDGE.push_status(f"Turn failed: {exc}")
+            BRIDGE.push_error(format_api_error(exc))
             BRIDGE.set_busy(False)
         finally:
             try:
@@ -937,7 +1288,9 @@ class HarnessApp(App[None]):
             BRIDGE.seal_turn_bubbles()
             BRIDGE.push_status("Ready")
         except Exception as exc:
-            BRIDGE.push_warn(f"RAG command failed: {type(exc).__name__}: {exc}")
+            from harness.providers.errors import format_api_error
+
+            BRIDGE.push_error(format_api_error(exc))
         finally:
             BRIDGE.set_busy(False)
             self._worker_lock.release()
