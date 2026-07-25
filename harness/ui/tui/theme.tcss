@@ -27,6 +27,37 @@ Screen {
     layout: vertical;
 }
 
+.execution-trace {
+    width: 100%;
+    height: auto;
+    margin: 0 0 1 0;
+    padding: 0 1;
+    color: #9FB3C8;
+    background: #122033 55%;
+    border-left: thick #4CA6FF;
+}
+
+.execution-trace:hover {
+    background: #182B43;
+}
+
+.execution-trace-content {
+    width: 100%;
+    height: auto;
+    padding: 0 0 0 1;
+}
+
+.trace-step {
+    width: 100%;
+    height: auto;
+    color: #9FB3C8;
+    margin: 0;
+}
+
+.execution-trace .tool-card {
+    margin: 0;
+}
+
 .tool-card {
     width: 100%;
     height: auto;
@@ -55,9 +86,19 @@ Screen {
 }
 
 .bubble-user {
-    color: $secondary;
+    width: 100%;
+    height: auto;
+    color: #F4F8FF;
     text-style: bold;
-    margin: 1 0 0 0;
+    margin: 1 0 1 0;
+    padding: 1 2;
+    background: #214A78;
+    border-left: thick #7FDBFF;
+    border-right: solid #356A9D;
+}
+
+.bubble-user:hover {
+    background: #28598D;
 }
 
 .bubble-step {
@@ -222,6 +263,9 @@ Screen {
     height: auto;
     max-height: 5;
     color: $text-muted;
+    padding: 0 1;
+    background: #0F1B2A;
+    border-left: tall #4CA6FF;
 }
 
 #pick-panel {

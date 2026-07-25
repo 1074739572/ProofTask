@@ -23,7 +23,7 @@ from harness.ui.tui.events import (
     ToolEvent,
 )
 from harness.ui.tui.mode import begin_tui_shutdown, set_tui_active
-from harness.ui.tui.widgets import MetaChip, ToolCard
+from harness.ui.tui.widgets import ExecutionTraceCard, MetaChip, ToolCard
 
 _CSS_PATH = Path(__file__).with_name("theme.tcss")
 _TURN_LIVE = "turn-live"
@@ -202,6 +202,7 @@ class HarnessApp(App[None]):
         self._permission_request: PermissionRequest | None = None
         self._permission_callback: Callable[[PermissionResponse], None] | None = None
         self._tool_cards: dict[str, ToolCard] = {}
+        self._active_trace: ExecutionTraceCard | None = None
         self._last_tool_signature: tuple[str, str] | None = None
         self._last_tool_card: ToolCard | None = None
         self._background_views: dict[str, BackgroundEvent] = {}
@@ -228,7 +229,7 @@ class HarnessApp(App[None]):
             yield Static("", id="progress-strip")
             with Vertical(id="background-tray"):
                 yield Label("后台任务", id="background-title")
-                yield Static("", id="background-list", markup=False)
+                yield Static("", id="background-list", markup=True)
             with Vertical(id="pick-panel"):
                 yield Label("", id="pick-title")
                 yield OptionList(id="pick-list")
@@ -432,6 +433,15 @@ class HarnessApp(App[None]):
         except Exception:
             pass
 
+    def _ensure_active_trace(self) -> ExecutionTraceCard:
+        """Create one per live turn so operational detail does not flood Chat."""
+        trace = self._active_trace
+        if trace is None:
+            trace = ExecutionTraceCard(live=self._live_turn)
+            self._chat_stream().mount(trace)
+            self._active_trace = trace
+        return trace
+
     def chat_append(self, kind: str, text: str, *, live: bool | None = None) -> None:
         body = (text or "").rstrip()
         if not body:
@@ -469,6 +479,12 @@ class HarnessApp(App[None]):
             except Exception:
                 pass
         self._live_turn = False
+        if self._active_trace is not None:
+            try:
+                self._active_trace.finish()
+            except Exception:
+                pass
+        self._active_trace = None
         self._tool_cards.clear()
         self._last_tool_card = None
         self._last_tool_signature = None
@@ -483,6 +499,12 @@ class HarnessApp(App[None]):
             except Exception:
                 pass
         self._live_turn = False
+        if self._active_trace is not None:
+            try:
+                self._active_trace.finish()
+            except Exception:
+                pass
+        self._active_trace = None
 
     def mount_welcome(self) -> None:
         from textual.containers import Horizontal, Vertical
@@ -660,21 +682,20 @@ class HarnessApp(App[None]):
         for part in chunk.splitlines():
             if part.strip():
                 clean = part.rstrip()
+                trace = self._ensure_active_trace()
                 if clean == self._last_step_text and self._last_step_widget is not None:
                     self._last_step_count += 1
                     self._last_step_widget.update(f"{clean}  ×{self._last_step_count}")
                     continue
-                self.chat_append("step", clean)
-                try:
-                    child = list(self._chat_stream().children)[-1]
-                    self._last_step_widget = child if isinstance(child, Static) else None
-                except Exception:
-                    self._last_step_widget = None
+                self._last_step_widget = trace.add_step(clean)
                 self._last_step_text = clean
                 self._last_step_count = 1
+                self._scroll_chat_end()
 
     def tui_set_answer(self, text: str) -> None:
         """Append the model answer into Chat history (no separate dock)."""
+        if self._active_trace is not None:
+            self._active_trace.finish()
         self.chat_append("assistant", text)
         try:
             self.query_one("#progress-strip", Static).update("✓ 理解目标  →  ✓ 执行  →  ✓ 回答")
@@ -686,6 +707,8 @@ class HarnessApp(App[None]):
         body = (text or "").strip()
         if not body:
             return
+        if self._active_trace is not None:
+            self._active_trace.finish(failed=True)
         self.chat_append("error", f"API 错误\n{body}")
         try:
             self.query_one("#progress-strip", Static).update(
@@ -714,9 +737,10 @@ class HarnessApp(App[None]):
         if card is None:
             card = ToolCard(event, live=self._live_turn)
             self._tool_cards[event.tool_use_id] = card
-            self._chat_stream().mount(card)
+            self._ensure_active_trace().add_tool(card)
         else:
             card.update_event(event)
+        self._ensure_active_trace().note_tool_phase(event.phase)
         self._last_tool_card = card
         self._last_tool_signature = signature
         if event.phase in ("failed", "blocked"):
@@ -741,11 +765,16 @@ class HarnessApp(App[None]):
         self._background_views[event.task_id] = event
         lines = []
         icons = {"running": "●", "completed": "✓", "failed": "✗"}
+        colors = {"running": "#4CA6FF", "completed": "#61D095", "failed": "#FF7B72"}
         for task in self._background_views.values():
             command = " ".join(task.command.split())
             if len(command) > 72:
                 command = command[:71] + "…"
-            lines.append(f"{icons.get(task.phase, '●')} {task.task_id}  {command}")
+            phase = task.phase
+            icon = icons.get(phase, "●")
+            color = colors.get(phase, "#9FB3C8")
+            # Rich markup makes state scanable without losing the compact list.
+            lines.append(f"[{color}]{icon} {task.task_id}[/{color}]  {command}")
         try:
             tray = self.query_one("#background-tray", Vertical)
             tray.display = bool(lines)
