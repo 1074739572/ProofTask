@@ -150,6 +150,7 @@ cp .env.example .env          # 填入 API Key 与 MODEL_ID
 pip install -r requirements.txt
 python main.py                # 默认 Textual TUI
 python main.py --classic      # 经典 Rich 行模式
+python main.py --node-cli     # Node.js + Ink 纯终端模式
 ```
 
 在**你的工作区目录**（cwd）跑 Agent；skills 从本包 `skills/` 加载；会话与任务状态写在 cwd 下的 `.project/` 等目录。

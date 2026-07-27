@@ -39,6 +39,11 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Force Textual TUI (default when textual is installed)",
     )
+    ui.add_argument(
+        "--node-cli",
+        action="store_true",
+        help="Run the Node.js terminal client",
+    )
     subparsers = parser.add_subparsers(dest="command")
 
     rag_parser = subparsers.add_parser(
@@ -161,6 +166,18 @@ if __name__ == "__main__":
 
     if args.command == "rag":
         raise SystemExit(_run_rag_command(args))
+
+    if args.node_cli:
+        import os
+        import subprocess
+        from pathlib import Path
+
+        node_cli = Path(__file__).resolve().parent / "node_cli"
+        if not (node_cli / "package.json").exists():
+            print("Node CLI is not installed: node_cli/package.json", file=sys.stderr)
+            raise SystemExit(2)
+        command = "npm.cmd" if os.name == "nt" else "npm"
+        raise SystemExit(subprocess.call([command, "run", "cli"], cwd=node_cli))
 
     from harness.cli import run_cli
     from harness.ui.tui import prefer_tui, run_tui

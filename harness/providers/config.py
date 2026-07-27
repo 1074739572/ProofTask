@@ -21,6 +21,25 @@ class ProviderConfig:
     api_key_fallback_env: str | None = None
 
 
+def _timeout_value(name: str, default: float) -> float:
+    raw = os.getenv(name, "").strip()
+    try:
+        value = float(raw) if raw else default
+    except ValueError:
+        value = default
+    return max(0.1, value)
+
+
+def provider_timeout() -> tuple[float, float, float, float]:
+    """Return connect, read, write and pool timeouts in seconds."""
+    return (
+        _timeout_value("HARNESS_LLM_CONNECT_TIMEOUT", 10.0),
+        _timeout_value("HARNESS_LLM_READ_TIMEOUT", 90.0),
+        _timeout_value("HARNESS_LLM_WRITE_TIMEOUT", 30.0),
+        _timeout_value("HARNESS_LLM_POOL_TIMEOUT", 10.0),
+    )
+
+
 def load_providers() -> dict[str, ProviderConfig]:
     if not PROVIDERS_CONFIG_PATH.exists():
         return {

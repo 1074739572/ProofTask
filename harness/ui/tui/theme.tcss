@@ -1,22 +1,31 @@
-/* Usage | Chat | Meta | Prompt — merged history layout */
+/* ── Palette ───────────────────────────────────────────────────
+ *  background  #0E1117   surface    #161B22   raised     #1C2129
+ *  accent      #5B9BD5   accent-dim #3A6A9E   accent-sub #243A58
+ *  success     #8DA6C2   warning    #D4A03C   error      #E05968
+ *  success-bg  #202A36   warning-bg #2D2618   error-bg   #2D1B1D
+ *  text        #D2D8E0   text-muted #6B7A8D   text-dim   #4A5568
+ *  border      #21262D   border-lit #2D3642
+ * ────────────────────────────────────────────────────────────── */
 
 Screen {
     layout: vertical;
-    background: $surface;
+    background: #0E1117;
 }
 
+/* ── top bar ──────────────────────────────────────────────── */
 #usage-bar {
     dock: top;
     height: 1;
-    background: $primary-darken-2;
-    color: $text;
+    background: #243A58;
+    color: #C8D6E5;
     padding: 0 1;
 }
 
+/* ── chat scroll area ──────────────────────────────────────── */
 #chat-pane {
     height: 1fr;
-    border: solid $accent;
-    border-title-color: $accent;
+    border: solid #2D3642;
+    border-title-color: #6B7A8D;
     padding: 0 1;
     scrollbar-gutter: stable;
 }
@@ -27,18 +36,19 @@ Screen {
     layout: vertical;
 }
 
+/* ── tool / trace cards ────────────────────────────────────── */
 .execution-trace {
     width: 100%;
     height: auto;
     margin: 0 0 1 0;
     padding: 0 1;
-    color: #9FB3C8;
-    background: #122033 55%;
-    border-left: thick #4CA6FF;
+    color: #8899B0;
+    background: #161B22;
+    border-left: tall #3A6A9E;
 }
 
 .execution-trace:hover {
-    background: #182B43;
+    background: #1C2129;
 }
 
 .execution-trace-content {
@@ -50,7 +60,7 @@ Screen {
 .trace-step {
     width: 100%;
     height: auto;
-    color: #9FB3C8;
+    color: #8899B0;
     margin: 0;
 }
 
@@ -62,155 +72,145 @@ Screen {
     width: 100%;
     height: auto;
     margin: 0 0 0 1;
-    color: $text-muted;
-    border-left: tall $primary-darken-1;
+    color: #6B7A8D;
+    border-left: tall #243A58;
 }
 
 .tool-card.tool-running {
-    color: $primary;
+    color: #7DB9E8;
 }
 
 .tool-card.tool-ok {
-    color: $success;
+    color: #8DA6C2;
 }
 
 .tool-card.tool-failed,
 .tool-card.tool-blocked {
-    color: $warning;
+    color: #D4A03C;
 }
 
 .tool-card-detail {
-    color: $text-muted;
+    color: #6B7A8D;
     padding: 0 1;
     max-height: 8;
 }
 
-.bubble-user {
+/* ── chat messages ─────────────────────────────────────────── */
+.chat-user {
     width: 100%;
     height: auto;
-    color: #F4F8FF;
+    color: #7DB9E8;
     text-style: bold;
-    margin: 1 0 1 0;
-    padding: 1 2;
-    background: #214A78;
-    border-left: thick #7FDBFF;
-    border-right: solid #356A9D;
-}
-
-.bubble-user:hover {
-    background: #28598D;
-}
-
-.bubble-step {
-    color: $text-muted;
-    margin: 0 0 0 1;
-}
-
-.bubble-assistant {
-    height: auto;
-    margin: 1 0 1 0;
-    padding: 1 1;
-    background: $boost;
-    border-left: thick $accent;
-}
-
-.bubble-error {
-    height: auto;
-    color: $error;
-    margin: 1 0;
+    margin: 1 0 0 0;
     padding: 0 1;
-    border-left: thick $error;
 }
 
-.bubble-system {
-    color: $text-muted;
+.chat-user.turn-live {
+    color: #A1C8F0;
+}
+
+.chat-assistant {
+    height: auto;
+    margin: 0 0 0 0;
+    padding: 0 1;
+}
+
+.chat-assistant.turn-live {
+    color: #C8D6E5;
+}
+
+.chat-error {
+    height: auto;
+    color: #E05968;
+    margin: 0 0 0 0;
+    padding: 0 1;
+}
+
+.chat-system {
+    color: #6B7A8D;
     text-style: italic;
     margin: 1 0;
 }
 
-.welcome-brand {
-    height: auto;
+.chat-step {
+    color: #6B7A8D;
+    margin: 0 0 0 1;
+}
+
+/* ── welcome screen ────────────────────────────────────────── */
+.welcome-screen {
     width: 100%;
-    margin: 1 0 1 0;
-    layout: horizontal;
-    align: left middle;
+    height: 1fr;
+    layout: vertical;
+    align: center middle;
+    padding: 0 3;
 }
 
 .welcome-smiley {
     width: auto;
     height: auto;
-    color: #E6B84D;
+    color: #7DB9E8;
     text-style: bold;
-    margin: 0 2 0 0;
-}
-
-.welcome-titles {
-    width: 1fr;
-    height: auto;
-    layout: vertical;
-    align: left middle;
+    margin: 0 0 1 0;
 }
 
 .welcome-hello {
     width: auto;
     height: auto;
-    color: #7FDBFF;
+    color: #A1C8F0;
     text-style: bold;
+    text-align: center;
 }
 
 .welcome-tagline {
     width: auto;
     height: auto;
-    color: #7FDBFF 55%;
+    color: #6B7A8D;
     margin: 0 0 0 0;
+    text-align: center;
 }
 
 .welcome-narrow {
-    color: #7FDBFF;
+    color: #A1C8F0;
     text-style: bold;
+    margin: 1 0 1 0;
+    text-align: center;
+}
+
+.welcome-sep {
+    width: auto;
+    height: 1;
+    color: #2D3642;
     margin: 1 0 1 0;
 }
 
 .welcome-quote-card {
     width: 100%;
     height: auto;
-    margin: 0 0 1 0;
-    padding: 0 1 0 2;
-    border-left: tall #E6B84D;
-    background: #E6B84D 8%;
-}
-
-.welcome-quote-label {
-    width: 100%;
-    color: #E6B84D 70%;
-    text-style: bold;
-    margin: 0 0 0 0;
+    margin: 0;
+    padding: 0 2;
+    border-left: tall #2D3642;
 }
 
 .welcome-quote-body {
     width: 100%;
-    color: #F5F0E6;
-    text-style: bold;
-    margin: 0 0 0 0;
+    color: #8899B0;
+    margin: 0;
+    text-align: center;
 }
 
 .welcome-quote-source {
     width: 100%;
-    color: #E6B84D 55%;
-    text-align: right;
-    margin: 0 0 0 0;
+    color: #6B7A8D;
+    text-align: center;
+    margin: 0;
 }
 
-.welcome-rule {
-    width: 100%;
-    height: 1;
-    margin: 0 0 1 0;
-}
-
+/* ── footer / meta / composer ───────────────────────────────── */
 #footer-stack {
     dock: bottom;
     height: auto;
-    border-top: solid $primary-darken-2;
+    border-top: solid #21262D;
     padding: 0 1 1 1;
 }
 
@@ -222,64 +222,59 @@ Screen {
 
 #meta-model,
 #meta-mode {
-    color: $primary;
+    color: #5B9BD5;
 }
 
 #meta-runtime {
     width: auto;
-    color: $text-muted;
+    color: #6B7A8D;
     margin: 0 1;
 }
 
 #meta-status {
     width: 1fr;
-    color: $text-muted;
+    color: #6B7A8D;
     text-align: right;
 }
 
-#progress-strip {
-    height: 1;
-    color: $text-muted;
-    padding: 0 1;
-}
-
+/* ── panels / overlays ─────────────────────────────────────── */
 #background-tray {
     display: none;
     height: auto;
     max-height: 7;
     margin: 0 0 1 0;
     padding: 0 1;
-    border-left: tall $secondary;
-    background: $boost;
+    border-left: tall #3A6A9E;
+    background: #161B22;
 }
 
 #background-title {
     height: 1;
-    color: $secondary;
+    color: #5B9BD5;
     text-style: bold;
 }
 
 #background-list {
     height: auto;
     max-height: 5;
-    color: $text-muted;
+    color: #6B7A8D;
     padding: 0 1;
-    background: #0F1B2A;
-    border-left: tall #4CA6FF;
+    background: #0E1117;
+    border-left: tall #3A6A9E;
 }
 
 #pick-panel {
     height: auto;
     max-height: 14;
     margin: 0 0 1 0;
-    background: $boost;
-    border: solid $primary-darken-1;
+    background: #161B22;
+    border: solid #2D3642;
 }
 
 #pick-title {
     height: 1;
     text-style: bold;
-    color: $primary;
+    color: #5B9BD5;
     padding: 0 1;
 }
 
@@ -291,7 +286,7 @@ Screen {
 
 #pick-hint {
     height: 1;
-    color: $text-muted;
+    color: #6B7A8D;
     padding: 0 1;
 }
 
@@ -301,20 +296,20 @@ Screen {
     max-height: 16;
     margin: 0 0 1 0;
     padding: 0 1;
-    background: $boost;
-    border: thick $warning;
+    background: #2D2618;
+    border: thick #D4A03C;
 }
 
 #interaction-title {
     height: 1;
-    color: $warning;
+    color: #D4A03C;
     text-style: bold;
 }
 
 #interaction-detail {
     height: auto;
     max-height: 5;
-    color: $text;
+    color: #D2D8E0;
     overflow-y: auto;
 }
 
@@ -337,37 +332,26 @@ Screen {
 #command-hints {
     display: none;
     height: 1;
-    color: $text-muted;
+    color: #6B7A8D;
     padding: 0 1;
 }
 
-#composer-row {
-    height: auto;
-    width: 100%;
-    layout: horizontal;
-    align: left bottom;
-    padding: 0 0 1 0;
-}
-
+/* ── composer ───────────────────────────────────────────────── */
 #user-input {
-    width: 1fr;
+    width: 100%;
     height: 3;
     min-height: 3;
     max-height: 8;
-    margin: 0 1 0 0;
-    border: tall $accent;
+    border: none;
+    border-top: solid #21262D;
+    padding: 0 1;
 }
 
 #user-input:focus {
-    border: tall $primary;
+    border-top: solid #5B9BD5;
 }
 
-#send-stop-btn {
-    width: 10;
-    min-width: 8;
-    height: 3;
-}
-
+/* ── modal ──────────────────────────────────────────────────── */
 AllowModal {
     align: center middle;
 }
@@ -377,22 +361,22 @@ AllowModal {
     max-width: 90%;
     height: auto;
     max-height: 80%;
-    background: $surface;
-    border: thick $warning;
+    background: #161B22;
+    border: thick #D4A03C;
     padding: 1 2;
 }
 
 #allow-title {
     text-style: bold;
-    color: $warning;
+    color: #D4A03C;
     margin-bottom: 1;
 }
 
 #allow-detail {
-    color: $text;
+    color: #D2D8E0;
     margin-bottom: 1;
 }
 
 #allow-hint {
-    color: $text-muted;
+    color: #6B7A8D;
 }

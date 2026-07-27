@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import threading
 
+import httpx
 from anthropic import Anthropic
 
-from harness.providers.config import ProviderConfig, resolve_api_key
+from harness.providers.config import ProviderConfig, provider_timeout, resolve_api_key
 
 _lock = threading.Lock()
 _clients: dict[str, Anthropic] = {}
@@ -26,6 +27,11 @@ def get_anthropic_client(provider: ProviderConfig) -> Anthropic:
                 f"Missing API key for provider '{provider.label}'. "
                 f"Set {envs} in .env"
             )
-        client = Anthropic(api_key=api_key, base_url=provider.base_url)
+        connect, read, write, pool = provider_timeout()
+        client = Anthropic(
+            api_key=api_key,
+            base_url=provider.base_url,
+            timeout=httpx.Timeout(read, connect=connect, write=write, pool=pool),
+        )
         _clients[provider.id] = client
         return client

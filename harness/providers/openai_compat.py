@@ -9,7 +9,7 @@ from typing import Any
 
 from openai import OpenAI
 
-from harness.providers.config import ProviderConfig, resolve_api_key
+from harness.providers.config import ProviderConfig, provider_timeout, resolve_api_key
 from harness.providers.types import MessageResponse, TextBlock, ToolUseBlock
 
 _lock = threading.Lock()
@@ -27,7 +27,14 @@ def get_openai_client(provider: ProviderConfig) -> OpenAI:
                 f"Missing API key for provider '{provider.label}'. "
                 f"Set {provider.api_key_env} in .env"
             )
-        client = OpenAI(api_key=api_key, base_url=provider.base_url)
+        import httpx
+
+        connect, read, write, pool = provider_timeout()
+        client = OpenAI(
+            api_key=api_key,
+            base_url=provider.base_url,
+            timeout=httpx.Timeout(read, connect=connect, write=write, pool=pool),
+        )
         _clients[provider.id] = client
         return client
 

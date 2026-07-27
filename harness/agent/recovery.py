@@ -5,6 +5,7 @@ from __future__ import annotations
 import random
 import time
 
+from harness.agent.cancel import is_cancelled
 from harness.settings import (
     BASE_DELAY_MS,
     FALLBACK_MODEL,
@@ -32,6 +33,31 @@ def retry_delay(attempt: int) -> float:
     return base + random.uniform(0, base * 0.25)
 
 
+def _sleep_cancelable(seconds: float) -> bool:
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if is_cancelled():
+            return False
+        time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+    return True
+
+
+def _report_retry(kind: str, attempt: int, delay: float) -> None:
+    from harness.ui.renderer import renderer
+
+    message = f"{kind} retry {attempt + 1}/{MAX_RETRIES} after {delay:.1f}s"
+    renderer.warn(message)
+
+
+def _is_transient(exc: Exception) -> bool:
+    name = type(exc).__name__.lower()
+    msg = str(exc).lower()
+    return any(
+        token in name or token in msg
+        for token in ("timeout", "connection", "temporarily unavailable", "502", "503", "529")
+    )
+
+
 def with_retry(fn, state: RecoveryState):
     for attempt in range(MAX_RETRIES):
         try:
@@ -43,11 +69,9 @@ def with_retry(fn, state: RecoveryState):
             msg = str(exc).lower()
             if "ratelimit" in name or "429" in msg:
                 delay = retry_delay(attempt)
-                print(
-                    f"  \033[33m[429] retry {attempt + 1}/{MAX_RETRIES} "
-                    f"after {delay:.1f}s\033[0m"
-                )
-                time.sleep(delay)
+                _report_retry("429", attempt, delay)
+                if not _sleep_cancelable(delay):
+                    raise RuntimeError("cancelled during retry")
                 continue
             if "overloaded" in name or "529" in msg or "overloaded" in msg:
                 state.consecutive_529 += 1
@@ -56,11 +80,15 @@ def with_retry(fn, state: RecoveryState):
                     state.consecutive_529 = 0
                     print(f"  \033[31m[529] switching to {FALLBACK_MODEL}\033[0m")
                 delay = retry_delay(attempt)
-                print(
-                    f"  \033[33m[529] retry {attempt + 1}/{MAX_RETRIES} "
-                    f"after {delay:.1f}s\033[0m"
-                )
-                time.sleep(delay)
+                _report_retry("529", attempt, delay)
+                if not _sleep_cancelable(delay):
+                    raise RuntimeError("cancelled during retry")
+                continue
+            if _is_transient(exc):
+                delay = retry_delay(attempt)
+                _report_retry("network", attempt, delay)
+                if not _sleep_cancelable(delay):
+                    raise RuntimeError("cancelled during retry")
                 continue
             raise
     raise RuntimeError(f"Max retries ({MAX_RETRIES}) exceeded")

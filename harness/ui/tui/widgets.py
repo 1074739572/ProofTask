@@ -65,10 +65,15 @@ class ExecutionTraceCard(Collapsible):
     folds after the final answer to keep the chat timeline focused on outcomes.
     """
 
-    def __init__(self, *, live: bool = True) -> None:
-        self._content = Vertical(classes="execution-trace-content")
+    def __init__(self, *, live: bool = True, initial_tools: list[ToolCard] | None = None) -> None:
+        tools = initial_tools or []
+        self._steps = Static("", classes="trace-step", markup=False)
+        self._content = Vertical(self._steps, *tools, classes="execution-trace-content")
+        self._pending_details: list = []
+        self._detail_flush_scheduled = False
+        self._step_lines: list[str] = []
         self._step_count = 0
-        self._tool_count = 0
+        self._tool_count = len(tools)
         self._failed = False
         self._live = live
         classes = "execution-trace"
@@ -82,20 +87,42 @@ class ExecutionTraceCard(Collapsible):
         )
 
     def _mount_detail(self, widget) -> None:
-        """Defer children created in the same tick as this card's first mount."""
+        """Mount details once the trace is attached, preserving event order."""
         if self._content.is_attached:
             self._content.mount(widget)
             return
-        # Textual attaches a newly mounted Collapsible on the next refresh.
-        # Deferring avoids mounting its child into an unattached container.
-        self.call_after_refresh(lambda: self._content.mount(widget))
+        self._pending_details.append(widget)
+        if self._detail_flush_scheduled:
+            return
+        self._detail_flush_scheduled = True
+
+        def _flush() -> None:
+            self._detail_flush_scheduled = False
+            if not self._content.is_attached:
+                self.call_after_refresh(_flush)
+                self._detail_flush_scheduled = True
+                return
+            pending, self._pending_details = self._pending_details, []
+            if pending:
+                self._content.mount(*pending)
+
+        self.call_after_refresh(_flush)
 
     def add_step(self, text: str) -> Static:
         self._step_count += 1
-        row = Static(text, classes="trace-step", markup=False)
-        self._mount_detail(row)
+        self._step_lines.append(text)
+        self._step_lines = self._step_lines[-80:]
+        self._steps.update("\n".join(self._step_lines))
         self._refresh_title()
-        return row
+        return self._steps
+
+    def repeat_last_step(self, text: str, count: int) -> None:
+        """Update the last step without mounting another layout node."""
+        if not self._step_lines:
+            self.add_step(text)
+            return
+        self._step_lines[-1] = f"{text}  ×{count}"
+        self._steps.update("\n".join(self._step_lines))
 
     def add_tool(self, card: ToolCard) -> None:
         self._tool_count += 1

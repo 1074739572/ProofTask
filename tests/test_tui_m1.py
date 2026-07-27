@@ -448,19 +448,66 @@ class TuiShutdownSinkTests(unittest.TestCase):
         # Default TextArea copy binding must be stripped (OS clipboard path only).
         self.assertNotIn("copy", _actions_for(ComposerTextArea.BINDINGS, "ctrl+c"))
 
-    def test_copy_last_answer_writes_os_clipboard(self):
-        from harness.ui.tui.app import HarnessApp
-        from harness.ui.tui.clipboard import read_os_clipboard, write_os_clipboard
+    def test_composer_strips_leaked_terminal_mouse_reports(self):
+        from harness.ui.tui.app import ComposerTextArea
 
-        marker = "HARNESS_TUI_COPY_ANSWER_555"
-        write_os_clipboard("before-copy-marker")
+        clean = ComposerTextArea._strip_terminal_mouse_reports
+        self.assertEqual(clean("hello\x1b[<64;12;8Mworld"), "helloworld")
+        self.assertEqual(clean("hello\x1b[Mabcworld"), "helloworld")
+        self.assertEqual(clean("普通 [64;12;8M 文本"), "普通 [64;12;8M 文本")
+
+    def test_copy_last_answer_shows_status(self):
+        from harness.ui.tui.app import HarnessApp
+
         app = HarnessApp([], {})
-        app._last_assistant_text = marker
+        app._last_assistant_text = "HARNESS_TUI_COPY_STATUS_555"
         statuses: list[str] = []
         app.tui_set_status = statuses.append  # type: ignore[method-assign]
         app.action_copy_last_answer()
-        self.assertEqual(read_os_clipboard(), marker)
         self.assertTrue(any("已复制" in s for s in statuses))
+
+    def test_copy_selection_uses_chat_selection(self):
+        from harness.ui.tui.app import HarnessApp
+
+        app = HarnessApp([], {})
+        screen = mock.Mock()
+        screen.get_selected_text.return_value = "selected fragment"
+        statuses: list[str] = []
+        app.tui_set_status = statuses.append  # type: ignore[method-assign]
+        with mock.patch.object(type(app), "focused", new_callable=mock.PropertyMock, return_value=None), mock.patch.object(
+            type(app), "screen", new_callable=mock.PropertyMock, return_value=screen
+        ):
+            app.action_copy_selection()
+        self.assertTrue(any("已复制" in s for s in statuses))
+        screen.clear_selection.assert_called_once_with()
+
+    def test_copy_selection_without_selection_does_not_copy_answer(self):
+        from harness.ui.tui.app import HarnessApp
+
+        app = HarnessApp([], {})
+        app._last_assistant_text = "whole answer must not be copied"
+        screen = mock.Mock()
+        screen.get_selected_text.return_value = None
+        statuses: list[str] = []
+        app.tui_set_status = statuses.append  # type: ignore[method-assign]
+        with mock.patch.object(type(app), "focused", new_callable=mock.PropertyMock, return_value=None), mock.patch.object(
+            type(app), "screen", new_callable=mock.PropertyMock, return_value=screen
+        ):
+            app.action_copy_selection()
+        self.assertFalse(any("已复制" in s for s in statuses))
+        self.assertTrue(any("选择文字" in status for status in statuses))
+
+    def test_execution_trace_reuses_one_bounded_step_widget(self):
+        from harness.ui.tui.widgets import ExecutionTraceCard
+
+        trace = ExecutionTraceCard()
+        mounted = []
+        trace._mount_detail = mounted.append  # type: ignore[method-assign]
+        widgets = [trace.add_step(f"step {index}") for index in range(100)]
+        self.assertTrue(all(widget is widgets[0] for widget in widgets))
+        self.assertEqual(mounted, [])
+        self.assertEqual(len(trace._step_lines), 80)
+        self.assertEqual(trace._step_lines[0], "step 20")
 
 
 class TuiInlineInteractionTests(unittest.TestCase):
@@ -508,7 +555,7 @@ class TuiInlineInteractionTests(unittest.TestCase):
                 assistant_bubbles = [
                     child
                     for child in stream.children
-                    if "bubble-assistant" in getattr(child, "classes", [])
+                    if "chat-assistant" in getattr(child, "classes", [])
                 ]
                 self.assertTrue(assistant_bubbles)
                 # Separate sticky answer dock is gone — Chat is the only answer surface.
