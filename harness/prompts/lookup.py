@@ -119,12 +119,23 @@ def append_lookup_constraint(text: str) -> str:
     return text.rstrip() + LOOKUP_CONSTRAINT
 
 
+def is_lookup_active(query: str | None = None) -> bool:
+    """True when the current context is lookup (keyword or explicit /mode lookup)."""
+    from harness.modes import get_mode
+
+    if get_mode() == "lookup":
+        return True
+    if query and is_lookup_query(query):
+        return True
+    return False
+
+
 def augment_query(query: str) -> str:
     """Return the user query with a lookup constraint appended when appropriate.
 
     The original wording is always preserved verbatim at the front; the
     constraint is appended so the model sees both the intent and the rules.
     """
-    if not is_lookup_query(query):
+    if not is_lookup_active(query):
         return query
     return append_lookup_constraint(query)

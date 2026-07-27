@@ -365,7 +365,7 @@ def run_cli() -> None:
         model_query = hook_result if isinstance(hook_result, str) else query
         from harness.project.session_registry import touch_session_title_from_query
 
-        from harness.prompts.lookup import is_lookup_query
+        from harness.prompts.lookup import is_lookup_active
         from harness.prompts.writing import is_writing_query
         from harness.rag.bootstrap import bootstrap_message, ensure_rag_indexed
 
@@ -375,7 +375,7 @@ def run_cli() -> None:
         turn_start = len(history)
         history.append({"role": "user", "content": model_query})
         context["latest_user_query"] = query
-        context["lookup_mode"] = is_lookup_query(query)
+        context["lookup_mode"] = is_lookup_active(query)
         context["writing_mode"] = is_writing_query(query) and not context["lookup_mode"]
         context.pop("rag_bootstrap", None)
         if context["writing_mode"]:

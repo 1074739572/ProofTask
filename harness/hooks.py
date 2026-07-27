@@ -172,7 +172,7 @@ def user_prompt_hook(query: str):
     from harness.ui.tool_display import hooks_verbose
     from harness.prompts.goal_stickiness import augment_if_needed
     from harness.prompts.lookup import augment_query as augment_lookup
-    from harness.prompts.lookup import is_lookup_query
+    from harness.prompts.lookup import is_lookup_active
     from harness.prompts.writing import augment_query as augment_writing
     from harness.prompts.writing import is_writing_query
 
@@ -183,7 +183,8 @@ def user_prompt_hook(query: str):
     else:
         base = None
 
-    if is_lookup_query(query):
+    # Activate lookup when keywords trigger OR the user is in /mode lookup.
+    if is_lookup_active(query):
         # Silent for the user: constraint is for the model only.
         looked = augment_lookup(query if base is None else base)
         return looked if looked is not None else base
