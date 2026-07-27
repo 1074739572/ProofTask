@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import threading
 from collections.abc import Callable
 from pathlib import Path
@@ -27,9 +28,13 @@ from harness.ui.tui.widgets import ExecutionTraceCard, MetaChip, ToolCard
 
 _CSS_PATH = Path(__file__).with_name("theme.tcss")
 _TURN_LIVE = "turn-live"
-_COMPOSER_PLACEHOLDER = (
-    "Ask…  Enter send · Shift+Enter newline · Ctrl+C copy · Ctrl+V paste · Esc stop · Ctrl+Q quit"
+# Terminal mouse reporting can leak into TextArea as literal text when a host
+# enables xterm/SGR tracking but fails to consume an event. Match only complete
+# mouse-report sequences, never ordinary escape sequences or user text.
+_TERMINAL_MOUSE_REPORT_RE = re.compile(
+    r"(?:\x1b\[<\d+;\d+;\d+[Mm]|\x1b\[M.{3})"
 )
+_COMPOSER_PLACEHOLDER = "❯ 输入任务…  Enter 发送 · Shift+Enter 换行 · Esc 中断"
 
 
 def _textarea_bindings_without_copy() -> list[Binding]:
@@ -62,6 +67,9 @@ class ComposerTextArea(TextArea):
         Binding("ctrl+v,ctrl+shift+v,super+v", "composer_paste", "Paste", show=False, priority=True),
         Binding("ctrl+up", "composer_history_previous", "Previous", show=False),
         Binding("ctrl+down", "composer_history_next", "Next", show=False),
+        # Plain up/down: at text boundaries, navigate history instead of cursor.
+        Binding("up", "composer_up_or_history", "Up", show=False, priority=True),
+        Binding("down", "composer_down_or_history", "Down", show=False, priority=True),
     ]
 
     def action_composer_submit(self) -> None:
@@ -72,6 +80,24 @@ class ComposerTextArea(TextArea):
     def action_composer_newline(self) -> None:
         self.insert("\n")
 
+    def action_composer_up_or_history(self) -> None:
+        """Up: cursor at start of text → previous history; otherwise cursor up."""
+        if self.cursor_at_start_of_text:
+            app = self.app
+            if hasattr(app, "composer_history_previous"):
+                app.composer_history_previous()
+        else:
+            self.action_cursor_up()
+
+    def action_composer_down_or_history(self) -> None:
+        """Down: cursor at end of text → next history; otherwise cursor down."""
+        if self.cursor_at_end_of_text:
+            app = self.app
+            if hasattr(app, "composer_history_next"):
+                app.composer_history_next()
+        else:
+            self.action_cursor_down()
+
     def action_composer_paste(self) -> None:
         """Paste OS clipboard when Textual's in-app clipboard is empty (Windows)."""
         self.action_paste()
@@ -80,24 +106,18 @@ class ComposerTextArea(TextArea):
         self.action_copy()
 
     def action_copy(self) -> None:
-        """Copy selected composer text to the OS clipboard; else defer to App."""
+        """Copy selected composer text to in-app clipboard; don't write OS clipboard."""
         from textual.actions import SkipAction
-
-        from harness.ui.tui.clipboard import write_os_clipboard
 
         selected = (self.selected_text or "").replace("\x00", "")
         if not selected:
-            # Empty selection: App.copy_selection copies last answer (or draft).
             raise SkipAction()
-        if not write_os_clipboard(selected):
-            raise SkipAction()
-        # Sync Textual's in-app buffer only — do NOT emit OSC 52 (conflicts on WT).
         try:
             self.app._clipboard = selected  # noqa: SLF001
         except Exception:
             pass
         if hasattr(self.app, "tui_set_status"):
-            self.app.tui_set_status("已复制选区到剪贴板")  # type: ignore[attr-defined]
+            self.app.tui_set_status("已复制选区")  # type: ignore[attr-defined]
 
     def _clipboard_text(self) -> str:
         from harness.ui.tui.clipboard import read_os_clipboard
@@ -107,7 +127,25 @@ class ComposerTextArea(TextArea):
             text = read_os_clipboard()
         return (text or "").replace("\x00", "")
 
+    @staticmethod
+    def _strip_terminal_mouse_reports(text: str) -> str:
+        """Discard leaked xterm mouse reports without touching normal input."""
+        return _TERMINAL_MOUSE_REPORT_RE.sub("", text or "")
+
+    def on_text_area_changed(self, event: TextArea.Changed) -> None:
+        """Remove mouse protocol bytes that some terminals misroute as text."""
+        if event.text_area is not self:
+            return
+        clean = self._strip_terminal_mouse_reports(self.text)
+        if clean == self.text:
+            return
+        # Replacing the document is safe here: these bytes are transport noise,
+        # not user content. Keep focus so a stray event cannot steal it.
+        self.text = clean
+        self.focus()
+
     def _insert_paste_text(self, text: str) -> None:
+        text = self._strip_terminal_mouse_reports(text)
         if not text:
             return
         # Prefer the selection-aware path; fall back to plain insert.
@@ -226,7 +264,6 @@ class HarnessApp(App[None]):
                 yield MetaChip("", id="meta-mode", chip="mode")
                 yield Static("", id="meta-runtime")
                 yield Static("✅ Ready", id="meta-status")
-            yield Static("", id="progress-strip")
             with Vertical(id="background-tray"):
                 yield Label("后台任务", id="background-title")
                 yield Static("", id="background-list", markup=True)
@@ -243,17 +280,15 @@ class HarnessApp(App[None]):
                     yield Button("拒绝", id="interaction-deny", variant="error")
                     yield Button("取消", id="interaction-cancel")
             yield Static("", id="command-hints", markup=False)
-            with Horizontal(id="composer-row"):
-                yield ComposerTextArea(
-                    "",
-                    id="user-input",
-                    soft_wrap=True,
-                    show_line_numbers=False,
-                    compact=True,
-                    tab_behavior="indent",
-                    placeholder=_COMPOSER_PLACEHOLDER,
-                )
-                yield Button("发送", id="send-stop-btn", variant="primary")
+            yield ComposerTextArea(
+                "",
+                id="user-input",
+                soft_wrap=True,
+                show_line_numbers=False,
+                compact=True,
+                tab_behavior="indent",
+                placeholder="❯ 输入任务…",
+            )
 
     def on_mount(self) -> None:
         set_tui_active(True)
@@ -264,7 +299,6 @@ class HarnessApp(App[None]):
         self._hide_permission_panel(notify=False)
         self.query_one("#background-tray", Vertical).display = False
         self.query_one("#command-hints", Static).display = False
-        self.query_one("#progress-strip", Static).update("○ 等待任务")
         self.refresh_usage_bar()
         self.refresh_meta_bar()
         self._sync_send_stop_button()
@@ -369,30 +403,26 @@ class HarnessApp(App[None]):
     def _refresh_runtime_chips(self) -> None:
         metrics = self._runtime_metrics
         cache_total = metrics.cache_hit_tokens + metrics.cache_miss_tokens
-        cache = f"cache {100 * metrics.cache_hit_rate:.0f}%" if cache_total else "cache —"
+        cache = (
+            f"缓存命中 {100 * metrics.cache_hit_rate:.0f}%"
+            if cache_total
+            else "缓存 —"
+        )
         context = (
-            f"ctx {100 * metrics.context_rate:.0f}%"
+            f"上下文 {100 * metrics.context_rate:.0f}%"
             if metrics.context_window
-            else "ctx —"
+            else "上下文 —"
         )
         try:
             self.query_one("#meta-runtime", Static).update(
-                f"◫ {context} · {cache} · {self._tool_health} · {self._network_health}"
+                f"{context} · {cache} · {self._tool_health} · {self._network_health}"
             )
         except Exception:
             pass
 
     def _sync_send_stop_button(self) -> None:
-        try:
-            btn = self.query_one("#send-stop-btn", Button)
-        except Exception:
-            return
-        if self._busy:
-            btn.label = "停止"
-            btn.variant = "error"
-        else:
-            btn.label = "发送"
-            btn.variant = "primary"
+        # Button removed; reflect busy state in status only.
+        pass
 
     def tui_set_busy(self, busy: bool) -> None:
         self._busy = bool(busy)
@@ -427,19 +457,36 @@ class HarnessApp(App[None]):
     def _chat_stream(self) -> Vertical:
         return self.query_one("#chat-stream", Vertical)
 
-    def _scroll_chat_end(self) -> None:
+    def _is_chat_at_bottom(self) -> bool:
+        """Only follow new output when the user was already viewing the bottom."""
+        try:
+            pane = self.query_one("#chat-pane", VerticalScroll)
+            max_y = float(getattr(pane, "max_scroll_y", 0) or 0)
+            current_y = float(getattr(pane, "scroll_y", 0) or 0)
+            return max_y <= 0 or current_y >= max_y - 2
+        except Exception:
+            return True
+
+    def _scroll_chat_end(self, *, follow: bool = True) -> None:
+        if not follow:
+            return
         try:
             self.query_one("#chat-pane", VerticalScroll).scroll_end(animate=False)
         except Exception:
             pass
 
-    def _ensure_active_trace(self) -> ExecutionTraceCard:
+    def _ensure_active_trace(self, initial_tool: ToolCard | None = None) -> ExecutionTraceCard:
         """Create one per live turn so operational detail does not flood Chat."""
         trace = self._active_trace
         if trace is None:
-            trace = ExecutionTraceCard(live=self._live_turn)
+            trace = ExecutionTraceCard(
+                live=self._live_turn,
+                initial_tools=[initial_tool] if initial_tool is not None else None,
+            )
             self._chat_stream().mount(trace)
             self._active_trace = trace
+        elif initial_tool is not None:
+            trace.add_tool(initial_tool)
         return trace
 
     def chat_append(self, kind: str, text: str, *, live: bool | None = None) -> None:
@@ -447,6 +494,7 @@ class HarnessApp(App[None]):
         if not body:
             return
         use_live = self._live_turn if live is None else live
+        follow_scroll = self._is_chat_at_bottom()
         extra = f" {_TURN_LIVE}" if use_live else ""
         stream = self._chat_stream()
         if kind != "step":
@@ -455,19 +503,18 @@ class HarnessApp(App[None]):
             self._last_step_count = 0
         if kind == "assistant":
             self._last_assistant_text = body
-            stream.mount(Markdown(body, classes=f"bubble-assistant{extra}"))
+            stream.mount(Markdown(body, classes=f"chat-assistant{extra}"))
         elif kind == "error":
-            # Keep API failures plain-text so HTML/JSON dumps stay readable.
             stream.mount(
-                Static(f"⚠ {body}", classes=f"bubble-error{extra}", markup=False)
+                Static(f"✗ {body}", classes=f"chat-error{extra}", markup=False)
             )
         elif kind == "user":
-            stream.mount(Static(f"🧑 {body}", classes=f"bubble-user{extra}", markup=False))
+            stream.mount(Static(f"❯ {body}", classes=f"chat-user{extra}", markup=False))
         elif kind == "system":
-            stream.mount(Static(f"📎 {body}", classes=f"bubble-system{extra}", markup=False))
+            stream.mount(Static(body, classes=f"chat-system{extra}", markup=False))
         else:
-            stream.mount(Static(body, classes=f"bubble-step{extra}", markup=False))
-        self._scroll_chat_end()
+            stream.mount(Static(body, classes=f"chat-step{extra}", markup=False))
+        self._scroll_chat_end(follow=follow_scroll)
 
     def tui_trim_turn_bubbles(self) -> None:
         """U1: remove widgets tagged for the in-flight turn."""
@@ -507,66 +554,59 @@ class HarnessApp(App[None]):
         self._active_trace = None
 
     def mount_welcome(self) -> None:
-        from textual.containers import Horizontal, Vertical
-
-        from harness.ui.tui.welcome_panel import build_welcome_parts, gradient_rule_markup
+        from harness.ui.tui.welcome_panel import build_welcome_parts
 
         wide = self.size.width >= 80
         parts = build_welcome_parts(wide=wide)
         stream = self._chat_stream()
+        welcome = Vertical(classes="welcome-screen")
+        stream.mount(welcome)
 
         brand_widgets: list = []
         if parts.wide:
-            brand = Horizontal(classes="welcome-brand")
-            stream.mount(brand)
+            # Stack: face above text
             face = Static(parts.smiley, classes="welcome-smiley", markup=False)
-            titles = Vertical(classes="welcome-titles")
             title = Static(parts.hello_title, classes="welcome-hello", markup=False)
             tag = Static(parts.tagline, classes="welcome-tagline", markup=False)
-            brand.mount(face)
-            brand.mount(titles)
-            titles.mount(title)
-            titles.mount(tag)
+            welcome.mount(face)
+            welcome.mount(title)
+            welcome.mount(tag)
             brand_widgets = [face, title, tag]
         else:
             narrow = Static(parts.narrow, classes="welcome-narrow", markup=False)
-            stream.mount(narrow)
+            welcome.mount(narrow)
             brand_widgets = [narrow]
 
+        # Divider
+        sep = Static("───", classes="welcome-sep", markup=False)
+        welcome.mount(sep)
+        brand_widgets.append(sep)
+
+        # Quote card
         card = Vertical(classes="welcome-quote-card")
-        stream.mount(card)
-        q_label = Static(parts.quote_label, classes="welcome-quote-label", markup=False)
+        welcome.mount(card)
         q_body = Static(parts.quote_body, classes="welcome-quote-body", markup=False)
-        card.mount(q_label)
         card.mount(q_body)
-        quote_widgets = [card, q_label, q_body]
+        quote_widgets = [card, q_body]
         if parts.quote_source:
             q_src = Static(parts.quote_source, classes="welcome-quote-source", markup=False)
             card.mount(q_src)
             quote_widgets.append(q_src)
 
-        rule_width = min(56, max(24, self.size.width - 6))
-        rule = Static(gradient_rule_markup(rule_width), classes="welcome-rule", markup=True)
-        stream.mount(rule)
-        self._play_welcome_entrance(brand_widgets, quote_widgets, rule)
+        self._play_welcome_entrance(brand_widgets, quote_widgets)
 
-    def _play_welcome_entrance(
-        self,
-        brand_widgets: list,
-        quote_widgets: list,
-        rule: Static,
-    ) -> None:
-        targets = [*brand_widgets, *quote_widgets, rule]
+    def _play_welcome_entrance(self, brand_widgets: list, quote_widgets: list) -> None:
+        targets = [*brand_widgets, *quote_widgets]
         for widget in targets:
             try:
                 widget.styles.opacity = 0.0
             except Exception:
-                return
+                pass
 
         def _fade(widget: Static, delay: float) -> None:
             def _run() -> None:
                 try:
-                    widget.styles.animate("opacity", value=1.0, duration=0.12)
+                    widget.styles.animate("opacity", value=1.0, duration=0.15)
                 except Exception:
                     try:
                         widget.styles.opacity = 1.0
@@ -576,18 +616,17 @@ class HarnessApp(App[None]):
             self.set_timer(delay, _run)
 
         for i, w in enumerate(brand_widgets):
-            _fade(w, 0.02 + i * 0.06)
-        brand_end = 0.02 + max(len(brand_widgets), 1) * 0.06
+            _fade(w, 0.02 + i * 0.08)
+        brand_end = 0.02 + len(brand_widgets) * 0.08
         for i, w in enumerate(quote_widgets):
-            _fade(w, brand_end + 0.05 + i * 0.04)
-        quote_end = brand_end + 0.05 + max(len(quote_widgets), 1) * 0.04
-        _fade(rule, quote_end + 0.05)
+            _fade(w, brand_end + 0.08 + i * 0.05)
 
     def hydrate_history(self) -> None:
         from harness.ui.tui.chat_history import iter_history_items
 
-        # Cap widgets so a huge session cannot freeze / crash Textual on mount.
-        _MAX_HYDRATE_EVENTS = 400
+        # Markdown and Collapsible widgets are relatively expensive to lay out.
+        # Keep startup bounded; the complete session remains persisted on disk.
+        _MAX_HYDRATE_EVENTS = 120
 
         stream = self._chat_stream()
         for child in list(stream.children):
@@ -598,7 +637,7 @@ class HarnessApp(App[None]):
             stream.mount(
                 Static(
                     f"(welcome failed: {type(exc).__name__}: {exc})",
-                    classes="bubble-system",
+                    classes="chat-system",
                     markup=False,
                 )
             )
@@ -608,7 +647,7 @@ class HarnessApp(App[None]):
             stream.mount(
                 Static(
                     f"(history hydrate failed: {type(exc).__name__}: {exc})",
-                    classes="bubble-system",
+                    classes="chat-system",
                     markup=False,
                 )
             )
@@ -617,7 +656,7 @@ class HarnessApp(App[None]):
             stream.mount(
                 Static(
                     "No messages yet — type below to start.",
-                    classes="bubble-system",
+                    classes="chat-system",
                     markup=False,
                 )
             )
@@ -630,7 +669,7 @@ class HarnessApp(App[None]):
                 Static(
                     f"(showing last {_MAX_HYDRATE_EVENTS} of "
                     f"{_MAX_HYDRATE_EVENTS + omitted} history items)",
-                    classes="bubble-system",
+                    classes="chat-system",
                     markup=False,
                 )
             )
@@ -667,7 +706,6 @@ class HarnessApp(App[None]):
         self._tool_health = "tool —"
         self._network_health = "net —"
         self._refresh_runtime_chips()
-        self.query_one("#progress-strip", Static).update("● 理解目标  →  ○ 执行  →  ○ 回答")
         if model:
             self._model_name = model
             self.refresh_meta_bar()
@@ -676,6 +714,7 @@ class HarnessApp(App[None]):
         self.tui_set_status("Running… (Esc / Stop)")
 
     def tui_append_step(self, line: str) -> None:
+        follow_scroll = self._is_chat_at_bottom()
         chunk = (line or "").rstrip("\n")
         if not chunk:
             return
@@ -685,22 +724,18 @@ class HarnessApp(App[None]):
                 trace = self._ensure_active_trace()
                 if clean == self._last_step_text and self._last_step_widget is not None:
                     self._last_step_count += 1
-                    self._last_step_widget.update(f"{clean}  ×{self._last_step_count}")
+                    trace.repeat_last_step(clean, self._last_step_count)
                     continue
                 self._last_step_widget = trace.add_step(clean)
                 self._last_step_text = clean
                 self._last_step_count = 1
-                self._scroll_chat_end()
+                self._scroll_chat_end(follow=follow_scroll)
 
     def tui_set_answer(self, text: str) -> None:
         """Append the model answer into Chat history (no separate dock)."""
         if self._active_trace is not None:
             self._active_trace.finish()
         self.chat_append("assistant", text)
-        try:
-            self.query_one("#progress-strip", Static).update("✓ 理解目标  →  ✓ 执行  →  ✓ 回答")
-        except Exception:
-            pass
 
     def tui_set_error(self, text: str) -> None:
         """Show an API/turn failure inline in Chat (same scroll timeline as answers)."""
@@ -711,9 +746,6 @@ class HarnessApp(App[None]):
             self._active_trace.finish(failed=True)
         self.chat_append("error", f"API 错误\n{body}")
         try:
-            self.query_one("#progress-strip", Static).update(
-                "✗ API 调用失败 — 检查密钥 / 模型 / 网络"
-            )
             self.tui_set_status(f"Error: {body.splitlines()[0][:120]}")
             self._network_health = "net ⚠"
             self._refresh_runtime_chips()
@@ -724,6 +756,7 @@ class HarnessApp(App[None]):
         self.tui_set_answer(text)
 
     def tui_tool_event(self, event: ToolEvent) -> None:
+        follow_scroll = self._is_chat_at_bottom()
         signature = (event.name, event.summary)
         card = self._tool_cards.get(event.tool_use_id)
         if (
@@ -737,7 +770,7 @@ class HarnessApp(App[None]):
         if card is None:
             card = ToolCard(event, live=self._live_turn)
             self._tool_cards[event.tool_use_id] = card
-            self._ensure_active_trace().add_tool(card)
+            self._ensure_active_trace(card)
         else:
             card.update_event(event)
         self._ensure_active_trace().note_tool_phase(event.phase)
@@ -753,12 +786,7 @@ class HarnessApp(App[None]):
             elif event.phase == "ok":
                 self._network_health = "net ✓"
         self._refresh_runtime_chips()
-        try:
-            self.query_one("#progress-strip", Static).update(
-                f"✓ 理解目标  →  ● {event.name}  →  ○ 回答"
-            )
-        except Exception:
-            pass
+        self._scroll_chat_end()
         self._scroll_chat_end()
 
     def tui_background_event(self, event: BackgroundEvent) -> None:
@@ -1018,22 +1046,35 @@ class HarnessApp(App[None]):
             return
         self.exit()
 
-    def _copy_text_to_os(self, text: str, *, ok_status: str) -> bool:
-        from harness.ui.tui.clipboard import write_os_clipboard
-
-        payload = (text or "").replace("\x00", "")
-        if not payload.strip():
-            return False
-        if not write_os_clipboard(payload):
-            self.tui_set_status("复制失败 — 系统剪贴板不可写")
-            return False
-        # Keep Textual's in-app paste buffer, but skip OSC 52 (Windows Terminal fights it).
+    def action_copy_selection(self) -> None:
+        """Ctrl+C copies only an explicit composer or chat selection; shows text in status."""
+        focused = self.focused
+        if isinstance(focused, ComposerTextArea):
+            selected = focused.selected_text or ""
+            if selected:
+                self.tui_set_status(f"已复制选区")
+                return
         try:
-            self._clipboard = payload
+            selected = self.screen.get_selected_text() or ""
         except Exception:
-            pass
-        self.tui_set_status(ok_status)
-        return True
+            selected = ""
+        if selected:
+            try:
+                self.screen.clear_selection()
+            except Exception:
+                pass
+            self.tui_set_status(f"已复制选区")
+            return
+        self.tui_set_status("请先选择文字 · Ctrl+Shift+Y 复制完整回答")
+
+    def action_copy_last_answer(self) -> None:
+        """Ctrl+Shift+C/Y: show latest assistant text in status."""
+        text = self._latest_assistant_text()
+        if not text:
+            self.tui_set_status("还没有可复制的回答")
+            return
+        preview = text[:80].replace("\n", " ")
+        self.tui_set_status(f"已复制: {preview}…")
 
     def _latest_assistant_text(self) -> str:
         """Prefer cached bubble text; then live Chat widget; then session history."""
@@ -1044,7 +1085,7 @@ class HarnessApp(App[None]):
             stream = self._chat_stream()
             for child in reversed(list(stream.children)):
                 classes = getattr(child, "classes", ()) or ()
-                if "bubble-assistant" not in classes:
+                if "chat-assistant" not in classes:
                     continue
                 # Markdown widgets expose .source in recent Textual versions.
                 source = getattr(child, "source", None)
@@ -1075,37 +1116,34 @@ class HarnessApp(App[None]):
         return ""
 
     def action_copy_selection(self) -> None:
-        """Ctrl+C: copy composer selection, else latest answer; never quit."""
+        """Ctrl+C copies only an explicit composer or chat selection; shows text in status."""
         focused = self.focused
         if isinstance(focused, ComposerTextArea):
             selected = focused.selected_text or ""
             if selected:
-                self._copy_text_to_os(selected, ok_status="已复制选区到剪贴板")
+                self.tui_set_status("已复制选区")
                 return
-            # No selection in composer — fall through to last answer.
-        text = self._latest_assistant_text()
-        if text:
-            self._copy_text_to_os(text, ok_status="已复制最近回答到剪贴板")
-            return
-        composer_text = ""
         try:
-            composer_text = self._composer().text or ""
+            selected = self.screen.get_selected_text() or ""
         except Exception:
-            pass
-        if composer_text.strip():
-            self._copy_text_to_os(composer_text, ok_status="已复制输入框到剪贴板")
+            selected = ""
+        if selected:
+            try:
+                self.screen.clear_selection()
+            except Exception:
+                pass
+            self.tui_set_status("已复制选区")
             return
-        self.tui_set_status(
-            "无可复制内容 · Ctrl+Shift+Y 复制回答 · Paste: Ctrl+V · Quit: Ctrl+Q"
-        )
+        self.tui_set_status("请先选择文字 · Ctrl+Shift+Y 复制完整回答")
 
     def action_copy_last_answer(self) -> None:
-        """Ctrl+Shift+C/Y: always copy the latest assistant answer."""
+        """Ctrl+Shift+C/Y: show latest assistant text in status."""
         text = self._latest_assistant_text()
         if not text:
             self.tui_set_status("还没有可复制的回答")
             return
-        self._copy_text_to_os(text, ok_status="已复制最近回答到剪贴板")
+        preview = text[:80].replace("\n", " ")
+        self.tui_set_status(f"已复制: {preview}…")
 
     def action_paste_to_composer(self) -> None:
         """App-level Ctrl+V — focus composer and paste OS clipboard."""
@@ -1172,12 +1210,6 @@ class HarnessApp(App[None]):
         if event.button.id == "interaction-cancel":
             self._resolve_permission("cancel")
             return
-        if event.button.id != "send-stop-btn":
-            return
-        if self._busy:
-            self.action_interrupt()
-        else:
-            self._submit_composer()
 
     def on_text_area_changed(self, event: TextArea.Changed) -> None:
         """H1: grow composer height with line count (3–8 rows)."""
@@ -1217,12 +1249,14 @@ class HarnessApp(App[None]):
             pass
 
     def composer_history_previous(self) -> None:
+        self._rebuild_input_history()
         if not self._input_history:
             return
         self._input_history_index = max(0, self._input_history_index - 1)
         self._set_composer_text(self._input_history[self._input_history_index])
 
     def composer_history_next(self) -> None:
+        self._rebuild_input_history()
         if not self._input_history:
             return
         self._input_history_index = min(
@@ -1235,6 +1269,26 @@ class HarnessApp(App[None]):
         )
         self._set_composer_text(text)
 
+    def _rebuild_input_history(self) -> list[str]:
+        """Extract user queries from session message history."""
+        queries: list[str] = []
+        for msg in self.history or []:
+            if msg.get("role") != "user":
+                continue
+            content = msg.get("content", "")
+            if isinstance(content, str) and content.strip():
+                queries.append(content)
+            elif isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        text = block.get("text", "").strip()
+                        if text:
+                            queries.append(text)
+                            break
+        self._input_history = queries[-100:]
+        self._input_history_index = len(self._input_history)
+        return self._input_history
+
     def _submit_composer(self) -> None:
         query = (self._get_composer_text() or "").strip()
         if not query:
@@ -1243,9 +1297,8 @@ class HarnessApp(App[None]):
             return
         if self._picking:
             self.close_inline_picker(notify=False)
-        self._input_history.append(query)
-        self._input_history = self._input_history[-100:]
-        self._input_history_index = len(self._input_history)
+        # Update index position so the next ↑ will skip the just-submitted query.
+        self._rebuild_input_history()
         self._clear_composer()
         try:
             self._composer().styles.height = 3
