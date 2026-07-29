@@ -21,7 +21,6 @@ from harness.ui.mode_picker import run_mode_picker
 from harness.project.resume import (
     checkpoint_history,
     inject_project_context,
-    resume_banner,
     run_resume_command,
     should_auto_inject_project_on_startup,
 )
@@ -208,11 +207,6 @@ def bootstrap_cli_session(
             renderer.warn(project_md.status)
         else:
             renderer.muted(project_md.status)
-
-        banner = resume_banner(binding=binding)
-        if banner:
-            renderer.plain(banner)
-            print()
 
     if should_auto_inject_project_on_startup():
         ok, note = inject_project_context(history, binding=binding, checkpoint=True)

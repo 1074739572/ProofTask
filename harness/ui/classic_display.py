@@ -143,7 +143,7 @@ def _plain_model_rows() -> list[str]:
 
 def render_status_footer(*, model: str, mode: str, context_rate: float | None = None, cache_hit_rate: float | None = None, mcp_count: int = 0) -> str:
     parts = [f"model {model}"]
-    if mode and mode != "direct":
+    if mode:
         parts.append(f"mode {mode}")
     if context_rate is not None:
         parts.append(f"ctx {100 * max(0.0, min(1.0, context_rate)):.0f}%")
