@@ -23,9 +23,6 @@ class RecoveryState:
         self.fallback_model: str | None = None
         self.has_nudged_empty_reply = False
         self.has_nudged_web_budget = False
-        # After LookupGuard consecutive blocks: strip tools until a text answer.
-        self.strip_tools_until_answer = False
-        self.has_lookup_force_finalize = False
 
 
 def retry_delay(attempt: int) -> float:
@@ -92,6 +89,90 @@ def with_retry(fn, state: RecoveryState):
                 continue
             raise
     raise RuntimeError(f"Max retries ({MAX_RETRIES}) exceeded")
+
+
+def is_model_recoverable_error(exc: Exception) -> bool:
+    """Whether switching to a different model/provider is worth trying."""
+    name = type(exc).__name__.lower()
+    msg = str(exc).lower()
+    status = getattr(exc, "status_code", None) or getattr(exc, "status", None) or getattr(exc, "code", None)
+    if isinstance(status, str) and status.isdigit():
+        status = int(status)
+    return bool(
+        status in (403, 404, 429, 500, 502, 503, 529)
+        or any(
+            token in name or token in msg
+            for token in (
+                "insufficient_balance",
+                "insufficient balance",
+                "billing",
+                "quota",
+                "permission",
+                "forbidden",
+                "does not exist",
+                "not found",
+                "overloaded",
+                "timeout",
+                "connection",
+                "temporarily unavailable",
+            )
+        )
+    )
+
+
+def candidate_recovery_models(current_model: str | None = None) -> list[str]:
+    """Return configured fallback candidates with API keys present.
+
+    Priority:
+    1. HARNESS_RECOVERY_MODELS comma list
+    2. FALLBACK_MODEL_ID
+    3. Other configured models whose providers have keys, preferring a different provider
+    """
+    import os
+
+    from harness.models import get_model, get_model_profile, list_models
+    from harness.providers.config import get_provider, resolve_api_key
+
+    current = current_model or get_model()
+    explicit = [m.strip() for m in os.getenv("HARNESS_RECOVERY_MODELS", "").split(",") if m.strip()]
+    if FALLBACK_MODEL:
+        explicit.append(FALLBACK_MODEL)
+
+    catalog = list_models()
+    known = {m["id"]: m for m in catalog}
+
+    def has_key(model_id: str) -> bool:
+        entry = known.get(model_id)
+        if not entry:
+            return False
+        try:
+            return bool(resolve_api_key(get_provider(entry.get("provider", "deepseek"))))
+        except Exception:
+            return False
+
+    ordered: list[str] = []
+    for model_id in explicit:
+        if model_id != current and has_key(model_id) and model_id not in ordered:
+            ordered.append(model_id)
+
+    try:
+        current_provider = get_model_profile(current).provider
+    except Exception:
+        current_provider = ""
+
+    other_provider = []
+    same_provider = []
+    for entry in catalog:
+        model_id = entry["id"]
+        if model_id == current or model_id in ordered:
+            continue
+        if not has_key(model_id):
+            continue
+        if entry.get("provider") != current_provider:
+            other_provider.append(model_id)
+        else:
+            same_provider.append(model_id)
+    return [*ordered, *other_provider, *same_provider]
 
 
 def is_prompt_too_long_error(exc: Exception) -> bool:

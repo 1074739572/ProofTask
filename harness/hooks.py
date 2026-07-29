@@ -49,17 +49,7 @@ def trigger_hooks(event: str, *args):
 
 
 def _hook_print(message: str, *, warn: bool = False) -> None:
-    """Route hook notices to TUI Steps when active; else classic stdout."""
-    from harness.ui.tui.mode import is_tui_active
-
-    if is_tui_active():
-        from harness.ui.tui.bridge import BRIDGE
-
-        if warn:
-            BRIDGE.push_warn(message)
-        else:
-            BRIDGE.push_step(message)
-        return
+    """Route hook notices to classic stdout."""
     if warn:
         print(f"\n\033[33m{message}\033[0m")
     else:

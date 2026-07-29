@@ -25,10 +25,11 @@ from harness.project.resume import (
     run_resume_command,
     should_auto_inject_project_on_startup,
 )
+from harness.project.session_registry import SessionBinding, touch_session_title_from_query
 from harness.project.session_store import bootstrap_session
 from harness.prompts.project_md import apply_project_instructions
 from harness.tasks import reconcile_task_board
-from harness.todos.state import load_todos_from_disk
+from harness.todos.state import load_todos_from_disk, set_binding as todos_set_binding
 from harness.project.session_undo import abort_inflight_turn, undo_last_turn
 from harness.project.tools import (
     run_project_clear,
@@ -46,6 +47,38 @@ from harness.ui.welcome import render_welcome
 from harness.usage import handle_usage_command
 
 
+def _print_status_footer() -> None:
+    """Dimmed footer bar: model · mode · today usage · mcp."""
+    try:
+        from datetime import date
+        from harness.models import get_model
+        from harness.modes import get_mode
+        from harness.mcp.pool import mcp_clients
+        from harness.usage.store import totals_for_day
+        from harness.ui.classic_display import render_status_footer
+
+        totals = totals_for_day(date.today())
+        cache_hit_rate = totals.hit_rate if totals.calls > 0 else None
+        print(
+            render_status_footer(
+                model=get_model(),
+                mode=get_mode(),
+                cache_hit_rate=cache_hit_rate,
+                mcp_count=len(mcp_clients),
+            )
+        )
+    except Exception:
+        pass
+
+
+def _fmt_token(n: int) -> str:
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M".rstrip("0").rstrip(".")
+    if n >= 1_000:
+        return f"{n / 1_000:.1f}k".rstrip("0").rstrip(".")
+    return str(n)
+
+
 def _match_cli_command(query: str, command: str) -> bool:
     """True for `/cmd` or `/cmd args` — avoids `/model` matching `/mode`."""
     text = query.strip().lower()
@@ -61,6 +94,7 @@ def _help_text() -> str:
   /mode grill              拷问模式：内置 grill-me，确认执行前不改代码
   /usage [today|week|month|year|YYYY-MM-DD|YYYY-MM|YYYY]
                            local token stats + hit rate (bars; kept across /clear)
+  /stats                   用量仪表盘：今日/7日/30日对比 + 分模型统计
   /undo                    cancel last completed question + reply
   Esc / Ctrl+C             stop in-flight turn; roll back to edit/resend question
   /resume                   list sessions (name · created)
@@ -119,7 +153,7 @@ def print_turn_assistants(messages: list, turn_start: int | None) -> None:
             console.terminal_print(text)
 
 
-def cron_autorun_loop(history: list, context: dict) -> None:
+def cron_autorun_loop(history: list, context: dict, *, binding: SessionBinding) -> None:
     while True:
         time.sleep(1)
         fired = consume_cron_queue()
@@ -132,10 +166,10 @@ def cron_autorun_loop(history: list, context: dict) -> None:
                     {"role": "user", "content": f"[Scheduled] {job.prompt}"}
                 )
                 renderer.hook("cron auto", job.prompt[:60])
-            agent_loop(history, context)
+            agent_loop(history, context, binding=binding)
             context.update(update_context(context, history))
             print_turn_assistants(history, turn_start)
-            checkpoint_history(history)
+            checkpoint_history(history, binding=binding)
 
 
 def bootstrap_cli_session(
@@ -143,12 +177,17 @@ def bootstrap_cli_session(
     welcome: bool = True,
     start_cron: bool = True,
     cli_active: bool = True,
-) -> tuple[list, dict]:
-    """Shared session bootstrap for classic CLI and Textual TUI."""
+) -> tuple[list, dict, SessionBinding]:
+    """Shared session bootstrap for classic CLI.
+
+    Returns (history, context, binding).  The *binding* pins all writes for
+    this process — other windows changing active_session.json don't affect it.
+    """
     terminal_state.CLI_ACTIVE = cli_active
 
-    history, session_source = bootstrap_session()
-    load_todos_from_disk()
+    history, binding, session_source = bootstrap_session()
+    todos_set_binding(binding)
+    load_todos_from_disk(binding=binding)
     reconciled = reconcile_task_board()
     if reconciled:
         renderer.warn(
@@ -156,7 +195,7 @@ def bootstrap_cli_session(
         )
     _, repair_fixes = repair_tool_pairing(history)
     if repair_fixes:
-        checkpoint_history(history)
+        checkpoint_history(history, binding=binding)
         renderer.warn(f"Repaired {repair_fixes} broken tool message(s) in saved session.")
     context = update_context({}, history if history else [])
     if session_source:
@@ -165,23 +204,21 @@ def bootstrap_cli_session(
 
     if welcome:
         render_welcome(session_source=session_source)
-        # UI-only: loaded source, none, disabled, or truncated — not sent to the model.
         if project_md.truncated:
             renderer.warn(project_md.status)
         else:
             renderer.muted(project_md.status)
 
-        banner = resume_banner()
+        banner = resume_banner(binding=binding)
         if banner:
             renderer.plain(banner)
             print()
 
     if should_auto_inject_project_on_startup():
-        ok, note = inject_project_context(history, checkpoint=True)
+        ok, note = inject_project_context(history, binding=binding, checkpoint=True)
         if ok:
             renderer.info(note)
             context = update_context(context, history)
-            # update_context spreads existing keys; re-assert after rebuilds.
             apply_project_instructions(context)
 
     bootstrap_results = bootstrap_mcp_servers()
@@ -197,13 +234,13 @@ def bootstrap_cli_session(
         pass
     if start_cron:
         threading.Thread(
-            target=cron_autorun_loop, args=(history, context), daemon=True
+            target=cron_autorun_loop, args=(history, context), kwargs={"binding": binding}, daemon=True
         ).start()
-    return history, context
+    return history, context, binding
 
 
 def run_cli() -> None:
-    history, context = bootstrap_cli_session()
+    history, context, binding = bootstrap_cli_session()
 
     redo_query: str | None = None
 
@@ -237,6 +274,11 @@ def run_cli() -> None:
             renderer.plain(handle_usage_command(query))
             print()
             continue
+        if _match_cli_command(query, "/stats"):
+            from harness.ui.classic_display import render_stats_dashboard
+            renderer.plain(render_stats_dashboard())
+            print()
+            continue
         if query.strip().lower() in ("/undo", "/u"):
             with agent_lock:
                 ok, message = undo_last_turn(history)
@@ -251,8 +293,33 @@ def run_cli() -> None:
         if _match_cli_command(query, "/resume"):
             parts = query.strip().split(maxsplit=1)
             sub = parts[1] if len(parts) > 1 else ""
+            if not sub:
+                from harness.ui.terminal_menu import select_from_list
+                from harness.project.session_registry import visible_session_summaries
+
+                sessions = visible_session_summaries(limit=20)
+                if sessions:
+                    labels = []
+                    for idx, s in enumerate(sessions):
+                        created = s.get("created_at") or s.get("updated_at") or 0
+                        import time as _time
+                        ts = _time.strftime("%m/%d %H:%M", _time.localtime(created)) if created else "—"
+                        title = (s["title"] or "(untitled)")[:40]
+                        mark = "  ← 当前" if s.get("active") else ""
+                        labels.append(f"{idx+1}. {title}  ·  {ts}{mark}")
+                    labels.append("✕  取消")
+                    choice = select_from_list(
+                        labels,
+                        title="选择会话",
+                        hint="↑↓ 选择 · Enter 确认 · Esc 取消",
+                    )
+                    if choice is not None and choice < len(sessions):
+                        sub = str(choice + 1)
             with agent_lock:
-                note = run_resume_command(sub, messages=history)
+                note, new_binding = run_resume_command(sub, messages=history, binding=binding)
+                if new_binding is not None:
+                    binding = new_binding
+                    todos_set_binding(binding)
                 repair_tool_pairing(history)
                 context = update_context(context, history)
                 renderer.plain(note)
@@ -264,7 +331,7 @@ def run_cli() -> None:
             parts = query.strip().split(maxsplit=1)
             sub = parts[1] if len(parts) > 1 else ""
             with agent_lock:
-                note = run_skill_command(sub, messages=history)
+                note = run_skill_command(sub, messages=history, binding=binding)
                 repair_tool_pairing(history)
                 context = update_context(context, history)
                 renderer.plain(note)
@@ -273,11 +340,14 @@ def run_cli() -> None:
         if _match_cli_command(query, "/clear"):
             parts = query.strip().split(maxsplit=1)
             sub = parts[1].lower() if len(parts) > 1 else ""
-            # OpenCode 模式：默认全清（session + todos + state.json）
-            # /clear session  → 只清对话，保留 state.json
             keep_project = sub in ("session", "chat", "history")
-            renderer.plain(run_project_clear(clear_project=not keep_project))
+            renderer.plain(run_project_clear(clear_project=not keep_project, binding=binding))
             history.clear()
+            # Start a new session binding
+            from harness.project.session_registry import create_session
+            binding = create_session()
+            todos_set_binding(binding)
+            load_todos_from_disk(binding=binding)
             context = update_context({}, [])
             project_md = apply_project_instructions(context)
             if project_md.truncated:
@@ -338,7 +408,9 @@ def run_cli() -> None:
             renderer.plain(
                 run_project_import_transcript(path=path_arg, mode=mode, merge=merge)
             )
-            history[:] = bootstrap_session()[0]
+            history[:], binding, _source = bootstrap_session()
+            todos_set_binding(binding)
+            load_todos_from_disk(binding=binding)
             context = update_context(context, history)
             print()
             continue
@@ -346,9 +418,7 @@ def run_cli() -> None:
         from harness.rag.file_mode import handle_file_mode_turn, is_file_mode
 
         # File mode: every normal message is document Q&A (RAG → answer).
-        # Slash commands above still work; exit with /mode direct.
         if is_file_mode() or get_mode() == "file":
-            # Same path as TUI: always RAG → assistant answer (not plain dump).
             renderer.user(query)
             renderer.assistant(handle_file_mode_turn(query))
             print()
@@ -359,19 +429,14 @@ def run_cli() -> None:
             renderer.muted(gate_note)
 
         hook_result = trigger_hooks("UserPromptSubmit", query)
-        # user_prompt_hook may return an augmented query (e.g. lookup-mode
-        # constraint appended). Show the user's original wording on screen,
-        # but send the augmented version to the model.
         model_query = hook_result if isinstance(hook_result, str) else query
-        from harness.project.session_registry import touch_session_title_from_query
 
         from harness.prompts.lookup import is_lookup_active
         from harness.prompts.writing import is_writing_query
         from harness.rag.bootstrap import bootstrap_message, ensure_rag_indexed
 
-        touch_session_title_from_query(query)
+        touch_session_title_from_query(query, binding=binding)
         repair_tool_pairing(history)
-        renderer.user(query)
         turn_start = len(history)
         history.append({"role": "user", "content": model_query})
         context["latest_user_query"] = query
@@ -398,7 +463,7 @@ def run_cli() -> None:
         try:
             with agent_lock:
                 try:
-                    interrupted = agent_loop(history, context, turn_start=turn_start)
+                    interrupted = agent_loop(history, context, turn_start=turn_start, binding=binding)
                 except KeyboardInterrupt:
                     request_cancel()
                     interrupted = True
@@ -416,20 +481,27 @@ def run_cli() -> None:
             with agent_lock:
                 context = update_context(context, history)
             print_turn_assistants(history, turn_start)
-            checkpoint_history(history)
+            checkpoint_history(history, binding=binding)
 
         inbox = consume_lead_inbox(route_protocol=True)
         if inbox:
-
-            def inbox_label(msg: dict) -> str:
-                req_id = msg.get("metadata", {}).get("request_id", "")
-                suffix = f" req:{req_id}" if req_id else ""
-                return f"{msg.get('type', 'message')}{suffix}"
-
-            inbox_text = "\n".join(
-                f"From {m['from']} [{inbox_label(m)}]: {m['content'][:200]}"
-                for m in inbox
-            )
+            groups: dict[str, list[dict]] = {}
+            for m in inbox:
+                groups.setdefault(m["from"], []).append(m)
+            tree_parts = ["Agents"]
+            branch_chars = ["├─ ", "│  ", "└─ ", "   "]
+            for agent_name, msgs in groups.items():
+                tree_parts.append(f"  {agent_name}")
+                for i, m in enumerate(msgs):
+                    prefix = branch_chars[0] if i < len(msgs) - 1 else branch_chars[2]
+                    indent = branch_chars[1] if i < len(msgs) - 1 else branch_chars[3]
+                    content = m.get("content", "")[:120]
+                    msg_type = m.get("type", "message")
+                    label = f" [{msg_type}]" if msg_type != "message" else ""
+                    tree_parts.append(f"  {prefix}{content}{label}")
+            inbox_text = "\n".join(tree_parts)
             history.append({"role": "user", "content": f"[Inbox]\n{inbox_text}"})
-            checkpoint_history(history)
+            checkpoint_history(history, binding=binding)
+
+        _print_status_footer()
         print()

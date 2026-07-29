@@ -18,6 +18,12 @@
     "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
     "api_key_env": "DASHSCOPE_API_KEY"
   },
+  "xiaomi-mimo": {
+    "label": "Xiaomi MiMo",
+    "type": "openai",
+    "base_url": "https://token-plan-cn.xiaomimimo.com/v1",
+    "api_key_env": "XIAOMI_MIMO_API_KEY"
+  },
   "anzhiyu": {
     "label": "鱼鱼API",
     "type": "openai",

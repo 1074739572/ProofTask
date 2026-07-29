@@ -68,31 +68,34 @@ class TestSessionScopedTodos(unittest.TestCase):
         from harness.todos.state import get_todos, load_todos_from_disk, set_todos
 
         with mock.patch.dict(os.environ, {"HARNESS_CONTINUE_SESSION": "0"}, clear=False):
-            messages, source = bootstrap_session()
+            messages, binding, source = bootstrap_session()
         self.assertEqual(messages, [])
+        self.assertIsNotNone(binding)
         self.assertIsNone(source)
-        load_todos_from_disk()
+        load_todos_from_disk(binding=binding)
         self.assertEqual(get_todos(), [])
 
+        from harness.todos.state import set_binding
+        set_binding(binding)
         set_todos(
             [{"content": "only in this session", "activeForm": "Doing…", "status": "in_progress"}]
         )
-        from harness.project.session_registry import session_paths
 
-        self.assertTrue(session_paths().todos_json.exists())
+        self.assertTrue(binding.todos_json.exists())
 
     def test_new_session_does_not_load_old_todos(self) -> None:
         from harness.project.session_registry import create_session, session_paths
-        from harness.todos.state import get_todos, load_todos_from_disk, set_todos
+        from harness.todos.state import get_todos, load_todos_from_disk, set_binding, set_todos
 
         first = create_session(title="first")
+        set_binding(first)
         set_todos(
             [{"content": "old work", "activeForm": "Working…", "status": "in_progress"}]
         )
         self.assertTrue(first.todos_json.exists())
 
         second = create_session(title="second")
-        load_todos_from_disk()
+        load_todos_from_disk(binding=second)
         self.assertEqual(get_todos(), [])
         self.assertFalse(second.todos_json.exists())
         # Old session still has its todos on disk
@@ -125,9 +128,10 @@ class TestSessionScopedTodos(unittest.TestCase):
     def test_clear_keeps_old_session_todos_on_disk(self) -> None:
         from harness.project.session_registry import create_session
         from harness.project.tools import run_project_clear
-        from harness.todos.state import set_todos
+        from harness.todos.state import set_binding, set_todos
 
         old = create_session(title="with-todos")
+        set_binding(old)
         set_todos(
             [{"content": "keep me", "activeForm": "Keeping…", "status": "pending"}]
         )
@@ -135,7 +139,7 @@ class TestSessionScopedTodos(unittest.TestCase):
         self.assertTrue(old_todos.exists())
 
         with mock.patch("harness.project.state.STATE_PATH", self.project / "state.json"):
-            msg = run_project_clear(clear_project=False)
+            msg = run_project_clear(clear_project=False, binding=old)
 
         self.assertIn("保留", msg)
         self.assertTrue(old_todos.exists())
@@ -156,13 +160,13 @@ class TestSessionScopedTodos(unittest.TestCase):
         meta = read_session_meta(a)
         meta["title"] = "first chat"
         write_session_meta(meta, a)
-        append_checkpoint([{"role": "user", "content": "hello from first"}])
+        append_checkpoint([{"role": "user", "content": "hello from first"}], binding=a)
 
         b = create_session(title="second chat")
         meta_b = read_session_meta(b)
         meta_b["title"] = "second chat"
         write_session_meta(meta_b, b)
-        append_checkpoint([{"role": "user", "content": "hello from second"}])
+        append_checkpoint([{"role": "user", "content": "hello from second"}], binding=b)
 
         # Prefer title resolve (order can tie on same-second timestamps)
         row, err = resolve_session_selector("first chat")
@@ -171,7 +175,7 @@ class TestSessionScopedTodos(unittest.TestCase):
         self.assertEqual(row["title"], "first chat")
 
         messages: list = [{"role": "user", "content": "stale"}]
-        note = switch_to_session(row["id"], messages)
+        new_binding, note = switch_to_session(row["id"], messages, binding=b)
         self.assertIn("first chat", note)
         self.assertIn("最近一条（用户）", note)
         self.assertIn("hello from first", note)
@@ -202,7 +206,7 @@ class TestSessionScopedTodos(unittest.TestCase):
         meta = read_session_meta(a)
         meta["title"] = "keep me"
         write_session_meta(meta, a)
-        append_checkpoint([{"role": "user", "content": "stay"}])
+        append_checkpoint([{"role": "user", "content": "stay"}], binding=a)
 
         b = create_session(title="delete me")
         meta_b = read_session_meta(b)
@@ -215,24 +219,24 @@ class TestSessionScopedTodos(unittest.TestCase):
         self.assertIsNone(err)
         assert row is not None
 
-        note = delete_session_entry(row, messages=[])
+        note, _new_binding = delete_session_entry(row, messages=[], binding=b)
         self.assertIn("delete me", note)
         self.assertTrue(note.startswith("已删除"))
-        self.assertFalse(b.root.exists())
-        self.assertTrue(a.root.exists())
+        self.assertFalse(b.paths.root.exists())
+        self.assertTrue(a.paths.root.exists())
 
     def test_delete_active_session_starts_fresh(self) -> None:
         from harness.project.session_registry import create_session, read_active_session_id
         from harness.project.session_registry import resolve_session_selector
         from harness.project.resume import delete_session_entry
 
-        create_session(title="current one")
+        current = create_session(title="current one")
         sid = read_active_session_id()
         assert sid
         row, _ = resolve_session_selector("1")
         assert row is not None
         messages = [{"role": "user", "content": "old"}]
-        note = delete_session_entry(row, messages)
+        note, new_binding = delete_session_entry(row, messages, binding=current)
         self.assertIn("已删除当前会话", note)
         self.assertEqual(messages, [])
         self.assertNotEqual(read_active_session_id(), sid)

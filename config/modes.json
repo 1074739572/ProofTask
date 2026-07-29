@@ -28,11 +28,12 @@
     },
     "orchestrate": {
       "label": "编排 Orchestrate",
-      "summary": "Lead 拆任务 + task() 分发 GLM/Qwen 子 agent",
-      "lead_model_hint": "deepseek-v4-flash",
+      "summary": "Sol 编排 + 自动派发子 agent（explore/code/write）",
+      "lead_model_hint": "gpt-5.6-sol",
       "enable_task": true,
+      "auto_route": true,
       "disable_tools": [],
-      "prompt": "Execution mode: ORCHESTRATE\n- You are the LEAD coordinator (current model). Do not implement large work alone.\n- On a new multi-step request: todo_write FIRST with the full plan.\n- Dispatch work with task(agent_type, prompt):\n  · code → GLM: implementation, scripts, bash, file edits\n  · write → Qwen: Chinese prose, chapter drafts, polish under output/\n  · explore → DeepSeek read-only: search/analyze before planning\n- You may fix trivial one-liners yourself; everything else → task().\n- After each task() returns, update todo_write before the next step.\n- Pass complete instructions in prompt; subagents do not see this history."
+      "prompt": "Execution mode: ORCHESTRATE\n- You are the Sol LEAD coordinator. The system has auto-routed the work to a sub-agent.\n- Review the sub-agent's results below and present a concise summary to the user.\n- If the sub-agent's output is insufficient, call spawn_teammate yourself for follow-up.\n- Do NOT re-do work the sub-agent already completed."
     },
     "file": {
       "label": "文件 File",

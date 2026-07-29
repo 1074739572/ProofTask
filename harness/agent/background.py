@@ -4,14 +4,23 @@ from __future__ import annotations
 
 import re
 import threading
+from dataclasses import dataclass
 
 from harness.agent.compact.persist import stabilize_tool_results
 from harness.hooks import trigger_hooks
 from harness.messages.blocks import block_field
 from harness.tools.dispatch import call_tool_handler
-from harness.ui.tui.events import BackgroundEvent
 
 _bg_counter = 0
+
+
+@dataclass(frozen=True)
+class BackgroundEvent:
+    task_id: str
+    command: str
+    phase: str
+    preview: str = ""
+
 background_tasks: dict[str, dict] = {}
 background_results: dict[str, str] = {}
 background_lock = threading.Lock()
@@ -85,15 +94,8 @@ def start_background_task(block, handlers: dict) -> str:
     return bg_id
 
 
-def _push_background_event(event: BackgroundEvent) -> bool:
-    from harness.ui.tui.mode import is_tui_active
-
-    if not is_tui_active():
-        return False
-    from harness.ui.tui.bridge import BRIDGE
-
-    BRIDGE.push_background(event)
-    return True
+def _push_background_event(event) -> bool:
+    return False
 
 
 def collect_background_results() -> list[str]:

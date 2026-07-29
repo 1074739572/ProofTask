@@ -13,6 +13,11 @@ Layout (Claude Code / OpenCode style — conversation ≠ long workflow)::
 
 Legacy flat files (``.project/session.jsonl``, ``todos.json``, ``session.meta.json``)
 are migrated once into ``sessions/<id>/``.
+
+**Per-process binding** — once a CLI window starts, its writes are pinned to
+a single ``session_id``.  Another window creating or switching sessions only
+updates ``active_session.json`` (the *suggestion* for the next launch), never
+the writes of an already-running window.
 """
 
 from __future__ import annotations
@@ -53,6 +58,25 @@ class SessionPaths:
         return self.root / "todos.json"
 
 
+@dataclass(frozen=True)
+class SessionBinding:
+    """Per-process session handle — all writes target this id, never re-reads active_session.json."""
+    session_id: str
+    paths: SessionPaths
+
+    @property
+    def session_jsonl(self) -> Path:
+        return self.paths.session_jsonl
+
+    @property
+    def meta_json(self) -> Path:
+        return self.paths.meta_json
+
+    @property
+    def todos_json(self) -> Path:
+        return self.paths.todos_json
+
+
 def sessions_root() -> Path:
     SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
     return SESSIONS_DIR
@@ -75,6 +99,7 @@ def read_active_session_id() -> str | None:
 
 
 def write_active_session_id(session_id: str) -> None:
+    """Update the global active pointer — only at session create / explicit /resume switch."""
     PROJECT_DIR.mkdir(parents=True, exist_ok=True)
     ACTIVE_SESSION_PATH.write_text(
         json.dumps({"id": session_id}, ensure_ascii=False, indent=2),
@@ -91,6 +116,16 @@ def session_paths(session_id: str | None = None) -> SessionPaths:
     return SessionPaths(session_id=sid, root=root)
 
 
+def session_binding(session_id: str) -> SessionBinding:
+    """Create a binding for an existing or new session directory."""
+    root = sessions_root() / session_id
+    root.mkdir(parents=True, exist_ok=True)
+    return SessionBinding(
+        session_id=session_id,
+        paths=SessionPaths(session_id=session_id, root=root),
+    )
+
+
 def _default_meta(*, title: str = "", created_at: int | None = None) -> dict:
     now = int(time.time()) if created_at is None else created_at
     return {
@@ -101,8 +136,8 @@ def _default_meta(*, title: str = "", created_at: int | None = None) -> dict:
     }
 
 
-def read_session_meta(paths: SessionPaths | None = None) -> dict:
-    target = paths or session_paths()
+def read_session_meta(binding: SessionBinding | None = None, paths: SessionPaths | None = None) -> dict:
+    target = paths or (binding.paths if binding else session_paths())
     if not target.meta_json.exists():
         return _default_meta()
     try:
@@ -120,8 +155,8 @@ def read_session_meta(paths: SessionPaths | None = None) -> dict:
     return data
 
 
-def write_session_meta(meta: dict, paths: SessionPaths | None = None) -> None:
-    target = paths or session_paths()
+def write_session_meta(meta: dict, binding: SessionBinding | None = None, paths: SessionPaths | None = None) -> None:
+    target = paths or (binding.paths if binding else session_paths())
     target.root.mkdir(parents=True, exist_ok=True)
     meta = dict(meta)
     meta["updated_at"] = int(time.time())
@@ -131,35 +166,32 @@ def write_session_meta(meta: dict, paths: SessionPaths | None = None) -> None:
     )
 
 
-def touch_session_title_from_query(query: str, *, max_len: int = 48) -> None:
+def touch_session_title_from_query(query: str, *, binding: SessionBinding) -> None:
     """Set title from first user query if still untitled."""
-    paths = session_paths()
-    meta = read_session_meta(paths)
+    meta = read_session_meta(binding=binding)
     title = (meta.get("title") or "").strip()
     if title and title != "(untitled)":
-        write_session_meta(meta, paths)
         return
     text = " ".join((query or "").strip().split())
     if not text:
         return
     if text.startswith("/"):
         return
-    if len(text) > max_len:
-        text = text[: max_len - 1] + "…"
+    if len(text) > 48:
+        text = text[:47] + "…"
     meta["title"] = text
-    write_session_meta(meta, paths)
+    write_session_meta(meta, binding=binding)
 
 
-def create_session(*, title: str = "") -> SessionPaths:
+def create_session(*, title: str = "") -> SessionBinding:
     sid = _new_session_id()
-    paths = SessionPaths(session_id=sid, root=sessions_root() / sid)
-    paths.root.mkdir(parents=True, exist_ok=True)
-    write_session_meta(_default_meta(title=title or "(untitled)"), paths)
+    binding = session_binding(sid)
+    write_session_meta(_default_meta(title=title or "(untitled)"), binding=binding)
     write_active_session_id(sid)
-    return paths
+    return binding
 
 
-def migrate_legacy_flat_session() -> SessionPaths | None:
+def migrate_legacy_flat_session() -> SessionBinding | None:
     """Move flat ``.project/session.jsonl`` (+ meta/todos) into ``sessions/<id>/``."""
     if not LEGACY_SESSION_PATH.exists() and not LEGACY_TODOS_PATH.exists():
         return None
@@ -167,31 +199,30 @@ def migrate_legacy_flat_session() -> SessionPaths | None:
     existing = read_active_session_id()
     if existing and (sessions_root() / existing).is_dir():
         if (sessions_root() / existing / "session.jsonl").exists():
-            return session_paths(existing)
+            return session_binding(existing)
 
     sid = _new_session_id()
-    paths = SessionPaths(session_id=sid, root=sessions_root() / sid)
-    paths.root.mkdir(parents=True, exist_ok=True)
+    binding = session_binding(sid)
 
     if LEGACY_SESSION_PATH.exists():
-        LEGACY_SESSION_PATH.rename(paths.session_jsonl)
+        LEGACY_SESSION_PATH.rename(binding.session_jsonl)
     if LEGACY_SESSION_META_PATH.exists():
-        LEGACY_SESSION_META_PATH.rename(paths.meta_json)
+        LEGACY_SESSION_META_PATH.rename(binding.meta_json)
     else:
-        write_session_meta(_default_meta(title="(migrated)"), paths)
+        write_session_meta(_default_meta(title="(migrated)"), binding=binding)
     if LEGACY_TODOS_PATH.exists():
-        LEGACY_TODOS_PATH.rename(paths.todos_json)
+        LEGACY_TODOS_PATH.rename(binding.todos_json)
 
     # Refresh meta timestamps / title defaults
-    meta = read_session_meta(paths)
+    meta = read_session_meta(binding=binding)
     if not meta.get("title") or meta.get("title") == "(untitled)":
         meta["title"] = "(migrated)"
-    write_session_meta(meta, paths)
+    write_session_meta(meta, binding=binding)
     write_active_session_id(sid)
-    return paths
+    return binding
 
 
-def ensure_active_session(*, fresh: bool) -> SessionPaths:
+def ensure_active_session(*, fresh: bool) -> SessionBinding:
     """Ensure an active session directory exists.
 
     ``fresh=True`` (OpenCode default): always create a new session id so todos
@@ -210,7 +241,7 @@ def ensure_active_session(*, fresh: bool) -> SessionPaths:
 
     sid = read_active_session_id()
     if sid and (sessions_root() / sid).is_dir():
-        return session_paths(sid)
+        return session_binding(sid)
     if migrated is not None:
         return migrated
     return create_session()
@@ -226,7 +257,7 @@ def list_session_summaries(*, limit: int = 20) -> list[dict]:
         if not path.is_dir():
             continue
         sp = SessionPaths(session_id=path.name, root=path)
-        meta = read_session_meta(sp)
+        meta = read_session_meta(paths=sp)
         msg_count = 0
         if sp.session_jsonl.exists():
             try:
@@ -330,6 +361,6 @@ def delete_session_by_id(session_id: str) -> tuple[bool, str]:
     if not root.is_dir():
         return False, f"会话不存在：{session_id}"
     sp = SessionPaths(session_id=session_id, root=root)
-    title = read_session_meta(sp).get("title") or "(untitled)"
+    title = read_session_meta(paths=sp).get("title") or "(untitled)"
     shutil.rmtree(root)
     return True, title

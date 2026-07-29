@@ -126,6 +126,7 @@ def inject_skill(
     messages: list,
     *,
     checkpoint: bool = True,
+    binding = None,
 ) -> tuple[bool, str]:
     """Append a marked user message with full skill body and optionally checkpoint."""
     scan_skills()
@@ -141,19 +142,19 @@ def inject_skill(
     if checkpoint:
         from harness.project.resume import checkpoint_history
 
-        checkpoint_history(messages)
+        checkpoint_history(messages, binding=binding)
     return True, skill_loaded_notice(raw)
 
 
-def run_skill_command(args: str = "", *, messages: list | None = None) -> str:
+def run_skill_command(args: str = "", *, messages: list | None = None, binding = None) -> str:
     """Handle /skill [name|list]."""
     raw = (args or "").strip()
     sub = raw.lower()
     if sub in ("", "list", "status", "ls", "pick", "picker"):
         return format_skill_command_status()
     if messages is None:
-        return "请在 CLI/TUI 中执行 /skill <name>"
-    _ok, note = inject_skill(raw, messages, checkpoint=True)
+        return "请在 CLI 中执行 /skill <name>"
+    _ok, note = inject_skill(raw, messages, checkpoint=True, binding=binding)
     return note
 
 

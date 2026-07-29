@@ -23,7 +23,7 @@ class CacheUsage:
 
 
 def parse_cache_usage(usage) -> CacheUsage | None:
-    """Extract cache hit/miss from Anthropic or DeepSeek-compatible usage objects."""
+    """Extract cache hit/miss from Anthropic, DeepSeek, or OpenAI-compatible usage objects."""
     if usage is None:
         return None
 
@@ -36,7 +36,6 @@ def parse_cache_usage(usage) -> CacheUsage | None:
     if read is not None or create is not None:
         hit = int(read or 0)
         billed_input = int(input_tokens or 0)
-        # When cache_read is reported, input_tokens is typically the uncached tail.
         miss = billed_input
         if hit == 0 and create:
             miss = max(miss, int(create))
@@ -55,6 +54,21 @@ def parse_cache_usage(usage) -> CacheUsage | None:
             miss_tokens=int(miss or 0),
             output_tokens=output,
             source="prompt_cache_hit_tokens",
+        )
+
+    # OpenAI-style usage: prompt_tokens + completion_tokens
+    prompt = getattr(usage, "prompt_tokens", None)
+    completion = getattr(usage, "completion_tokens", None)
+    if prompt is not None:
+        # Check for cached tokens in prompt_tokens_details
+        details = getattr(usage, "prompt_tokens_details", None)
+        cached = int(getattr(details, "cached_tokens", 0) or 0) if details else 0
+        miss = int(prompt) - cached if cached else int(prompt)
+        return CacheUsage(
+            hit_tokens=cached,
+            miss_tokens=max(0, miss),
+            output_tokens=int(completion or 0) if completion else None,
+            source="openai_prompt_tokens",
         )
 
     if input_tokens is not None:

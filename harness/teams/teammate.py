@@ -13,6 +13,7 @@ from harness.models import get_model
 from harness.settings import (
     IDLE_POLL_INTERVAL,
     IDLE_TIMEOUT,
+    TEAMMATE_MAX_RUNTIME,
     WORKTREES_DIR,
 )
 from harness.tasks import claim_task, complete_task, list_tasks, load_task, scan_unclaimed_tasks
@@ -77,6 +78,7 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
         return f"Teammate '{name}' already exists"
 
     protocol_ctx = {"waiting_plan": None}
+    started_at = time.monotonic()
     system = (
         f"You are '{name}', a {role}. "
         f"Use tools to complete tasks. "
@@ -111,7 +113,11 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
         return False
 
     def run() -> None:
+        outcome_type = "result"
+        outcome_detail = ""
+        tool_calls = 0
         wt_ctx: dict[str, str | None] = {"path": None}
+        BUS.send(name, "lead", f"started: {role} — {prompt[:90]}", "progress")
 
         def _wt_cwd() -> Path | None:
             path = wt_ctx["path"]
@@ -229,6 +235,12 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
 
         messages = [{"role": "user", "content": prompt}]
         while True:
+            if time.monotonic() - started_at >= TEAMMATE_MAX_RUNTIME:
+                outcome_type = "timeout"
+                outcome_detail = (
+                    f"Worker runtime exceeded {TEAMMATE_MAX_RUNTIME}s before completion."
+                )
+                break
             if len(messages) <= 3:
                 messages.insert(
                     0,
@@ -261,6 +273,14 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
                                 "content": "<inbox>" + json.dumps(non_protocol) + "</inbox>",
                             }
                         )
+                if time.monotonic() - started_at >= TEAMMATE_MAX_RUNTIME:
+                    outcome_type = "timeout"
+                    outcome_detail = (
+                        f"Worker runtime exceeded {TEAMMATE_MAX_RUNTIME}s before an LLM call."
+                    )
+                    should_shutdown = True
+                    break
+                BUS.send(name, "lead", "thinking: requesting model response", "progress")
                 try:
                     response = create_message(
                         model_id=get_model(),
@@ -269,15 +289,21 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
                         tools=sub_tools,
                         max_tokens=8000,
                     )
-                except Exception:
+                except Exception as exc:
+                    outcome_type = "error"
+                    outcome_detail = f"failed: LLM call failed: {type(exc).__name__}: {exc}"
+                    should_shutdown = True
                     break
                 messages.append({"role": "assistant", "content": response.content})
                 if not has_tool_use(response.content):
+                    outcome_detail = "done: completed assigned prompt"
+                    should_shutdown = True
                     break
                 results = []
                 for block in response.content:
                     if block.type != "tool_use":
                         continue
+                    tool_calls += 1
                     if block.name == "submit_plan":
                         output = teammate_submit_plan(name, block.input.get("plan", ""))
                         match = re.search(r"\((req_\d+)\)", output)
@@ -286,6 +312,15 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
                         )
                     else:
                         handler = sub_handlers.get(block.name)
+                        from harness.ui.tool_display import summarize_tool_input
+                        summary = summarize_tool_input(block.name, block.input)
+                        phase = "reading" if block.name == "read_file" else "running"
+                        BUS.send(
+                            name,
+                            "lead",
+                            f"{phase}: {block.name}" + (f" {summary}" if summary else ""),
+                            "progress",
+                        )
                         output = call_tool_handler(handler, block.input, block.name)
                     results.append(
                         {
@@ -307,17 +342,38 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
             if idle_result in ("shutdown", "timeout"):
                 break
 
-        summary = "Done."
+        summary = ""
         for msg in reversed(messages):
-            if msg["role"] == "assistant" and isinstance(msg["content"], list):
-                for block in msg["content"]:
-                    if getattr(block, "type", None) == "text":
-                        summary = block.text
-                        break
-                else:
-                    continue
+            if msg["role"] != "assistant":
+                continue
+            content = msg.get("content")
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if getattr(block, "type", None) == "text" and block.text.strip():
+                    summary = block.text.strip()
+                    break
+            if summary:
                 break
-        BUS.send(name, "lead", summary, "result")
+        if outcome_type != "result":
+            prior_summary = summary
+            summary = outcome_detail or f"Worker ended with {outcome_type}."
+            if prior_summary:
+                summary += f"\nLast worker text: {prior_summary}"
+        elif not summary:
+            summary = outcome_detail or (
+                f"Worker ended without a text summary after {tool_calls} tool call(s)."
+            )
+        BUS.send(
+            name,
+            "lead",
+            summary,
+            outcome_type,
+            {
+                "elapsed_seconds": round(time.monotonic() - started_at, 1),
+                "tool_calls": tool_calls,
+            },
+        )
         active_teammates.pop(name, None)
 
     active_teammates[name] = True

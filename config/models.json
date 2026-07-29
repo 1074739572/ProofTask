@@ -30,30 +30,37 @@
       "context_window": 128000
     },
     {
-      "id": "qwen3.7-max",
+      "id": "qwen3.7-plus",
       "provider": "qwen",
       "label": "通义千问 Plus",
       "api_model": "qwen3.7-max",
       "context_window": 1000000
     },
     {
-      "id": "qwen-max",
+      "id": "qwen3.7-max",
       "provider": "qwen",
-      "label": "通义千问 Max",
-      "api_model": "qwen-max",
-      "context_window": 32000
+      "label": "通义千问 3.7Max",
+      "api_model": "qwen3.7-max",
+      "context_window": 1000000
+    },
+    {
+      "id": "mimo-v2.5-pro",
+      "provider": "xiaomi-mimo",
+      "label": "Xiaomi MiMo V2.5 Pro (long-context explorer)",
+      "api_model": "mimo-v2.5-pro",
+      "context_window": 1000000
     },
     {
       "id": "gpt-5.6-terra",
       "provider": "anzhiyu",
-      "label": "GPT-5.6 Terra (推荐)",
+      "label": "GPT-5.6 Terra",
       "api_model": "gpt-5.6-terra",
       "context_window": 1000000
     },
     {
       "id": "gpt-5.6-luna",
       "provider": "anzhiyu",
-      "label": "GPT-5.6 Luna (省额度)",
+      "label": "GPT-5.6 Luna",
       "api_model": "gpt-5.6-luna",
       "context_window": 1000000
     },

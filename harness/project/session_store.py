@@ -9,6 +9,10 @@ Messages and session-scoped todos live under::
     .project/sessions/<id>/todos.json
 
 Long-running workflow state remains ``.project/state.json`` (single slot, opt-in).
+
+**Per-process binding** — once a window starts, all writes go to its pinned
+``SessionBinding``.  ``active_session.json`` is only read at bootstrap and during
+explicit ``/resume`` switches.
 """
 
 from __future__ import annotations
@@ -21,14 +25,16 @@ from pathlib import Path
 from harness.project.session import (
     HISTORY_PATH,
     deserialize_messages,
-    save_history,
     serialize_messages,
 )
 from harness.project.session_registry import (
+    SessionBinding,
+    create_session,
     ensure_active_session,
     read_active_session_id,
     read_session_meta,
-    session_paths,
+    session_binding,
+    write_active_session_id,
     write_session_meta,
 )
 from harness.project import session_registry as session_registry
@@ -56,31 +62,25 @@ def bootstrap_from_transcript_enabled() -> bool:
     return flag in ("1", "true", "yes", "on")
 
 
-def _session_path() -> Path:
-    return session_paths().session_jsonl
+# ── per-binding helpers ──────────────────────────────────────────────
+
+def _load_meta(binding: SessionBinding) -> dict:
+    return read_session_meta(binding=binding)
 
 
-def _meta_path() -> Path:
-    return session_paths().meta_json
+def _save_meta(meta: dict, binding: SessionBinding) -> None:
+    write_session_meta(meta, binding=binding)
 
 
-def _load_meta() -> dict:
-    return read_session_meta()
-
-
-def _save_meta(meta: dict) -> None:
-    write_session_meta(meta)
-
-
-def _append_record(record: dict) -> None:
-    path = _session_path()
+def _append_record(record: dict, binding: SessionBinding) -> None:
+    path = binding.session_jsonl
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
-def _read_records() -> list[dict]:
-    path = _session_path()
+def _read_records(binding: SessionBinding) -> list[dict]:
+    path = binding.session_jsonl
     if not path.exists():
         return []
     records: list[dict] = []
@@ -112,13 +112,29 @@ def _active_start_index(records: list[dict]) -> int:
     return last_boundary + 1
 
 
-def load_session_messages() -> list | None:
-    records = _read_records()
+def _append_message_records(
+    serialized_messages: list[dict],
+    binding: SessionBinding,
+    start: int = 0,
+) -> int:
+    appended = 0
+    for message in serialized_messages[start:]:
+        _append_record({"type": "message", **message}, binding)
+        appended += 1
+    return appended
+
+
+# ── public API (all require explicit session_id or binding) ──────────
+
+def load_session_messages(*, session_id: str | None = None, binding: SessionBinding | None = None) -> list | None:
+    """Load active messages for *session_id* (or the given binding)."""
+    b = binding or session_binding(session_id or read_active_session_id() or "?")
+    records = _read_records(b)
     if not records:
         return None
 
     raw_messages: list[dict] = []
-    for record in records[_active_start_index(records) :]:
+    for record in records[_active_start_index(records):]:
         message = _message_from_record(record)
         if message is not None:
             raw_messages.append(message)
@@ -128,18 +144,23 @@ def load_session_messages() -> list | None:
     return deserialize_messages(raw_messages)
 
 
-def session_stats() -> dict:
-    path = _session_path()
-    records = _read_records() if path.exists() else []
+def session_stats(*, session_id: str | None = None, binding: SessionBinding | None = None) -> dict:
+    if binding is not None:
+        b = binding
+    elif session_id is not None:
+        b = session_binding(session_id)
+    else:
+        b = session_binding(read_active_session_id() or "?")
+    path = b.session_jsonl
+    records = _read_records(b) if path.exists() else []
     active_start = _active_start_index(records)
     active_messages = sum(
         1 for record in records[active_start:] if record.get("type") == "message"
     )
     boundaries = sum(1 for record in records if record.get("type") == "compact_boundary")
-    sid = read_active_session_id() or "?"
     return {
         "path": str(path),
-        "session_id": sid,
+        "session_id": b.session_id,
         "exists": path.exists(),
         "total_records": len(records),
         "active_messages": active_messages,
@@ -148,37 +169,31 @@ def session_stats() -> dict:
     }
 
 
-def _append_message_records(serialized_messages: list[dict], start: int = 0) -> int:
-    appended = 0
-    for message in serialized_messages[start:]:
-        _append_record({"type": "message", **message})
-        appended += 1
-    return appended
-
-
-def append_checkpoint(messages: list) -> None:
+def append_checkpoint(messages: list, *, binding: SessionBinding) -> None:
+    """Persist *messages* to the bound session.  Never reads active_session.json."""
     if not messages:
         return
 
-    # Ensure session dir exists even if bootstrap skipped somehow
-    ensure_active_session(fresh=False)
-
-    meta = _load_meta()
+    binding.paths.root.mkdir(parents=True, exist_ok=True)
+    meta = _load_meta(binding)
     persisted = int(meta.get("active_persisted", 0))
-    if persisted > len(messages):
-        persisted = 0
 
     serialized = serialize_messages(messages)
-    _append_message_records(serialized, start=persisted)
-    meta["active_persisted"] = len(messages)
-    _save_meta(meta)
-    save_history(messages)
+
+    # Guard: if messages list shrank (e.g. compact), reset cursor.
+    if persisted > len(serialized):
+        persisted = 0
+
+    _append_message_records(serialized, binding, start=persisted)
+    # Use the filtered count as cursor so ephemeral messages don't cause drift.
+    meta["active_persisted"] = len(serialized)
+    _save_meta(meta, binding)
 
 
-def replace_session(messages: list, archive: bool = True) -> None:
-    clear_session(archive=archive)
+def replace_session(messages: list, *, binding: SessionBinding) -> None:
+    clear_session(binding=binding, archive=True)
     if messages:
-        append_checkpoint(messages)
+        append_checkpoint(messages, binding=binding)
 
 
 def record_compact_boundary(
@@ -186,6 +201,8 @@ def record_compact_boundary(
     pre_tokens: int,
     transcript_path: str | Path,
     messages_after_compact: list,
+    *,
+    binding: SessionBinding,
 ) -> None:
     _append_record(
         {
@@ -194,17 +211,17 @@ def record_compact_boundary(
             "pre_tokens": pre_tokens,
             "transcript": str(transcript_path).replace("\\", "/"),
             "ts": int(time.time()),
-        }
+        },
+        binding,
     )
     serialized = serialize_messages(messages_after_compact)
-    _append_message_records(serialized)
-    meta = _load_meta()
-    meta["active_persisted"] = len(messages_after_compact)
-    _save_meta(meta)
-    save_history(messages_after_compact)
+    _append_message_records(serialized, binding)
+    meta = _load_meta(binding)
+    meta["active_persisted"] = len(serialized)
+    _save_meta(meta, binding)
 
 
-def _migrate_history_json() -> list | None:
+def _migrate_history_json(binding: SessionBinding) -> list | None:
     if not HISTORY_PATH.exists():
         return None
     payload = json.loads(HISTORY_PATH.read_text(encoding="utf-8"))
@@ -213,15 +230,15 @@ def _migrate_history_json() -> list | None:
         return None
 
     for message in raw:
-        _append_record({"type": "message", **message})
-    meta = _load_meta()
+        _append_record({"type": "message", **message}, binding)
+    meta = _load_meta(binding)
     meta["active_persisted"] = len(raw)
     meta["migrated_from"] = "history.json"
-    _save_meta(meta)
+    _save_meta(meta, binding)
     return deserialize_messages(raw)
 
 
-def _bootstrap_from_transcript() -> list | None:
+def _bootstrap_from_transcript(binding: SessionBinding) -> list | None:
     if not TRANSCRIPT_DIR.exists():
         return None
     transcripts = sorted(
@@ -244,70 +261,64 @@ def _bootstrap_from_transcript() -> list | None:
     except ValueError:
         return None
 
-    for message in serialize_messages(restored):
-        _append_record({"type": "message", **message})
-    meta = _load_meta()
-    meta["active_persisted"] = len(restored)
+    serialized = serialize_messages(restored)
+    for message in serialized:
+        _append_record({"type": "message", **message}, binding)
+    meta = _load_meta(binding)
+    meta["active_persisted"] = len(serialized)
     meta["bootstrapped_from"] = latest.name
-    _save_meta(meta)
-    save_history(restored)
+    _save_meta(meta, binding)
     return restored
 
 
-def bootstrap_session() -> tuple[list, str | None]:
-    """OpenCode-style bootstrap. Returns (messages, source note).
+def bootstrap_session() -> tuple[list, SessionBinding, str | None]:
+    """OpenCode-style bootstrap. Returns (messages, binding, source_note).
 
     By default this returns an empty session on every launch (OpenCode mode) and
     creates a **new** ``sessions/<id>/`` so todos do not leak from prior chats.
     Enable ``HARNESS_CONTINUE_SESSION=1`` to reload the active session (Claude
     Code ``-c`` style) and optionally ``HARNESS_BOOTSTRAP_TRANSCRIPT=1`` to fall
     back to ``.transcripts/`` when no live session exists.
+
+    The returned ``SessionBinding`` pins all subsequent writes for this process.
     """
     fresh = not continue_session_on_startup()
-    paths = ensure_active_session(fresh=fresh)
+    binding = ensure_active_session(fresh=fresh)
 
     if fresh:
-        return [], None
+        return [], binding, None
 
-    loaded = load_session_messages()
+    loaded = load_session_messages(binding=binding)
     if loaded:
-        save_history(loaded)
-        stats = session_stats()
+        stats = session_stats(binding=binding)
         return (
             loaded,
-            f"sessions/{paths.session_id}/session.jsonl（{stats['active_messages']} 条活跃消息）",
+            binding,
+            f"sessions/{binding.session_id}/session.jsonl（{stats['active_messages']} 条活跃消息）",
         )
 
-    migrated = _migrate_history_json()
+    migrated = _migrate_history_json(binding)
     if migrated:
-        return migrated, "已从 history.json 迁移至 session.jsonl"
+        return migrated, binding, "已从 history.json 迁移至 session.jsonl"
 
     if bootstrap_from_transcript_enabled():
-        from_transcript = _bootstrap_from_transcript()
+        from_transcript = _bootstrap_from_transcript(binding)
         if from_transcript:
-            meta = _load_meta()
+            meta = _load_meta(binding)
             source = meta.get("bootstrapped_from", "transcript")
-            return from_transcript, f"从 .transcripts/{source} 引导恢复"
+            return from_transcript, binding, f"从 .transcripts/{source} 引导恢复"
 
-    return [], None
+    return [], binding, None
 
 
-def clear_session(archive: bool = True) -> str | None:
-    """End the current session and start a new empty one.
+def clear_session(*, binding: SessionBinding, archive: bool = True) -> str | None:
+    """Archive the current session directory. Returns old path for display.
 
-    Previous ``sessions/<id>/`` (including its ``todos.json``) is left on disk
-    when ``archive=True`` so it can appear in the session list. The active
-    pointer moves to a fresh session id.
+    Does NOT create a new session — the caller must do that via
+    ``create_session()`` so the new binding is captured correctly.
     """
-    from harness.project.session_registry import create_session
-
-    old_id = read_active_session_id()
-    old_path = None
-    if old_id:
-        try:
-            old_path = str(session_paths(old_id).root)
-        except RuntimeError:
-            old_path = None
+    old_id = binding.session_id
+    old_path = str(binding.paths.root)
 
     if HISTORY_PATH.exists():
         HISTORY_PATH.unlink()
@@ -318,14 +329,13 @@ def clear_session(archive: bool = True) -> str | None:
         archived = PROJECT_DIR / f"session_{int(time.time())}.jsonl"
         legacy.rename(archived)
 
-    create_session()
     if archive and old_path:
         return old_path
     return None
 
 
-def format_session_line() -> str:
-    stats = session_stats()
+def format_session_line(*, binding: SessionBinding | None = None) -> str:
+    stats = session_stats(binding=binding) if binding is not None else session_stats()
     sid = stats.get("session_id", "?")
     if not continue_session_on_startup():
         if stats["exists"] or sid not in ("?", ""):

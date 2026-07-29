@@ -1,8 +1,4 @@
-"""Unified terminal rendering (Rich) with plain-text fallback.
-
-When the Textual TUI is active (O1), all output goes exclusively to the TUI
-bridge — no Rich dual-write.
-"""
+"""Unified classic terminal rendering (Rich with plain-text fallback)."""
 
 from __future__ import annotations
 
@@ -17,7 +13,6 @@ from harness.ui.tool_display import (
     summarize_failure_output,
     summarize_tool_input,
 )
-from harness.ui.tui.events import ToolEvent
 
 try:
     from rich.console import Console
@@ -31,58 +26,10 @@ except ImportError:
 _console = Console(highlight=False, legacy_windows=False) if _RICH else None
 
 
-def _tui_bridge():
-    from harness.ui.tui.mode import is_tui_active, is_tui_shutdown
-
-    if is_tui_active():
-        from harness.ui.tui.bridge import BRIDGE
-
-        return BRIDGE
-    # Quitting TUI while worker still runs: never fall through to Rich console.
-    if is_tui_shutdown():
-        return _SHUTDOWN_SINK
-    return None
-
-
-class _ShutdownSink:
-    """No-op sink used while TUI is shutting down (X1)."""
-
-    def push_step(self, line: str) -> None:
-        return None
-
-    def push_final(self, text: str) -> None:
-        return None
-
-    def push_error(self, text: str) -> None:
-        return None
-
-    def push_warn(self, text: str) -> None:
-        return None
-
-    def push_status(self, text: str) -> None:
-        return None
-
-    def set_busy(self, busy: bool) -> None:
-        return None
-
-    def push_tool(self, event: ToolEvent) -> None:
-        return None
-
-    def reset_turn(self, user_query: str = "", model: str = "") -> None:
-        return None
-
-
-_SHUTDOWN_SINK = _ShutdownSink()
-
-
 class Renderer:
-    """Single entry for CLI/TUI output; keeps loop/llm free of ad-hoc prints."""
+    """Single entry for classic CLI output; keeps loop/llm free of ad-hoc prints."""
 
     def _write(self, text: str, *, style: str | None = None, end: str = "\n") -> None:
-        bridge = _tui_bridge()
-        if bridge is not None:
-            bridge.push_step(str(text).rstrip("\n") if end == "\n" else str(text))
-            return
         if not _RICH or _console is None:
             print(text, end=end, flush=True)
             return
@@ -111,17 +58,9 @@ class Renderer:
         self._write(message, style=theme.MUTED)
 
     def warn(self, message: str) -> None:
-        bridge = _tui_bridge()
-        if bridge is not None:
-            bridge.push_warn(message)
-            return
         self._write(message, style=theme.WARN)
 
     def error(self, message: str) -> None:
-        bridge = _tui_bridge()
-        if bridge is not None:
-            bridge.push_error(message)
-            return
         self._write(message, style=theme.ERROR)
 
     def hook(self, label: str, detail: str = "") -> None:
@@ -131,9 +70,6 @@ class Renderer:
         self._write(f"[hook] {label}{suffix}", style=theme.HOOK)
 
     def user(self, text: str) -> None:
-        if _tui_bridge() is not None:
-            # TUI already shows the query in Steps via reset_turn.
-            return
         if _RICH:
             self._write("")
             self._write(f"{theme.PROMPT}{text}", style=theme.USER)
@@ -142,19 +78,6 @@ class Renderer:
 
     def assistant(self, text: str) -> None:
         if not text:
-            return
-        bridge = _tui_bridge()
-        if bridge is not None:
-            from harness.providers.errors import is_error_assistant_text
-
-            if is_error_assistant_text(text):
-                # Strip the history marker so the dock shows a clean error card.
-                clean = text.lstrip()
-                if clean.startswith("[Error]"):
-                    clean = clean[len("[Error]") :].lstrip(" :")
-                bridge.push_error(clean or text)
-                return
-            bridge.push_final(text)
             return
         if _RICH and _console is not None:
             self._write("")
@@ -182,12 +105,6 @@ class Renderer:
         tool_use_id: str = "",
     ) -> None:
         summary = summarize_tool_input(name, tool_input)
-        bridge = _tui_bridge()
-        if bridge is not None:
-            bridge.push_tool(
-                ToolEvent(tool_use_id or f"{name}-current", name, summary, "running")
-            )
-            return
         detail = f"  {summary}" if summary else ""
         self._write(f"● {name}{detail}", style=theme.TOOL)
 
@@ -202,18 +119,6 @@ class Renderer:
     ) -> None:
         """Collapse identical consecutive calls instead of reprinting full lines."""
         summary = summarize_tool_input(name, tool_input)
-        bridge = _tui_bridge()
-        if bridge is not None:
-            bridge.push_tool(
-                ToolEvent(
-                    tool_use_id or f"{name}-repeat-{streak}",
-                    name,
-                    summary,
-                    "blocked" if blocked else "repeat",
-                    streak=streak,
-                )
-            )
-            return
         detail = f"  {summary}" if summary else ""
         if blocked:
             self._write(
@@ -235,36 +140,44 @@ class Renderer:
         tool_input: dict | None = None,
         tool_use_id: str = "",
     ) -> None:
-        bridge = _tui_bridge()
-        if bridge is not None:
-            failed = is_failure_tool_output(preview)
-            low = preview.lower()
-            phase = (
-                "blocked"
-                if failed and ("blocked" in low or "permission denied" in low)
-                else ("failed" if failed else "ok")
-            )
-            summary = summarize_tool_input(name or "tool", tool_input)
-            result_preview = (
-                summarize_failure_output(preview)
-                if failed
-                else " ".join(str(preview).split())[:limit]
-            )
-            bridge.push_tool(
-                ToolEvent(
-                    tool_use_id or f"{name or 'tool'}-current",
-                    name or "tool",
-                    summary,
-                    phase,
-                    preview=result_preview,
-                )
-            )
-            return
         # Success results stay silent in the terminal (still go to the model).
         if not is_failure_tool_output(preview):
             return
         summary = summarize_failure_output(preview)
         self._write(f"  → {summary}", style=theme.WARN)
+
+    def round_header(self, prefix: str, round_num: int, thinking_text: str, max_len: int = 50) -> None:
+        """Show round start with truncated thinking text."""
+        text = (thinking_text or "").strip()
+        if len(text) > max_len:
+            text = text[:max_len] + "..."
+        if text:
+            line = f"  ◆ Round {round_num} · \"{text}\""
+        else:
+            line = f"  ◆ Round {round_num}"
+        self._write(line, style=theme.MUTED)
+
+    def round_tool(self, name: str, tool_input: dict | None, result_preview: str, limit: int = 60) -> None:
+        """Show collapsed tool call within a round: ● tool  args → result."""
+        summary = summarize_tool_input(name, tool_input)
+        result_text = str(result_preview).strip()
+        if len(result_text) > limit:
+            result_text = result_text[:limit] + "…"
+        if result_text:
+            line = f"    ● {name}  {summary} → {result_text}"
+        else:
+            line = f"    ● {name}  {summary}"
+        self._write(line, style=theme.TOOL)
+
+    def round_final(self, prefix: str, text: str, tool_count: int, elapsed: float, max_len: int = 50) -> None:
+        """Show final answer round with stats."""
+        answer = (text or "").strip()
+        if len(answer) > max_len:
+            answer = answer[:max_len] + "..."
+        line = f"  ◆ Final · \"{answer}\""
+        self._write(line, style=theme.MUTED)
+        stats_line = f"    └─ {tool_count} tools · {elapsed:.1f}s"
+        self._write(stats_line, style=theme.MUTED)
 
     def files_changed(self, paths: list[str]) -> None:
         """End-of-turn summary of files write_file/edit_file touched."""
@@ -280,12 +193,6 @@ class Renderer:
     def todo_checklist(self, todos: list[dict[str, str]]) -> None:
         if not todos:
             return
-        bridge = _tui_bridge()
-        if bridge is not None:
-            from harness.ui.todos import _plain_checklist
-
-            bridge.push_step(_plain_checklist(todos))
-            return
         if _RICH and _console is not None:
             from harness.ui.todos import render_todo_checklist
 
@@ -298,14 +205,6 @@ class Renderer:
     @contextmanager
     def llm_busy(self, model_tag: str):
         label = f"Thinking  {model_tag}"
-        bridge = _tui_bridge()
-        if bridge is not None:
-            bridge.push_status(label)
-            try:
-                yield
-            finally:
-                bridge.push_status("Running… (Esc to stop)")
-            return
         if _RICH and _console is not None:
             with _console.status(f"[{theme.ACCENT}]{label}[/{theme.ACCENT}]", spinner="dots"):
                 yield

@@ -24,12 +24,6 @@ def _log_cache_usage(response, *, model_id: str) -> None:
     parsed = parse_cache_usage(getattr(response, "usage", None))
     if parsed is None:
         return
-    from harness.ui.tui.mode import is_tui_active
-
-    if is_tui_active():
-        from harness.ui.tui.bridge import BRIDGE
-
-        BRIDGE.push_cache_usage(parsed.hit_tokens, parsed.miss_tokens)
     try:
         record_usage(model=model_id, cache=parsed)
     except OSError as exc:

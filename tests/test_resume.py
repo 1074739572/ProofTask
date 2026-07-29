@@ -49,7 +49,7 @@ class TestResume(unittest.TestCase):
             )
             with mock.patch("harness.project.resume.sync_chapters_from_disk", side_effect=lambda s: s):
                 with mock.patch("harness.project.resume.append_checkpoint"):
-                    ok, _ = inject_project_context(messages, checkpoint=False)
+                    ok, _ = inject_project_context(messages, binding=mock.Mock(), checkpoint=False)
         self.assertTrue(ok)
         self.assertEqual(len(messages), 1)
         self.assertIn("[Resume context]", messages[0]["content"])
@@ -78,8 +78,9 @@ class TestOpenCodeBootstrap(unittest.TestCase):
             {"HARNESS_CONTINUE_SESSION": "0", "HARNESS_BOOTSTRAP_TRANSCRIPT": "0"},
             clear=False,
         ):
-            messages, source = bootstrap_session()
+            messages, binding, source = bootstrap_session()
         self.assertEqual(messages, [])
+        self.assertIsNotNone(binding)
         self.assertIsNone(source)
 
 

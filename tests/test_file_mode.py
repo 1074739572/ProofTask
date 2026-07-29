@@ -1,6 +1,7 @@
 """Tests for /mode file document Q&A routing."""
 
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -157,6 +158,6 @@ def test_tui_file_mode_bypasses_agent_loop(monkeypatch):
         lambda *args, **kwargs: pytest.fail("file mode must bypass agent_loop"),
     )
 
-    result = session_mod.run_agent_turn([], {}, "文档里写了什么？")
+    result = session_mod.run_agent_turn([], {}, "文档里写了什么？", binding=mock.MagicMock())
     assert result["interrupted"] is False
     assert rendered == ["grounded answer"]

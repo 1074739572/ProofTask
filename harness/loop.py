@@ -15,12 +15,13 @@ from harness.agent.compact import compact_history, prepare_context, reactive_com
 from harness.agent.cron import consume_cron_queue
 from harness.agent.recovery import (
     RecoveryState,
+    candidate_recovery_models,
+    is_model_recoverable_error,
     is_prompt_too_long_error,
     with_retry,
 )
 from harness.agent.grounding_guard import GroundingGuard
 from harness.agent.repeat_guard import RepeatGuard
-from harness.agent.lookup_guard import LOOKUP_FORCE_ANSWER, LookupGuard
 from harness.agent.writing_guard import WritingGuard
 from harness.context import update_context
 from harness.hooks import trigger_hooks
@@ -28,6 +29,7 @@ from harness.llm import create_message
 from harness.messages.blocks import block_field, block_text, has_displayable_text, is_text, is_tool_use
 from harness.messages.repair import finalize_cancelled_tool_round, repair_tool_pairing
 from harness.models import get_model
+from harness.modes import mode_auto_route, mode_enables_task, mode_lead_model_hint
 from harness.project.session import serialize_messages
 from harness.prompts import assemble_static_system_prompt, messages_with_ephemeral_context
 from harness.settings import (
@@ -50,17 +52,31 @@ def _append_assistant(messages: list, content) -> None:
     messages.append(serialize_messages([{"role": "assistant", "content": content}])[0])
 
 
-def _publish_context_metrics(messages: list) -> None:
-    from harness.ui.tui.mode import is_tui_active
+def _latest_plain_user(messages: list) -> str:
+    for msg in reversed(messages):
+        if msg.get("role") != "user":
+            continue
+        content = msg.get("content")
+        if isinstance(content, str) and content.strip() and not content.startswith("["):
+            return content.strip()
+    return ""
 
-    if not is_tui_active():
-        return
-    from harness.agent.compact import estimate_tokens, model_context_window
-    from harness.ui.tui.bridge import BRIDGE
 
-    BRIDGE.push_context_usage(
-        estimate_tokens(messages),
-        model_context_window(get_model()),
+def _local_failure_summary(messages: list, errors: list[str], *, attempted_models: list[str]) -> str:
+    from harness.ui.classic_display import render_failure_summary
+
+    teammate_notes: list[str] = []
+    for msg in reversed(messages):
+        content = msg.get("content")
+        if isinstance(content, str) and content.startswith("[Inbox]"):
+            teammate_notes.append(content.replace("[Inbox]", "").strip())
+            if len(teammate_notes) >= 3:
+                break
+    return render_failure_summary(
+        user_query=_latest_plain_user(messages),
+        errors=errors,
+        attempted_models=attempted_models,
+        teammate_notes=teammate_notes,
     )
 
 
@@ -69,7 +85,10 @@ def call_llm(messages: list, context: dict, tools: list, state: RecoveryState, m
     # over swapping personas for evals — see harness.prompts.lookup.
     system = context.get("system_override") or assemble_static_system_prompt()
     api_messages = messages_with_ephemeral_context(messages, context)
-    model_id = state.fallback_model or get_model()
+    # Subagent-enabled modes may bind a coordinator model independently from
+    # the user's direct model selection. Recovery fallback remains highest priority.
+    lead_model = mode_lead_model_hint() if mode_enables_task() else None
+    model_id = state.fallback_model or lead_model or get_model()
     return with_retry(
         lambda: create_message(
             model_id=model_id,
@@ -88,10 +107,12 @@ def agent_loop(
     *,
     turn_start: int | None = None,
     max_rounds: int | None = None,
+    binding = None,
 ) -> bool:
     """Run until the agent finishes or cancel is requested. Returns True if interrupted.
 
     max_rounds: optional cap on LLM turns (used by evals). None = unlimited.
+    binding: optional SessionBinding for persisting compact boundaries.
     """
     from harness.prompts.ephemeral import reset_ephemeral_cache
 
@@ -101,10 +122,6 @@ def agent_loop(
     llm_rounds = 0
     repeat_guard = RepeatGuard()
     grounding_guard = GroundingGuard()
-    # lookup_mode (CLI) or web_budget (e.g. GAIA eval) both enable fetch caps
-    lookup_guard = LookupGuard(
-        active=bool(context.get("lookup_mode") or context.get("web_budget"))
-    )
     writing_guard = WritingGuard(active=bool(context.get("writing_mode")))
     mutations = TurnMutationTracker()
 
@@ -145,12 +162,19 @@ def agent_loop(
             )
 
         prepare_context(messages)
-        _publish_context_metrics(messages)
         repair_tool_pairing(messages)
         context = update_context(context, messages)
         tools, handlers = get_tool_pool()
-        if state.strip_tools_until_answer:
-            tools, handlers = [], {}
+
+        # Auto-route: when enabled, classify and dispatch the latest user
+        # message to a sub-agent before the lead model sees it.
+        if llm_rounds == 0 and mode_auto_route():
+            from harness.modes.routing import route_user_message
+
+            if route_user_message(messages):
+                # Routing happened; re-prepare context with the injected result.
+                context = update_context(context, messages)
+                tools, handlers = get_tool_pool()
 
         try:
             llm_rounds += 1
@@ -165,16 +189,47 @@ def agent_loop(
             from harness.providers.errors import format_api_error
 
             formatted = format_api_error(exc)
-            error_msg = {
-                "role": "assistant",
-                "content": [{"type": "text", "text": f"[Error] {formatted}"}],
-                # Prevent print_turn_assistants from re-emitting via assistant().
-                "_ui_final_printed": True,
-            }
-            messages.append(error_msg)
-            # TUI: sticky error dock; classic CLI: styled error line.
-            renderer.error(formatted)
-            return _finish(False)
+            attempted_models = [state.fallback_model or get_model()]
+            if is_model_recoverable_error(exc):
+                for candidate in candidate_recovery_models(get_model()):
+                    if candidate in attempted_models:
+                        continue
+                    renderer.warn(f"模型调用失败，尝试恢复模型：{candidate}")
+                    state.fallback_model = candidate
+                    attempted_models.append(candidate)
+                    try:
+                        response = call_llm(messages, context, tools, state, max_tokens)
+                        break
+                    except Exception as retry_exc:
+                        formatted = format_api_error(retry_exc)
+                        continue
+                else:
+                    response = None
+                if response is not None:
+                    # Continue normal processing with the recovered response.
+                    pass
+                else:
+                    fallback_text = _local_failure_summary(
+                        messages,
+                        [formatted],
+                        attempted_models=attempted_models,
+                    )
+                    messages.append(
+                        {"role": "assistant", "content": [{"type": "text", "text": fallback_text}]}
+                    )
+                    renderer.error(fallback_text)
+                    return _finish(False)
+            else:
+                fallback_text = _local_failure_summary(
+                    messages,
+                    [formatted],
+                    attempted_models=attempted_models,
+                )
+                messages.append(
+                    {"role": "assistant", "content": [{"type": "text", "text": fallback_text}]}
+                )
+                renderer.error(fallback_text)
+                return _finish(False)
 
         if is_cancelled():
             return _finish(True)
@@ -221,13 +276,11 @@ def agent_loop(
 
             emit_final_assistant(messages, response.content)
             trigger_hooks("Stop", messages)
-            state.strip_tools_until_answer = False
             return _finish(False)
 
         results = []
         compacted_now = False
         had_todo_write = False
-        force_lookup_finalize = False
         grounding_block, grounding_msg = grounding_guard.evaluate(
             messages, response.content
         )
@@ -289,7 +342,7 @@ def agent_loop(
                 )
 
             if name == "compact":
-                messages[:] = compact_history(messages)
+                messages[:] = compact_history(messages, binding=binding)
                 messages.append(
                     {
                         "role": "user",
@@ -312,34 +365,6 @@ def agent_loop(
                         "type": "tool_result",
                         "tool_use_id": tool_use_id,
                         "content": output,
-                    }
-                )
-                continue
-
-            lookup_block, lookup_msg = lookup_guard.check_before_fetch(
-                name, tool_input if isinstance(tool_input, dict) else None
-            )
-            if lookup_block:
-                if lookup_guard.note_block():
-                    force_lookup_finalize = True
-                renderer.tool_repeat(
-                    name,
-                    tool_input if isinstance(tool_input, dict) else None,
-                    streak=lookup_guard.fetch_count + 1,
-                    blocked=True,
-                    tool_use_id=tool_use_id,
-                )
-                renderer.tool_result(
-                    lookup_msg,
-                    name=name,
-                    tool_input=tool_input if isinstance(tool_input, dict) else None,
-                    tool_use_id=tool_use_id,
-                )
-                results.append(
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": tool_use_id,
-                        "content": lookup_msg,
                     }
                 )
                 continue
@@ -413,36 +438,8 @@ def agent_loop(
                 continue
 
             handler = handlers.get(name)
-            lookup_guard.note_fetch(name, tool_input if isinstance(tool_input, dict) else None)
             output = call_tool_handler(handler, tool_input, name)
-            lookup_guard.note_result(
-                name, tool_input if isinstance(tool_input, dict) else None, str(output)
-            )
             writing_guard.note_tool(name)
-            # Mid-budget nudge: once we've used >=60% of the web budget, inject a
-            # one-shot reminder so the agent starts converging instead of
-            # fetching more. Only fires once per turn.
-            if (
-                lookup_guard.active
-                and lookup_guard.max_fetches is not None
-                and lookup_guard.max_fetches > 2
-                and not state.has_nudged_web_budget
-                and lookup_guard.fetch_count
-                >= max(2, int(lookup_guard.max_fetches * 0.6))
-            ):
-                state.has_nudged_web_budget = True
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": (
-                            f"[Harness] You've used {lookup_guard.fetch_count} of "
-                            f"{lookup_guard.max_fetches} web tool calls. Wrap up: "
-                            "synthesize what you have and produce the final answer. "
-                            "Only fetch again if a single, specific source is clearly "
-                            "missing. Prefer `FINAL ANSWER: ...` if requested."
-                        ),
-                    }
-                )
             mutations.note(
                 name,
                 tool_input if isinstance(tool_input, dict) else None,
@@ -480,8 +477,3 @@ def agent_loop(
             note_llm_round_without_todo_update()
 
         messages.append({"role": "user", "content": build_user_content(results)})
-        if force_lookup_finalize and not state.has_lookup_force_finalize:
-            state.has_lookup_force_finalize = True
-            state.strip_tools_until_answer = True
-            messages.append({"role": "user", "content": LOOKUP_FORCE_ANSWER})
-            renderer.warn("LookupGuard: forcing answer (no more web tools)")

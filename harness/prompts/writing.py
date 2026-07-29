@@ -44,7 +44,6 @@ _IMPL_HINTS = [
     "implement",
     "refactor",
     "hooks.py",
-    "lookup_guard",
     "writing_guard",
 ]
 

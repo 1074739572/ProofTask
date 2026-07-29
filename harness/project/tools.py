@@ -92,18 +92,23 @@ def run_project_note(notes: str) -> str:
     return f"Notes saved.\n\n{format_status(state)}"
 
 
-def run_project_clear(*, clear_project: bool = True) -> str:
+def run_project_clear(*, clear_project: bool = True, binding=None) -> str:
     """OpenCode-style /clear: by default wipes session + todos + project state.
 
     Pass ``clear_project=False`` for the lighter "/clear session" variant that
     keeps ``.project/state.json`` (thesis chapter table) on disk.
     """
+    from harness.project.session_registry import ensure_active_session, read_active_session_id, session_binding
     from harness.project.session_store import clear_session
     from harness.project.state import STATE_PATH
     from harness.todos.state import clear_todos
 
+    if binding is None:
+        sid = read_active_session_id()
+        binding = session_binding(sid) if sid else ensure_active_session(fresh=False)
+
     clear_todos(delete_file=False)
-    archived = clear_session(archive=True)
+    archived = clear_session(binding=binding, archive=True)
     parts = []
     if archived:
         parts.append(f"已结束会话（目录保留，含其 todos）：{archived}")

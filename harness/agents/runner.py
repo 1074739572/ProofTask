@@ -103,8 +103,11 @@ def run_agent_task(description: str, prompt: str, agent_type: str) -> str:
     renderer.info(f"[task:{agent_type}] {description} → {profile.model_id}")
     started = time.time()
     tool_count = 0
+    round_num = 0
+    final_text: str | None = None
 
     for _ in range(30):
+        round_num += 1
         response = create_message(
             model_id=profile.model_id,
             system=system,
@@ -112,11 +115,19 @@ def run_agent_task(description: str, prompt: str, agent_type: str) -> str:
             tools=tools,
             max_tokens=8000,
         )
+
+        # Extract thinking text for this round (truncated to 50 chars)
+        thinking_text = extract_text(response.content) or ""
+        renderer.round_header(f"[{agent_type}]", round_num, thinking_text, max_len=50)
+
         messages.append(
             serialize_messages([{"role": "assistant", "content": response.content}])[0]
         )
         if not has_tool_use(response.content):
+            # Final round — no more tools
+            final_text = thinking_text
             break
+
         results = []
         for block in response.content:
             if not is_tool_use(block):
@@ -131,6 +142,8 @@ def run_agent_task(description: str, prompt: str, agent_type: str) -> str:
                 handler = handlers.get(name)
                 output = call_tool_handler(handler, tool_input, name)
                 trigger_hooks("PostToolUse", block, output)
+                # Show collapsed tool call: ● tool  args → result
+                renderer.round_tool(name, tool_input, str(output))
             results.append(
                 {
                     "type": "tool_result",
@@ -141,14 +154,22 @@ def run_agent_task(description: str, prompt: str, agent_type: str) -> str:
         messages.append({"role": "user", "content": results})
 
     elapsed = time.time() - started
-    for msg in reversed(messages):
-        if msg["role"] == "assistant":
-            text = extract_text(msg["content"])
-            if text:
-                return (
-                    f"[{agent_type} / {profile.model_id}] {description} "
-                    f"({tool_count} tools, {elapsed:.1f}s)\n\n{text}"
-                )
+
+    # If we didn't capture a final_text (loop ran 30 rounds), extract it now
+    if final_text is None:
+        for msg in reversed(messages):
+            if msg["role"] == "assistant":
+                t = extract_text(msg["content"])
+                if t:
+                    final_text = t
+                    break
+
+    if final_text:
+        renderer.round_final(f"[{agent_type}]", final_text, tool_count, elapsed, max_len=50)
+        return (
+            f"[{agent_type} / {profile.model_id}] {description} "
+            f"({tool_count} tools, {elapsed:.1f}s)\n\n{final_text}"
+        )
     return f"[{agent_type}] finished without summary ({tool_count} tools, {elapsed:.1f}s)"
 
 

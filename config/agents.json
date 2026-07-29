@@ -1,25 +1,23 @@
 {
-  "lead_model_hint": "deepseek-v4-flash",
+  "lead_model_hint": "gpt-5.6-sol",
   "agents": {
     "code": {
-      "model_id": "glm-5.2-flash",
-      "label": "Code worker (GLM)",
+      "model_id": "deepseek-v4-pro",
+      "label": "Code worker (DeepSeek V4 Pro)",
       "tools": ["bash", "read_file", "write_file", "edit_file", "glob"],
-      "system": "You implement code, fix bugs, and run commands. Complete the assignment, then return a concise summary: files changed, commands run, result status. Do not spawn subagents."
+      "system": "You are the implementation worker. Read the relevant code, implement the requested change, and run focused verification. Complete the assignment, then return a concise summary: files changed, commands run, and result status. Do not spawn subagents."
     },
     "write": {
       "model_id": "qwen-max",
       "label": "Writing worker (Qwen)",
       "tools": ["read_file", "write_file", "glob", "rag_search", "rag_status"],
-      "system": "You write and revise Chinese prose, reports, and documentation under output/. "
-      "Use rag_search on indexed files/ before drafting each section. "
-      "Complete the assignment, then return a concise summary. Do not spawn subagents."
+      "system": "You write and revise Chinese prose, reports, and documentation under output/. Use rag_search on indexed files/ before drafting each section. Complete the assignment, then return a concise summary. Do not spawn subagents."
     },
     "explore": {
-      "model_id": "deepseek-v4-flash",
-      "label": "Explore worker (DeepSeek)",
+      "model_id": "mimo-v2.5-pro",
+      "label": "Large-context explorer (Xiaomi MiMo)",
       "tools": ["bash", "read_file", "glob"],
-      "system": "Read-only exploration: search the codebase and report findings. NEVER modify files. Return a concise summary."
+      "system": "You are the large-context, read-only exploration worker. Search and read all files needed for the assigned question, identify relevant paths and symbols, and return evidence-backed findings for the lead. NEVER modify files. Do not design unrelated changes or spawn subagents."
     }
   }
 }

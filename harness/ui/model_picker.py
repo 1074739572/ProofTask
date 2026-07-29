@@ -8,7 +8,7 @@ from harness.ui.terminal_menu import is_interactive_tty, select_from_list
 
 
 def menu_entries() -> tuple[list[str], list[str], int]:
-    """Labels, model ids, and initial cursor index for pickers (CLI + TUI)."""
+    """Labels, model ids, and initial cursor index for CLI pickers."""
     current = get_model()
     key_status = provider_key_status()
     labels: list[str] = []

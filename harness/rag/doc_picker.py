@@ -85,27 +85,6 @@ def _read_key_with_space() -> str:
     return key
 
 
-def _run_tui_doc_picker() -> str:
-    """Block on the Textual multi-select panel (worker-thread safe)."""
-    from harness.ui.tui.bridge import BRIDGE
-
-    rows = list_indexed_sources()
-    if not rows:
-        return (
-            "尚无已索引文档。\n"
-            "先 /rag files 查看本地上传，再 /rag index files。"
-        )
-    chosen = BRIDGE.ask_doc_multi_select(rows)
-    if chosen is None:
-        return "Selection unchanged."
-    set_selection(chosen)
-    if not chosen:
-        return "Selection cleared — 将搜索全部已索引文档。"
-    lines = ["Saved selection:"]
-    lines.extend(f"  - {name}" for name in chosen)
-    return "\n".join(lines)
-
-
 def run_doc_picker() -> str:
     rows = list_indexed_sources()
     if not rows:
@@ -113,14 +92,6 @@ def run_doc_picker() -> str:
             "尚无已索引文档。\n"
             "先 /rag files 查看本地上传，再 /rag index files。"
         )
-
-    try:
-        from harness.ui.tui.mode import is_tui_active
-
-        if is_tui_active():
-            return _run_tui_doc_picker()
-    except Exception:
-        pass
 
     if not is_interactive_tty():
         return (

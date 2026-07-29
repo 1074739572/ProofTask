@@ -9,6 +9,7 @@ from typing import Literal
 from harness.models import get_model, get_model_profile, model_label
 from harness.modes import (
     mode_builtin_skills_section,
+    mode_enables_task,
     mode_lead_model_hint,
     mode_prompt_section,
 )
@@ -81,10 +82,16 @@ def build_session_context(
         hint = mode_lead_model_hint()
         current = get_model()
         if hint and current != hint:
-            sections.append(
-                f"Mode lead hint: {hint} is recommended for this mode "
-                f"(current: {current}). Switch with /model if needed."
-            )
+            if mode_enables_task():
+                sections.append(
+                    f"Mode lead binding: this mode runs the lead with {hint} "
+                    f"(direct model selection: {current})."
+                )
+            else:
+                sections.append(
+                    f"Mode lead hint: {hint} is recommended for this mode "
+                    f"(current: {current}). Switch with /model if needed."
+                )
 
     if include_project_instructions:
         project_block = format_project_instructions_block(context)

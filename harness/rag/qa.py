@@ -119,7 +119,7 @@ def answer_question(
 
     context = build_context(hits)
 
-    # Surface that retrieval actually ran (especially important in TUI file mode).
+    # Surface that retrieval actually ran.
     try:
         from harness.ui.renderer import renderer
 

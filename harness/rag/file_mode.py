@@ -188,7 +188,7 @@ def handle_file_mode_turn(query: str) -> str:
     if get_scope() == SCOPE_SELECTED and not load_selection():
         return "指定文档列表为空。请说「指定文档」或「搜全部」。"
 
-    # Visible retrieval cue (TUI step / CLI muted) before LLM answer.
+    # Visible retrieval cue before LLM answer.
     from harness.ui.renderer import renderer
 
     renderer.muted(f"检索中 · {format_selection_summary()}")

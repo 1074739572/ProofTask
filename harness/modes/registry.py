@@ -21,6 +21,7 @@ class ModeProfile:
     disable_tools: frozenset[str]
     builtin_skills: tuple[str, ...] = ()
     confirm_before_execute: bool = False
+    auto_route: bool = False
 
 
 def _builtin_fallback() -> dict:
@@ -78,6 +79,7 @@ def get_mode_profile(mode_id: str) -> ModeProfile | None:
         disable_tools=frozenset(entry.get("disable_tools") or []),
         builtin_skills=tuple(str(name).strip() for name in skills if str(name).strip()),
         confirm_before_execute=bool(entry.get("confirm_before_execute", False)),
+        auto_route=bool(entry.get("auto_route", False)),
     )
 
 
@@ -93,6 +95,8 @@ def format_mode_catalog() -> str:
             lines.append(f"    {profile.summary}")
         if profile.enable_task:
             lines.append("    task tool: on")
+        if profile.auto_route:
+            lines.append("    auto route: on")
         if profile.confirm_before_execute:
             lines.append("    confirm-before-execute: on (tools locked until 确认执行/go)")
         if profile.builtin_skills:

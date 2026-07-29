@@ -44,7 +44,7 @@ static system（可缓存） + ephemeral user 消息（todos / 时间 / 最新�
 | `tasks.py` | s12 | 持久化任务图 |
 | `agent/background.py` | s13 | 后台 bash |
 | `agent/cron.py` | s14 | 定时调度 |
-| `teams/*` | s15–s17 | 邮箱、协议、自治队友 |
+| `teams/*` | s15–s17 | 邮箱、协议、自治队友；运行时行为见 [docs/teammate-lifecycle.md](docs/teammate-lifecycle.md) |
 | `worktree.py` | s18 | 目录隔离 |
 | `mcp/*` | s19 | MCP 发现与调用 |
 | `providers/` / `rag/` / `project/` / `ui/` | — | 本仓库扩展：多模型、检索、会话、终端 UI |

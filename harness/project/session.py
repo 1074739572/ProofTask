@@ -1,4 +1,10 @@
-"""Persist and restore CLI conversation history."""
+"""Persist and restore CLI conversation history.
+
+``history.json`` is a legacy compatibility mirror.  After the session-binding
+refactor it is **never written** by checkpoints — ``session.jsonl`` is the sole
+authoritative record.  ``history.json`` is only used as a one-time migration
+source for sessions created before the binding refactor.
+"""
 
 from __future__ import annotations
 
@@ -67,19 +73,26 @@ def deserialize_messages(data: list[dict]) -> list:
 
 
 def save_history(messages: list) -> None:
-    PROJECT_DIR.mkdir(parents=True, exist_ok=True)
-    payload = {"version": 1, "messages": serialize_messages(messages)}
-    HISTORY_PATH.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    """Legacy compat — no longer writes history.json.
+
+    ``session.jsonl`` is the authoritative record.  This function exists only
+    so tests and old call sites don't break; it is a no-op.
+    """
+    # Intentionally empty — session.jsonl is the single source of truth.
+    return
 
 
 def load_history() -> list | None:
     from harness.project.session_store import bootstrap_session
 
-    messages, _ = bootstrap_session()
+    messages, _binding, _source = bootstrap_session()
     return messages if messages else None
 
 
 def clear_history() -> None:
     from harness.project.session_store import clear_session
+    from harness.project.session_registry import session_binding, read_active_session_id
 
-    clear_session(archive=True)
+    sid = read_active_session_id()
+    if sid:
+        clear_session(binding=session_binding(sid), archive=True)

@@ -79,3 +79,6 @@ readme_vanna.md
 docker-compose.yml
 my.ini
 temp_pdf*.txt
+  
+# Generated scraps folder  
+_scraps/  

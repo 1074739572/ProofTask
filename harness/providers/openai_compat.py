@@ -161,6 +161,7 @@ def openai_response_to_anthropic(completion) -> MessageResponse:
     choice = completion.choices[0]
     message = choice.message
     blocks: list = []
+    usage = getattr(completion, "usage", None)
 
     if message.content:
         blocks.append(TextBlock(text=message.content))
@@ -184,6 +185,7 @@ def openai_response_to_anthropic(completion) -> MessageResponse:
         content=blocks,
         stop_reason=_map_stop_reason(choice.finish_reason, has_tool_calls),
         model=getattr(completion, "model", None),
+        usage=usage,
     )
 
 

@@ -6,6 +6,9 @@ Path::
 
 Legacy ``.project/todos.json`` is migrated by ``session_registry`` into a
 session folder; this module never writes the flat path again.
+
+**Per-process binding** — ``todos_path()`` requires an explicit ``session_id``
+or ``SessionBinding`` so todo writes never leak into another window's session.
 """
 
 from __future__ import annotations
@@ -16,26 +19,36 @@ import re
 from pathlib import Path
 from typing import Any
 
+from harness.project.session_registry import SessionBinding, read_active_session_id, session_binding
+
 _CURRENT: list[dict[str, str]] = []
 rounds_since_todo_update: int = 0
 
+# Cached binding — set by load_todos_from_disk / explicit init.
+_current_binding: SessionBinding | None = None
 
-def todos_path() -> Path:
-    """Return todos.json for the active session (creates session dir if needed)."""
-    from harness.project.session_registry import (
-        ensure_active_session,
-        read_active_session_id,
-        session_paths,
-    )
 
-    if not read_active_session_id():
+def todos_path(
+    *,
+    session_id: str | None = None,
+    binding: SessionBinding | None = None,
+) -> Path:
+    """Return todos.json for a specific session (or the process-bound session)."""
+    if binding is not None:
+        return binding.todos_json
+    if session_id is not None:
+        return session_binding(session_id).todos_json
+    if _current_binding is not None:
+        return _current_binding.todos_json
+    sid = read_active_session_id()
+    if not sid:
+        from harness.project.session_registry import ensure_active_session
         ensure_active_session(fresh=False)
-    return session_paths().todos_json
+        sid = read_active_session_id()
+    return session_binding(sid or "?").todos_json
 
 
 # Back-compat: ``from harness.todos.state import TODOS_PATH`` resolves via __getattr__.
-
-
 def __getattr__(name: str):
     if name == "TODOS_PATH":
         return todos_path()
@@ -44,6 +57,12 @@ def __getattr__(name: str):
 
 def get_todos() -> list[dict[str, str]]:
     return list(_CURRENT)
+
+
+def set_binding(binding: SessionBinding) -> None:
+    """Pin the process-wide todo binding (called once at bootstrap)."""
+    global _current_binding
+    _current_binding = binding
 
 
 def _derive_active_form(content: str, status: str) -> str:
@@ -146,10 +165,16 @@ def clear_todos(*, delete_file: bool = True) -> None:
         path.unlink()
 
 
-def load_todos_from_disk() -> list[dict[str, str]]:
-    global _CURRENT
+def load_todos_from_disk(
+    *,
+    session_id: str | None = None,
+    binding: SessionBinding | None = None,
+) -> list[dict[str, str]]:
+    global _CURRENT, _current_binding
+    if binding is not None:
+        _current_binding = binding
     try:
-        path = todos_path()
+        path = todos_path(session_id=session_id, binding=binding)
     except Exception:
         _CURRENT = []
         return []

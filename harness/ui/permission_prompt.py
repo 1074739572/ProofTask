@@ -1,16 +1,24 @@
-"""Cancel-aware permission prompts for classic and Textual interfaces.
-
-Textual uses an inline panel; classic keeps the y/N terminal prompt.
-"""
+"""Cancel-aware permission prompts for classic CLI."""
 
 from __future__ import annotations
 
 import sys
 import time
+from dataclasses import dataclass
 
 from harness.agent.cancel import is_cancelled, request_cancel
 from harness.ui.interrupt_listener import pause_key_poll, resume_key_poll
-from harness.ui.tui.events import PermissionResponse
+
+
+@dataclass(frozen=True)
+class PermissionResponse:
+    request_id: str
+    decision: str
+    value: str = ""
+
+    @property
+    def allowed(self) -> bool:
+        return self.decision == "allow"
 
 
 def ask_permission(
@@ -21,18 +29,7 @@ def ask_permission(
     editable: bool = False,
 ) -> PermissionResponse:
     """Return a structured decision and an optionally edited value."""
-    from harness.ui.tui.mode import is_tui_active
-
     body = (detail if detail is not None else prompt).strip()
-    if is_tui_active():
-        from harness.ui.tui.bridge import BRIDGE
-
-        return BRIDGE.ask_permission(
-            body or "(no detail)",
-            title=title or "Allow destructive command?",
-            editable=editable,
-        )
-
     choice = ask_allow(prompt, detail=detail, title=title)
     decision = "cancel" if choice is None else ("allow" if choice else "deny")
     return PermissionResponse("classic-permission", decision, body)
@@ -51,17 +48,6 @@ def ask_allow(
         False — deny (n / Enter / default)
         None  — cancelled (Esc, Ctrl+C, or cooperative cancel flag)
     """
-    from harness.ui.tui.mode import is_tui_active
-
-    if is_tui_active():
-        from harness.ui.tui.bridge import BRIDGE
-
-        body = (detail if detail is not None else prompt).strip()
-        return BRIDGE.ask_allow(
-            body or "(no detail)",
-            title=title or "Allow destructive command?",
-        )
-
     print(prompt, end="", flush=True)
     pause_key_poll()
     try:

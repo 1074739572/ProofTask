@@ -58,7 +58,7 @@ def _degraded_compact(label: str, messages: list) -> list:
     )
 
 
-def compact_history(messages: list) -> list:
+def compact_history(messages: list, *, binding=None) -> list:
     from harness.project.session_store import record_compact_boundary
     from harness.ui.tool_display import hooks_verbose
 
@@ -75,11 +75,12 @@ def compact_history(messages: list) -> list:
         compacted = _degraded_compact("Compacted — summary unavailable", messages)
     else:
         compacted = _build_compacted("Compacted", summary, messages)
-    record_compact_boundary("auto", estimate_size(messages), transcript, compacted)
+    if binding is not None:
+        record_compact_boundary("auto", estimate_size(messages), transcript, compacted, binding=binding)
     return compacted
 
 
-def reactive_compact(messages: list) -> list:
+def reactive_compact(messages: list, *, binding=None) -> list:
     from harness.project.session_store import record_compact_boundary
     from harness.ui.tool_display import hooks_verbose
 
@@ -96,7 +97,8 @@ def reactive_compact(messages: list) -> list:
         compacted = _degraded_compact("Reactive compact — summary unavailable", messages)
     else:
         compacted = _build_compacted("Reactive compact", summary, messages)
-    record_compact_boundary("reactive", estimate_size(messages), transcript, compacted)
+    if binding is not None:
+        record_compact_boundary("reactive", estimate_size(messages), transcript, compacted, binding=binding)
     return compacted
 
 

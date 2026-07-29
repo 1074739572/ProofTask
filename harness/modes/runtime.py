@@ -156,7 +156,8 @@ def format_mode_status() -> str:
     if profile.enable_task:
         parts.append("task() enabled → see config/agents.json")
     if profile.lead_model_hint:
-        parts.append(f"recommended lead /model: {profile.lead_model_hint}")
+        label = "bound lead model" if profile.enable_task else "recommended lead /model"
+        parts.append(f"{label}: {profile.lead_model_hint}")
     if profile.builtin_skills:
         parts.append(f"builtin skills: {', '.join(profile.builtin_skills)}")
     return "\n".join(parts)
@@ -224,6 +225,16 @@ def mode_enables_task() -> bool:
     if profile.confirm_before_execute and not is_execute_unlocked():
         return False
     return profile.enable_task
+
+
+def mode_auto_route() -> bool:
+    """Whether the system should auto-route user messages to sub-agents."""
+    profile = get_current_mode_profile()
+    if profile is None:
+        return False
+    if profile.confirm_before_execute and not is_execute_unlocked():
+        return False
+    return profile.auto_route
 
 
 def mode_lead_model_hint() -> str | None:

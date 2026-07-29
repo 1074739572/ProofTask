@@ -91,5 +91,21 @@ else:
 IDLE_POLL_INTERVAL = 5
 IDLE_TIMEOUT = 60
 
+
+def _positive_seconds(name: str, default: int) -> int:
+    raw = os.getenv(name, "").strip()
+    try:
+        value = int(raw) if raw else default
+    except ValueError:
+        value = default
+    return max(1, value)
+
+
+# Teammates check this deadline between model and tool calls. It is deliberately
+# lower than the router's absolute wait so a cooperative timeout can be reported.
+TEAMMATE_MAX_RUNTIME = _positive_seconds("HARNESS_TEAMMATE_MAX_RUNTIME", 540)
+ROUTE_IDLE_TIMEOUT = _positive_seconds("HARNESS_ROUTE_IDLE_TIMEOUT", 180)
+ROUTE_MAX_RUNTIME = _positive_seconds("HARNESS_ROUTE_MAX_RUNTIME", 600)
+
 # Welcome hero variants for /banner demo: classic | emoji | typewriter | shadow3d
 BANNER_STYLE = os.getenv("HARNESS_BANNER", "classic").strip().lower()

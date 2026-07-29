@@ -1,12 +1,25 @@
-"""Resume: Claude Code-style session continue + opt-in project context."""
+"""Resume: Claude Code-style session continue + opt-in project context.
+
+**Per-process binding** — ``checkpoint_history`` and ``switch_to_session`` use
+the window-pinned ``SessionBinding``.  ``/resume`` atomically checkpoints the
+old binding, then swaps the process-wide binding to the new session.
+"""
 
 from __future__ import annotations
 
 import os
 
+from harness.project.session_registry import (
+    SessionBinding,
+    read_session_meta,
+    session_binding,
+    write_active_session_id,
+    write_session_meta,
+)
 from harness.project.session_store import (
     append_checkpoint,
     format_session_line,
+    load_session_messages,
     session_stats,
 )
 from harness.project.state import (
@@ -72,7 +85,7 @@ def project_context_message() -> str | None:
     )
 
 
-def inject_project_context(messages: list, *, checkpoint: bool = True) -> tuple[bool, str]:
+def inject_project_context(messages: list, *, binding: SessionBinding, checkpoint: bool = True) -> tuple[bool, str]:
     """Append opt-in project context to the active session."""
     msg = project_context_message()
     if not msg:
@@ -83,18 +96,18 @@ def inject_project_context(messages: list, *, checkpoint: bool = True) -> tuple[
 
     messages.append({"role": "user", "content": msg})
     if checkpoint:
-        append_checkpoint(messages)
+        append_checkpoint(messages, binding=binding)
     return True, "已注入论文项目上下文。请继续输入你的问题。"
 
 
-def resume_banner() -> str | None:
+def resume_banner(*, binding: SessionBinding) -> str | None:
     """Optional startup banner (informational only — never auto-injects)."""
-    stats = session_stats()
+    stats = session_stats(binding=binding)
     state = load_state()
     if not stats["exists"] and state is None:
         return None
 
-    lines = ["--- 会话 ---", format_session_line()]
+    lines = ["--- 会话 ---", format_session_line(binding=binding)]
     if state and show_project_in_welcome():
         state = sync_chapters_from_disk(state)
         done = sum(1 for c in state.chapters if c.status == "done")
@@ -149,37 +162,34 @@ def _last_message_preview(messages: list, *, max_len: int = 220) -> str | None:
     return None
 
 
-def switch_to_session(session_id: str, messages: list) -> str:
-    """Make ``session_id`` active and replace ``messages`` with its history + todos."""
-    from harness.project.session_registry import (
-        read_session_meta,
-        session_paths,
-        write_active_session_id,
-        write_session_meta,
-    )
-    from harness.project.session_store import load_session_messages
+def switch_to_session(session_id: str, messages: list, *, binding: SessionBinding) -> tuple[SessionBinding, str]:
+    """Checkpoint *binding*, then switch *messages* to *session_id*. Returns (new_binding, note)."""
     from harness.todos.state import load_todos_from_disk
 
-    paths = session_paths(session_id)
-    if not paths.root.is_dir():
-        return f"会话不存在：{session_id}"
+    # 1. Checkpoint current binding before we leave it.
+    if messages:
+        append_checkpoint(messages, binding=binding)
+
+    target_binding = session_binding(session_id)
+    if not target_binding.paths.root.is_dir():
+        return binding, f"会话不存在：{session_id}"
 
     write_active_session_id(session_id)
-    loaded = load_session_messages() or []
+    loaded = load_session_messages(binding=target_binding) or []
     messages.clear()
     messages.extend(loaded)
 
-    meta = read_session_meta(paths)
+    meta = read_session_meta(binding=target_binding)
     meta["active_persisted"] = len(loaded)
-    write_session_meta(meta, paths)
-    load_todos_from_disk()
+    write_session_meta(meta, binding=target_binding)
+    load_todos_from_disk(binding=target_binding)
 
     title = meta.get("title") or "(untitled)"
     lines = [f"已切换到会话：{title}（{len(loaded)} 条消息）"]
     preview = _last_message_preview(loaded)
     if preview:
         lines.append(preview)
-    return "\n".join(lines)
+    return target_binding, "\n".join(lines)
 
 
 def format_resume_status(*, include_project: bool = True) -> str:
@@ -216,7 +226,7 @@ def delete_workflow_state() -> str:
     return f"已删除长任务：{title}"
 
 
-def delete_session_entry(row: dict, messages: list | None) -> str:
+def delete_session_entry(row: dict, messages: list | None, *, binding: SessionBinding) -> tuple[str, SessionBinding]:
     """Delete one session directory; if it was active, start a fresh session."""
     from harness.project.session_registry import (
         create_session,
@@ -227,20 +237,25 @@ def delete_session_entry(row: dict, messages: list | None) -> str:
     was_active = row.get("active")
     ok, title_or_err = delete_session_by_id(row["id"])
     if not ok:
-        return title_or_err
+        return title_or_err, binding
 
     if was_active and messages is not None:
         messages.clear()
-        create_session()
+        new_binding = create_session()
         clear_todos(delete_file=False)
-        load_todos_from_disk()
-        return f"已删除当前会话：{title_or_err}。已开启新会话。"
+        load_todos_from_disk(binding=new_binding)
+        return f"已删除当前会话：{title_or_err}。已开启新会话。", new_binding
 
-    return f"已删除会话：{title_or_err}"
+    return f"已删除会话：{title_or_err}", binding
 
 
-def run_resume_command(args: str = "", *, messages: list | None = None) -> str:
-    """Handle /resume [N|name|project|status]."""
+def run_resume_command(
+    args: str = "",
+    *,
+    messages: list | None = None,
+    binding: SessionBinding | None = None,
+) -> tuple[str, SessionBinding | None]:
+    """Handle /resume [N|name|project|status]. Returns (note, new_binding_or_None)."""
     from harness.project.session_registry import resolve_session_selector
 
     raw = (args or "").strip()
@@ -252,39 +267,48 @@ def run_resume_command(args: str = "", *, messages: list | None = None) -> str:
             return (
                 "用法：\n"
                 "  /resume delete <序号|名称>   删除列表中的会话\n"
-                "  /resume delete project       删除长任务 state.json"
+                "  /resume delete project       删除长任务 state.json",
+                binding,
             )
         if target.lower() in ("project", "workflow", "thesis", "长任务"):
-            return delete_workflow_state()
+            return delete_workflow_state(), binding
         row, err = resolve_session_selector(target)
         if err:
-            return err
+            return err, binding
         assert row is not None
         if messages is None:
-            return "请在 CLI 中执行 /resume delete <序号>"
-        return delete_session_entry(row, messages)
+            return "请在 CLI 中执行 /resume delete <序号>", binding
+        if binding is None:
+            return "内部错误：缺少会话绑定", binding
+        note, new_binding = delete_session_entry(row, messages, binding=binding)
+        return note, new_binding
 
     if sub in ("", "status", "list", "session"):
-        return format_resume_status(include_project=True)
+        return format_resume_status(include_project=True), binding
 
     if sub in ("project", "thesis", "chapters"):
         if messages is None:
-            return "请在 CLI 中执行 /resume project，将论文上下文注入当前会话。"
-        _ok, message = inject_project_context(messages, checkpoint=True)
-        return message
+            return "请在 CLI 中执行 /resume project，将论文上下文注入当前会话。", binding
+        if binding is None:
+            return "内部错误：缺少会话绑定", binding
+        _ok, message = inject_project_context(messages, binding=binding, checkpoint=True)
+        return message, binding
 
-    # /resume 2  or  /resume 你现在的任务是什么
+    # /resume 2  or  /resume <name>
     row, err = resolve_session_selector(raw)
     if err:
-        return err
+        return err, binding
     assert row is not None
     if messages is None:
-        return "请在 CLI 中执行 /resume <序号> 以切换会话。"
+        return "请在 CLI 中执行 /resume <序号> 以切换会话。", binding
+    if binding is None:
+        return "内部错误：缺少会话绑定", binding
     if row["active"]:
         preview = _last_message_preview(messages or [])
         base = f"已在当前会话：{row['title']}"
-        return f"{base}\n{preview}" if preview else base
-    return switch_to_session(row["id"], messages)
+        return (f"{base}\n{preview}" if preview else base), binding
+    new_binding, note = switch_to_session(row["id"], messages, binding=binding)
+    return note, new_binding
 
 
 # Backward-compatible alias used in tests/docs
@@ -326,6 +350,6 @@ def on_write_file(path: str) -> None:
                 return
 
 
-def checkpoint_history(messages: list) -> None:
+def checkpoint_history(messages: list, *, binding: SessionBinding) -> None:
     if messages:
-        append_checkpoint(messages)
+        append_checkpoint(messages, binding=binding)

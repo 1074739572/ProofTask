@@ -180,19 +180,8 @@ if __name__ == "__main__":
         raise SystemExit(subprocess.call([command, "run", "cli"], cwd=node_cli))
 
     from harness.cli import run_cli
-    from harness.ui.tui import prefer_tui, run_tui
 
-    use_classic = bool(args.classic) or not prefer_tui()
-    if args.tui:
-        use_classic = False
+    # TUI removed — always use classic Rich CLI.
+    run_cli()
+    raise SystemExit(0)
 
-    if use_classic:
-        run_cli()
-        raise SystemExit(0)
-
-    try:
-        run_tui()
-    except ImportError as exc:
-        print(str(exc), file=sys.stderr)
-        print("Falling back to classic CLI…", file=sys.stderr)
-        run_cli()
