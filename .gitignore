@@ -23,8 +23,8 @@ venv/
 .rag/
 .project/
 
-# Node TUI experiments (removed; do not re-add)
-node_tui/
+# Node TUI frontend: track source, never node_modules
+node_tui/node_modules/
 node_modules/
 
 # Eval run artifacts

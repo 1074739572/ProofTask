@@ -1,0 +1,22 @@
+{
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "node_modules/@oven/bun-windows-x64/bin/bun.exe src-open/index.tsx",
+    "build": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@opentui/core": "^0.4.5",
+    "@opentui/solid": "^0.4.5",
+    "solid-js": "^1.9.12"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "bun": "^1.3.14",
+    "tsx": "^4.23.1",
+    "typescript": "^5.7.2"
+  },
+  "optionalDependencies": {
+    "bun": "^1.3.14"
+  }
+}

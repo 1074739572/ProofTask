@@ -1,0 +1,4 @@
+import {render} from '@opentui/solid';
+import {App} from './App.tsx';
+
+render(() => <App />, {useMouse: true, exitOnCtrlC: false, targetFps: 30}).catch((error: unknown) => { console.error('OpenTUI render failed:', error); process.exit(1); });

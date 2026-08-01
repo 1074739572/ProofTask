@@ -1,0 +1,10 @@
+# Dependencies & build output (regenerate with: npm install; npm run build)
+node_modules/
+dist/
+
+# Local downloads & archives
+*.tgz
+
+# Debug/diagnostic scratch output (kept out of git)
+*.txt
+bunfig.bak.toml
