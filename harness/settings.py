@@ -16,6 +16,7 @@ load_dotenv(override=True)
 SKILLS_DIR = PACKAGE_ROOT / "skills"
 CONFIG_DIR = PACKAGE_ROOT / "config"
 MCP_CONFIG_PATH = CONFIG_DIR / "mcp.json"
+PERMISSIONS_CONFIG_PATH = CONFIG_DIR / "permissions.json"
 PROVIDERS_CONFIG_PATH = CONFIG_DIR / "providers.json"
 MODELS_CONFIG_PATH = CONFIG_DIR / "models.json"
 

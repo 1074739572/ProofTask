@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from harness.console import terminal_print
+from harness.ui import events
 
 
 def assistant_text_blocks(content) -> list[str]:
@@ -32,7 +33,15 @@ def emit_final_assistant(messages: list, content) -> None:
     for text in assistant_text_blocks(content):
         if not (text or "").strip():
             continue
-        terminal_print(text)
+        # In JSONL event mode, print_turn_assistants emits the single final
+        # assistant_message. Calling terminal_print here would route through
+        # renderer.assistant and duplicate the event. Classic CLI still prints
+        # immediately for the historical safety net.
+        if not events.is_enabled():
+            terminal_print(text)
         printed_any = True
     if printed_any and messages and messages[-1].get("role") == "assistant":
-        messages[-1]["_ui_final_printed"] = True
+        # Only mark printed in classic CLI mode. In JSONL mode the safety-net
+        # print_turn_assistants path must still emit the single assistant_message.
+        if not events.is_enabled():
+            messages[-1]["_ui_final_printed"] = True

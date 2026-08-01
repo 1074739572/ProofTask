@@ -1,5 +1,9 @@
 # 008 — Textual TUI（M2 同页交互）
 
+## 状态更新（2026-07 清理）
+
+**Textual TUI 已移除**：`harness/ui/tui/` 与 `textual` 依赖不再存在，`main.py` 默认即 classic Rich CLI。本记录的设计取舍（分区展示、工具卡原位更新、欢迎页 hero、同页权限面板、Ctrl+C 复制等）仍作为当前 classic UI 的行为参考；权限面板与工具步骤展示实现在 `harness/ui/`（`permission_prompt.py` / `tool_display.py` / `renderer.py`）。
+
 ## 痛点
 
 经典 Rich 行模式难以做成「Kimi / 千问」式分区；终答与步骤拆开也不好回看历史。
@@ -112,16 +116,16 @@ python -m harness.ui.tui.quotes today
 
 忙碌中禁止切换；需先 Stop。
 
-## 关键文件
+## 关键文件（设计时引用；Textual 已移除，下表仅存档）
 
-| 路径 | 作用 |
+| 路径（已移除） | 作用（能力去向） |
 |------|------|
-| `harness/ui/tui/app.py` | 布局 · 同页权限 · 工具/后台状态 · 固定终答 · composer |
-| `harness/ui/tui/events.py` | Tool / Background / Permission / RuntimeMetrics 事件模型 |
-| `harness/ui/tui/bridge.py` | worker → Textual 主线程；权限等待与指标合并 |
-| `harness/ui/tui/commands.py` | `/model` `/mode` `/resume` `/clear` `/usage` |
-| `harness/ui/tui/chat_history.py` | session → 结构化聊天与工具事件 |
-| `harness/ui/tui/usage_bar.py` | 顶栏用量与 cache hit rate |
-| `harness/ui/tui/widgets.py` | 可点 MetaChip、可折叠 ToolCard |
-| `harness/ui/renderer.py` | TUI exclusive sink；结构化工具事件入口 |
+| `harness/ui/tui/app.py` | 布局 · 同页权限 · 工具/后台状态 · 固定终答 · composer（→ classic：`harness/ui/renderer.py`） |
+| `harness/ui/tui/events.py` | 事件模型（→ `harness/ui/events.py` / `harness/event_stream.py`） |
+| `harness/ui/tui/bridge.py` | worker → 主线程桥接（→ `harness/ui/permission_events.py`） |
+| `harness/ui/tui/commands.py` | 斜杠命令（→ `harness/cli.py`） |
+| `harness/ui/tui/chat_history.py` | session → 结构化聊天（→ `harness/project/transcript.py`） |
+| `harness/ui/tui/usage_bar.py` | 用量与 cache hit rate（→ `harness/usage/report.py`） |
+| `harness/ui/tui/widgets.py` | MetaChip / ToolCard（→ `harness/ui/tool_display.py`） |
+| `harness/ui/renderer.py` | 结构化工具事件入口 |
 | `harness/agent/background.py` | 后台任务状态事件；精确慢命令识别 |

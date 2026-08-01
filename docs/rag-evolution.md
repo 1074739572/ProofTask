@@ -217,7 +217,7 @@ VLM 必须显式配置，系统不会默认把本地文档发送到外部服务�
 
 文档问答和 coding Agent 的风险不同。file mode 固定走“检索 → 回答”，不会让模型自行决定是否检索，也不会启动写文件、Shell 等工具，因此更适合连续问文档。
 
-当前 Classic CLI 与 Textual TUI 使用相同短路；默认检索全部文档，可用 `/rag select` 缩小范围。该 selection 同时约束 file 问答和 Agent `rag_search`，避免两套范围语义。
+当前默认检索全部文档，可用 `/rag select` 缩小范围。该 selection 同时约束 file 问答和 Agent `rag_search`，避免两套范围语义。
 
 ## 4. 没有选择的方案
 

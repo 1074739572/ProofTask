@@ -7,6 +7,7 @@ from contextlib import contextmanager
 
 from harness import terminal_state
 from harness.ui import theme
+from harness.ui import events
 from harness.ui.tool_display import (
     hooks_verbose,
     is_failure_tool_output,
@@ -30,6 +31,11 @@ class Renderer:
     """Single entry for classic CLI output; keeps loop/llm free of ad-hoc prints."""
 
     def _write(self, text: str, *, style: str | None = None, end: str = "\n") -> None:
+        # In JSONL event-stream mode, human-readable classic output must stay
+        # silent. Otherwise stderr diagnostics are mirrored by the TUI as logs,
+        # producing duplicate Response + classic Assistant panels.
+        if events.is_enabled():
+            return
         if not _RICH or _console is None:
             print(text, end=end, flush=True)
             return
@@ -52,15 +58,19 @@ class Renderer:
         print(theme.PROMPT + line, end="", flush=True)
 
     def info(self, message: str) -> None:
+        events.emit("log", level="info", text=str(message))
         self._write(message, style=theme.INFO)
 
     def muted(self, message: str) -> None:
+        events.emit("log", level="muted", text=str(message))
         self._write(message, style=theme.MUTED)
 
     def warn(self, message: str) -> None:
+        events.emit("log", level="warn", text=str(message))
         self._write(message, style=theme.WARN)
 
     def error(self, message: str) -> None:
+        events.emit("error", text=str(message))
         self._write(message, style=theme.ERROR)
 
     def hook(self, label: str, detail: str = "") -> None:
@@ -70,6 +80,7 @@ class Renderer:
         self._write(f"[hook] {label}{suffix}", style=theme.HOOK)
 
     def user(self, text: str) -> None:
+        events.emit("user_message", text=str(text))
         if _RICH:
             self._write("")
             self._write(f"{theme.PROMPT}{text}", style=theme.USER)
@@ -78,6 +89,9 @@ class Renderer:
 
     def assistant(self, text: str) -> None:
         if not text:
+            return
+        events.emit("assistant_message", text=str(text))
+        if events.is_enabled():
             return
         if _RICH and _console is not None:
             self._write("")
@@ -95,6 +109,7 @@ class Renderer:
         preview = " ".join(lines)
         if len(preview) > 220:
             preview = preview[:219] + "…"
+        events.emit("assistant_intent", text=preview)
         self._write(f"› {preview}", style=theme.MUTED)
 
     def tool_start(
@@ -105,6 +120,13 @@ class Renderer:
         tool_use_id: str = "",
     ) -> None:
         summary = summarize_tool_input(name, tool_input)
+        events.emit(
+            "tool_start",
+            id=tool_use_id,
+            name=name,
+            input=tool_input or {},
+            summary=summary,
+        )
         detail = f"  {summary}" if summary else ""
         self._write(f"● {name}{detail}", style=theme.TOOL)
 
@@ -119,6 +141,15 @@ class Renderer:
     ) -> None:
         """Collapse identical consecutive calls instead of reprinting full lines."""
         summary = summarize_tool_input(name, tool_input)
+        events.emit(
+            "tool_repeat",
+            id=tool_use_id,
+            name=name,
+            input=tool_input or {},
+            summary=summary,
+            streak=streak,
+            blocked=blocked,
+        )
         detail = f"  {summary}" if summary else ""
         if blocked:
             self._write(
@@ -140,10 +171,19 @@ class Renderer:
         tool_input: dict | None = None,
         tool_use_id: str = "",
     ) -> None:
+        failed = is_failure_tool_output(preview)
+        summary = summarize_failure_output(preview) if failed else ""
+        events.emit(
+            "tool_end",
+            id=tool_use_id,
+            name=name or "",
+            ok=not failed,
+            summary=summary,
+            preview=str(preview)[:limit],
+        )
         # Success results stay silent in the terminal (still go to the model).
-        if not is_failure_tool_output(preview):
+        if not failed:
             return
-        summary = summarize_failure_output(preview)
         self._write(f"  → {summary}", style=theme.WARN)
 
     def round_header(self, prefix: str, round_num: int, thinking_text: str, max_len: int = 50) -> None:
@@ -183,15 +223,20 @@ class Renderer:
         """End-of-turn summary of files write_file/edit_file touched."""
         if not paths:
             return
+        events.emit("files_changed", paths=paths)
         self._write("Changed files:", style=theme.MUTED)
         for path in paths:
             self._write(f"  · {path}", style=theme.TOOL)
 
     def plain(self, message: str) -> None:
+        events.emit("log", level="plain", text=str(message))
         self._write(message)
 
     def todo_checklist(self, todos: list[dict[str, str]]) -> None:
         if not todos:
+            return
+        events.emit("task_update", tasks=todos)
+        if events.is_enabled():
             return
         if _RICH and _console is not None:
             from harness.ui.todos import render_todo_checklist
@@ -205,12 +250,18 @@ class Renderer:
     @contextmanager
     def llm_busy(self, model_tag: str):
         label = f"Thinking  {model_tag}"
-        if _RICH and _console is not None:
-            with _console.status(f"[{theme.ACCENT}]{label}[/{theme.ACCENT}]", spinner="dots"):
+        events.emit("thinking_start", phase="calling_model", model=model_tag)
+        try:
+            if events.is_enabled():
                 yield
-        else:
-            self.muted(f"[llm] {model_tag}")
-            yield
+            elif _RICH and _console is not None:
+                with _console.status(f"[{theme.ACCENT}]{label}[/{theme.ACCENT}]", spinner="dots"):
+                    yield
+            else:
+                self.muted(f"[llm] {model_tag}")
+                yield
+        finally:
+            events.emit("thinking_end", phase="calling_model", model=model_tag)
 
 
 renderer = Renderer()

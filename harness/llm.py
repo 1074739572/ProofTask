@@ -28,6 +28,14 @@ def _log_cache_usage(response, *, model_id: str) -> None:
         record_usage(model=model_id, cache=parsed)
     except OSError as exc:
         renderer.warn(f"usage ledger write failed: {exc}")
+    from harness.ui.events import emit, is_enabled
+    if is_enabled():
+        emit(
+            "usage_update",
+            input_tokens=parsed.input_tokens,
+            output_tokens=int(parsed.output_tokens or 0),
+            cache_read_tokens=parsed.hit_tokens,
+        )
     if not hooks_verbose():
         return
     rate = f"{100 * parsed.hit_rate:.0f}%"
@@ -45,7 +53,14 @@ def create_message(
     tools: list | None = None,
     model_id: str | None = None,
 ):
+    from harness.ui.events import emit as _emit, is_enabled as _is_enabled
+
     profile = get_model_profile(model_id)
+
+    def _delta_callback(text: str, _event_type: str) -> None:
+        _emit("assistant_delta", text=text, model=profile.api_model)
+
+    on_delta = _delta_callback if _is_enabled() else None
 
     with renderer.llm_busy(_format_llm_tag(profile)):
         response = create_provider_message(
@@ -54,6 +69,7 @@ def create_message(
             max_tokens=max_tokens,
             system=system,
             tools=tools,
+            on_delta=on_delta,
         )
 
     _log_cache_usage(response, model_id=profile.id)

@@ -6,6 +6,7 @@ __pycache__/
 *.py[cod]
 .venv/
 venv/
+.pytest_cache/
 
 # Local-only artifacts: downloads, experiments, scratch scripts, and run outputs.
 # Keep reusable source under its feature directory; only local state belongs here.
@@ -21,6 +22,10 @@ venv/
 .scheduled_tasks.json
 .rag/
 .project/
+
+# Node TUI experiments (removed; do not re-add)
+node_tui/
+node_modules/
 
 # Eval run artifacts
 evals/results/

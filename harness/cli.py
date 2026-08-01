@@ -275,7 +275,7 @@ def run_cli() -> None:
             continue
         if query.strip().lower() in ("/undo", "/u"):
             with agent_lock:
-                ok, message = undo_last_turn(history)
+                ok, message = undo_last_turn(history, binding=binding)
                 context = update_context(context, history)
             renderer.plain(message)
             print()
@@ -466,7 +466,7 @@ def run_cli() -> None:
             clear_cancel()
 
         if interrupted:
-            message, rolled_back = abort_inflight_turn(history, turn_start)
+            message, rolled_back = abort_inflight_turn(history, turn_start, binding=binding)
             renderer.plain(message)
             context = update_context(context, history)
             if rolled_back:

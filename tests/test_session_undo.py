@@ -13,6 +13,11 @@ from harness.project.session_undo import (
 )
 
 
+def _mock_binding() -> mock.Mock:
+    """Return a minimal mock SessionBinding for tests that do not hit disk."""
+    return mock.Mock(spec=["session_id", "session_jsonl"])
+
+
 class TestSessionUndo(unittest.TestCase):
     def test_abort_rolls_back_user_and_partial_assistant(self) -> None:
         messages = [
@@ -24,7 +29,7 @@ class TestSessionUndo(unittest.TestCase):
         turn_start = 2
 
         with mock.patch("harness.project.session_undo.replace_session"):
-            message, rolled = abort_inflight_turn(messages, turn_start, archive=False)
+            message, rolled = abort_inflight_turn(messages, turn_start, binding=_mock_binding())
 
         self.assertEqual(len(messages), 2)
         self.assertEqual(rolled, "why is ch07 wrong?")
@@ -37,7 +42,7 @@ class TestSessionUndo(unittest.TestCase):
             {"role": "assistant", "content": "partial…"},
         ]
         with mock.patch("harness.project.session_undo.replace_session"):
-            message, rolled = abort_inflight_turn(messages, turn_start=99, archive=False)
+            message, rolled = abort_inflight_turn(messages, turn_start=99, binding=_mock_binding())
         self.assertEqual(rolled, "hello")
         self.assertEqual(len(messages), 0)
         self.assertIn("rolled back", message)
@@ -64,7 +69,7 @@ class TestSessionUndo(unittest.TestCase):
             {"role": "assistant", "content": "done"},
         ]
         with mock.patch("harness.project.session_undo.replace_session"):
-            ok, msg = undo_last_turn(messages, archive=False)
+            ok, msg = undo_last_turn(messages, binding=_mock_binding())
         self.assertTrue(ok)
         self.assertEqual(len(messages), 2)
         self.assertIn("second", msg)

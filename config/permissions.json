@@ -1,0 +1,52 @@
+{
+  "permission": {
+    "*": "ask",
+    "external_directory": "ask",
+    "read_file": {
+      "*": "allow",
+      "*.env": "deny",
+      "*.env.*": "deny",
+      "*.env.example": "allow"
+    },
+    "glob": "allow",
+    "todo_write": "allow",
+    "load_skill": "allow",
+    "compact": "allow",
+    "list_tasks": "allow",
+    "get_task": "allow",
+    "check_inbox": "allow",
+    "list_crons": "allow",
+    "rag_search": "allow",
+    "rag_status": "allow",
+    "project_status": "allow",
+    "web_search": "allow",
+    "mcp__fetch__fetch": "allow",
+    "mcp__playwright__browser_navigate": "allow",
+    "mcp__playwright__browser_navigate_back": "allow",
+    "mcp__playwright__browser_snapshot": "allow",
+    "mcp__playwright__browser_take_screenshot": "allow",
+    "mcp__playwright__browser_console_messages": "allow",
+    "mcp__playwright__browser_network_requests": "allow",
+    "mcp__playwright__browser_wait_for": "allow",
+    "mcp__playwright__browser_resize": "allow",
+    "mcp__playwright__browser_tabs": "ask",
+    "mcp__*": "ask",
+    "write_file": "ask",
+    "edit_file": "ask",
+    "bash": {
+      "*": "ask",
+      "dir *": "allow",
+      "type *": "allow",
+      "where *": "allow",
+      "git status*": "allow",
+      "git diff*": "allow",
+      "git log*": "allow",
+      "python -c *": "ask",
+      "rm *": "deny",
+      "del *": "ask",
+      "sudo *": "deny",
+      "shutdown*": "deny",
+      "reboot*": "deny"
+    }
+  }
+}

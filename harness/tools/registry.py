@@ -107,57 +107,99 @@ def run_check_inbox() -> str:
 BUILTIN_TOOLS = [
     {
         "name": "bash",
-        "description": "Run a shell command.",
+        "description": (
+            "Run a shell command. Long-running commands (installs, builds, "
+            "tests, servers) are automatically moved to the background and you "
+            "get a task_notification when they finish. For commands that need "
+            "more time, pass `timeout` in milliseconds (default 120000, max "
+            "3600000). Pass `run_in_background: true` to keep working while a "
+            "slow command runs."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "command": {"type": "string"},
-                "run_in_background": {"type": "boolean"},
+                "timeout": {
+                    "type": "integer",
+                    "description": "Timeout in milliseconds (default 120000, max 3600000).",
+                },
+                "run_in_background": {
+                    "type": "boolean",
+                    "description": "Run in background and return immediately; result arrives as a task_notification.",
+                },
             },
             "required": ["command"],
         },
     },
     {
         "name": "read_file",
-        "description": "Read file contents.",
+        "description": (
+            "Read file contents with line numbers and a header showing total lines. "
+            "Use `limit`/`offset` to page through large files. Binary files and "
+            "paths escaping the workspace are rejected; non-UTF-8 (e.g. GBK) files "
+            "are decoded automatically."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "path": {"type": "string"},
-                "limit": {"type": "integer"},
-                "offset": {"type": "integer"},
+                "limit": {
+                    "type": "integer",
+                    "description": "Max lines to return (page through big files).",
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "0-based starting line.",
+                },
             },
             "required": ["path"],
         },
     },
     {
         "name": "write_file",
-        "description": "Write content to a file.",
+        "description": (
+            "Write content to a file (creates parent directories). "
+            "Content is capped at 2,000,000 chars; write larger files in chunks or via bash."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "path": {"type": "string"},
-                "content": {"type": "string"},
+                "content": {
+                    "type": "string",
+                    "description": "File content (max 2,000,000 chars).",
+                },
             },
             "required": ["path", "content"],
         },
     },
     {
         "name": "edit_file",
-        "description": "Replace exact text in a file once.",
+        "description": (
+            "Replace exact text in a file. If `old_text` appears multiple times, only "
+            "the Nth `occurrence` (1-based, default 1) is replaced and the result "
+            "reports how many remain. On mismatch, returns a closest-match line hint."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "path": {"type": "string"},
                 "old_text": {"type": "string"},
                 "new_text": {"type": "string"},
+                "occurrence": {
+                    "type": "integer",
+                    "description": "Which occurrence to replace, 1-based (default 1).",
+                },
             },
             "required": ["path", "old_text", "new_text"],
         },
     },
     {
         "name": "glob",
-        "description": "Find files matching a glob pattern.",
+        "description": (
+            "Find files matching a glob pattern. Use `**` for recursive matches "
+            "(e.g. `**/*.py`)."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {"pattern": {"type": "string"}},

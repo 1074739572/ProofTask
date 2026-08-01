@@ -197,6 +197,9 @@ def create_openai_message(
     max_tokens: int,
     system: str | None = None,
     tools: list | None = None,
+    reasoning_effort: str | None = None,
+    extra_body: dict | None = None,
+    on_delta: callable = None,
 ) -> MessageResponse:
     client = get_openai_client(provider)
     openai_messages = anthropic_messages_to_openai(messages)
@@ -208,9 +211,84 @@ def create_openai_message(
         "messages": openai_messages,
         "max_tokens": max_tokens,
     }
+    if reasoning_effort:
+        kwargs["reasoning_effort"] = reasoning_effort
+    if extra_body:
+        kwargs["extra_body"] = {**(kwargs.get("extra_body") or {}), **extra_body}
     openai_tools = anthropic_tools_to_openai(tools)
     if openai_tools:
         kwargs["tools"] = openai_tools
 
+    if on_delta is not None:
+        kwargs["stream"] = True
+        return _stream_openai(client, kwargs, on_delta)
+
     completion = client.chat.completions.create(**kwargs)
     return openai_response_to_anthropic(completion)
+
+
+def _stream_openai(client: OpenAI, kwargs: dict, on_delta: callable) -> MessageResponse:
+    """Stream chunks from OpenAI, calling on_delta(text, event_type) for TUI updates."""
+    from harness.ui.events import is_enabled
+
+    stream = client.chat.completions.create(**kwargs)
+    text_parts: list[str] = []
+    tool_call_buf: dict[str, dict] = {}  # index -> {id, name, args}
+    finish_reason: str | None = None
+    model: str | None = None
+    usage = None
+
+    for chunk in stream:
+        if not chunk.choices:
+            usage = usage or getattr(chunk, 'usage', None)
+            model = model or getattr(chunk, 'model', None)
+            continue
+        choice = chunk.choices[0]
+        delta = choice.delta
+        finish_reason = finish_reason or getattr(choice, 'finish_reason', None)
+        model = model or getattr(chunk, 'model', None)
+        usage = usage or getattr(chunk, 'usage', None)
+
+        if delta is None:
+            continue
+
+        # Text delta
+        if delta.content:
+            text_parts.append(delta.content)
+            if is_enabled():
+                on_delta(delta.content, "text_delta")
+
+        # Tool call delta
+        for tc in delta.tool_calls or []:
+            idx = tc.index
+            buf = tool_call_buf.setdefault(idx, {"id": "", "name": "", "args": ""})
+            if tc.id:
+                buf["id"] = tc.id
+            if tc.function and tc.function.name:
+                buf["name"] = tc.function.name
+            if tc.function and tc.function.arguments:
+                buf["args"] += tc.function.arguments
+
+    # Build blocks from accumulated stream
+    blocks: list = []
+    if text_parts:
+        blocks.append(TextBlock(text="".join(text_parts)))
+
+    has_tool_calls = bool(tool_call_buf)
+    for buf in sorted(tool_call_buf.values(), key=lambda b: list(tool_call_buf.keys())[list(tool_call_buf.values()).index(b)]):
+        try:
+            parsed = json.loads(buf["args"] or "{}")
+        except json.JSONDecodeError:
+            parsed = {"raw": buf["args"]}
+        blocks.append(ToolUseBlock(
+            id=buf["id"] or f"call_{uuid.uuid4().hex[:12]}",
+            name=buf["name"],
+            input=parsed if isinstance(parsed, dict) else {"value": parsed},
+        ))
+
+    return MessageResponse(
+        content=blocks,
+        stop_reason=_map_stop_reason(finish_reason, has_tool_calls),
+        model=model,
+        usage=usage,
+    )

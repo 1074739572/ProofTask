@@ -139,25 +139,3 @@ def test_prompt_shows_file_tag(monkeypatch):
 
     monkeypatch.setattr(runtime_mod, "_current_mode", "file")
     assert "|file]" in format_cli_prompt()
-
-
-def test_tui_file_mode_bypasses_agent_loop(monkeypatch):
-    import harness.project.session_registry as registry_mod
-    import harness.rag.file_mode as file_mode_mod
-    import harness.ui.tui.session as session_mod
-
-    rendered: list[str] = []
-    monkeypatch.setattr(file_mode_mod, "is_file_mode", lambda: True)
-    monkeypatch.setattr(file_mode_mod, "handle_file_mode_turn", lambda query: "grounded answer")
-    monkeypatch.setattr(registry_mod, "touch_session_title_from_query", lambda query: None)
-    monkeypatch.setattr(session_mod.renderer, "user", lambda text: None)
-    monkeypatch.setattr(session_mod.renderer, "assistant", rendered.append)
-    monkeypatch.setattr(
-        session_mod,
-        "agent_loop",
-        lambda *args, **kwargs: pytest.fail("file mode must bypass agent_loop"),
-    )
-
-    result = session_mod.run_agent_turn([], {}, "文档里写了什么？", binding=mock.MagicMock())
-    assert result["interrupted"] is False
-    assert rendered == ["grounded answer"]

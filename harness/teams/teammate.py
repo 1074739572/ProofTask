@@ -144,7 +144,7 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
             },
             {
                 "name": "read_file",
-                "description": "Read file.",
+                "description": "Read file with line numbers and total-line header; use limit/offset to page.",
                 "input_schema": {
                     "type": "object",
                     "properties": {

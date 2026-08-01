@@ -16,6 +16,7 @@ def create_provider_message(
     max_tokens: int,
     system: str | None = None,
     tools: list | None = None,
+    on_delta: callable = None,
 ):
     provider = get_provider(profile.provider)
     # Session blocks may include provider-specific shapes; sanitize before API.
@@ -46,6 +47,9 @@ def create_provider_message(
             max_tokens=max_tokens,
             system=system,
             tools=tools,
+            reasoning_effort=profile.reasoning_effort,
+            extra_body=profile.extra_body,
+            on_delta=on_delta,
         )
 
     raise RuntimeError(f"Unsupported provider type '{provider.type}' for '{provider.id}'")

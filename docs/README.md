@@ -18,9 +18,12 @@
 | RAG 解析、检索、回答怎么分层评测 | [rag-evaluation.md](./rag-evaluation.md) |
 | 项目说明书 HARNESS.md | [project-instructions.md](./project-instructions.md) |
 | 工具注册 / 调用 / 权限 | [tools.md](./tools.md) |
+| 队友生命周期 | [teammate-lifecycle.md](./teammate-lifecycle.md) |
 | 2026-07-07 大改总览 | [CHANGELOG-2026-07-07.md](./CHANGELOG-2026-07-07.md) |
 | 2026-07-12 会话 / lookup / 评测 | [CHANGELOG-2026-07-12.md](./CHANGELOG-2026-07-12.md) |
 | 2026-07-15 落锚 / 工具 UI / skills | [CHANGELOG-2026-07-15.md](./CHANGELOG-2026-07-15.md) |
+
+本地约定：`.local/` 只放下载、实验与运行产物（不入库，见根 [.gitignore](../.gitignore)）。
 
 ---
 
@@ -36,6 +39,14 @@
 | [004](./bugs/004-context-compaction.md) | 上下文压缩丢信息 | Phase 1 + 最新 user 优先 |
 | [005](./bugs/005-tool-loop-drift.md) | 工具空转与目标漂移 | 部分缓解（RepeatGuard · Lookup mode） |
 | [006](./bugs/006-final-answer-buried.md) | 最终回答看不见（漏打 · 刷屏） | 已缓解（turn_start + 静默诊断行） |
+| [007](./bugs/007-permission-interrupt-gbk.md) | 权限卡住 / Esc / GBK | 已缓解 |
+| [008](./bugs/008-textual-tui-m1.md) | Textual TUI M1 | 已移除（设计存档；当前默认 Rich CLI） |
+| [009](./bugs/009-compact-empty-summary.md) | Compact 空摘要失忆 | 已修复 |
+| [010](./bugs/010-lookup-guard-calibration.md) | LookupGuard 校准 | 已修复 |
+| [011](./bugs/011-autocompact-token-threshold.md) | Auto-compact 过早 | 已修复 |
+| [012](./bugs/012-pie-menus-lookup-throttle.md) | Pie Menus 联网护栏过紧 | 已修复+验过 |
+| [013](./bugs/013-append-only-history-cache.md) | 工具历史改写破坏缓存前缀 | 已修复+回归通过 |
+| [014](./bugs/014-long-turn-api-stall.md) | 长任务等待模型时 TUI 假死 | 已定位，延期修复 |
 
 五条线的关系见 [bugs/README.md](./bugs/README.md) 里的关系图（含 006 终答可见）。
 

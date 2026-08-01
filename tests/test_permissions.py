@@ -1,0 +1,166 @@
+"""Declarative permission engine tests."""
+
+from __future__ import annotations
+
+from unittest import mock
+
+from harness.hooks import permission_hook
+from harness.permissions.config import _normalize_rules
+from harness.permissions.engine import evaluate_permission
+from harness.permissions.state import (
+    add_session_rule,
+    clear_session_rules,
+    session_rules,
+)
+
+
+def test_bash_last_matching_rule_wins():
+    rules = {
+        "*": "ask",
+        "bash": {
+            "*": "ask",
+            "git *": "allow",
+            "git push*": "deny",
+        },
+    }
+    assert evaluate_permission("bash", {"command": "git status"}, rules=rules).effect == "allow"
+    assert evaluate_permission("bash", {"command": "git push origin main"}, rules=rules).effect == "deny"
+
+
+def test_file_resource_rules_can_deny_env_but_allow_example():
+    rules = {
+        "read_file": {
+            "*": "allow",
+            "*.env": "deny",
+            "*.env.*": "deny",
+            "*.env.example": "allow",
+        }
+    }
+    assert evaluate_permission("read_file", {"path": ".env"}, rules=rules).effect == "deny"
+    assert evaluate_permission("read_file", {"path": ".env.local"}, rules=rules).effect == "deny"
+    assert evaluate_permission("read_file", {"path": ".env.example"}, rules=rules).effect == "allow"
+
+
+def test_tool_name_wildcard_matches_mcp_tools():
+    rules = {
+        "*": "allow",
+        "mcp__*": "ask",
+        "mcp__github__delete_branch": "deny",
+    }
+    assert evaluate_permission("mcp__fetch__fetch", {"url": "https://example.com"}, rules=rules).effect == "ask"
+    assert evaluate_permission("mcp__github__delete_branch", {"branch": "main"}, rules=rules).effect == "deny"
+
+
+def test_mcp_annotations_are_fallback_only():
+    assert (
+        evaluate_permission(
+            "mcp__docs__search",
+            {"query": "permissions"},
+            mcp_meta={"readOnly": True},
+            rules={},
+        ).effect
+        == "allow"
+    )
+    assert (
+        evaluate_permission(
+            "mcp__unknown__mutate",
+            {"id": "1"},
+            mcp_meta={},
+            rules={},
+        ).effect
+        == "ask"
+    )
+
+
+def test_normalize_accepts_top_level_string_policy():
+    assert _normalize_rules({"permission": "allow"}) == {"*": "allow"}
+
+
+def test_session_rule_overrides_config():
+    clear_session_rules()
+    try:
+        add_session_rule("bash", "npm test*", "allow")
+        decision = evaluate_permission(
+            "bash",
+            {"command": "npm test -- --watch=false"},
+            rules={"bash": {"*": "ask"}},
+        )
+        assert decision.effect == "allow"
+        assert decision.source == "session"
+    finally:
+        clear_session_rules()
+
+
+def test_external_directory_gate_runs_before_tool_permission():
+    rules = {
+        "read_file": "allow",
+        "external_directory": "ask",
+    }
+    decision = evaluate_permission(
+        "read_file",
+        {"path": "C:/outside/project/notes.txt"},
+        rules=rules,
+        include_saved=False,
+    )
+    assert decision.effect == "ask"
+    assert decision.save_tool == "external_directory"
+    assert decision.external_resource is not None
+
+
+def test_external_directory_can_be_allowed_then_tool_rule_applies():
+    rules = {
+        "external_directory": {"C:/outside/project*": "allow"},
+        "read_file": "allow",
+    }
+    decision = evaluate_permission(
+        "read_file",
+        {"path": "C:/outside/project/notes.txt"},
+        rules=rules,
+        include_saved=False,
+    )
+    assert decision.effect == "allow"
+    assert decision.tool == "read_file"
+
+
+def test_permission_hook_remembers_session_approval():
+    clear_session_rules()
+    response = mock.Mock(decision="session", allowed=True, remember_session=True, remember_always=False, value="")
+    block = {"name": "bash", "input": {"command": "npm test"}}
+    try:
+        with mock.patch("harness.hooks.evaluate_permission") as evaluate, mock.patch(
+            "harness.hooks.ask_permission", return_value=response
+        ), mock.patch("harness.hooks.audit_permission"):
+            evaluate.return_value = mock.Mock(
+                effect="ask",
+                resource="npm test",
+                reason="matched bash:*",
+                source="config",
+                save_tool="bash",
+                save_resource="npm test*",
+                external_resource=None,
+            )
+            assert permission_hook(block) is None
+        assert any(rule.tool == "bash" and rule.resource == "npm test*" for rule in session_rules())
+    finally:
+        clear_session_rules()
+
+
+def test_permission_hook_persists_always_approval():
+    response = mock.Mock(decision="always", allowed=True, remember_session=False, remember_always=True, value="")
+    block = {"name": "bash", "input": {"command": "npm test"}}
+    with mock.patch("harness.hooks.evaluate_permission") as evaluate, mock.patch(
+        "harness.hooks.ask_permission", return_value=response
+    ), mock.patch("harness.hooks.audit_permission"), mock.patch(
+        "harness.hooks.add_persistent_rule"
+    ) as add_persistent:
+        evaluate.return_value = mock.Mock(
+            effect="ask",
+            resource="npm test",
+            reason="matched bash:*",
+            source="config",
+            save_tool="bash",
+            save_resource="npm test*",
+            external_resource=None,
+        )
+        assert permission_hook(block) is None
+    add_persistent.assert_called_once_with("bash", "npm test*", "allow")

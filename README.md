@@ -62,7 +62,7 @@ cd learn-claude-code
 | 欢迎页 / Session 面板 | Rich UI，中文状态行 |
 | 模型 / 模式选择器 | 终端 ↑↓ 菜单；`/mode` 含 direct / file / writing / lookup 等 |
 | 工具终端 UI | 只显示步骤 `›`/`●` + 回合末 Changed files；成功结果不刷屏 |
-| **Textual TUI（默认）** | 固定 4 区 Header/Steps/Answer/Prompt；`--classic` 回退 Rich CLI | [008](docs/bugs/008-textual-tui-m1.md) |
+| **Rich 行式 CLI（默认）** | 欢迎页 / 步骤 UI / 权限面板 / 回合文件摘要；`--event-stream` 输出 JSONL | [008](docs/bugs/008-textual-tui-m1.md) |
 | 中文 CLI 文案 | `/help`、`/resume`、`/clear`、`/rag` 等 |
 | 本地用量统计 | `.project/usage/`；`/usage`；提示符显示当前模型 |
 | 评测 | mini-eval / SWE-bench / GAIA validation | [evals](docs/evals.md) |
@@ -148,20 +148,18 @@ improved_harness/
 cd improved_harness
 cp .env.example .env          # 填入 API Key 与 MODEL_ID
 pip install -r requirements.txt
-python main.py                # 默认 Textual TUI
-python main.py --classic      # 经典 Rich 行模式
-python main.py --node-cli     # Node.js + Ink 纯终端模式
+python main.py                # 默认 Rich 行式 CLI
+python main.py --classic      # 同上（兼容参数，等价默认）
+python main.py --event-stream # JSONL 事件流后端（供外部 TUI 客户端）
 ```
 
 在**你的工作区目录**（cwd）跑 Agent；skills 从本包 `skills/` 加载；会话与任务状态写在 cwd 下的 `.project/` 等目录。
 
-TUI：顶栏 **今日/周用量**；Chat 顶部 **欢迎页**（hero + 每日一句 + 会话摘要）再接历史；聊天下方 **🤖模型 / 🧭模式 / 状态**（可点选）；底部输入。`HARNESS_TUI=0` 等同 `--classic`。
+欢迎页：顶部 **hero + 每日一句 + 会话摘要** 再接历史。每日一句队列在 `.project/daily_quotes.json`（Hitokoto），不足 5 条时启动后后台自动补货。
 
-每日一句：本地队列 `.project/daily_quotes.json`（Hitokoto）；不足 5 条启动后后台补货。手动：`python -m harness.ui.tui.quotes refill`。
+内置斜杠命令：`/help`、`/model`、`/mode`（含 **file** 文档问答）、`/resume`、`/skill`、`/clear`、`/quit`、`/usage`、`/rag`。
 
-TUI 内置：`/model`、`/mode`、`/resume`、`/skill`、`/clear`、`/help`、`/quit`。其余斜杠（`/rag`、`/usage`…）仍可用 `--classic`。
-
-常用命令：`/help`、`/model`、`/mode`（含 **file** 文档问答）、`/resume`、`/skill`、`/clear`；classic 另有 `/usage`、`/rag` 等。
+`--event-stream` 输出 JSONL 事件（`assistant_delta` / `tool_start` / `permission_request` 等），供外部 TUI 客户端消费；`--event-stream` 后端事件定义见 `harness/event_stream.py`。
 
 ```text
 › Working goal: 修好 lookup 死循环

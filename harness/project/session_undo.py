@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from harness.messages.repair import repair_tool_pairing, strip_trailing_incomplete_tool_turns
+from harness.project.session_registry import SessionBinding
 from harness.project.session_store import replace_session
 
 # User-role messages that are harness injections, not CLI turns.
@@ -53,7 +54,7 @@ def preview_last_turn(messages: list) -> str | None:
     return f'"{preview}" ({removed} message(s))'
 
 
-def undo_last_turn(messages: list, *, archive: bool = True) -> tuple[bool, str]:
+def undo_last_turn(messages: list, *, binding: SessionBinding) -> tuple[bool, str]:
     index = find_last_turn_index(messages)
     if index is None:
         return False, "Nothing to undo (no previous user prompt in this session)."
@@ -61,7 +62,7 @@ def undo_last_turn(messages: list, *, archive: bool = True) -> tuple[bool, str]:
     preview = preview_last_turn(messages)
     removed_count = len(messages) - index
     del messages[index:]
-    replace_session(messages, archive=archive)
+    replace_session(messages, binding=binding)
     return True, f"Undid last turn — removed {removed_count} message(s): {preview}"
 
 
@@ -104,8 +105,8 @@ def abort_inflight_turn(
     messages: list,
     turn_start: int | None,
     *,
+    binding: SessionBinding,
     keep_user: bool = False,
-    archive: bool = True,
 ) -> tuple[str, str | None]:
     """
     Interrupt handler: trim the in-flight turn and persist.
@@ -119,7 +120,7 @@ def abort_inflight_turn(
     resolved = resolve_turn_start(messages, turn_start)
     if resolved is None:
         removed = strip_trailing_incomplete_tool_turns(messages)
-        replace_session(messages, archive=archive)
+        replace_session(messages, binding=binding)
         if removed:
             return f"Interrupted — cleaned {removed} orphaned tool message(s).", None
         return "Interrupted — session already clean.", None
@@ -128,7 +129,7 @@ def abort_inflight_turn(
     removed = truncate_turn(messages, resolved, keep_user=keep_user)
     strip_trailing_incomplete_tool_turns(messages)
     repair_tool_pairing(messages)
-    replace_session(messages, archive=archive)
+    replace_session(messages, binding=binding)
 
     if keep_user:
         if removed:

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from harness.providers.config import get_provider, provider_key_status, resolve_api_key
@@ -15,6 +15,7 @@ MODELS_CONFIG_PATH = PACKAGE_ROOT / "config" / "models.json"
 
 _lock = threading.Lock()
 _current_model: str = ""
+_current_effort: str | None = None
 _catalog: list[dict] = []
 _default_model: str = ""
 
@@ -28,6 +29,8 @@ class ModelProfile:
     provider: str
     api_model: str
     thinking: bool = False
+    reasoning_effort: str | None = None
+    extra_body: dict = field(default_factory=dict)
     context_window: int = 0
 
 
@@ -40,6 +43,9 @@ def _load_catalog() -> tuple[str, list[dict]]:
                 "label": fallback,
                 "provider": "deepseek",
                 "api_model": fallback,
+                "thinking": False,
+                "reasoning_effort": None,
+                "extra_body": {},
                 "context_window": 1_000_000,
             }
         ]
@@ -58,6 +64,8 @@ def _load_catalog() -> tuple[str, list[dict]]:
                 "provider": entry.get("provider", "deepseek"),
                 "api_model": entry.get("api_model", model_id),
                 "thinking": bool(entry.get("thinking")),
+                "reasoning_effort": entry.get("reasoning_effort"),
+                "extra_body": entry.get("extra_body") or {},
                 "context_window": int(entry.get("context_window") or 0),
             }
         )
@@ -68,6 +76,9 @@ def _load_catalog() -> tuple[str, list[dict]]:
                 "label": default,
                 "provider": "deepseek",
                 "api_model": default,
+                "thinking": False,
+                "reasoning_effort": None,
+                "extra_body": {},
                 "context_window": 1_000_000,
             }
         ]
@@ -81,6 +92,8 @@ def _profile_from_entry(entry: dict) -> ModelProfile:
         provider=entry.get("provider", "deepseek"),
         api_model=entry.get("api_model", entry["id"]),
         thinking=bool(entry.get("thinking")),
+        reasoning_effort=entry.get("reasoning_effort"),
+        extra_body=dict(entry.get("extra_body") or {}),
         context_window=int(entry.get("context_window") or 0),
     )
 
@@ -105,6 +118,8 @@ def initialize_model(override: str | None = None) -> str:
                     "provider": "deepseek",
                     "api_model": initial,
                     "thinking": False,
+                    "reasoning_effort": None,
+                    "extra_body": {},
                     "context_window": 0,
                 }
             ]
@@ -129,14 +144,20 @@ def get_model_profile(model_id: str | None = None) -> ModelProfile:
         mid = model_id or _current_model or _default_model
         for entry in _catalog:
             if entry["id"] == mid:
-                return _profile_from_entry(entry)
-        return ModelProfile(
+                profile = _profile_from_entry(entry)
+                if _current_effort:
+                    return replace(profile, reasoning_effort=_current_effort)
+                return profile
+        profile = ModelProfile(
             id=mid,
             label=mid,
             provider="deepseek",
             api_model=mid,
+            reasoning_effort=_current_effort,
+            extra_body={},
             context_window=0,
         )
+        return profile
 
 
 def _provider_label(provider_id: str) -> str:
@@ -223,10 +244,14 @@ def format_model_list() -> str:
             marker = " *" if entry["id"] == current else "  "
             suffix = entry["label"]
             api = entry.get("api_model", entry["id"])
-            if api != entry["id"] or entry.get("thinking"):
+            if api != entry["id"] or entry.get("thinking") or entry.get("reasoning_effort") or entry.get("extra_body"):
                 bits = [f"api={api}"]
                 if entry.get("thinking"):
                     bits.append("thinking")
+                if entry.get("reasoning_effort"):
+                    bits.append(f"effort={entry.get('reasoning_effort')}")
+                if entry.get("extra_body"):
+                    bits.append("extra_body")
                 suffix += f" [{', '.join(bits)}]"
             lines.append(f"{marker} {entry['id']:<28} {suffix}")
 
@@ -234,6 +259,46 @@ def format_model_list() -> str:
     lines.append("Switch with: /model  (interactive)  or  /model <id>")
     lines.append(f"API keys: edit {PACKAGE_ROOT / '.env'}")
     return "\n".join(lines)
+
+
+def get_reasoning_effort() -> str | None:
+    with _lock:
+        return _current_effort
+
+
+def set_reasoning_effort(effort: str | None) -> str:
+    global _current_effort
+    allowed = {"minimal", "low", "medium", "high", "xhigh", "off", "none", ""}
+    value = (effort or "").strip().lower()
+    if value not in allowed:
+        return "Unknown effort. Available: minimal, low, medium, high, xhigh, off"
+    with _lock:
+        _current_effort = None if value in ("", "off", "none") else value
+        return f"Reasoning effort: {_current_effort or 'model default'}"
+
+
+def format_effort_list() -> str:
+    current = get_reasoning_effort() or "model default"
+    return "Reasoning effort options:\n  minimal\n  low\n  medium\n  high\n  xhigh\n  off (model default)\n\nCurrent: " + current
+
+
+def handle_effort_command(query: str) -> str:
+    parts = query.strip().split(maxsplit=1)
+    if len(parts) == 1 or parts[1].lower() in ("list", "pick", "picker"):
+        return format_effort_list()
+    return set_reasoning_effort(parts[1])
+
+
+def list_efforts() -> list[dict]:
+    current = get_reasoning_effort() or "off"
+    return [
+        {"id": "off", "label": "Model default", "detail": "no override", "current": current == "off"},
+        {"id": "minimal", "label": "Minimal", "detail": "fastest", "current": current == "minimal"},
+        {"id": "low", "label": "Low", "detail": "cheap/fast", "current": current == "low"},
+        {"id": "medium", "label": "Medium", "detail": "balanced", "current": current == "medium"},
+        {"id": "high", "label": "High", "detail": "stronger reasoning", "current": current == "high"},
+        {"id": "xhigh", "label": "XHigh", "detail": "maximum reasoning", "current": current == "xhigh"},
+    ]
 
 
 def handle_model_command(query: str) -> str:

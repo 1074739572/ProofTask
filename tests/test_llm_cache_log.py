@@ -35,3 +35,38 @@ def test_cache_usage_prints_when_verbose(monkeypatch):
         _log_cache_usage(_response(), model_id="qwen-max")
         renderer.muted.assert_called_once()
         assert "hit=" in renderer.muted.call_args.args[0]
+
+
+def test_usage_update_emitted_when_event_stream_enabled():
+    import io
+    import json
+    from harness.ui import events
+
+    sink = io.StringIO()
+    events.enable_event_stream(sink)
+    try:
+        with patch("harness.llm.record_usage"):
+            _log_cache_usage(_response(), model_id="qwen-max")
+        lines = [json.loads(line) for line in sink.getvalue().splitlines() if line.strip()]
+        usage = [line for line in lines if line["type"] == "usage_update"]
+        assert usage, "usage_update should be emitted"
+        payload = usage[-1]
+        assert payload["input_tokens"] == 10
+        assert payload["output_tokens"] == 3
+        assert payload["cache_read_tokens"] == 8
+    finally:
+        events.disable_event_stream()
+
+
+def test_no_usage_update_when_usage_missing():
+    import io
+    from harness.ui import events
+
+    sink = io.StringIO()
+    events.enable_event_stream(sink)
+    try:
+        with patch("harness.llm.record_usage"):
+            _log_cache_usage(SimpleNamespace(usage=None), model_id="qwen-max")
+        assert sink.getvalue().strip() == ""
+    finally:
+        events.disable_event_stream()

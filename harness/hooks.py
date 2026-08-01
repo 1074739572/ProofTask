@@ -6,9 +6,16 @@ import re
 
 from harness.mcp.pool import mcp_tool_meta
 from harness.messages.blocks import block_field
+from harness.permissions.engine import evaluate_permission
+from harness.permissions.state import (
+    add_persistent_rule,
+    add_session_rule,
+    audit_permission,
+)
 from harness.settings import WORKDIR
 from harness.tools.filesystem import safe_path
-from harness.ui.permission_prompt import ask_permission
+from harness.ui import events
+from harness.ui.permission_prompt import PermissionResponse, ask_permission
 
 HOOKS: dict[str, list] = {
     "UserPromptSubmit": [],
@@ -18,13 +25,6 @@ HOOKS: dict[str, list] = {
 }
 
 DENY_LIST = ["rm -rf /", "sudo", "shutdown", "reboot", "mkfs", "dd if="]
-
-# Word-boundary destructive tokens (avoid substring false positives like "from").
-_DESTRUCTIVE_RE = re.compile(
-    r"(?:^|[\s;&|])(?:rm|chmod)\s|"
-    r"(?:^|[\s;&|])>\s*/etc/",
-    re.IGNORECASE,
-)
 
 # Spawning a nested interactive agent / new console hijacks the session.
 _NESTED_AGENT_RE = re.compile(
@@ -49,40 +49,21 @@ def trigger_hooks(event: str, *args):
 
 
 def _hook_print(message: str, *, warn: bool = False) -> None:
-    """Route hook notices to classic stdout."""
+    """Route hook notices to classic stdout; stay silent in JSONL event-stream mode."""
+    from harness.ui import events
+
+    if events.is_enabled():
+        return
     if warn:
         print(f"\n\033[33m{message}\033[0m")
     else:
         print(f"\033[90m{message}\033[0m" if message.startswith("[HOOK]") else message)
 
 
-# Playwright MCP tools that only browse / observe — not true destructive ops.
-# (Playwright marks many as destructiveHint; prompting on every navigate breaks search.)
-_MCP_BROWSE_SOFT_ALLOW = frozenset(
-    {
-        "browser_navigate",
-        "browser_navigate_back",
-        "browser_snapshot",
-        "browser_take_screenshot",
-        "browser_console_messages",
-        "browser_network_requests",
-        "browser_tabs",
-        "browser_wait_for",
-        "browser_resize",
-        "browser_handle_dialog",
-    }
-)
-
-
-def _mcp_tool_short_name(full_name: str) -> str:
-    # mcp__playwright__browser_navigate → browser_navigate
-    parts = full_name.split("__")
-    return parts[-1] if len(parts) >= 3 else full_name
-
-
 def permission_hook(block):
     name = block_field(block, "name", "")
     tool_input = block_field(block, "input", {}) or {}
+
     if name == "bash":
         command = tool_input.get("command", "")
         for pattern in DENY_LIST:
@@ -95,47 +76,89 @@ def permission_hook(block):
                 "script or service in-process with a finite command; if it needs "
                 "a separate terminal, tell the user the exact command to run."
             )
-        if _DESTRUCTIVE_RE.search(command):
-            _hook_print("[permission] destructive command", warn=True)
-            _hook_print(f"  {command}")
-            response = ask_permission(
-                "  Allow? [y/N] ",
-                detail=command,
-                title="Allow destructive command?",
-                editable=True,
-            )
-            if response.decision == "cancel":
-                return "Permission denied: cancelled by user"
-            if not response.allowed:
-                return "Permission denied by user"
-            edited = response.value.strip()
-            if edited and edited != command:
-                tool_input["command"] = edited
+
     if name in ("write_file", "edit_file"):
         path = tool_input.get("path", "")
         try:
             safe_path(path)
         except Exception:
             return f"Permission denied: path escapes workspace: {path}"
-    if name.startswith("mcp__"):
-        meta = mcp_tool_meta.get(name, {})
-        # readOnly wins over a noisy destructiveHint (browse tools).
-        if meta.get("readOnly"):
-            return None
-        short = _mcp_tool_short_name(name)
-        if short in _MCP_BROWSE_SOFT_ALLOW:
-            return None
-        if meta.get("destructive"):
-            _hook_print(f"[permission] MCP destructive tool: {name}", warn=True)
-            response = ask_permission(
-                "  Allow? [y/N] ",
-                detail=name,
-                title="Allow MCP destructive tool?",
-            )
-            if response.decision == "cancel":
-                return "Permission denied: cancelled by user"
-            if not response.allowed:
-                return "Permission denied by user"
+
+    decision = evaluate_permission(
+        name,
+        tool_input if isinstance(tool_input, dict) else {},
+        mcp_meta=mcp_tool_meta.get(name),
+    )
+    audit_permission(
+        {
+            "event": "decision",
+            "tool": name,
+            "resource": decision.resource,
+            "effect": decision.effect,
+            "reason": decision.reason,
+            "source": decision.source,
+            "save_tool": decision.save_tool,
+            "save_resource": decision.save_resource,
+        }
+    )
+    if decision.effect == "allow":
+        return None
+    if decision.effect == "deny":
+        audit_permission(
+            {
+                "event": "blocked",
+                "tool": name,
+                "resource": decision.resource,
+                "reason": decision.reason,
+            }
+        )
+        return (
+            f"Permission denied: {name} on {decision.resource!r} "
+            f"({decision.reason})"
+        )
+
+    _hook_print(f"[permission] {name} requires approval", warn=True)
+    if decision.resource and decision.resource != "*":
+        _hook_print(f"  {decision.resource}")
+    if decision.external_resource:
+        _hook_print(f"  external: {decision.external_resource}")
+    if events.is_enabled():
+        from harness.ui.permission_events import request_permission
+        choice = request_permission(name, decision.resource or name, f"Allow {name}?")
+        response = PermissionResponse("jsonl-permission", choice, decision.resource or name)
+    else:
+        response = ask_permission(
+            "  Allow? [y/N] ",
+            detail=decision.resource or name,
+            title=f"Allow {name}?",
+            editable=name == "bash",
+            remember=True,
+        )
+    audit_permission(
+        {
+            "event": "reply",
+            "tool": name,
+            "resource": decision.resource,
+            "reply": response.decision,
+            "save_tool": decision.save_tool,
+            "save_resource": decision.save_resource,
+        }
+    )
+    if response.decision == "cancel":
+        return "Permission denied: cancelled by user"
+    if not response.allowed:
+        return "Permission denied by user"
+    save_tool = decision.save_tool or name
+    save_resource = decision.save_resource or decision.resource or "*"
+    if response.remember_session:
+        add_session_rule(save_tool, save_resource, "allow")
+    if response.remember_always:
+        add_persistent_rule(save_tool, save_resource, "allow")
+    if name == "bash":
+        edited = response.value.strip()
+        command = tool_input.get("command", "")
+        if edited and edited != command:
+            tool_input["command"] = edited
     return None
 
 

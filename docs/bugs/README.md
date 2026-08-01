@@ -19,7 +19,7 @@
 | [005](./005-tool-loop-drift.md) | 工具空转与目标漂移 | 部分缓解 | LookupGuard 硬拦；micro_compact 防嵌套；MCP 超时温和返回 |
 | [006](./006-final-answer-buried.md) | 最终回答看不见 | 已缓解 | A：compact 后 turn_start 漏打；B：cache/compact 刷屏盖住；C：loop 内立即打印 |
 | [007](./007-permission-interrupt-gbk.md) | 权限卡住 / Esc / GBK | 已缓解 | Allow? 可取消；禁嵌套 agent；bash UTF-8 |
-| [008](./008-textual-tui-m1.md) | Textual TUI M1 | 已落地 | 默认 4 区 TUI；`--classic` 回退 |
+| [008](./008-textual-tui-m1.md) | Textual TUI M1 | 已移除 | 设计取舍存档；当前默认 Rich CLI |
 | [009](./009-compact-empty-summary.md) | Compact 空摘要失忆 | 已修复 | 推理模型摘要在 thinking 块；extract 只读 text → `(empty summary)` |
 | [010](./010-lookup-guard-calibration.md) | LookupGuard 校准 | 已修复 | 硬失败不烧全局 stale；连续 block 强制收口 + 禁 memory |
 | [011](./011-autocompact-token-threshold.md) | Auto-compact 过早 | 已修复 | 50KB 字符硬限 → `0.835×context_window`（token） |
@@ -46,7 +46,7 @@
                    └► 012 Pie Menus（near-dup / 跑题 SERP / 去掉次数硬顶）
 终答看得见吗 ──► 006（漏打 / 刷屏 / loop 内打印）
 权限 / 打断卡死 ──► 007（Allow? + GBK）
-默认交互壳 ──► 008（Textual TUI · --classic）
+默认交互壳 ──► 008（Textual 设计存档；当前 Rich CLI）
 ```
 
 | 用户痛点 | 主要文档 | 004 有没有帮到 |

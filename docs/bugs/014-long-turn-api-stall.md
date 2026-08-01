@@ -47,6 +47,6 @@
 - `harness/agent/cancel.py`
 - `harness/providers/anthropic.py`
 - `harness/providers/openai_compat.py`
-- `harness/ui/tui/session.py`
-- `harness/ui/tui/bridge.py`
-- `harness/ui/tui/app.py`
+- `harness/providers/router.py`
+- `harness/cli.py`（等待时的 UI 状态）
+- `harness/ui/renderer.py`

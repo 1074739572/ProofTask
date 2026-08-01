@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import threading
 
 from harness.agent.background import (
@@ -45,7 +46,7 @@ from harness.todos.state import note_llm_round_without_todo_update, rounds_since
 from harness.ui.renderer import renderer
 from harness.ui.turn_summary import TurnMutationTracker
 
-agent_lock = threading.Lock()
+agent_lock = threading.RLock()
 
 
 def _append_assistant(messages: list, content) -> None:
@@ -111,10 +112,21 @@ def agent_loop(
 ) -> bool:
     """Run until the agent finishes or cancel is requested. Returns True if interrupted.
 
-    max_rounds: optional cap on LLM turns (used by evals). None = unlimited.
+    max_rounds: optional cap on LLM turns (used by evals). When None the cap is
+    read from HARNESS_MAX_LLM_ROUNDS (default 40) so an agent looping on tools
+    cannot spin forever; pass max_rounds=0 to disable the cap entirely.
     binding: optional SessionBinding for persisting compact boundaries.
     """
     from harness.prompts.ephemeral import reset_ephemeral_cache
+
+    if max_rounds is None:
+        raw = os.getenv("HARNESS_MAX_LLM_ROUNDS", "40").strip()
+        try:
+            max_rounds = int(raw)
+        except ValueError:
+            max_rounds = 40
+        if max_rounds <= 0:
+            max_rounds = None  # 0 disables the cap (explicit opt-out)
 
     reset_ephemeral_cache()
     state = RecoveryState()
@@ -135,15 +147,16 @@ def agent_loop(
             return _finish(True)
 
         if max_rounds is not None and llm_rounds >= max_rounds:
+            note = (
+                f"[Stopped] reached max_rounds={max_rounds}. The agent looked "
+                f"stuck in a loop, so the turn was stopped. Send a new message "
+                f"to continue, or raise HARNESS_MAX_LLM_ROUNDS."
+            )
+            renderer.warn(note)
             messages.append(
                 {
                     "role": "assistant",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": f"[Stopped] reached max_rounds={max_rounds}",
-                        }
-                    ],
+                    "content": [{"type": "text", "text": note}],
                 }
             )
             trigger_hooks("Stop", messages)
