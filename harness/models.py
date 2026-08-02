@@ -53,7 +53,7 @@ def _normalize_effort_options(values: object) -> tuple[str, ...]:
 
 
 def _effort_options_text(options: tuple[str, ...]) -> str:
-    return ", ".join(options) if options else "none declared"
+    return ", ".join("extra high" if opt == "xhigh" else opt for opt in options) if options else "none declared"
 
 
 @dataclass(frozen=True)
@@ -301,7 +301,7 @@ def format_model_list() -> str:
                 if entry.get("reasoning_effort"):
                     bits.append(f"default effort={entry.get('reasoning_effort')}")
                 if entry.get("effort_options"):
-                    bits.append(f"efforts={_effort_options_text(tuple(entry.get('effort_options') or ())) }")
+                    bits.append(f"efforts={_effort_options_text(tuple(entry.get('effort_options') or ()))}")
                 if entry.get("extra_body"):
                     bits.append("extra_body")
                 suffix += f" [{', '.join(bits)}]"
