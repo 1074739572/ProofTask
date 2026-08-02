@@ -87,3 +87,14 @@ temp_pdf*.txt
   
 # Generated scraps folder  
 _scraps/  
+
+# OCR tooling artifacts (screen capture slices / regions)
+image_slices/
+ocr_regions/
+make_ocr_regions.py
+ocr_win.ps1
+
+# Ad-hoc run outputs
+_task_outputs/
+harness-engineering-review-*.png
+preview_harness_review.jpg
