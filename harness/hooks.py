@@ -12,7 +12,7 @@ from harness.permissions.state import (
     add_session_rule,
     audit_permission,
 )
-from harness.settings import WORKDIR
+from harness.settings import WORKDIR, get_workdir
 from harness.tools.filesystem import safe_path
 from harness.ui import events
 from harness.ui.permission_prompt import PermissionResponse, ask_permission
@@ -212,7 +212,7 @@ def user_prompt_hook(query: str):
 
     if not hooks_verbose():
         return None
-    _hook_print(f"[HOOK] UserPromptSubmit: {WORKDIR}")
+    _hook_print(f"[HOOK] UserPromptSubmit: {get_workdir()}")
     return None
 
 

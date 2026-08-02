@@ -42,7 +42,7 @@ class MessageBus:
             return []
         msgs = [
             json.loads(line)
-            for line in inbox.read_text(encoding="utf-8").splitlines()
+            for line in inbox.read_text(encoding="utf-8", errors="replace").splitlines()
             if line.strip()
         ]
         inbox.unlink()

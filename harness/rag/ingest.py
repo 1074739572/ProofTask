@@ -22,7 +22,15 @@ from harness.rag.enrichment import (
     vision_stats,
 )
 from harness.rag.parents import is_parent, is_searchable
-from harness.settings import PACKAGE_ROOT, WORKDIR
+from harness.settings import PACKAGE_ROOT, get_workdir
+
+# Current workspace root as a module attribute so tests can monkeypatch it and
+# workspace switching can re-point it without restarting the process.
+WORKDIR = get_workdir()
+
+
+def _workdir() -> Path:
+    return WORKDIR if WORKDIR is not None else get_workdir()
 
 
 def resolve_path(path: str | None) -> Path:
@@ -30,16 +38,16 @@ def resolve_path(path: str | None) -> Path:
         candidate = DEFAULT_CORPUS
         if candidate.exists():
             return candidate
-        return WORKDIR / "files" / "样例"
+        return _workdir() / "files" / "样例"
 
     raw = Path(path)
     if raw.is_absolute():
         return raw
-    for base in (WORKDIR, PACKAGE_ROOT):
+    for base in (_workdir(), PACKAGE_ROOT):
         candidate = (base / raw).resolve()
         if candidate.exists():
             return candidate
-    return (WORKDIR / raw).resolve()
+    return (_workdir() / raw).resolve()
 
 
 def discover_files(root: Path) -> list[Path]:

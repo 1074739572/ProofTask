@@ -15,10 +15,12 @@ def list_corpus_inventory(path: str = DEFAULT_INDEX_PATH) -> list[dict]:
     Each row: index, source, path, state ('indexed'|'stale'|'pending'|'missing'),
     chunks, chars, selected.
     """
+    from harness.rag.ingest import WORKDIR as _ingest_workdir
+
     try:
         root = resolve_path(path)
     except Exception:
-        root = Path.cwd() / "files"
+        root = _ingest_workdir / "files"
 
     manifest = load_manifest()
     sources = dict(manifest.get("sources") or {})
@@ -130,10 +132,12 @@ def _skipped_unsupported_summary(root: Path) -> str:
 
 def format_files_list(path: str = DEFAULT_INDEX_PATH) -> str:
     """Human-readable local corpus inventory with index marks."""
+    from harness.rag.ingest import WORKDIR as _ingest_workdir
+
     try:
         root = resolve_path(path)
     except Exception:
-        root = Path.cwd() / "files"
+        root = _ingest_workdir / "files"
 
     rows = list_corpus_inventory(path)
     reason = index_refresh_reason(path if root.exists() else None)

@@ -17,6 +17,7 @@ from typing import Any
 from harness.agent.cancel import clear_cancel, request_cancel
 from harness.cli import (
     _match_cli_command,
+    _resolve_open_directory,
     bootstrap_cli_session,
     print_turn_assistants,
 )
@@ -43,14 +44,14 @@ def _status_payload(context: dict, binding, history: list) -> dict:
     from harness.agent.compact.sizing import estimate_tokens, model_context_window
     from harness.models import get_model
     from harness.modes import get_mode
-    from harness.settings import WORKDIR
+    from harness.settings import get_workdir
     from harness.usage.store import totals_for_day
 
     usage = totals_for_day()
     return {
         "model": get_model(),
         "mode": get_mode(),
-        "cwd": str(WORKDIR),
+        "cwd": str(get_workdir()),
         "session_id": getattr(binding, "session_id", ""),
         "running": False,
         "session_source": context.get("session_source", ""),
@@ -70,6 +71,76 @@ def _emit_status(context: dict, binding, history: list, *, running: bool = False
     payload["running"] = running
     emit("session_status", **payload)
     emit("task_update", tasks=get_todos())
+
+
+def _handle_open_workspace(query: str) -> tuple[str | None, str | None, bool]:
+    """Resolve a TUI `/open` request.
+
+    Returns ``(note, target_cwd, list_mode)``.
+
+    - ``list_mode=True``: the user typed bare ``/open`` — the caller should emit
+      the recent-projects list (``workspace_list`` event) instead of switching.
+    - otherwise ``target_cwd`` is the resolved workspace directory to switch to
+      (in-process, no restart), or ``note`` holds the error message.
+    """
+    raw_path = query.strip()[len("/open") :].strip()
+    if not raw_path:
+        return None, None, True
+
+    # `/open <N>` selects the Nth recently opened project.
+    if raw_path.isdigit():
+        from harness.workspace import list_recent_projects
+
+        projects = list_recent_projects()
+        index = int(raw_path)
+        if index < 1 or index > len(projects):
+            return f"序号超出范围（1–{len(projects)}）", None, False
+        target = projects[index - 1]["path"]
+        return f"Switching workspace to {target}", target, False
+
+    workspace, error = _resolve_open_directory(query)
+    if workspace is None:
+        return error, None, False
+    return f"Switching workspace to {workspace}", str(workspace), False
+
+
+def _emit_workspace_list() -> None:
+    """Emit the recent-projects list as a structured event + readable log."""
+    from harness.workspace import list_recent_projects
+
+    projects = list_recent_projects()
+    emit("workspace_list", projects=projects)
+    if not projects:
+        emit("log", level="plain", text="还没有打开过其他项目。用法：/open <目录>")
+        return
+    lines = ["最近打开的项目：/open <目录> 切换（或 /open 序号）"]
+    for index, project in enumerate(projects, start=1):
+        mark = "  ← 当前" if project["current"] else ""
+        lines.append(f"  {index}. {project['path']}{mark}")
+    emit("log", level="plain", text="\n".join(lines))
+
+
+def _handle_completion_request(command: dict) -> dict:
+    """Resolve a ``completion_request`` command into a ``completion_result`` payload.
+
+    Mirrors the CLI's readline tab completion: ``@path`` completes files and
+    directories, ``/open <path>`` completes directories only.  Uses the shared
+    pure core (``harness.path_completion``) so TUI and CLI stay in sync.
+    """
+    from harness.path_completion import complete_paths
+    from harness.settings import get_workdir
+
+    text = str(command.get("text") or "")
+    cursor = command.get("cursor")
+    try:
+        cursor_pos = int(cursor) if cursor is not None else None
+    except (TypeError, ValueError):
+        cursor_pos = None
+    candidates = complete_paths(text, cursor_pos, cwd=get_workdir())
+    return {
+        "request_id": str(command.get("request_id") or ""),
+        "candidates": candidates,
+    }
 
 
 def _handle_slash_command(query: str, history: list, binding) -> tuple[str | None, object]:
@@ -159,6 +230,8 @@ def _handle_slash_command(query: str, history: list, binding) -> tuple[str | Non
     if query.strip().lower() in ("/help",):
         return (
             "TUI commands:\n"
+            "  /open <directory>  — switch workspace (instant, no restart)\n"
+            "  @path + Tab        — complete file/dir path\n"
             "  /model <id>  — switch model (use /models to list)\n"
             "  /effort      — choose reasoning effort\n"
             "  /models      — list available models\n"
@@ -182,6 +255,33 @@ def _run_user_turn(query: str, history: list, context: dict, binding, *, echo_us
     # messages, regardless of echo_user. Feedback is delivered via log events.
     if echo_user and not query.strip().startswith("/"):
         emit("user_message", text=query, silent=False)
+
+    # /open switches the workspace in-process (no backend restart): validate,
+    # flip the active workspace root, re-bind sessions, and reset RAG caches.
+    # Emits `workspace_switched` so the TUI can refresh the header; the process
+    # keeps running with zero SDK re-imports.
+    if _match_cli_command(query, "/open"):
+        note, target, list_mode = _handle_open_workspace(query)
+        if list_mode:
+            _emit_workspace_list()
+            return context, False, binding
+        if target is None:
+            emit("log", level="warn", text=note)
+            return context, False, binding
+        from harness.workspace import switch_workspace
+
+        ok, result, new_binding = switch_workspace(target)
+        if not ok:
+            emit("log", level="warn", text=result)
+            return context, False, binding
+        if new_binding is not None:
+            from harness.todos.state import set_binding as _todos_set_binding
+
+            _todos_set_binding(new_binding)
+            binding = new_binding
+        emit("workspace_switched", cwd=result.replace("Switched workspace → ", "").strip())
+        emit("log", level="plain", text=result)
+        return update_context(context, history), False, binding
 
     if query.strip().startswith("/"):
         command_note, new_binding = _handle_slash_command(query, history, binding)
@@ -331,6 +431,10 @@ def run_event_stream() -> None:
                 continue
             if ctype == "clear":
                 emit("ui_clear")
+                continue
+            if ctype == "completion_request":
+                payload = _handle_completion_request(command)
+                emit("completion_result", **payload)
                 continue
             if ctype in ("user_message", "slash_command"):
                 text = str(command.get("text") or command.get("command") or "").strip()

@@ -49,7 +49,7 @@ def _find_task_path(task_id: str) -> Path | None:
 
 
 def _load_task_from_path(path: Path) -> Task:
-    data = json.loads(path.read_text(encoding="utf-8"))
+    data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
     if "completed_at" not in data:
         data["completed_at"] = None
     return Task(**data)

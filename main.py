@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 """Run the improved harness agent from the package root."""
 
-# Apply SSL patch early, before any huggingface_hub imports.
-# Required on some Windows machines where huggingface.co's CA is missing.
-import harness._ssl_patch  # noqa: F401
-
 import argparse
+import os
 import sys
+from pathlib import Path
 
 
 def _ensure_utf8_stdio() -> None:
@@ -23,6 +21,12 @@ def _ensure_utf8_stdio() -> None:
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="improved_harness agent CLI")
+    parser.add_argument(
+        "--workspace",
+        "-C",
+        metavar="DIR",
+        help="Switch to DIR before starting",
+    )
     parser.add_argument(
         "--banner-demo",
         action="store_true",
@@ -105,6 +109,16 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _change_workspace(workspace: str | None) -> None:
+    if not workspace:
+        return
+    path = Path(workspace).expanduser()
+    try:
+        os.chdir(path)
+    except OSError as exc:
+        raise SystemExit(f"Cannot open workspace {workspace!r}: {exc}") from exc
+
+
 def _run_rag_command(args: argparse.Namespace) -> int:
     from harness.rag.commands import (
         run_rag_add,
@@ -152,6 +166,12 @@ def _run_rag_command(args: argparse.Namespace) -> int:
 if __name__ == "__main__":
     _ensure_utf8_stdio()
     args = _parse_args()
+    _change_workspace(args.workspace)
+
+    # Apply the SSL patch before any huggingface_hub import, but only after the
+    # workspace switch: importing the harness package eagerly freezes
+    # harness.settings.WORKDIR from the pre-switch cwd.
+    import harness._ssl_patch  # noqa: F401
 
     if args.banner_demo:
         from harness.ui.banner import run_banner_demo

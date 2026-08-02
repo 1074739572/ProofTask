@@ -8,7 +8,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from harness.settings import WORKDIR, WORKTREES_DIR
+from harness.settings import WORKDIR, WORKTREES_DIR, get_workdir
 from harness.tasks import load_task, save_task
 
 VALID_WT_NAME = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
@@ -31,7 +31,7 @@ def run_git(args: list[str]) -> tuple[bool, str]:
     try:
         result = subprocess.run(
             ["git"] + args,
-            cwd=WORKDIR,
+            cwd=get_workdir(),
             capture_output=True,
             text=True,
             timeout=30,

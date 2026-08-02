@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import os
+import threading
+from dataclasses import dataclass
 from pathlib import Path
 
 from dotenv import load_dotenv
 
 PACKAGE_ROOT = Path(__file__).resolve().parent.parent
-WORKDIR = Path.cwd()
 
 load_dotenv(PACKAGE_ROOT / ".env")
 load_dotenv(override=True)
@@ -20,18 +21,100 @@ PERMISSIONS_CONFIG_PATH = CONFIG_DIR / "permissions.json"
 PROVIDERS_CONFIG_PATH = CONFIG_DIR / "providers.json"
 MODELS_CONFIG_PATH = CONFIG_DIR / "models.json"
 
-TRANSCRIPT_DIR = WORKDIR / ".transcripts"
-TOOL_RESULTS_DIR = WORKDIR / ".task_outputs" / "tool-results"
-TASKS_DIR = WORKDIR / ".tasks"
-WORKTREES_DIR = WORKDIR / ".worktrees"
-MAILBOX_DIR = WORKDIR / ".mailboxes"
-MEMORY_DIR = WORKDIR / ".memory"
-PROJECT_DIR = WORKDIR / ".project"
-MEMORY_INDEX = MEMORY_DIR / "MEMORY.md"
-DURABLE_CRON_PATH = WORKDIR / ".scheduled_tasks.json"
+# The process workspace.  ``WORKDIR`` is the startup directory (frozen at import
+# time, historically ``Path.cwd()``); the *active* workspace is tracked in
+# ``WorkspaceContext`` so a running process can switch projects without
+# restarting (opencode-style directory-bound sessions).  Everything that must
+# follow the current project reads ``get_workdir()``.
+WORKDIR = Path.cwd()
+
+_WORKSPACE_LOCK = threading.RLock()
+_workspace = WORKDIR
+_workspace_generation = 0
+
+
+@dataclass(frozen=True)
+class WorkspacePaths:
+    """Paths derived from a workspace root (recomputed on every switch)."""
+
+    root: Path
+    transcript_dir: Path
+    tool_results_dir: Path
+    tasks_dir: Path
+    worktrees_dir: Path
+    mailbox_dir: Path
+    memory_dir: Path
+    memory_index: Path
+    project_dir: Path
+    durable_cron_path: Path
+
+
+def _derive_paths(root: Path) -> WorkspacePaths:
+    return WorkspacePaths(
+        root=root,
+        transcript_dir=root / ".transcripts",
+        tool_results_dir=root / ".task_outputs" / "tool-results",
+        tasks_dir=root / ".tasks",
+        worktrees_dir=root / ".worktrees",
+        mailbox_dir=root / ".mailboxes",
+        memory_dir=root / ".memory",
+        memory_index=root / ".memory" / "MEMORY.md",
+        project_dir=root / ".project",
+        durable_cron_path=root / ".scheduled_tasks.json",
+    )
+
+
+# Module-level mirrors of the startup workspace.  These are kept for
+# backward-compatible imports; code that must follow live switches should use
+# ``get_workspace()`` / ``get_workdir()`` instead.
+_ws = _derive_paths(WORKDIR)
+
+TRANSCRIPT_DIR = _ws.transcript_dir
+TOOL_RESULTS_DIR = _ws.tool_results_dir
+TASKS_DIR = _ws.tasks_dir
+WORKTREES_DIR = _ws.worktrees_dir
+MAILBOX_DIR = _ws.mailbox_dir
+MEMORY_DIR = _ws.memory_dir
+PROJECT_DIR = _ws.project_dir
+MEMORY_INDEX = _ws.memory_index
+DURABLE_CRON_PATH = _ws.durable_cron_path
 
 for path in (TASKS_DIR, WORKTREES_DIR, MAILBOX_DIR, PROJECT_DIR):
     path.mkdir(exist_ok=True)
+
+
+def get_workdir() -> Path:
+    """Active workspace root (thread-safe, follows in-process switches)."""
+    with _WORKSPACE_LOCK:
+        return _workspace
+
+
+def get_workspace_paths() -> WorkspacePaths:
+    """Active derived paths (thread-safe)."""
+    with _WORKSPACE_LOCK:
+        return _derive_paths(_workspace)
+
+
+def workspace_generation() -> int:
+    """Increments on every workspace switch — caches keyed on it can invalidate."""
+    with _WORKSPACE_LOCK:
+        return _workspace_generation
+
+
+def switch_workspace(root: Path) -> int:
+    """Atomically switch the active workspace root.
+
+    Returns the new generation.  Callers are responsible for refreshing any
+    state that depends on the derived paths (sessions, RAG, tasks).
+    """
+    global _workspace, _workspace_generation
+    root = root.expanduser().resolve()
+    with _WORKSPACE_LOCK:
+        _workspace = root
+        _workspace_generation += 1
+        for path in (root / ".tasks", root / ".worktrees", root / ".mailboxes", root / ".project"):
+            path.mkdir(parents=True, exist_ok=True)
+        return _workspace_generation
 
 FALLBACK_MODEL = os.getenv("FALLBACK_MODEL_ID")
 
@@ -110,3 +193,12 @@ ROUTE_MAX_RUNTIME = _positive_seconds("HARNESS_ROUTE_MAX_RUNTIME", 600)
 
 # Welcome hero variants for /banner demo: classic | emoji | typewriter | shadow3d
 BANNER_STYLE = os.getenv("HARNESS_BANNER", "classic").strip().lower()
+
+# Skills catalog directory: project-level `skills/` next to the workspace root
+# (same layout as the built-in worktree skills and Claude Code's skills dir).
+SKILLS_DIR = WORKDIR / "skills"
+
+# Declarative config files under `config/`.
+CONFIG_DIR = WORKDIR / "config"
+MCP_CONFIG_PATH = CONFIG_DIR / "mcp.json"
+PERMISSIONS_CONFIG_PATH = CONFIG_DIR / "permissions.json"

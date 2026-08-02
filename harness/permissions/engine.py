@@ -9,7 +9,7 @@ from pathlib import Path
 
 from harness.permissions.config import PermissionEffect, PermissionRule, load_permission_rules
 from harness.permissions.state import SavedPermissionRule, load_persistent_rules, session_rules
-from harness.settings import WORKDIR
+from harness.settings import WORKDIR, get_workdir
 
 
 @dataclass(frozen=True)
@@ -56,7 +56,7 @@ def _external_resource_for_path(path_text: str) -> str | None:
         if not path.is_absolute():
             return None
         resolved = path.resolve()
-        base = WORKDIR.resolve()
+        base = get_workdir().resolve()
         if resolved.is_relative_to(base):
             return None
         if resolved.is_file():

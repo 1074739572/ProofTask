@@ -10,7 +10,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-from harness.settings import WORKDIR
+from harness.settings import WORKDIR, get_workdir
 
 CANDIDATE_NAMES = ("HARNESS.md", "AGENTS.md")
 DEFAULT_MAX_CHARS = 12_000
@@ -96,7 +96,7 @@ def find_project_md(
             enabled=False,
         )
 
-    root = (start or WORKDIR).resolve()
+    root = (start or get_workdir()).resolve()
     limit = max_chars if max_chars is not None else max_project_md_chars()
     depth_limit = max_depth if max_depth is not None else max_project_md_depth()
 

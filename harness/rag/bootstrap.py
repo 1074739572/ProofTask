@@ -14,7 +14,7 @@ from harness.rag.ingest import (
 )
 from harness.rag.pipeline import build_index, rag_status_dict
 from harness.rag.tools import format_rag_index_result
-from harness.settings import PACKAGE_ROOT, WORKDIR
+from harness.settings import PACKAGE_ROOT, WORKDIR, get_workdir
 
 DEFAULT_INDEX_PATH = "files"
 
@@ -169,10 +169,11 @@ def bootstrap_message(result: dict) -> str:
 
 
 def suggested_corpus_dirs() -> list[Path]:
+    workdir = get_workdir()
     candidates = [
-        WORKDIR / "files",
+        workdir / "files",
         PACKAGE_ROOT / "files",
-        WORKDIR / "files" / "样例",
+        workdir / "files" / "样例",
         PACKAGE_ROOT / "files" / "样例",
     ]
     seen: set[str] = set()

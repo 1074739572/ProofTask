@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 import threading
 import time
 
@@ -85,8 +86,23 @@ def _match_cli_command(query: str, command: str) -> bool:
     return text == command or text.startswith(command + " ")
 
 
+def _resolve_open_directory(query: str) -> tuple[Path | None, str]:
+    raw_path = query.strip()[len("/open") :].strip()
+    if not raw_path:
+        return None, "Usage: /open <directory>"
+    path = Path(raw_path).expanduser()
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError as exc:
+        return None, f"Cannot open {raw_path!r}: {exc}"
+    if not resolved.is_dir():
+        return None, f"Cannot open {raw_path!r}: not a directory"
+    return resolved, ""
+
+
 def _help_text() -> str:
     return """Commands:
+  /open <directory>        switch workspace in-process (instant, no restart)
   /model                   pick model (↑↓ Enter) or /model <id>
   /mode [id]               pick mode (↑↓ Enter): direct|plan|orchestrate|file|grill
   /mode file               文档问答：每句检索 files/；进模式时选指定/全部文档
@@ -246,6 +262,40 @@ def run_cli() -> None:
             break
         if query.strip().lower() in ("q", "exit", ""):
             break
+        if _match_cli_command(query, "/open"):
+            # In-process workspace switch (same semantics as the TUI bridge):
+            # bare `/open` lists recent projects, `/open N` picks by index,
+            # `/open <dir>` switches.  No process restart.
+            from harness.event_stream import _emit_workspace_list, _handle_open_workspace
+            from harness.todos.state import set_binding as _todos_set_binding
+            from harness.workspace import switch_workspace
+
+            note, target, list_mode = _handle_open_workspace(query)
+            if list_mode:
+                _emit_workspace_list()
+                print()
+                continue
+            if target is None:
+                renderer.warn(note)
+                print()
+                continue
+            ok, result, new_binding = switch_workspace(target)
+            if not ok:
+                renderer.warn(result)
+                print()
+                continue
+            if new_binding is not None:
+                binding = new_binding
+                _todos_set_binding(binding)
+                from harness.todos.state import load_todos_from_disk
+
+                load_todos_from_disk(binding=binding)
+            history.clear()
+            context = update_context({}, [])
+            apply_project_instructions(context)
+            renderer.plain(result)
+            print()
+            continue
         if _match_cli_command(query, "/model"):
             parts = query.strip().split(maxsplit=1)
             if len(parts) == 1 or parts[1].lower() in ("list", "pick", "picker"):

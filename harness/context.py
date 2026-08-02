@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 from harness.mcp.pool import mcp_clients
-from harness.settings import MEMORY_INDEX, WORKDIR
+from harness.settings import get_workspace_paths
 from harness.teams.bus import active_teammates
 
 
 def update_context(context: dict, messages: list) -> dict:
     memories = ""
-    if MEMORY_INDEX.exists():
-        memories = MEMORY_INDEX.read_text(encoding="utf-8")[:2000]
+    memory_index = get_workspace_paths().memory_index
+    if memory_index.exists():
+        # MEMORY.md may be hand-edited or written by older releases in a
+        # non-UTF-8 encoding; never let a decode error break the turn.
+        memories = memory_index.read_text(encoding="utf-8", errors="replace")[:2000]
     return {
         **context,
         "memories": memories,

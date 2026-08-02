@@ -29,7 +29,7 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
-from harness.settings import PROJECT_DIR
+from harness.settings import PROJECT_DIR, get_workspace_paths
 
 SESSIONS_DIR = PROJECT_DIR / "sessions"
 ACTIVE_SESSION_PATH = PROJECT_DIR / "active_session.json"
@@ -38,6 +38,30 @@ ACTIVE_SESSION_PATH = PROJECT_DIR / "active_session.json"
 LEGACY_SESSION_PATH = PROJECT_DIR / "session.jsonl"
 LEGACY_SESSION_META_PATH = PROJECT_DIR / "session.meta.json"
 LEGACY_TODOS_PATH = PROJECT_DIR / "todos.json"
+
+# Startup-bound default (used to detect test overrides via mock.patch).
+_DEFAULT_PROJECT_DIR = PROJECT_DIR
+
+
+def _active_project_dir() -> Path:
+    """Directory holding this workspace's session state (.project/).
+
+    Follows in-process workspace switches so that `/open <dir>` binds the
+    session store to the new project without restarting the process.  When the
+    module-level ``PROJECT_DIR`` has been patched (tests / legacy callers) it
+    wins over the live workspace root.
+    """
+    if PROJECT_DIR is not _DEFAULT_PROJECT_DIR:
+        return PROJECT_DIR
+    return get_workspace_paths().project_dir
+
+
+def _active_sessions_dir() -> Path:
+    return _active_project_dir() / "sessions"
+
+
+def _active_session_path() -> Path:
+    return _active_project_dir() / "active_session.json"
 
 
 @dataclass(frozen=True)
@@ -78,8 +102,9 @@ class SessionBinding:
 
 
 def sessions_root() -> Path:
-    SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
-    return SESSIONS_DIR
+    root = _active_sessions_dir()
+    root.mkdir(parents=True, exist_ok=True)
+    return root
 
 
 def _new_session_id() -> str:
@@ -88,10 +113,11 @@ def _new_session_id() -> str:
 
 
 def read_active_session_id() -> str | None:
-    if not ACTIVE_SESSION_PATH.exists():
+    path = _active_session_path()
+    if not path.exists():
         return None
     try:
-        data = json.loads(ACTIVE_SESSION_PATH.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
     except (json.JSONDecodeError, OSError):
         return None
     sid = data.get("id")
@@ -100,8 +126,9 @@ def read_active_session_id() -> str | None:
 
 def write_active_session_id(session_id: str) -> None:
     """Update the global active pointer — only at session create / explicit /resume switch."""
-    PROJECT_DIR.mkdir(parents=True, exist_ok=True)
-    ACTIVE_SESSION_PATH.write_text(
+    project_dir = _active_project_dir()
+    project_dir.mkdir(parents=True, exist_ok=True)
+    _active_session_path().write_text(
         json.dumps({"id": session_id}, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
@@ -141,7 +168,7 @@ def read_session_meta(binding: SessionBinding | None = None, paths: SessionPaths
     if not target.meta_json.exists():
         return _default_meta()
     try:
-        data = json.loads(target.meta_json.read_text(encoding="utf-8"))
+        data = json.loads(target.meta_json.read_text(encoding="utf-8", errors="replace"))
     except (json.JSONDecodeError, OSError):
         return _default_meta()
     if "created_at" not in data:
@@ -249,11 +276,12 @@ def ensure_active_session(*, fresh: bool) -> SessionBinding:
 
 def list_session_summaries(*, limit: int = 20) -> list[dict]:
     """Newest-first summaries for /resume status (not a full picker yet)."""
-    if not SESSIONS_DIR.exists():
+    sessions_dir = _active_sessions_dir()
+    if not sessions_dir.exists():
         return []
     active = read_active_session_id()
     rows: list[dict] = []
-    for path in SESSIONS_DIR.iterdir():
+    for path in sessions_dir.iterdir():
         if not path.is_dir():
             continue
         sp = SessionPaths(session_id=path.name, root=path)

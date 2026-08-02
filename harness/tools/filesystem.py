@@ -8,9 +8,10 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
-from harness.settings import WORKDIR
+from harness.settings import WORKDIR, get_workdir
 
 if sys.platform == "win32":
     import ctypes
@@ -18,7 +19,7 @@ if sys.platform == "win32":
 
 
 def safe_path(path: str, cwd: Path | None = None) -> Path:
-    base = cwd or WORKDIR
+    base = cwd or get_workdir()
     resolved = (base / path).resolve()
     if not resolved.is_relative_to(base):
         raise ValueError(f"Path escapes workspace: {path}")
@@ -161,7 +162,7 @@ def run_bash(
     timeout_s = _timeout_seconds(timeout)
     kwargs: dict = {
         "shell": True,
-        "cwd": cwd or WORKDIR,
+        "cwd": cwd or get_workdir(),
         "stdout": subprocess.PIPE,
         "stderr": subprocess.PIPE,
         "text": True,
@@ -195,6 +196,87 @@ def run_bash(
         if job is not None:
             ctypes.windll.kernel32.CloseHandle(job)
     output = (out + err).strip()
+    return output[:50000] if output else "(no output)"
+
+
+def run_bash_streaming(
+    command: str,
+    cwd: Path | None = None,
+    timeout: int | None = None,
+    tool_use_id: str = "",
+) -> str:
+    """Run a bash command and stream each output line as a `tool_output` event.
+
+    Mirrors Claude Code's live tool output: every stdout/stderr line is emitted
+    as ``events.emit("tool_output", id=tool_use_id, line=...)`` while the command
+    runs, so the TUI can show the output streaming in real time instead of a
+    black box that resolves at the end. Returns the full combined output with
+    the same semantics as :func:`run_bash`.
+    """
+    from harness.ui import events
+
+    timeout_s = _timeout_seconds(timeout)
+    kwargs: dict = {
+        "shell": True,
+        "cwd": cwd or get_workdir(),
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+    }
+    if sys.platform != "win32":
+        kwargs["start_new_session"] = True
+    proc = subprocess.Popen(command, **kwargs)
+    job = _assign_windows_job(proc) if sys.platform == "win32" else None
+
+    collected: list[str] = []
+    lock = threading.Lock()
+
+    def pump(stream) -> None:
+        for raw in iter(stream.readline, ""):
+            line = raw.rstrip("\n")
+            if not line:
+                continue
+            with lock:
+                collected.append(line)
+            try:
+                events.emit("tool_output", id=tool_use_id, line=line)
+            except Exception:
+                pass
+
+    reader_out = threading.Thread(target=pump, args=(proc.stdout,), daemon=True)
+    reader_err = threading.Thread(target=pump, args=(proc.stderr,), daemon=True)
+    reader_out.start()
+    reader_err.start()
+
+    timed_out = False
+    try:
+        proc.wait(timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        if job is not None:
+            ctypes.windll.kernel32.TerminateJobObject(job, 1)
+            ctypes.windll.kernel32.CloseHandle(job)
+            job = None
+        else:
+            _kill_process_tree(proc)
+        proc.wait(timeout=10)
+    finally:
+        if job is not None:
+            ctypes.windll.kernel32.CloseHandle(job)
+    reader_out.join(timeout=2)
+    reader_err.join(timeout=2)
+
+    with lock:
+        output = "\n".join(collected).strip()
+    if timed_out:
+        return (
+            f"Error: Timeout ({int(timeout_s)}s). The command did not finish "
+            f"within the timeout. If it is expected to take longer, retry with "
+            f"a larger `timeout` (in milliseconds, up to {MAX_BASH_TIMEOUT_MS}) "
+            f"or pass `run_in_background: true`."
+        )
     return output[:50000] if output else "(no output)"
 
 
@@ -357,7 +439,7 @@ def run_glob(pattern: str, cwd: Path | None = None) -> str:
     import glob as globlib
 
     try:
-        base = cwd or WORKDIR
+        base = cwd or get_workdir()
         results = []
         for match in globlib.glob(pattern, root_dir=base, recursive=True):
             if (base / match).resolve().is_relative_to(base):

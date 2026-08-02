@@ -182,7 +182,7 @@ def load_todos_from_disk(
         _CURRENT = []
         return []
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        raw = json.loads(path.read_text(encoding="utf-8", errors="replace"))
     except (json.JSONDecodeError, OSError):
         _CURRENT = []
         return []

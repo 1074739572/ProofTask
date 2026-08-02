@@ -46,7 +46,11 @@ _CANONICAL_BY_ALIAS: dict[str, str] = {
 
 
 def _cwd() -> Path:
-    return Path.cwd()
+    # Read the live module attribute (not a from-import copy) so both in-process
+    # workspace switches (workspace.py setattr) and test monkeypatching work.
+    from harness.rag import ingest as ingest_mod
+
+    return ingest_mod.WORKDIR or ingest_mod.get_workdir()
 
 
 def _corpus_dir() -> Path:

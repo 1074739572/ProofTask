@@ -84,7 +84,7 @@ def _read_records(binding: SessionBinding) -> list[dict]:
     if not path.exists():
         return []
     records: list[dict] = []
-    for line_no, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+    for line_no, line in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
         line = line.strip()
         if not line:
             continue

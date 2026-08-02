@@ -118,7 +118,7 @@ def load_durable_jobs() -> None:
     if not DURABLE_CRON_PATH.exists():
         return
     try:
-        for item in json.loads(DURABLE_CRON_PATH.read_text(encoding="utf-8")):
+        for item in json.loads(DURABLE_CRON_PATH.read_text(encoding="utf-8", errors="replace")):
             job = CronJob(**item)
             if not validate_cron(job.cron):
                 scheduled_jobs[job.id] = job

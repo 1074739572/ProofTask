@@ -15,7 +15,7 @@ from harness.modes import (
 )
 from harness.prompts.project_md import format_project_instructions_block
 from harness.providers.config import get_provider
-from harness.settings import WORKDIR
+from harness.settings import WORKDIR, get_workdir
 from harness.todos.format import format_todos_for_prompt
 from harness.todos.state import get_todos
 
@@ -121,7 +121,7 @@ def build_session_context(
         sections.append(
             "Latest user request — respond ONLY to this unless they explicitly "
             f"ask to continue another task:\n{latest}\n"
-            f"Project root: {WORKDIR}\n"
+            f"Project root: {get_workdir()}\n"
             "Python package path is `harness/` (there is no `src/harness/`).\n"
             "If this message answers a choice you offered, continue the pending "
             "Working goal with that choice. Do not explore `harness/` or "

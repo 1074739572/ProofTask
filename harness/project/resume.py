@@ -26,7 +26,7 @@ from harness.project.state import (
     load_state,
     sync_chapters_from_disk,
 )
-from harness.settings import WORKDIR
+from harness.settings import WORKDIR, get_workdir
 
 RESUME_CONTEXT_PREFIX = "[Resume context]"
 LEGACY_SESSION_PREFIX = "[Session resumed]"
@@ -78,7 +78,7 @@ def project_context_message() -> str | None:
         f"项目：{state.title}（{state.project_id}）\n"
         f"进度：{done}/{total} 章已完成\n"
         f"当前章节：{state.current_chapter} {current_title}\n"
-        f"输出：{WORKDIR}/{state.output_dir}/\n"
+        f"输出：{get_workdir()}/{state.output_dir}/\n"
         f"源文档：{state.source_doc}\n\n"
         f"写章节时可 load_skill(thesis-writing)。"
         f"完整章节表请调用 project_status。"
