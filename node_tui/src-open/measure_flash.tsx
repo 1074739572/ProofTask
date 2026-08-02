@@ -3,7 +3,7 @@ process.env.DEBUG_SKIP_BACKEND = '1';
 const {App} = await import('./App.tsx');
 import {createSignal, Show} from 'solid-js';
 import {testRender} from '@opentui/solid';
-import type {Entry} from './App.tsx';
+import type {Entry} from './sections.ts';
 
 const W = 100, H = 30;
 

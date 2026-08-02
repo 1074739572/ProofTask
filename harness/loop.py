@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import threading
+from pathlib import Path
 
 from harness.agent.background import (
     build_user_content,
@@ -451,7 +452,20 @@ def agent_loop(
                 continue
 
             handler = handlers.get(name)
-            output = call_tool_handler(handler, tool_input, name)
+            if name == "bash" and isinstance(tool_input, dict):
+                # Stream stdout/stderr line-by-line as tool_output events so the
+                # TUI shows live output (Claude Code style) instead of a black
+                # box that resolves when the command finishes.
+                from harness.tools.filesystem import run_bash_streaming
+
+                output = run_bash_streaming(
+                    command=str(tool_input.get("command", "")),
+                    cwd=Path(tool_input["cwd"]) if tool_input.get("cwd") else None,
+                    timeout=tool_input.get("timeout"),
+                    tool_use_id=tool_use_id,
+                )
+            else:
+                output = call_tool_handler(handler, tool_input, name)
             writing_guard.note_tool(name)
             mutations.note(
                 name,

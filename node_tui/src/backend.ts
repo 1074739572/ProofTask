@@ -7,15 +7,40 @@ import type {UiEvent} from './types.js';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, '..', '..');
 
+export type BackendOptions = {
+  cwd?: string;
+};
+
 export type Backend = {
   process: ChildProcessWithoutNullStreams;
+  cwd?: string;
   send: (command: Record<string, unknown>) => void;
   stop: () => void;
 };
 
-export function startBackend(onEvent: (event: UiEvent) => void, onDiagnostic: (line: string) => void): Backend {
+/** Pure helper: build the python argv for a given workspace (or default root). */
+export function buildBackendArgs(cwd?: string): string[] {
+  const args = ['main.py', '--event-stream'];
+  if (cwd) args.push('-C', cwd);
+  return args;
+}
+
+/** Resolve the initial workspace from HARNESS_WORKSPACE or `--workspace <dir>`. */
+export function initialWorkspace(): string | undefined {
+  const fromEnv = process.env.HARNESS_WORKSPACE;
+  if (fromEnv) return fromEnv;
+  const flagIndex = process.argv.indexOf('--workspace');
+  if (flagIndex >= 0 && process.argv[flagIndex + 1]) return process.argv[flagIndex + 1];
+  return undefined;
+}
+
+export function startBackend(
+  onEvent: (event: UiEvent) => void,
+  onDiagnostic: (line: string) => void,
+  options: BackendOptions = {},
+): Backend {
   const python = process.env.PYTHON || (process.platform === 'win32' ? 'python' : 'python3');
-  const child = spawn(python, ['main.py', '--event-stream'], {
+  const child = spawn(python, buildBackendArgs(options.cwd), {
     cwd: repoRoot,
     stdio: ['pipe', 'pipe', 'pipe'],
     env: {...process.env, PYTHONIOENCODING: 'utf-8'},
@@ -53,6 +78,7 @@ export function startBackend(onEvent: (event: UiEvent) => void, onDiagnostic: (l
 
   return {
     process: child,
+    cwd: options.cwd,
     send(command) {
       if (child.killed || !child.stdin.writable) return;
       child.stdin.write(JSON.stringify(command) + '\n');

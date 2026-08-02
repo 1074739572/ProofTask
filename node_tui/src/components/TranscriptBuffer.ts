@@ -82,6 +82,36 @@ function flushFiles(lines: TranscriptLine[], files: string[], width: number) {
   files.length = 0;
 }
 
+function subagentMark(status: 'running' | 'done' | 'failed'): string {
+  if (status === 'done') return '✓';
+  if (status === 'failed') return '✕';
+  return '⠙';
+}
+
+function subagentColor(status: 'running' | 'done' | 'failed'): string {
+  if (status === 'done') return 'green';
+  if (status === 'failed') return 'red';
+  return 'yellow';
+}
+
+function flushSubagent(lines: TranscriptLine[], agent: ChatItem & {kind: 'subagent'}, width: number) {
+  const a = agent.agent;
+  if (a.status === 'running') {
+    // Expanded while working: header + nested rounds/tools (opencode/Claude Code style)
+    pushWrapped(lines, `  ${subagentMark('running')} ${a.agentType} · ${a.description} · ${a.model}`, 'yellow', width);
+    for (const round of a.rounds) pushWrapped(lines, `    ${round}`, 'gray', width);
+    for (const tool of a.tools) {
+      const summary = tool.summary ? `  ${tool.summary}` : '';
+      pushWrapped(lines, `      ${subagentMark(tool.status)} ${tool.name}${summary}`, subagentColor(tool.status), width);
+    }
+  } else {
+    // Collapsed on completion: one summary line, no nested flood
+    const stats = `${a.toolCount ?? a.tools.length} tools · ${(a.elapsed ?? 0).toFixed(1)}s`;
+    pushWrapped(lines, `  ${subagentMark(a.status)} ${a.agentType} · ${a.description} · ${stats}`, subagentColor(a.status), width);
+  }
+  pushLine(lines);
+}
+
 export function buildTranscriptLines(items: ChatItem[], width: number): TranscriptLine[] {
   const lines: TranscriptLine[] = [];
   const bodyWidth = Math.max(16, width - 2);
@@ -97,6 +127,10 @@ export function buildTranscriptLines(items: ChatItem[], width: number): Transcri
     switch (item.kind) {
       case 'tool':
         actions.push(item.tool);
+        break;
+      case 'subagent':
+        flushDeferred();
+        flushSubagent(lines, item, bodyWidth);
         break;
       case 'files':
         files.push(...item.paths);

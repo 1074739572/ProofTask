@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+import uuid
 
 from harness.agents.registry import get_agent_profile, validate_agent_model
 from harness.hooks import trigger_hooks
@@ -100,7 +101,11 @@ def run_agent_task(description: str, prompt: str, agent_type: str) -> str:
     system = f"{profile.system}\n\nWorking directory: {WORKDIR}"
     messages = [{"role": "user", "content": prompt}]
 
-    renderer.info(f"[task:{agent_type}] {description} → {profile.model_id}")
+    # Every subagent run gets its own id so the TUI can group all nested
+    # round/tool events into one scoped block instead of leaking them into the
+    # main timeline as flat logs.
+    run_id = uuid.uuid4().hex[:8]
+    renderer.subagent_start(run_id, agent_type, description, profile.model_id)
     started = time.time()
     tool_count = 0
     round_num = 0
@@ -118,7 +123,7 @@ def run_agent_task(description: str, prompt: str, agent_type: str) -> str:
 
         # Extract thinking text for this round (truncated to 50 chars)
         thinking_text = extract_text(response.content) or ""
-        renderer.round_header(f"[{agent_type}]", round_num, thinking_text, max_len=50)
+        renderer.subagent_round(run_id, round_num, thinking_text, max_len=50)
 
         messages.append(
             serialize_messages([{"role": "assistant", "content": response.content}])[0]
@@ -133,6 +138,7 @@ def run_agent_task(description: str, prompt: str, agent_type: str) -> str:
             if not is_tool_use(block):
                 continue
             tool_count += 1
+            tool_use_id = block_field(block, "id", "")
             blocked = trigger_hooks("PreToolUse", block)
             if blocked:
                 output = str(blocked)
@@ -140,14 +146,15 @@ def run_agent_task(description: str, prompt: str, agent_type: str) -> str:
                 name = block_field(block, "name", "")
                 tool_input = block_field(block, "input", {}) or {}
                 handler = handlers.get(name)
+                renderer.subagent_tool(run_id, name, tool_input, tool_use_id=tool_use_id)
                 output = call_tool_handler(handler, tool_input, name)
                 trigger_hooks("PostToolUse", block, output)
-                # Show collapsed tool call: ● tool  args → result
-                renderer.round_tool(name, tool_input, str(output))
+                # Nested collapsed tool line: ● tool  args → result
+                renderer.subagent_tool(run_id, name, tool_input, str(output), tool_use_id=tool_use_id)
             results.append(
                 {
                     "type": "tool_result",
-                    "tool_use_id": block_field(block, "id", ""),
+                    "tool_use_id": tool_use_id,
                     "content": str(output),
                 }
             )
@@ -165,11 +172,12 @@ def run_agent_task(description: str, prompt: str, agent_type: str) -> str:
                     break
 
     if final_text:
-        renderer.round_final(f"[{agent_type}]", final_text, tool_count, elapsed, max_len=50)
+        renderer.subagent_end(run_id, final_text, tool_count, elapsed, max_len=50)
         return (
             f"[{agent_type} / {profile.model_id}] {description} "
             f"({tool_count} tools, {elapsed:.1f}s)\n\n{final_text}"
         )
+    renderer.subagent_end(run_id, "finished without summary", tool_count, elapsed, max_len=50)
     return f"[{agent_type}] finished without summary ({tool_count} tools, {elapsed:.1f}s)"
 
 

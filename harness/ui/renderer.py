@@ -228,6 +228,83 @@ class Renderer:
         for path in paths:
             self._write(f"  · {path}", style=theme.TOOL)
 
+    # ---- subagent lifecycle (nested, scoped UI block) ----
+    #
+    # A subagent must never leak into the main timeline as plain logs.  These
+    # methods emit structured `subagent_*` events (TUI renders a nested block)
+    # AND keep the classic CLI lines (which `_write` suppresses automatically
+    # in event-stream mode, so nothing is duplicated).
+
+    def subagent_start(self, run_id: str, agent_type: str, description: str, model: str) -> None:
+        from harness.settings import get_workdir
+
+        events.emit(
+            "subagent_start",
+            id=run_id,
+            agent_type=agent_type,
+            description=str(description),
+            model=str(model),
+            cwd=str(get_workdir()),
+        )
+        self._write(f"[task:{agent_type}] {description} → {model}", style=theme.INFO)
+
+    def subagent_round(self, run_id: str, round_num: int, thinking_text: str, max_len: int = 50) -> None:
+        text = (thinking_text or "").strip()
+        if len(text) > max_len:
+            text = text[:max_len] + "..."
+        events.emit("subagent_round", id=run_id, round=round_num, text=text)
+        if text:
+            line = f"    ◆ Round {round_num} · \"{text}\""
+        else:
+            line = f"    ◆ Round {round_num}"
+        self._write(line, style=theme.MUTED)
+
+    def subagent_tool(
+        self,
+        run_id: str,
+        name: str,
+        tool_input: dict | None,
+        result_preview: str | None = None,
+        *,
+        tool_use_id: str = "",
+        limit: int = 60,
+    ) -> None:
+        """Emit one nested tool line; pass ``result_preview`` for the completion."""
+        summary = summarize_tool_input(name, tool_input)
+        events.emit(
+            "subagent_tool",
+            id=run_id,
+            tool_use_id=tool_use_id,
+            name=name,
+            summary=summary,
+            ok=None if result_preview is None else not is_failure_tool_output(result_preview),
+        )
+        result_text = str(result_preview).strip() if result_preview is not None else ""
+        if len(result_text) > limit:
+            result_text = result_text[:limit] + "…"
+        if result_text:
+            line = f"      ● {name}  {summary} → {result_text}"
+        else:
+            line = f"      ● {name}  {summary}"
+        self._write(line, style=theme.TOOL)
+
+    def subagent_end(self, run_id: str, text: str, tool_count: int, elapsed: float, max_len: int = 50) -> None:
+        answer = (text or "").strip()
+        if len(answer) > max_len:
+            answer = answer[:max_len] + "..."
+        events.emit(
+            "subagent_end",
+            id=run_id,
+            ok=True,
+            tools=tool_count,
+            elapsed=round(elapsed, 1),
+            summary=answer,
+        )
+        line = f"  ✓ Finished · \"{answer}\""
+        self._write(line, style=theme.MUTED)
+        stats_line = f"    └─ {tool_count} tools · {elapsed:.1f}s"
+        self._write(stats_line, style=theme.MUTED)
+
     def plain(self, message: str) -> None:
         events.emit("log", level="plain", text=str(message))
         self._write(message)

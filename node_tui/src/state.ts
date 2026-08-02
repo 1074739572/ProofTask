@@ -1,4 +1,4 @@
-import type {AppState, ToolRecord, UiEvent, ChatItem} from './types.js';
+import type {AppState, SubagentRecord, SubagentTool, ToolRecord, UiEvent, ChatItem} from './types.js';
 
 export const initialState: AppState = {
   ready: false,
@@ -45,6 +45,16 @@ function clearThinking(state: AppState): AppState {
 
 function clearStreaming(state: AppState): AppState {
   return {...state, items: state.items.filter(item => item.kind !== 'streaming')};
+}
+
+function updateSubagent(state: AppState, id: string, updater: (agent: SubagentRecord) => SubagentRecord): AppState {
+  const idx = state.items.findIndex(item => item.kind === 'subagent' && item.agent.id === id);
+  if (idx < 0) return state;
+  const items = state.items.map((item, i) => {
+    if (i !== idx || item.kind !== 'subagent') return item;
+    return {kind: 'subagent', agent: updater(item.agent), ts: item.ts} as ChatItem;
+  });
+  return {...state, items};
 }
 
 export function reduceEvent(state: AppState, event: UiEvent): AppState {
@@ -143,6 +153,48 @@ export function reduceEvent(state: AppState, event: UiEvent): AppState {
       };
       return appendOrReplaceToolItem(upsertTool({...state, phase: failed ? 'blocked' : 'calling_model'}, tool), tool, event.ts);
     }
+    case 'subagent_start': {
+      const agent: SubagentRecord = {
+        id: event.id,
+        agentType: event.agent_type,
+        description: event.description,
+        model: event.model,
+        status: 'running',
+        rounds: [],
+        tools: [],
+      };
+      return pushItem(clearThinking({...state, phase: 'tool_running', running: true}), {kind: 'subagent', agent, ts: event.ts});
+    }
+    case 'subagent_round':
+      return updateSubagent(state, event.id, agent => ({...agent, rounds: [...agent.rounds, `◆ Round ${event.round} · "${event.text}"`]}));
+    case 'subagent_tool': {
+      const key = event.tool_use_id || `${event.name}-${state.items.length}-${Date.now()}`;
+      return updateSubagent(state, event.id, agent => {
+        const existing = agent.tools.find(t => t.key === key);
+        if (existing) {
+          if (event.ok === null || event.ok === undefined) return agent;
+          return {
+            ...agent,
+            tools: agent.tools.map(t => (t.key === key ? {...t, status: event.ok ? 'done' : 'failed'} : t)),
+          };
+        }
+        const tool = {
+          key,
+          name: event.name,
+          summary: event.summary || '',
+          status: (event.ok === null || event.ok === undefined) ? 'running' : (event.ok ? 'done' : 'failed'),
+        } as SubagentTool;
+        return {...agent, tools: [...agent.tools, tool]};
+      });
+    }
+    case 'subagent_end':
+      return updateSubagent(state, event.id, agent => ({
+        ...agent,
+        status: event.ok ? 'done' : 'failed',
+        toolCount: event.tools,
+        elapsed: event.elapsed,
+        summary: event.summary,
+      }));
     case 'task_update':
       return pushItem({...state, tasks: event.tasks}, {kind: 'tasks', tasks: event.tasks, ts: event.ts});
     case 'files_changed':
@@ -168,6 +220,25 @@ export function reduceEvent(state: AppState, event: UiEvent): AppState {
       return {...state, picker: null};
     case 'exit':
       return pushItem(state, {kind: 'log', level: 'muted', text: 'backend requested exit', ts: event.ts});
+    case 'completion_result':
+      return state; // handled imperatively by the App (input-level state)
+    case 'workspace_switched':
+      return {...state, cwd: event.cwd, items: [], tools: [], tasks: [], phase: 'idle', sessionId: ''};
+    case 'workspace_list':
+      if (!event.projects || event.projects.length === 0) return state;
+      return {
+        ...state,
+        picker: {
+          id: 'workspace',
+          title: 'Open project',
+          selected: 0,
+          items: event.projects.map((project, index) => ({
+            id: String(index + 1),
+            label: project.current ? `${project.path} (current)` : project.path,
+            detail: 'Enter to switch',
+          })),
+        },
+      };
     default:
       return state;
   }

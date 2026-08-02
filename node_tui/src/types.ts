@@ -35,7 +35,14 @@ export type UiEvent =
   | { type: 'task_update'; seq?: number; ts?: number; tasks: TodoItem[] }
   | { type: 'files_changed'; seq?: number; ts?: number; paths: string[] }
   | { type: 'log'; seq?: number; ts?: number; level?: string; text: string }
-  | { type: 'error'; seq?: number; ts?: number; text: string };
+  | { type: 'error'; seq?: number; ts?: number; text: string }
+  | { type: 'completion_result'; seq?: number; ts?: number; request_id?: string; candidates: string[] }
+  | { type: 'workspace_switched'; seq?: number; ts?: number; cwd: string }
+  | { type: 'workspace_list'; seq?: number; ts?: number; projects: Array<{path: string; current: boolean}> }
+  | { type: 'subagent_start'; seq?: number; ts?: number; id: string; agent_type: string; description: string; model: string; cwd?: string }
+  | { type: 'subagent_round'; seq?: number; ts?: number; id: string; round: number; text: string }
+  | { type: 'subagent_tool'; seq?: number; ts?: number; id: string; tool_use_id?: string; name: string; summary: string; ok?: boolean | null }
+  | { type: 'subagent_end'; seq?: number; ts?: number; id: string; ok: boolean; tools: number; elapsed: number; summary: string };
 
 export type ToolRecord = {
   key: string;
@@ -48,6 +55,26 @@ export type ToolRecord = {
   streak?: number;
 };
 
+export type SubagentTool = {
+  key: string;
+  name: string;
+  summary: string;
+  status: 'running' | 'done' | 'failed';
+};
+
+export type SubagentRecord = {
+  id: string;
+  agentType: string;
+  description: string;
+  model: string;
+  status: 'running' | 'done' | 'failed';
+  rounds: string[];
+  tools: SubagentTool[];
+  toolCount?: number;
+  elapsed?: number;
+  summary?: string;
+};
+
 export type ChatItem =
   | { kind: 'user'; text: string; ts?: number }
   | { kind: 'assistant'; text: string; ts?: number }
@@ -55,6 +82,7 @@ export type ChatItem =
   | { kind: 'thinking'; text?: string; ts?: number }
   | { kind: 'streaming'; text: string; ts?: number }
   | { kind: 'tool'; tool: ToolRecord; ts?: number }
+  | { kind: 'subagent'; agent: SubagentRecord; ts?: number }
   | { kind: 'tasks'; tasks: TodoItem[]; ts?: number }
   | { kind: 'files'; paths: string[]; ts?: number }
   | { kind: 'log'; level?: string; text: string; ts?: number }
