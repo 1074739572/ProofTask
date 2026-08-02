@@ -16,34 +16,6 @@
       "context_window": 1000000
     },
     {
-      "id": "glm-5.2-flash",
-      "provider": "zhipu",
-      "label": "智谱 GLM-5.2",
-      "api_model": "glm-5.2",
-      "context_window": 1000000
-    },
-    {
-      "id": "glm-4-plus",
-      "provider": "zhipu",
-      "label": "智谱 GLM-5.1",
-      "api_model": "glm-5.1",
-      "context_window": 128000
-    },
-    {
-      "id": "qwen3.7-plus",
-      "provider": "qwen",
-      "label": "通义千问 Plus",
-      "api_model": "qwen3.7-max",
-      "context_window": 1000000
-    },
-    {
-      "id": "qwen3.7-max",
-      "provider": "qwen",
-      "label": "通义千问 3.7Max",
-      "api_model": "qwen3.7-max",
-      "context_window": 1000000
-    },
-    {
       "id": "mimo-v2.5-pro",
       "provider": "xiaomi-mimo",
       "label": "Xiaomi MiMo V2.5 Pro (long-context explorer)",
@@ -55,56 +27,17 @@
       "provider": "anzhiyu",
       "label": "GPT-5.6 Terra",
       "api_model": "gpt-5.6-terra",
-      "context_window": 1000000
-    },
-    {
-      "id": "gpt-5.6-luna",
-      "provider": "anzhiyu",
-      "label": "GPT-5.6 Luna",
-      "api_model": "gpt-5.6-luna",
-      "context_window": 1000000
+      "context_window": 1000000,
+      "effort_options": ["minimal", "low", "medium", "high"]
     },
     {
       "id": "gpt-5.6-sol",
       "provider": "anzhiyu",
       "label": "GPT-5.6 Sol (高规格)",
       "api_model": "gpt-5.6-sol",
-      "context_window": 1000000
-    },
-    {
-      "id": "gpt-5.5",
-      "provider": "anzhiyu",
-      "label": "GPT-5.5",
-      "api_model": "gpt-5.5",
-      "context_window": 1000000
-    },
-    {
-      "id": "claude-opus-4-8",
-      "provider": "anzhiyu",
-      "label": "Claude Opus 4.8",
-      "api_model": "claude-opus-4-8",
-      "context_window": 200000
-    },
-    {
-      "id": "claude-opus-4-7",
-      "provider": "anzhiyu",
-      "label": "Claude Opus 4.7",
-      "api_model": "claude-opus-4-7",
-      "context_window": 200000
-    },
-    {
-      "id": "claude-opus-4-6",
-      "provider": "anzhiyu",
-      "label": "Claude Opus 4.6",
-      "api_model": "claude-opus-4-6",
-      "context_window": 200000
-    },
-    {
-      "id": "grok-build-console",
-      "provider": "anzhiyu",
-      "label": "Grok Build Console (编程)",
-      "api_model": "grok-build-console",
-      "context_window": 200000
+      "context_window": 1000000,
+      "reasoning_effort": "high",
+      "effort_options": ["minimal", "low", "medium", "high"]
     }
   ]
 }

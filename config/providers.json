@@ -1,22 +1,9 @@
 {
   "deepseek": {
-    "label": "DeepSeek",
-    "type": "anthropic",
-    "base_url": "https://api.deepseek.com/anthropic",
-    "api_key_env": "DEEPSEEK_API_KEY",
-    "api_key_fallback_env": "ANTHROPIC_API_KEY"
-  },
-  "zhipu": {
-    "label": "智谱 GLM",
-    "type": "anthropic",
-    "base_url": "https://open.bigmodel.cn/api/anthropic",
-    "api_key_env": "ZHIPU_API_KEY"
-  },
-  "qwen": {
-    "label": "通义千问",
+    "label": "OpenCode Go (DeepSeek)",
     "type": "openai",
-    "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-    "api_key_env": "DASHSCOPE_API_KEY"
+    "base_url": "https://opencode.ai/zen/go/v1",
+    "api_key_env": "OPENCODE_GO_API_KEY"
   },
   "xiaomi-mimo": {
     "label": "Xiaomi MiMo",

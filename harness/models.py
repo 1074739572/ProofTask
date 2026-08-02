@@ -13,11 +13,47 @@ from harness.providers.config import get_provider, provider_key_status, resolve_
 PACKAGE_ROOT = Path(__file__).resolve().parent.parent
 MODELS_CONFIG_PATH = PACKAGE_ROOT / "config" / "models.json"
 
-_lock = threading.Lock()
+_lock = threading.RLock()
 _current_model: str = ""
 _current_effort: str | None = None
 _catalog: list[dict] = []
 _default_model: str = ""
+
+EFFORT_ORDER = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+OFF_ALIASES = {"", "off", "default", "model-default", "model default"}
+EFFORT_DETAILS = {
+    "none": "disable reasoning where the model supports it",
+    "minimal": "lowest reasoning budget",
+    "low": "cheap/fast reasoning",
+    "medium": "balanced reasoning",
+    "high": "stronger reasoning",
+    "xhigh": "extra-high reasoning, only on models that declare support",
+    "max": "maximum reasoning, only on models that declare support",
+}
+
+
+def _normalize_effort(value: object) -> str | None:
+    text = str(value or "").strip().lower()
+    if text in OFF_ALIASES:
+        return None
+    return text if text in EFFORT_ORDER else None
+
+
+def _normalize_effort_options(values: object) -> tuple[str, ...]:
+    if values is None:
+        return ()
+    if isinstance(values, str):
+        raw = [part.strip() for part in values.replace(",", " ").split()]
+    elif isinstance(values, (list, tuple)):
+        raw = [str(part).strip() for part in values]
+    else:
+        raw = []
+    allowed = {_normalize_effort(part) for part in raw}
+    return tuple(effort for effort in EFFORT_ORDER if effort in allowed)
+
+
+def _effort_options_text(options: tuple[str, ...]) -> str:
+    return ", ".join(options) if options else "none declared"
 
 
 @dataclass(frozen=True)
@@ -30,6 +66,7 @@ class ModelProfile:
     api_model: str
     thinking: bool = False
     reasoning_effort: str | None = None
+    effort_options: tuple[str, ...] = ()
     extra_body: dict = field(default_factory=dict)
     context_window: int = 0
 
@@ -45,6 +82,7 @@ def _load_catalog() -> tuple[str, list[dict]]:
                 "api_model": fallback,
                 "thinking": False,
                 "reasoning_effort": None,
+                "effort_options": [],
                 "extra_body": {},
                 "context_window": 1_000_000,
             }
@@ -64,7 +102,8 @@ def _load_catalog() -> tuple[str, list[dict]]:
                 "provider": entry.get("provider", "deepseek"),
                 "api_model": entry.get("api_model", model_id),
                 "thinking": bool(entry.get("thinking")),
-                "reasoning_effort": entry.get("reasoning_effort"),
+                "reasoning_effort": _normalize_effort(entry.get("reasoning_effort")),
+                "effort_options": _normalize_effort_options(entry.get("effort_options")),
                 "extra_body": entry.get("extra_body") or {},
                 "context_window": int(entry.get("context_window") or 0),
             }
@@ -78,6 +117,7 @@ def _load_catalog() -> tuple[str, list[dict]]:
                 "api_model": default,
                 "thinking": False,
                 "reasoning_effort": None,
+                "effort_options": [],
                 "extra_body": {},
                 "context_window": 1_000_000,
             }
@@ -119,6 +159,7 @@ def initialize_model(override: str | None = None) -> str:
                     "api_model": initial,
                     "thinking": False,
                     "reasoning_effort": None,
+                    "effort_options": [],
                     "extra_body": {},
                     "context_window": 0,
                 }
@@ -168,7 +209,7 @@ def _provider_label(provider_id: str) -> str:
 
 
 def set_model(model_id: str) -> str:
-    global _current_model
+    global _current_model, _current_effort
     model_id = model_id.strip()
     if not model_id:
         return "Usage: /model <id>   or   /model list"
@@ -189,6 +230,10 @@ def set_model(model_id: str) -> str:
                 f"Set {envs} in .env"
             )
         _current_model = model_id
+        effort_reset_note = ""
+        if _current_effort and _current_effort not in profile.effort_options:
+            effort_reset_note = f"; effort reset from {_current_effort} to model default"
+            _current_effort = None
         api_note = ""
         if profile.api_model != profile.id:
             api_note = f" → API: {profile.api_model}"
@@ -196,7 +241,7 @@ def set_model(model_id: str) -> str:
             api_note += " (thinking on)"
         return (
             f"Switched to {model_id} ({profile.label}) "
-            f"[{_provider_label(profile.provider)}]{api_note}"
+            f"[{_provider_label(profile.provider)}]{api_note}{effort_reset_note}"
         )
 
 
@@ -220,6 +265,10 @@ def format_model_status() -> str:
         extra += f" → API: {api}"
     if profile.thinking:
         extra += " (thinking)"
+    if profile.reasoning_effort:
+        extra += f" (effort={profile.reasoning_effort})"
+    elif profile.effort_options:
+        extra += f" (effort options: {_effort_options_text(profile.effort_options)})"
     return f"Model: {profile.id}{extra}  —  /model to switch"
 
 
@@ -244,12 +293,15 @@ def format_model_list() -> str:
             marker = " *" if entry["id"] == current else "  "
             suffix = entry["label"]
             api = entry.get("api_model", entry["id"])
-            if api != entry["id"] or entry.get("thinking") or entry.get("reasoning_effort") or entry.get("extra_body"):
+            has_effort_meta = entry.get("reasoning_effort") or entry.get("effort_options")
+            if api != entry["id"] or entry.get("thinking") or has_effort_meta or entry.get("extra_body"):
                 bits = [f"api={api}"]
                 if entry.get("thinking"):
                     bits.append("thinking")
                 if entry.get("reasoning_effort"):
-                    bits.append(f"effort={entry.get('reasoning_effort')}")
+                    bits.append(f"default effort={entry.get('reasoning_effort')}")
+                if entry.get("effort_options"):
+                    bits.append(f"efforts={_effort_options_text(tuple(entry.get('effort_options') or ())) }")
                 if entry.get("extra_body"):
                     bits.append("extra_body")
                 suffix += f" [{', '.join(bits)}]"
@@ -268,18 +320,49 @@ def get_reasoning_effort() -> str | None:
 
 def set_reasoning_effort(effort: str | None) -> str:
     global _current_effort
-    allowed = {"minimal", "low", "medium", "high", "xhigh", "off", "none", ""}
-    value = (effort or "").strip().lower()
-    if value not in allowed:
-        return "Unknown effort. Available: minimal, low, medium, high, xhigh, off"
+    value = str(effort or "").strip().lower()
+    normalized = _normalize_effort(value)
+
     with _lock:
-        _current_effort = None if value in ("", "off", "none") else value
-        return f"Reasoning effort: {_current_effort or 'model default'}"
+        profile = get_model_profile()
+        options = profile.effort_options
+        if value in OFF_ALIASES:
+            _current_effort = None
+            return "Reasoning effort: model default"
+        if normalized is None:
+            available = ", ".join(["off", *options]) or "off"
+            return f"Unknown effort '{value}'. Available for {profile.id}: {available}"
+        if not options:
+            return (
+                f"Model {profile.id} does not declare reasoning_effort support. "
+                "Use /effort off, or add effort_options to config/models.json."
+            )
+        if normalized not in options:
+            return (
+                f"Effort '{normalized}' is not supported by {profile.id}. "
+                f"Available: off, {_effort_options_text(options)}"
+            )
+        _current_effort = normalized
+        return f"Reasoning effort for {profile.id}: {_current_effort}"
 
 
 def format_effort_list() -> str:
+    profile = get_model_profile()
     current = get_reasoning_effort() or "model default"
-    return "Reasoning effort options:\n  minimal\n  low\n  medium\n  high\n  xhigh\n  off (model default)\n\nCurrent: " + current
+    lines = [
+        f"Reasoning effort options for {profile.id}:",
+        "  off  — model default / no override",
+    ]
+    if profile.effort_options:
+        for effort in profile.effort_options:
+            marker = " *" if current == effort else "  "
+            lines.append(f"{marker} {effort:<7} — {EFFORT_DETAILS.get(effort, '')}")
+    else:
+        lines.append("  (this model has no declared reasoning_effort options)")
+    lines.append("")
+    lines.append(f"Current: {current}")
+    lines.append("Configure per-model options in config/models.json via effort_options.")
+    return "\n".join(lines)
 
 
 def handle_effort_command(query: str) -> str:
@@ -290,15 +373,22 @@ def handle_effort_command(query: str) -> str:
 
 
 def list_efforts() -> list[dict]:
+    profile = get_model_profile()
     current = get_reasoning_effort() or "off"
-    return [
+    items = [
         {"id": "off", "label": "Model default", "detail": "no override", "current": current == "off"},
-        {"id": "minimal", "label": "Minimal", "detail": "fastest", "current": current == "minimal"},
-        {"id": "low", "label": "Low", "detail": "cheap/fast", "current": current == "low"},
-        {"id": "medium", "label": "Medium", "detail": "balanced", "current": current == "medium"},
-        {"id": "high", "label": "High", "detail": "stronger reasoning", "current": current == "high"},
-        {"id": "xhigh", "label": "XHigh", "detail": "maximum reasoning", "current": current == "xhigh"},
     ]
+    for effort in profile.effort_options:
+        label = "XHigh" if effort == "xhigh" else effort.title()
+        items.append({
+            "id": effort,
+            "label": label,
+            "detail": EFFORT_DETAILS.get(effort, ""),
+            "current": current == effort,
+        })
+    if len(items) == 1:
+        items[0]["detail"] = f"{profile.id} has no declared effort options"
+    return items
 
 
 def handle_model_command(query: str) -> str:
