@@ -8,11 +8,17 @@ import time
 import traceback
 
 from evals.cases import compact as compact_cases
+from evals.cases import clean as clean_cases
+from evals.cases import evaluation as eval_cases
+from evals.cases import features as feat_cases
 from evals.cases import live as live_cases
+from evals.cases import mechanisms as mech_cases
 from evals.cases import modes as mode_cases
 from evals.cases import permissions as perm_cases
+from evals.cases import project_md as project_md_cases
 from evals.cases import simulated as sim_cases
 from evals.cases import tools_mcp as tools_cases
+from evals.cases import verification as ver_cases
 from evals.errors import EvalSkip, EvalWarn
 from evals.report import format_report, save_report
 from evals.types import EvalCase, EvalReport, EvalResult
@@ -24,7 +30,13 @@ def all_cases() -> list[EvalCase]:
         *mode_cases.CASES,
         *tools_cases.CASES,
         *compact_cases.CASES,
+        *clean_cases.CASES,
+        *eval_cases.CASES,
         *sim_cases.CASES,
+        *mech_cases.CASES,
+        *feat_cases.CASES,
+        *ver_cases.CASES,
+        *project_md_cases.CASES,
         *live_cases.CASES,
     ]
 

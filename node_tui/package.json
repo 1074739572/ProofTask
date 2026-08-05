@@ -2,7 +2,7 @@
   "type": "module",
   "private": true,
   "scripts": {
-    "dev": "node_modules/@oven/bun-windows-x64/bin/bun.exe src-open/index.tsx",
+    "dev": ".\\node_modules\\@oven\\bun-windows-x64\\bin\\bun.exe src-open/index.tsx",
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.ink.json --noEmit",
     "test": "node --import tsx --test test/*.test.ts"

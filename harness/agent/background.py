@@ -112,13 +112,16 @@ def collect_background_results() -> list[str]:
         with background_lock:
             task = background_tasks.pop(bg_id)
             output = background_results.pop(bg_id, "")
-        summary = output[:200] if len(output) > 200 else output
+        summary = output[:2000] if len(output) > 2000 else output
+        exit_code = 0 if not str(output).startswith("Error:") else 1
         notifications.append(
             f"<task_notification>\n"
             f"  <task_id>{bg_id}</task_id>\n"
             f"  <status>completed</status>\n"
+            f"  <exit_code>{exit_code}</exit_code>\n"
             f"  <command>{task['command']}</command>\n"
             f"  <summary>{summary}</summary>\n"
+            f"  <output_chars>{len(output)}</output_chars>\n"
             f"</task_notification>"
         )
     return notifications

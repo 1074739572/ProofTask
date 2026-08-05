@@ -3,21 +3,28 @@
 from __future__ import annotations
 
 import threading
+from typing import TYPE_CHECKING
 
 import httpx
-from anthropic import Anthropic
 
 from harness.providers.config import ProviderConfig, provider_timeout, resolve_api_key
 
+if TYPE_CHECKING:
+    from anthropic import Anthropic
+
 _lock = threading.Lock()
-_clients: dict[str, Anthropic] = {}
+_clients: dict[str, "Anthropic"] = {}
 
 
-def get_anthropic_client(provider: ProviderConfig) -> Anthropic:
+def get_anthropic_client(provider: ProviderConfig) -> "Anthropic":
     with _lock:
         cached = _clients.get(provider.id)
         if cached is not None:
             return cached
+        # Lazy import: the Anthropic SDK is ~7s to import on Windows; only pay
+        # that cost when a turn actually needs an Anthropic client.
+        from anthropic import Anthropic
+
         api_key = resolve_api_key(provider)
         if not api_key:
             envs = provider.api_key_env

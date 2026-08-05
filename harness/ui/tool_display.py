@@ -27,6 +27,24 @@ def hooks_verbose() -> bool:
     }
 
 
+def show_tool_lines() -> bool:
+    """Whether per-tool intent/start lines are printed to the terminal.
+
+    Default OFF: every tool request otherwise prints two lines
+    (``› <rationale>`` and ``● <tool> <summary>``), which many users find
+    noisy. Set ``HARNESS_SHOW_TOOL_LINES=1`` to bring them back. Events are
+    still emitted either way (TUI / JSONL unaffected).
+    """
+    import os
+
+    return os.getenv("HARNESS_SHOW_TOOL_LINES", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 def is_failure_tool_output(output: Any) -> bool:
     text = str(output if output is not None else "").strip()
     if not text:

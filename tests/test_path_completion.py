@@ -68,7 +68,7 @@ def test_prompt_input_restores_original_completer(monkeypatch):
 
     original = object()
     state = {"completer": original, "delims": " old ", "hook": None}
-    monkeypatch.setattr(prompt_input, "READLINE_AVAILABLE", True)
+    monkeypatch.setattr(prompt_input, "readline_available", lambda: True)
     monkeypatch.setattr(readline, "get_completer", lambda: state["completer"])
     monkeypatch.setattr(readline, "set_completer", lambda value: state.__setitem__("completer", value))
     monkeypatch.setattr(readline, "get_completer_delims", lambda: state["delims"])

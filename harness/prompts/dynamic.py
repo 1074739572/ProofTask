@@ -22,6 +22,41 @@ from harness.todos.state import get_todos
 TimeGranularity = Literal["seconds", "minute"]
 
 
+def _format_platform() -> str:
+    """OS-aware shell guidance injected every turn so the agent picks the
+    right command family up front (avoids ls→dir / grep→findstr churn).
+
+    The ``bash`` tool runs via ``subprocess.Popen(shell=True)``, which on
+    Windows means cmd.exe — Unix commands fail with confusing errors.
+    """
+    import platform as _platform
+
+    system = _platform.system()  # "Windows" | "Linux" | "Darwin"
+    if system == "Windows":
+        return (
+            "System environment: Windows. The `bash` tool executes via "
+            "cmd.exe (shell=True), so use Windows command syntax:\n"
+            "- `dir` not `ls`; `findstr` not `grep`; `type` not `cat`\n"
+            "- `del` not `rm`; `copy`/`move` not `cp`/`mv`; `where` not `which`\n"
+            "- no `tail`: use `findstr` or Python; no `touch`: use `type nul > file`\n"
+            "- prefer the `glob` tool over `find`/`dir /s` for searching files\n"
+            "- do NOT use multi-line `python -c` (cmd breaks newlines); "
+            "write a temporary .py file and run it\n"
+            "- path separator: backslash `\\` (quoted) or forward slash `/` both work"
+        )
+    if system == "Linux":
+        return (
+            "System environment: Linux. The `bash` tool executes via a POSIX "
+            "shell; standard Unix commands (ls/grep/tail/find/cat) work."
+        )
+    if system == "Darwin":
+        return (
+            "System environment: macOS. The `bash` tool executes via a POSIX "
+            "shell; standard Unix commands (ls/grep/tail/find/cat) work."
+        )
+    return f"System environment: {system}."
+
+
 def _format_time(*, granularity: TimeGranularity) -> str:
     now = datetime.now()
     if granularity == "minute":
@@ -49,6 +84,7 @@ def build_session_context(
     include_teammates: bool = True,
     include_todos: bool = True,
     include_project_instructions: bool = True,
+    include_platform: bool = True,
 ) -> str:
     """Dynamic harness state for the model (ephemeral message body, not static system)."""
     sections: list[str] = []
@@ -56,6 +92,9 @@ def build_session_context(
 
     if include_time:
         sections.append(f"Current time: {_format_time(granularity=granularity)}")
+
+    if include_platform:
+        sections.append(_format_platform())
 
     if include_model:
         current = get_model()

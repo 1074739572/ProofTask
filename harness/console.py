@@ -12,4 +12,3 @@ def terminal_print(text: str) -> None:
 
 
 CLI_ACTIVE = terminal_state.CLI_ACTIVE
-READLINE_AVAILABLE = terminal_state.READLINE_AVAILABLE

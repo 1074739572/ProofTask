@@ -11,6 +11,7 @@ from harness.ui import events
 from harness.ui.tool_display import (
     hooks_verbose,
     is_failure_tool_output,
+    show_tool_lines,
     summarize_failure_output,
     summarize_tool_input,
 )
@@ -43,7 +44,7 @@ class Renderer:
             _console.print(text, style=style, end=end)
             return
         line = ""
-        if terminal_state.READLINE_AVAILABLE:
+        if terminal_state.readline_available():
             try:
                 import readline
 
@@ -110,6 +111,8 @@ class Renderer:
         if len(preview) > 220:
             preview = preview[:219] + "…"
         events.emit("assistant_intent", text=preview)
+        if not show_tool_lines():
+            return
         self._write(f"› {preview}", style=theme.MUTED)
 
     def tool_start(
@@ -127,6 +130,8 @@ class Renderer:
             input=tool_input or {},
             summary=summary,
         )
+        if not show_tool_lines():
+            return
         detail = f"  {summary}" if summary else ""
         self._write(f"● {name}{detail}", style=theme.TOOL)
 

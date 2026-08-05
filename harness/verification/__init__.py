@@ -1,0 +1,117 @@
+"""Deterministic verification gate (L3).
+
+The bridge between the feature store (L2) and controlled command execution:
+
+- a feature declares its verification (``feature.verification``);
+- :func:`verify_feature_command` runs that declared command under the
+  policy + permission gates and updates the feature state through the ONLY
+  gate into ``passing`` (``harness.features.verify_feature``).
+
+Layer map (per the reliability plan §4):
+
+- ``policy.py``  — what may run as a verification command (structural gate);
+- ``runner.py``  — controlled execution (cwd / stdin / timeout / output);
+- ``evidence.py`` — build :class:`VerificationEvidence` from a run result;
+- feature store (``harness.features``) — durable state + evidence record.
+
+Public API::
+
+    verify_feature_command(feature_id, *, workspace, timeout_s) -> Feature
+    run_verification(command, *, workspace, timeout_s) -> VerificationRunResult
+    check_verification_command(command) -> VerificationDecision
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+from harness.features import (
+    Feature,
+    claim_feature,
+    get_feature,
+    verify_feature,
+)
+from harness.verification.evidence import evidence_from_result
+from harness.verification.policy import (
+    ALLOWED_PROGRAMS,
+    DENY_TOKENS,
+    GIT_READONLY_SUBCOMMANDS,
+    MAX_VERIFICATION_COMMAND_LEN,
+    VerificationDecision,
+    check_verification_command,
+)
+from harness.verification.runner import (
+    DEFAULT_VERIFY_TIMEOUT_S,
+    VerificationRunResult,
+    run_verification,
+)
+
+__all__ = [
+    "ALLOWED_PROGRAMS",
+    "DENY_TOKENS",
+    "GIT_READONLY_SUBCOMMANDS",
+    "MAX_VERIFICATION_COMMAND_LEN",
+    "DEFAULT_VERIFY_TIMEOUT_S",
+    "Feature",
+    "VerificationDecision",
+    "VerificationRunResult",
+    "check_verification_command",
+    "run_verification",
+    "verify_feature_command",
+]
+
+
+def verify_feature_command(
+    feature_id: str,
+    *,
+    workspace: str | Path | None = None,
+    timeout_s: float | None = None,
+) -> Feature:
+    """Run a feature's declared verification and update its state.
+
+    Behavior:
+
+    - a ``not_started`` feature is claimed first (auto-activate) so a fresh
+      feature can be verified immediately;
+    - policy/permission rejections do NOT raise — they mark the feature
+      ``failing`` with the rejection reason (the state machine stays the
+      single source of truth);
+    - a successful run (exit 0, no timeout) records evidence and flips the
+      feature to ``passing`` via ``harness.features.verify_feature`` — the
+      only path that may set ``passing``.
+    """
+    workspace = Path(workspace).expanduser().resolve() if workspace else None
+    feature: Feature = get_feature(feature_id, workspace)
+    if feature.state == "not_started":
+        feature = claim_feature(feature_id, workspace)
+
+    result = run_verification(
+        feature.verification,
+        workspace=feature.workspace or workspace,
+        timeout_s=timeout_s,
+    )
+
+    error: str | None = None
+    if result.error is not None:
+        error = result.error
+    elif result.exit_code != 0:
+        error = f"verification failed with exit code {result.exit_code}"
+
+    # Policy/permission rejections and workspace-mutation failures never
+    # executed successfully — record the reason, no fake evidence. Timeouts
+    # keep evidence (exit 124 convention).
+    executed = result.error is None or result.timed_out
+    evidence = (
+        evidence_from_result(result, workspace=str(feature.workspace or workspace))
+        if executed
+        else None
+    )
+
+    return verify_feature(
+        feature_id,
+        passed=result.passed,
+        evidence=evidence,
+        error=error,
+        workspace=workspace,
+    )

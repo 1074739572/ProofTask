@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from harness.models import get_model
 from harness.path_completion import ReadlinePathCompleter
-from harness.terminal_state import READLINE_AVAILABLE
+from harness.terminal_state import readline_available
 
 
 def format_cli_prompt() -> str:
@@ -20,7 +20,7 @@ def format_cli_prompt() -> str:
 
 
 def _read_with_path_completion(prompt: str, *, redo: str | None = None) -> str:
-    if not READLINE_AVAILABLE:
+    if not readline_available():
         return input(prompt)
 
     import readline
@@ -56,7 +56,7 @@ def read_cli_query(*, redo: str | None = None, prompt: str | None = None) -> str
     if not redo:
         return _read_with_path_completion(active_prompt)
 
-    if READLINE_AVAILABLE:
+    if readline_available():
         line = _read_with_path_completion(active_prompt, redo=redo)
         return line if line.strip() else redo
 

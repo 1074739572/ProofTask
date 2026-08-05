@@ -47,6 +47,7 @@ class WorkspacePaths:
     memory_index: Path
     project_dir: Path
     durable_cron_path: Path
+    features_dir: Path
 
 
 def _derive_paths(root: Path) -> WorkspacePaths:
@@ -61,6 +62,7 @@ def _derive_paths(root: Path) -> WorkspacePaths:
         memory_index=root / ".memory" / "MEMORY.md",
         project_dir=root / ".project",
         durable_cron_path=root / ".scheduled_tasks.json",
+        features_dir=root / ".features",
     )
 
 
@@ -112,7 +114,7 @@ def switch_workspace(root: Path) -> int:
     with _WORKSPACE_LOCK:
         _workspace = root
         _workspace_generation += 1
-        for path in (root / ".tasks", root / ".worktrees", root / ".mailboxes", root / ".project"):
+        for path in (root / ".tasks", root / ".worktrees", root / ".mailboxes", root / ".project", root / ".features"):
             path.mkdir(parents=True, exist_ok=True)
         return _workspace_generation
 

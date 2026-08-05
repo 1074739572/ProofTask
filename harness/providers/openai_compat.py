@@ -5,30 +5,34 @@ from __future__ import annotations
 import json
 import threading
 import uuid
-from typing import Any
-
-from openai import OpenAI
+from typing import TYPE_CHECKING, Any
 
 from harness.providers.config import ProviderConfig, provider_timeout, resolve_api_key
 from harness.providers.types import MessageResponse, TextBlock, ToolUseBlock
 
+if TYPE_CHECKING:
+    from openai import OpenAI
+
 _lock = threading.Lock()
-_clients: dict[str, OpenAI] = {}
+_clients: dict[str, "OpenAI"] = {}
 
 
-def get_openai_client(provider: ProviderConfig) -> OpenAI:
+def get_openai_client(provider: ProviderConfig) -> "OpenAI":
     with _lock:
         cached = _clients.get(provider.id)
         if cached is not None:
             return cached
+        # Lazy import: the OpenAI SDK is ~5s to import on Windows; only pay
+        # that cost when a turn actually needs an OpenAI-compatible client.
+        import httpx
+        from openai import OpenAI
+
         api_key = resolve_api_key(provider)
         if not api_key:
             raise RuntimeError(
                 f"Missing API key for provider '{provider.label}'. "
                 f"Set {provider.api_key_env} in .env"
             )
-        import httpx
-
         connect, read, write, pool = provider_timeout()
         client = OpenAI(
             api_key=api_key,

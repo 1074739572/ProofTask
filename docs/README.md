@@ -11,6 +11,8 @@
 |-----------|------|
 | 项目是什么、怎么跑 | [README.md](../README.md) |
 | 模块怎么拆、数据落哪 | [ARCHITECTURE.md](../ARCHITECTURE.md) |
+| Harness 可靠性改进总计划（来龙去脉 · 七层体系 · 实施状态） | [harness-reliability-plan.md](./harness-reliability-plan.md) |
+| 简历点（STAR + 量化成果） | [resume-harness-engineering.md](./resume-harness-engineering.md) |
 | 问题编号与关联关系 | [bugs/README.md](./bugs/README.md) |
 | 本地能力回归怎么评 | [evals.md](./evals.md) |
 | 本地 RAG 仿写怎么接 | [rag.md](./rag.md) |

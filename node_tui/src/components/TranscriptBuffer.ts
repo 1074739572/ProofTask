@@ -10,7 +10,7 @@ function clean(text: string): string {
   return (text || '').replace(/\r/g, '').trimEnd();
 }
 
-function wrapText(text: string, width: number): string[] {
+export function wrapText(text: string, width: number): string[] {
   const max = Math.max(12, width);
   const rawLines = clean(text).split('\n');
   const out: string[] = [];

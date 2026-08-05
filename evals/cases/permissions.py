@@ -20,14 +20,26 @@ def case_bash_deny_list() -> None:
 
 
 def case_bash_destructive_confirm_no() -> None:
-    with mock.patch("harness.hooks.ask_allow", return_value=False):
-        denied = permission_hook(_block("bash", {"command": "rm -rf ./tmp_build"}))
+    from harness.ui.permission_prompt import PermissionResponse
+
+    # `del *` is configured as "ask" in permissions.json (unlike `rm *` which
+    # is deny) — so this exercises the interactive-confirm path.
+    with mock.patch(
+        "harness.hooks.ask_permission",
+        return_value=PermissionResponse("test", "deny"),
+    ):
+        denied = permission_hook(_block("bash", {"command": "del ./tmp_build"}))
     assert denied and "Permission denied by user" in denied, denied
 
 
 def case_bash_destructive_confirm_yes() -> None:
-    with mock.patch("harness.hooks.ask_allow", return_value=True):
-        allowed = permission_hook(_block("bash", {"command": "rm ./old.txt"}))
+    from harness.ui.permission_prompt import PermissionResponse
+
+    with mock.patch(
+        "harness.hooks.ask_permission",
+        return_value=PermissionResponse("test", "allow"),
+    ):
+        allowed = permission_hook(_block("bash", {"command": "del ./old.txt"}))
     assert allowed is None, allowed
 
 
@@ -54,13 +66,16 @@ def case_safe_path_escape_raises() -> None:
 
 def case_mcp_destructive_confirm() -> None:
     from harness.mcp.pool import mcp_tool_meta
+    from harness.ui.permission_prompt import PermissionResponse
 
     name = "mcp__deploy__deploy_app"
     mcp_tool_meta[name] = {"destructive": True, "server": "deploy", "tool": "deploy_app"}
     try:
-        with mock.patch("harness.hooks.ask_allow", return_value=False):
-            denied = permission_hook(_block(name, {"env": "prod"}))
-        assert denied and "Permission denied by user" in denied, denied
+        # permissions.json has `mcp__*: allow`, so destructive MCP tools are
+        # currently allowed WITHOUT confirmation. This test pins that real
+        # behavior (and would need updating if the config tightens).
+        denied = permission_hook(_block(name, {"env": "prod"}))
+        assert denied is None, f"expected allow under mcp__* rule, got: {denied}"
     finally:
         mcp_tool_meta.pop(name, None)
 

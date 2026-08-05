@@ -10,12 +10,16 @@ from __future__ import annotations
 import json
 import random
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from harness.settings import TASKS_DIR
 
-TASKS_ARCHIVE_DIR = TASKS_DIR / "archive"
+
+def _archive_dir() -> Path:
+    """Archive directory — computed at call time so tests that patch
+    TASKS_DIR (or a workspace switch) never write to a stale path."""
+    return TASKS_DIR / "archive"
 
 
 @dataclass
@@ -28,6 +32,11 @@ class Task:
     blockedBy: list[str]
     worktree: str | None = None
     completed_at: float | None = None
+    # L2 extensions — defaulted so legacy JSON files (without these keys)
+    # still load via Task(**data).
+    feature_ids: list[str] = field(default_factory=list)
+    attempts: int = 0
+    last_error: str | None = None
 
 
 def _active_path(task_id: str) -> Path:
@@ -35,7 +44,7 @@ def _active_path(task_id: str) -> Path:
 
 
 def _archive_path(task_id: str) -> Path:
-    return TASKS_ARCHIVE_DIR / f"{task_id}.json"
+    return _archive_dir() / f"{task_id}.json"
 
 
 def _find_task_path(task_id: str) -> Path | None:
@@ -91,20 +100,20 @@ def list_tasks(*, include_archived: bool = False) -> list[Task]:
         _load_task_from_path(path)
         for path in sorted(TASKS_DIR.glob("task_*.json"))
     ]
-    if include_archived and TASKS_ARCHIVE_DIR.exists():
+    if include_archived and _archive_dir().exists():
         tasks.extend(
             _load_task_from_path(path)
-            for path in sorted(TASKS_ARCHIVE_DIR.glob("task_*.json"))
+            for path in sorted(_archive_dir().glob("task_*.json"))
         )
     return tasks
 
 
 def list_archived_tasks() -> list[Task]:
-    if not TASKS_ARCHIVE_DIR.exists():
+    if not _archive_dir().exists():
         return []
     return [
         _load_task_from_path(path)
-        for path in sorted(TASKS_ARCHIVE_DIR.glob("task_*.json"))
+        for path in sorted(_archive_dir().glob("task_*.json"))
     ]
 
 
@@ -153,13 +162,27 @@ def claim_task(task_id: str, owner: str = "agent") -> str:
         return "Cannot start — " + ", ".join(parts)
     task.owner = owner
     task.status = "in_progress"
+    task.attempts += 1
     save_task(task)
     print(f"  \033[36m[claim] {task.subject} → in_progress\033[0m")
     return f"Claimed {task.id} ({task.subject})"
 
 
+def attach_feature(task_id: str, feature_id: str) -> str:
+    """Link a feature (harness.features) to a task. Idempotent."""
+    path = _active_path(task_id)
+    if not path.exists():
+        raise FileNotFoundError(f"task {task_id} is not on the active board")
+    task = _load_task_from_path(path)
+    if feature_id not in task.feature_ids:
+        task.feature_ids.append(feature_id)
+        save_task(task)
+        return f"Attached {feature_id} to {task_id}"
+    return f"{feature_id} already attached to {task_id}"
+
+
 def _archive_task(task: Task) -> None:
-    TASKS_ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+    _archive_dir().mkdir(parents=True, exist_ok=True)
     save_task(task, archived=True)
     active = _active_path(task.id)
     if active.exists():
@@ -176,6 +199,75 @@ def complete_task(task_id: str) -> str:
     task = _load_task_from_path(path)
     if task.status != "in_progress":
         return f"Task {task_id} is {task.status}, cannot complete"
+
+    # L4 clean-state gate: report in warn mode; block in enforce mode.
+    # (Delayed import keeps harness.tasks free of a hard dependency on clean.)
+    from harness.clean import clean_mode, run_clean_check
+    from harness.settings import get_workspace_paths
+    from harness.ui import events
+
+    mode = clean_mode()
+
+    # Check the task's own workspace (its worktree, if bound) — not whatever
+    # workspace the process happens to be in right now.
+    ws_paths = get_workspace_paths()
+    check_ws: Path | None = None
+    if task.worktree:
+        candidate = ws_paths.worktrees_dir / task.worktree
+        if candidate.exists():
+            check_ws = candidate
+
+    report = run_clean_check(check_ws)
+    if mode == "enforce" and not report.ok:
+        failures = ", ".join(c.id for c in report.hard_failures)
+        if not events.is_enabled():
+            print(f"\n\033[31m[clean:enforce] blocking completion — {failures}\033[0m")
+            print(report.summary())
+        return (
+            f"Cannot complete {task.id} — clean-state check failed ({failures}). "
+            f"Fix the issues and retry. Details:\n{report.summary()}"
+        )
+    if mode == "warn" and not report.ok and not events.is_enabled():
+        print(f"\n\033[33m[clean:warn]\033[0m")
+        print(report.summary())
+
+    # L2 completion gate: every linked feature must be passing and fresh.
+    if task.feature_ids:
+        from harness.features import feature_is_stale, list_features
+
+        features = list_features(workspace=check_ws) if check_ws else list_features()
+        by_id = {f.id: f for f in features}
+        missing = [fid for fid in task.feature_ids if fid not in by_id]
+        not_passing = [
+            f"{fid} ({by_id[fid].name}) [{by_id[fid].state}]"
+            for fid in task.feature_ids
+            if fid in by_id and by_id[fid].state != "passing"
+        ]
+        stale = [
+            f"{fid} ({by_id[fid].name})"
+            for fid in task.feature_ids
+            if fid in by_id and by_id[fid].state == "passing" and feature_is_stale(by_id[fid])
+        ]
+        problems: list[str] = []
+        if missing:
+            problems.append("missing features: " + ", ".join(missing))
+        if not_passing:
+            problems.append("not passing: " + ", ".join(not_passing))
+        if stale:
+            problems.append("stale (code changed after verification): " + ", ".join(stale))
+        if problems:
+            detail = "; ".join(problems)
+            if mode == "enforce":
+                if not events.is_enabled():
+                    print(f"\n\033[31m[clean:enforce] blocking completion — features not done\033[0m")
+                    print(f"  {detail}")
+                return (
+                    f"Cannot complete {task.id} — linked features are not all "
+                    f"passing and fresh. {detail}"
+                )
+            if not events.is_enabled():
+                print(f"\n\033[33m[clean:warn]\033[0m features not all done: {detail}")
+
     task.status = "completed"
     task.completed_at = time.time()
     _archive_task(task)
@@ -224,7 +316,7 @@ def clear_active_tasks(*, archive: bool = True) -> str:
     if not paths:
         return "Active task board is already empty."
     if archive:
-        TASKS_ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+        _archive_dir().mkdir(parents=True, exist_ok=True)
         for path in paths:
             task = _load_task_from_path(path)
             task.status = "cancelled"

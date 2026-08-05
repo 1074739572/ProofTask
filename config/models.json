@@ -6,14 +6,17 @@
       "provider": "deepseek",
       "label": "DeepSeek V4 Flash (fast)",
       "api_model": "deepseek-v4-flash",
-      "context_window": 1000000
+      "context_window": 1000000,
+      "effort_options": ["low", "high", "max"]
     },
     {
       "id": "deepseek-v4-pro",
       "provider": "deepseek",
       "label": "DeepSeek V4 Pro (stronger)",
       "api_model": "deepseek-v4-pro",
-      "context_window": 1000000
+      "context_window": 1000000,
+      "reasoning_effort": "high",
+      "effort_options": ["low", "high", "max"]
     },
     {
       "id": "mimo-v2.5-pro",
@@ -23,12 +26,22 @@
       "context_window": 1000000
     },
     {
+      "id": "gpt-5.6-luna",
+      "provider": "anzhiyu",
+      "label": "GPT-5.6 Luna",
+      "api_model": "gpt-5.6-luna",
+      "context_window": 1000000,
+      "effort_options": ["medium", "high", "xhigh", "max", "ultra"],
+      "api_effort_values": {"xhigh": "xhigh"}
+    },
+    {
       "id": "gpt-5.6-terra",
       "provider": "anzhiyu",
       "label": "GPT-5.6 Terra",
       "api_model": "gpt-5.6-terra",
       "context_window": 1000000,
-      "effort_options": ["minimal", "low", "medium", "high"]
+      "effort_options": ["medium", "high", "xhigh", "max", "ultra"],
+      "api_effort_values": {"xhigh": "xhigh"}
     },
     {
       "id": "gpt-5.6-sol",
@@ -37,7 +50,8 @@
       "api_model": "gpt-5.6-sol",
       "context_window": 1000000,
       "reasoning_effort": "high",
-      "effort_options": ["minimal", "low", "medium", "high"]
+      "effort_options": ["medium", "high", "xhigh", "max", "ultra"],
+      "api_effort_values": {"xhigh": "xhigh"}
     }
   ]
 }

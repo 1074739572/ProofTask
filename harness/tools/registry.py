@@ -86,6 +86,93 @@ def run_complete_task(task_id: str) -> str:
         return f"Error: task {task_id} not found"
 
 
+# --- feature tools (L2/L3/L5) ------------------------------------------------
+
+def _feature_workspace():
+    from harness.settings import get_workdir
+
+    return get_workdir()
+
+
+def run_create_feature(
+    name: str, behavior: str, verification: str, evaluation_required: bool = False
+) -> str:
+    from harness.features import create_feature
+
+    feature = create_feature(
+        name,
+        behavior,
+        verification,
+        workspace=_feature_workspace(),
+        evaluation_required=evaluation_required,
+    )
+    return f"Created {feature.id}: {feature.name} [{feature.state}]"
+
+
+def run_claim_feature(feature_id: str) -> str:
+    from harness.features import claim_feature
+
+    try:
+        feature = claim_feature(feature_id, workspace=_feature_workspace())
+    except FileNotFoundError:
+        return f"Error: feature {feature_id} not found in workspace"
+    except ValueError as exc:
+        return f"Error: {exc}"
+    return f"Claimed {feature.id} -> {feature.state}"
+
+
+def run_list_features() -> str:
+    from harness.features import list_features
+
+    features = list_features(workspace=_feature_workspace())
+    if not features:
+        return "No features in this workspace."
+    return "\n".join(
+        f"  {f.id}: {f.name} [{f.state}]"
+        + (f" (evaluation_required)" if f.evaluation_required else "")
+        for f in features
+    )
+
+
+def run_verify_feature(feature_id: str, timeout_s: float | None = None) -> str:
+    from harness.verification import verify_feature_command
+
+    try:
+        feature = verify_feature_command(
+            feature_id, workspace=_feature_workspace(), timeout_s=timeout_s
+        )
+    except FileNotFoundError:
+        return f"Error: feature {feature_id} not found in workspace"
+    except ValueError as exc:
+        return f"Error: {exc}"
+    tail = ""
+    if feature.evidence:
+        ev = feature.evidence[-1]
+        tail = f" | exit={ev.get('exit_code')} | {ev.get('stdout_tail', '')[:120]}"
+    return f"Verified {feature.id} -> {feature.state}{tail}"
+
+
+def run_evaluate_feature(feature_id: str) -> str:
+    from harness.evaluation import run_evaluation
+
+    try:
+        feature = run_evaluation(feature_id, workspace=_feature_workspace())
+    except FileNotFoundError:
+        return f"Error: feature {feature_id} not found in workspace"
+    evaluation = feature.evaluation or {}
+    verdict = evaluation.get("passed")
+    if verdict is None:
+        return (
+            f"Evaluation of {feature.id} failed/recorded: "
+            f"{evaluation.get('error', 'no verdict')}"
+        )
+    findings = evaluation.get("findings", [])
+    return (
+        f"Evaluated {feature.id}: passed={verdict} | {evaluation.get('summary', '')} "
+        f"| {len(findings)} finding(s)"
+    )
+
+
 def run_send_message(to: str, content: str) -> str:
     BUS.send("lead", to, content)
     return f"Sent to {to}"
@@ -153,6 +240,64 @@ BUILTIN_TOOLS = [
                 },
             },
             "required": ["path"],
+        },
+    },
+    {
+        "name": "create_feature",
+        "description": (
+            "Create a feature (smallest unit of user-visible behavior) with a "
+            "declared verification command. State machine: not_started -> active "
+            "-> passing/failing/blocked. A feature only reaches passing with "
+            "verification evidence."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "behavior": {"type": "string", "description": "What the user asked for, in verifiable terms."},
+                "verification": {"type": "string", "description": "Read-only command to prove it (e.g. pytest -q, python tests/check.py)."},
+                "evaluation_required": {"type": "boolean", "description": "Whether an independent evaluator should review it."},
+            },
+            "required": ["name", "behavior", "verification"],
+        },
+    },
+    {
+        "name": "claim_feature",
+        "description": "Mark a feature as being worked on (not_started -> active).",
+        "input_schema": {
+            "type": "object",
+            "properties": {"feature_id": {"type": "string"}},
+            "required": ["feature_id"],
+        },
+    },
+    {
+        "name": "list_features",
+        "description": "List all features in the current workspace with their state.",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "verify_feature",
+        "description": (
+            "Run a feature's declared verification under the policy + permission "
+            "gates. Only a passing verification (exit 0) sets the feature to "
+            "passing, with evidence."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "feature_id": {"type": "string"},
+                "timeout_s": {"type": "number", "description": "Optional timeout in seconds."},
+            },
+            "required": ["feature_id"],
+        },
+    },
+    {
+        "name": "evaluate_feature",
+        "description": "Run the independent (read-only) evaluator on a feature and record findings (advisory).",
+        "input_schema": {
+            "type": "object",
+            "properties": {"feature_id": {"type": "string"}},
+            "required": ["feature_id"],
         },
     },
     {
@@ -560,6 +705,11 @@ BUILTIN_HANDLERS = {
     "get_task": run_get_task,
     "claim_task": run_claim_task,
     "complete_task": run_complete_task,
+    "create_feature": run_create_feature,
+    "claim_feature": run_claim_feature,
+    "list_features": run_list_features,
+    "verify_feature": run_verify_feature,
+    "evaluate_feature": run_evaluate_feature,
     "schedule_cron": run_schedule_cron,
     "list_crons": run_list_crons,
     "cancel_cron": run_cancel_cron,

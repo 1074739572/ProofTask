@@ -4,6 +4,7 @@ import {initialWorkspace, startBackend, type Backend} from './backend.js';
 import {initialState, reduceEvent} from './state.js';
 import {HeaderStatus} from './components/HeaderStatus.js';
 import {Timeline, transcriptLineCount} from './components/Timeline.js';
+import {Welcome} from './components/Welcome.js';
 import {CommandPalette} from './components/CommandPalette.js';
 import {Composer} from './components/Composer.js';
 import {useTerminalSize} from './hooks/useTerminalSize.js';
@@ -94,7 +95,13 @@ function App() {
     setFollowBottom(true);
     setScrollTopLine(maxScrollTop);
     if (!isSlashCommand(text)) dispatch({type: 'thinking_start', phase: 'preparing'});
-    backendRef.current?.send({type: 'user_message', text});
+    // Slash commands are non-interactive control commands — send as
+    // slash_command so the backend runs them instantly (even while the agent
+    // is busy) without flipping the UI into the running state.
+    backendRef.current?.send({
+      type: isSlashCommand(text) ? 'slash_command' : 'user_message',
+      text,
+    });
     setCompletion(null);
     setCompletionPending(false);
     setInput('');
@@ -167,7 +174,11 @@ function App() {
   return (
     <Box flexDirection="column" width={columns} height={rows} paddingX={compact ? 0 : 1}>
       {header}
-      <Timeline items={state.items} rows={timelineRows} columns={columns} scrollTopLine={scrollTopLine} />
+      {state.items.length === 0 && state.welcome.art.length > 0 ? (
+        <Welcome welcome={state.welcome} rows={timelineRows} columns={columns} />
+      ) : (
+        <Timeline items={state.items} rows={timelineRows} columns={columns} scrollTopLine={scrollTopLine} />
+      )}
       {state.picker ? <CommandPalette picker={state.picker} rows={paletteRows} /> : null}
       {completion || completionPending ? (
         <Box>

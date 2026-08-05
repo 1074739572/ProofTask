@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from harness.models import ModelProfile
+from harness.models import ModelProfile, api_reasoning_effort
 from harness.project.session import messages_for_api
 from harness.providers.anthropic import get_anthropic_client
 from harness.providers.config import get_provider
@@ -47,7 +47,7 @@ def create_provider_message(
             max_tokens=max_tokens,
             system=system,
             tools=tools,
-            reasoning_effort=profile.reasoning_effort,
+            reasoning_effort=api_reasoning_effort(profile),
             extra_body=profile.extra_body,
             on_delta=on_delta,
         )

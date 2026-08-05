@@ -6,19 +6,8 @@ import readline from 'node:readline';
 import {alwaysSeparate, setPreLayoutSiblingMargin} from './layout.ts';
 import {buildSections} from './sections.ts';
 import type {ActionRow, Entry, Section, SubagentStatus} from './sections.ts';
-
-// Purple-focused palette used by the compact usage header and the TUI focus states.
-const C = {
-  primary: '#6f6fff',
-  secondary: '#a9aeff',
-  accent: '#4b3fe3',
-  error: '#e8463a',
-  warning: '#efaa17',
-  success: '#1dc981',
-  info: '#27d2bf',
-  textMuted: '#a1a1aa',
-  text: '#e5e5e5',
-} as const;
+import {C} from './theme.ts';
+import {WelcomeView} from './Welcome.tsx';
 
 export type OverlayOption = {name: string; description: string; value: string};
 export type Overlay = {kind: 'permission' | 'picker'; id: string; title: string; pickerId?: string; options: OverlayOption[]};
@@ -29,6 +18,47 @@ const textareaBindings = [
 ];
 
 const repoRoot = process.cwd().replace(/[\\/]node_tui$/, '');
+
+// Read the default model straight from config/models.json (+ MODEL_ID env) so
+// the status bar shows the real model name the moment the TUI paints, instead
+// of a placeholder that only updates once the backend's first session_status
+// arrives (~1.5s later). The backend keeps being the source of truth and will
+// overwrite this on the first status event.
+function readDefaultModel(): string {
+  const envModel = (process.env.MODEL_ID || '').trim();
+  try {
+    const fs = require('node:fs');
+    const path = require('node:path');
+    const file = path.join(repoRoot, 'config', 'models.json');
+    if (fs.existsSync(file)) {
+      const data = JSON.parse(fs.readFileSync(file, 'utf-8'));
+      const def = data && typeof data === 'object' ? data.default : null;
+      if (typeof def === 'string' && def.trim()) return def.trim();
+    }
+  } catch {
+    // fall through to env / placeholder
+  }
+  return envModel || 'model';
+}
+
+// Same idea for the default mode (config/modes.json "default" key). The
+// backend overwrites both on its first session_status event.
+function readDefaultMode(): string {
+  try {
+    const fs = require('node:fs');
+    const path = require('node:path');
+    const file = path.join(repoRoot, 'config', 'modes.json');
+    if (fs.existsSync(file)) {
+      const data = JSON.parse(fs.readFileSync(file, 'utf-8'));
+      const def = data && typeof data === 'object' ? data.default : null;
+      if (typeof def === 'string' && def.trim()) return def.trim();
+    }
+  } catch {
+    // fall through
+  }
+  return 'mode';
+}
+
 const child = process.env.DEBUG_SKIP_BACKEND === '1' ? null : spawn(process.env.PYTHON || 'python', ['main.py', '--event-stream'], {cwd: repoRoot, stdio: ['pipe', 'pipe', 'pipe'], env: {...process.env, PYTHONIOENCODING: 'utf-8'}});
 let reportDiagnostic: (text: string) => void = (text: string) => { process.stderr.write(`${text}\n`); };
 if (child?.stderr) {
@@ -65,6 +95,25 @@ function contextHeader(width: number, used: number, window: number, today: numbe
   if (innerWidth >= fixed.length + 7) return `${todayText} · ${cacheText} · Context ${bar} ${usageText} ${percent}`;
   if (innerWidth >= 38) return `Context ${bar} ${percent} · ${todayText}`;
   return `Ctx ${bar} ${percent}`;
+}
+
+function effortShortLabel(label: string, value: string): string {
+  const text = (label || '').trim();
+  if (text && text !== 'Model default') return text;
+  return value && value !== 'off' ? value : 'Default';
+}
+
+function repoBase(cwd: string): string {
+  if (!cwd) return '';
+  return cwd.split(/[\\/]/).filter(Boolean).pop() || cwd;
+}
+
+// Usage header text. Wide terminals get the product + workspace identity up
+// front; narrow ones keep the usage-only line so nothing important is clipped.
+function headerText(width: number, used: number, window: number, today: number, cacheRead: number, input: number, cwd: string): string {
+  const prefix = width >= 90 ? (cwd ? `Harness · ${repoBase(cwd)} · ` : 'Harness · ') : '';
+  const context = contextHeader(Math.max(20, width - prefix.length), used, window, today, cacheRead, input);
+  return prefix + context;
 }
 
 function formatElapsed(start?: number, end?: number, now = 0): string {
@@ -408,10 +457,13 @@ function LogView(props: {entries: () => Entry[]; now: () => number; active: () =
   </scrollbox>;
 }
 
-export function App(props?: {debugEntries?: Entry[]; debugOverlay?: Overlay; debugUsage?: {input: number; output: number; cacheRead: number; contextUsed?: number; contextWindow?: number}}) {
+export function App(props?: {debugEntries?: Entry[]; debugOverlay?: Overlay; debugUsage?: {input: number; output: number; cacheRead: number; contextUsed?: number; contextWindow?: number}; debugEffort?: {value: string; label: string; options: OverlayOption[]}; debugWelcome?: {quote: string; art: string[]}}) {
   const dims = useTerminalDimensions();
   const [entries, setEntries] = createSignal<Entry[]>(props?.debugEntries ?? []); const [input, setInput] = createSignal('');
-  const [model, setModel] = createSignal('model'); const [mode, setMode] = createSignal('mode'); const [cwd, setCwd] = createSignal(''); const [session, setSession] = createSignal('');
+  const [model, setModel] = createSignal(readDefaultModel()); const [mode, setMode] = createSignal(readDefaultMode()); const [cwd, setCwd] = createSignal(''); const [session, setSession] = createSignal('');
+  const [effort, setEffort] = createSignal(props?.debugEffort?.value ?? 'off'); const [effortLabel, setEffortLabel] = createSignal(props?.debugEffort?.label ?? 'Model default'); const [effortOptions, setEffortOptions] = createSignal<OverlayOption[]>(props?.debugEffort?.options ?? []);
+  // Welcome panel data mirrored from the CLI startup (daily quote only).
+  const [welcomeQuote, setWelcomeQuote] = createSignal(props?.debugWelcome?.quote ?? '');
   const [todayInput, setTodayInput] = createSignal(props?.debugUsage?.input ?? 0); const [todayOutput, setTodayOutput] = createSignal(props?.debugUsage?.output ?? 0); const [todayCacheRead, setTodayCacheRead] = createSignal(props?.debugUsage?.cacheRead ?? 0);
   const [contextUsed, setContextUsed] = createSignal(props?.debugUsage?.contextUsed ?? 0); const [contextWindow, setContextWindow] = createSignal(props?.debugUsage?.contextWindow ?? 0);
   // Keyboard focus follows only visible collapsible rows.
@@ -440,8 +492,15 @@ export function App(props?: {debugEntries?: Entry[]; debugOverlay?: Overlay; deb
   const [historyIdx, setHistoryIdx] = createSignal(-1);
   // Toast for picker feedback
   const [toast, setToast] = createSignal<{text: string; time: number} | null>(null);
-  // Startup tracking
-  const [startup, setStartup] = createSignal(true);
+  // Tracks whether the user has started a conversation. The welcome panel stays
+  // visible until the first real submit — background backend logs must not
+  // dismiss it, which is why this is not keyed off entries().length.
+  const [userStarted, setUserStarted] = createSignal(false);
+  // Backend readiness. The welcome panel renders immediately with a local
+  // quote; when the backend's first event lands we mark it ready and swap in
+  // the real daily quote. Nothing blocks on startup. Debug renders inject
+  // entries directly and have no real backend, so they start ready.
+  const [backendReady, setBackendReady] = createSignal(props?.debugEntries != null);
   let turnStart = 0; let turnToolCount = 0; let turnFiles: string[] = []; let turnTokens = {inp: 0, out: 0, cache: 0};
   let responseId = ''; let pendingPrompt = ''; let actionCounter = 0; let firstEvent = true;
   // Reference to the multiline composer so programmatic edits (history recall,
@@ -459,11 +518,10 @@ export function App(props?: {debugEntries?: Entry[]; debugOverlay?: Overlay; deb
     return Math.max(1, Math.min(MAX_COMPOSER_LINES, Math.max(explicit, wrapped)));
   };
   const timer = setInterval(() => setNow(Date.now()), 250); onCleanup(() => clearInterval(timer));
-  // Fixed layout budget: usage header with border(3), composer(1..5) + status(1), startup(1), overlay(var).
+  // Fixed layout budget: usage header with border(3), composer(1..5) + status(1), overlay(var).
   const viewportHeight = () => {
     const h = dims().height;
-    let used = 3 + 1 + composerLines();
-    if (startup()) used += 1;
+    let used = 3 + 1 + composerLines() + 1; // +1 fixed startup indicator row
     if (overlay()) {
       const o = overlay()!;
       const rows = Math.min(o.options.length, 8);
@@ -471,6 +529,11 @@ export function App(props?: {debugEntries?: Entry[]; debugOverlay?: Overlay; deb
     }
     return Math.max(3, h - used);
   };
+  // The welcome panel shows as soon as the TUI opens and stays until the user
+  // submits their first prompt (it is not dismissed by backend logs, which may
+  // arrive while the panel is on screen). Ctrl+L clearing a session brings it
+  // back naturally.
+  const showWelcome = () => !overlay() && !running() && !userStarted();
   // Sliding window around the selected index. Must be a memo: the <Show> child
   // callback runs untracked, so plain consts inside it would freeze at open time.
   const overlayWindow = createMemo(() => {
@@ -543,19 +606,35 @@ export function App(props?: {debugEntries?: Entry[]; debugOverlay?: Overlay; deb
     if (!deltaFlushTimer) deltaFlushTimer = setTimeout(flushDeltas, 66);
   };
   const begin = (nextPhase: string) => { setPhase(nextPhase); setRunning(true); if (!startedAt()) setStartedAt(Date.now()); };
+  const openEffortPicker = () => {
+    const options = effortOptions();
+    if (options.length) {
+      const selected = Math.max(0, options.findIndex(option => option.value === effort()));
+      setOverlay({kind: 'picker', id: 'effort', pickerId: 'effort', title: 'Select reasoning effort', options});
+      setOverlayIndex(selected);
+    } else {
+      send({type: 'user_message', text: '/effort', silent: true});
+    }
+  };
   const elapsed = () => startedAt() ? `${Math.floor((now() - startedAt()) / 1000)}s` : '0s';
   const spinner = () => ['|', '/', '-', '\\'][Math.floor(now() / 180) % 4];
   reportDiagnostic = (text: string) => add({id: `log-${Date.now()}`, kind: 'log', text: 'Backend', detail: text});
   if (child?.stdout) {
     const rl = readline.createInterface({input: child.stdout});
     rl.on('line', raw => { try {
-      if (firstEvent) { firstEvent = false; setStartup(false); }
+      if (firstEvent) { firstEvent = false; setBackendReady(true); }
       const event = JSON.parse(raw); switch (event.type) {
       case 'session_status': {
         setModel(value(event, 'model') || 'model'); setMode(value(event, 'mode') || 'mode'); setCwd(value(event, 'cwd', 'working_dir')); setSession(value(event, 'session', 'session_id'));
+        setEffort(value(event, 'reasoning_effort') || 'off'); setEffortLabel(value(event, 'reasoning_effort_label') || 'Model default');
+        setEffortOptions((event.reasoning_effort_options || []).map((x: any) => ({name: x.label || x.id, description: x.detail || '', value: x.id || 'off'})));
         setTodayInput(Number(event.today_input_tokens || 0)); setTodayOutput(Number(event.today_output_tokens || 0)); setTodayCacheRead(Number(event.today_cache_read_tokens || 0));
         setContextUsed(Number(event.ctx_tokens || 0)); setContextWindow(Number(event.ctx_window || 0));
         if (event.running) { setRunning(true); setPhase(value(event, 'phase') || 'running'); if (!startedAt()) setStartedAt(Date.now()); }
+        break;
+      }
+      case 'welcome': {
+        setWelcomeQuote(value(event, 'quote') || '');
         break;
       }
       case 'usage_update': {
@@ -604,16 +683,18 @@ export function App(props?: {debugEntries?: Entry[]; debugOverlay?: Overlay; deb
       case 'permission_request': setOverlay({kind: 'permission', id: event.id, title: event.title || `Allow ${event.tool}?`, options: [{name: 'Allow once', description: event.resource || '', value: 'allow'}, {name: 'Allow session', description: 'Remember until this TUI exits', value: 'session'}, {name: 'Deny', description: 'Block this tool call', value: 'deny'}]}); setOverlayIndex(0); break;
     }} catch { /* stdout is JSONL; malformed diagnostics are ignored */ } });
   }
-  const selectOverlay = () => {
+  const selectOverlay = (index?: number) => {
     const current = overlay();
     if (!current) return;
-    const option = current.options[overlayIndex()];
+    const selectedIndex = index ?? overlayIndex();
+    const option = current.options[selectedIndex];
     if (!option) return;
     if (current.kind === 'permission') {
       send({type: 'permission_response', id: current.id, decision: option.value});
       setToast({text: option.name, time: Date.now()});
     } else {
       const command = current.pickerId === 'model' ? `/model ${option.value}` : current.pickerId === 'resume' ? `/resume ${option.value}` : current.pickerId === 'effort' ? `/effort ${option.value}` : `/mode ${option.value}`;
+      if (current.pickerId === 'effort') { setEffort(String(option.value || 'off')); setEffortLabel(option.name || 'Model default'); }
       send({type: 'user_message', text: command, silent: true});
       setToast({text: `Switched: ${option.name}`, time: Date.now()});
     }
@@ -630,8 +711,9 @@ export function App(props?: {debugEntries?: Entry[]; debugOverlay?: Overlay; deb
       return;
     }
     if (event?.ctrl && name === 'q') { send({type: 'exit'}); child?.kill?.(); process.exit(0); }
+    if (event?.ctrl && name === 'e') { openEffortPicker(); event.preventDefault?.(); return; }
     if (event?.ctrl && name === 'c') send({type: 'interrupt'});
-    if (event?.ctrl && name === 'l') { setEntries([]); send({type: 'clear'}); }
+    if (event?.ctrl && name === 'l') { setEntries([]); setUserStarted(false); send({type: 'clear'}); }
     // Input history: with an empty composer, ↑ recalls past commands and ↓
     // walks back toward the newest, past the end clears the input. When the
     // composer has text, ↑/↓ move the cursor inside the multiline buffer.
@@ -674,6 +756,7 @@ export function App(props?: {debugEntries?: Entry[]; debugOverlay?: Overlay; deb
     const isCommand = text.startsWith('/');
     if (!isCommand) add({id: `prompt-${Date.now()}`, kind: 'prompt', text});
     pendingPrompt = text;
+    setUserStarted(true);
     send({type: 'user_message', text});
     setInput('');
     textareaRef?.setText?.('');
@@ -684,28 +767,41 @@ export function App(props?: {debugEntries?: Entry[]; debugOverlay?: Overlay; deb
     {/* Single-line usage header: today's totals plus current context pressure. */}
     <box height={3} flexShrink={0} border borderStyle="rounded" borderColor={C.accent} paddingX={1}>
       <text fg={contextWindow() > 0 && contextUsed() / contextWindow() >= 0.95 ? C.error : contextWindow() > 0 && contextUsed() / contextWindow() >= 0.8 ? C.warning : C.primary} wrapMode="none" truncate>
-        {contextHeader(dims().width, contextUsed(), contextWindow(), todayInput() + todayOutput(), todayCacheRead(), todayInput())}
+        {headerText(dims().width, contextUsed(), contextWindow(), todayInput() + todayOutput(), todayCacheRead(), todayInput(), cwd())}
       </text>
     </box>
-    {/* Startup indicator */}
-    <Show when={startup()}>
-      <box paddingX={1}>
+    {/* Startup indicator: stays one row so the welcome panel never jumps when
+        the backend's first event lands (~1.5-2s). */}
+    <box height={1} flexShrink={0} paddingX={1}>
+      <Show when={!backendReady()}>
         <text fg={C.warning}>Starting backend...</text>
-      </box>
+      </Show>
+    </box>
+    <Show when={showWelcome()} fallback={
+      <LogView entries={entries} now={now} height={viewportHeight()} active={() => !overlay()} composerEmpty={() => !overlay() && input() === ''} focusId={focusId} onCycleFocus={cycleFocus} onToggleExpand={toggleExpand} onClearFocus={() => setFocusId(null)} onSummaryClick={toggleSummaryExpand} />
+    }>
+      <WelcomeView width={dims().width} height={viewportHeight()} quote={welcomeQuote()} />
     </Show>
-    <LogView entries={entries} now={now} height={viewportHeight()} active={() => !overlay()} composerEmpty={() => !overlay() && input() === ''} focusId={focusId} onCycleFocus={cycleFocus} onToggleExpand={toggleExpand} onClearFocus={() => setFocusId(null)} onSummaryClick={toggleSummaryExpand} />
     <Show when={overlay()}>
       <box border borderStyle="rounded" borderColor={C.accent} title={` ${overlay()?.title} `} height={(overlayWindow()?.rows ?? 0) + 3} paddingX={1} flexDirection="column">
-        <For each={overlayWindow()?.options ?? []}>{(option, i) => <box flexDirection="row">
-          <text fg={(overlayWindow()?.start ?? 0) + i() === overlayIndex() ? C.success : C.textMuted}>{(overlayWindow()?.start ?? 0) + i() === overlayIndex() ? '▶ ' : '  '}{option.name}</text>
-          {option.description ? <text fg={C.textMuted}>  {option.description}</text> : null}
-        </box>}</For>
+        <For each={overlayWindow()?.options ?? []}>{(option, i) => {
+          const absoluteIndex = () => (overlayWindow()?.start ?? 0) + i();
+          const active = () => absoluteIndex() === overlayIndex();
+          return <box flexDirection="row" onMouseUp={(event: any) => { if (event?.button === 0) { setOverlayIndex(absoluteIndex()); selectOverlay(absoluteIndex()); } }}>
+            <text fg={active() ? C.success : C.textMuted}>{active() ? '▶ ' : '  '}{option.name}</text>
+            {option.description ? <text fg={C.textMuted}>  {option.description}</text> : null}
+          </box>;
+        }}</For>
         <text fg={C.textMuted}>{overlayWindow()! && overlayWindow()!.total > overlayWindow()!.rows ? `${overlayIndex() + 1}/${overlayWindow()!.total} · ` : ''}↑↓ select · Enter confirm · Esc cancel</text>
       </box>
     </Show>
     <box height={1 + composerLines()} flexShrink={0} paddingX={1} flexDirection="column">
       <box height={composerLines()} flexShrink={0} flexDirection="row">
-        <text fg={C.primary} wrapMode="none" truncate>{model()} / {mode()}</text>
+        <text fg={C.primary} wrapMode="none" truncate>{mode()}</text>
+        <text fg={C.textMuted} wrapMode="none"> · </text>
+        <text fg={C.primary} wrapMode="none" truncate>{model()}</text>
+        <text fg={C.textMuted} wrapMode="none"> · </text>
+        <text fg={C.info} wrapMode="none" truncate selectable={false} onMouseUp={(event: any) => { if (event?.button === 0) openEffortPicker(); }}>{effortShortLabel(effortLabel(), effort())} ▾</text>
         <text fg={C.primary}> › </text>
         <Show when={!overlay()} fallback={<text fg={C.textMuted}>↑↓ select · Enter confirm</text>}>
           <textarea flexGrow={1} focused height={composerLines()} placeholder={running() ? 'working…' : 'Ask anything…'} initialValue={input()} keyBindings={textareaBindings as any} onContentChange={() => { const v = textareaRef?.plainText ?? ''; if (v !== input()) setInput(v); }} onSubmit={submit as any} ref={el => { textareaRef = el as any; }} />
@@ -718,7 +814,7 @@ export function App(props?: {debugEntries?: Entry[]; debugOverlay?: Overlay; deb
         <text fg={C.success} wrapMode="none" truncate>{toast()?.text}</text>
       </Show>
       <Show when={!running() && !toast() && !overlay()}>
-        <text fg={C.textMuted} wrapMode="none" truncate>Enter 提交 · Shift+Enter 换行 · 空输入 ↑↓ 历史</text>
+        <text fg={C.textMuted} wrapMode="none" truncate>{dims().width >= 76 ? 'Enter 提交 · Shift+Enter 换行 · Ctrl+E 选择推理档位 · 空输入 ↑↓ 历史' : 'Enter 提交 · Shift+Enter 换行 · Ctrl+E 档位 · ↑↓ 历史'}</text>
       </Show>
     </box>
   </box>;

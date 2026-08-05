@@ -89,7 +89,13 @@ def _tools_for_agent(allowed: list[str]) -> tuple[list[dict], dict]:
     return tools, handlers
 
 
-def run_agent_task(description: str, prompt: str, agent_type: str) -> str:
+def run_agent_task(
+    description: str,
+    prompt: str,
+    agent_type: str,
+    *,
+    cwd: str | Path | None = None,
+) -> str:
     error = validate_agent_model(agent_type)
     if error:
         return f"Error: {error}"
@@ -98,7 +104,8 @@ def run_agent_task(description: str, prompt: str, agent_type: str) -> str:
     assert profile is not None
 
     tools, handlers = _tools_for_agent(profile.tools)
-    system = f"{profile.system}\n\nWorking directory: {WORKDIR}"
+    workdir = str(cwd) if cwd else str(WORKDIR)
+    system = f"{profile.system}\n\nWorking directory: {workdir}"
     messages = [{"role": "user", "content": prompt}]
 
     # Every subagent run gets its own id so the TUI can group all nested

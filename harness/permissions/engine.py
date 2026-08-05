@@ -154,6 +154,24 @@ def evaluate_single_permission(
     source_tool: str | None = None,
     external_resource: str | None = None,
 ) -> PermissionDecision:
+    loaded = rules if rules is not None else load_permission_rules()
+    config_effect, config_matched = _evaluate_config_rules(tool_name, resource, loaded)
+
+    # Safety red line: a config `deny` (e.g. `rm *`, `sudo *`) must NEVER be
+    # overridden by a saved "always allow" rule. A user's single "always"
+    # click on `bash *` must not silently disable the deny-list.
+    if config_effect == "deny":
+        return PermissionDecision(
+            effect="deny",
+            tool=tool_name,
+            resource=resource,
+            reason=f"config deny ({config_matched}) overrides saved rules",
+            save_tool=tool_name,
+            save_resource=resource,
+            source="config",
+            external_resource=external_resource,
+        )
+
     if include_saved:
         effect, matched, source = _evaluate_saved_rules(
             tool_name,
@@ -172,8 +190,8 @@ def evaluate_single_permission(
                 external_resource=external_resource,
             )
 
-    loaded = rules if rules is not None else load_permission_rules()
-    effect, matched = _evaluate_config_rules(tool_name, resource, loaded)
+    effect = config_effect
+    matched = config_matched
     source = "config"
     if effect is None and fallback_to_mcp:
         effect = _fallback_from_mcp_meta(source_tool or tool_name, mcp_meta)

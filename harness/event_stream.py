@@ -12,6 +12,8 @@ import json
 import queue
 import sys
 import threading
+from datetime import date
+from pathlib import Path
 from typing import Any
 
 from harness.agent.cancel import clear_cancel, request_cancel
@@ -40,17 +42,44 @@ def _json_dumps(payload: Any) -> str:
     return json.dumps(payload, ensure_ascii=False, default=str)
 
 
+#: Slash commands that are NON-interactive control commands: they take effect
+#: instantly (no LLM round, no context/history/binding mutation) and therefore
+#: must be executable while the agent is running — never flip the UI into the
+#: "running" state, never print "Agent is already running".
+_INSTANT_SLASH_PREFIXES = ("/model", "/effort", "/mode", "/models", "/usage", "/help")
+
+
+def _is_instant_slash_command(query: str) -> bool:
+    """True when `query` is an instant configuration switch (model/mode/effort).
+
+    These are pure configuration changes (or read-only listings): they do not
+    need the agent, do not mutate context/history/binding, and are safe to run
+    concurrently with a running turn. Everything else (messages, /open, /resume,
+    /clear, /rag) goes through the normal turn queue.
+    """
+    q = query.strip().lower()
+    if not q:
+        return False
+    return any(q == p or q.startswith(p + " ") for p in _INSTANT_SLASH_PREFIXES)
+
+
 def _status_payload(context: dict, binding, history: list) -> dict:
     from harness.agent.compact.sizing import estimate_tokens, model_context_window
-    from harness.models import get_model
+    from harness.models import get_model, get_reasoning_effort, list_efforts
     from harness.modes import get_mode
     from harness.settings import get_workdir
     from harness.usage.store import totals_for_day
 
     usage = totals_for_day()
+    effort_items = list_efforts()
+    effort_id = get_reasoning_effort() or "off"
+    effort_label = next((item.get("label") for item in effort_items if item.get("current")), "Model default")
     return {
         "model": get_model(),
         "mode": get_mode(),
+        "reasoning_effort": effort_id,
+        "reasoning_effort_label": effort_label,
+        "reasoning_effort_options": effort_items,
         "cwd": str(get_workdir()),
         "session_id": getattr(binding, "session_id", ""),
         "running": False,
@@ -64,6 +93,19 @@ def _status_payload(context: dict, binding, history: list) -> dict:
         "ctx_tokens": estimate_tokens(history or []),
         "ctx_window": model_context_window(),
     }
+
+
+def _emit_welcome() -> None:
+    """Mirror the CLI startup welcome (smiley art + today's quote) as one event."""
+    from harness.ui.banner import SMILEY
+    from harness.ui.quotes import get_daily_quote
+
+    emit(
+        "welcome",
+        art=list(SMILEY),
+        quote=get_daily_quote(),
+        date=date.today().isoformat(),
+    )
 
 
 def _emit_status(context: dict, binding, history: list, *, running: bool = False) -> None:
@@ -281,7 +323,18 @@ def _run_user_turn(query: str, history: list, context: dict, binding, *, echo_us
             binding = new_binding
         emit("workspace_switched", cwd=result.replace("Switched workspace → ", "").strip())
         emit("log", level="plain", text=result)
-        return update_context(context, history), False, binding
+        # Start a fresh session in the new workspace: drop the old project's
+        # history AND reload the new project's HARNESS.md. Otherwise the agent
+        # keeps following the previous project's rules (old context leak).
+        from harness.prompts.project_md import apply_project_instructions
+        from harness.prompts.ephemeral import reset_ephemeral_cache
+        from harness.context import update_context as _update_context
+
+        history.clear()
+        context = _update_context({}, [])
+        apply_project_instructions(context, start=Path(target))
+        reset_ephemeral_cache()
+        return context, False, binding
 
     if query.strip().startswith("/"):
         command_note, new_binding = _handle_slash_command(query, history, binding)
@@ -382,8 +435,12 @@ def run_event_stream() -> None:
                 turn_queue.task_done()
                 break
             query, echo_user = item
-            running.set()
-            emit("agent_start", phase="preparing")
+            # Slash commands (handled inside _run_user_turn, no LLM round) must
+            # NOT flip the UI into "running": no agent_start, no running flag.
+            is_slash = query.strip().startswith("/")
+            if not is_slash:
+                running.set()
+                emit("agent_start", phase="preparing")
             _interrupted = False
             try:
                 with state_lock:
@@ -393,14 +450,16 @@ def run_event_stream() -> None:
                 emit("error", text=f"Turn failed: {exc}")
             finally:
                 clear_cancel()
-                running.clear()
-                emit("agent_end", status="interrupted" if _interrupted else "done")
+                if not is_slash:
+                    running.clear()
+                    emit("agent_end", status="interrupted" if _interrupted else "done")
                 turn_queue.task_done()
 
     worker_thread = threading.Thread(target=worker, name="harness-event-stream-worker", daemon=True)
     worker_thread.start()
 
     _emit_status(context, binding, history, running=False)
+    _emit_welcome()
     emit("ready")
 
     try:
@@ -439,6 +498,14 @@ def run_event_stream() -> None:
             if ctype in ("user_message", "slash_command"):
                 text = str(command.get("text") or command.get("command") or "").strip()
                 if not text:
+                    continue
+                # Non-interactive control commands (model/mode/effort switches)
+                # run instantly — even while the agent is busy. They need no
+                # LLM round and never flip the UI into the "running" state.
+                if _is_instant_slash_command(text):
+                    note, _new_binding = _handle_slash_command(text, history, binding)
+                    if note:
+                        emit("log", level="plain", text=note)
                     continue
                 if running.is_set() or not turn_queue.empty():
                     emit("log", level="warn", text="Agent is already running. Press Ctrl+C to interrupt before sending another message.")

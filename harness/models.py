@@ -19,7 +19,14 @@ _current_effort: str | None = None
 _catalog: list[dict] = []
 _default_model: str = ""
 
-EFFORT_ORDER = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+EFFORT_ORDER = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
+EFFORT_ALIASES = {
+    "extra high": "xhigh",
+    "extra-high": "xhigh",
+    "extra_high": "xhigh",
+    "x high": "xhigh",
+    "x-high": "xhigh",
+}
 OFF_ALIASES = {"", "off", "default", "model-default", "model default"}
 EFFORT_DETAILS = {
     "none": "disable reasoning where the model supports it",
@@ -27,15 +34,17 @@ EFFORT_DETAILS = {
     "low": "cheap/fast reasoning",
     "medium": "balanced reasoning",
     "high": "stronger reasoning",
-    "xhigh": "extra-high reasoning, only on models that declare support",
-    "max": "maximum reasoning, only on models that declare support",
+    "xhigh": "extra-high reasoning",
+    "max": "maximum reasoning",
+    "ultra": "ultra reasoning",
 }
 
 
 def _normalize_effort(value: object) -> str | None:
-    text = str(value or "").strip().lower()
+    text = str(value or "").strip().lower().replace("_", "-")
     if text in OFF_ALIASES:
         return None
+    text = EFFORT_ALIASES.get(text, text)
     return text if text in EFFORT_ORDER else None
 
 
@@ -43,7 +52,7 @@ def _normalize_effort_options(values: object) -> tuple[str, ...]:
     if values is None:
         return ()
     if isinstance(values, str):
-        raw = [part.strip() for part in values.replace(",", " ").split()]
+        raw = [part.strip() for part in values.split(",")]
     elif isinstance(values, (list, tuple)):
         raw = [str(part).strip() for part in values]
     else:
@@ -52,8 +61,29 @@ def _normalize_effort_options(values: object) -> tuple[str, ...]:
     return tuple(effort for effort in EFFORT_ORDER if effort in allowed)
 
 
+def _effort_display(effort: str) -> str:
+    return "extra high" if effort == "xhigh" else effort
+
+
 def _effort_options_text(options: tuple[str, ...]) -> str:
-    return ", ".join("extra high" if opt == "xhigh" else opt for opt in options) if options else "none declared"
+    return ", ".join(_effort_display(opt) for opt in options) if options else "none declared"
+
+
+def _normalize_api_effort_values(values: object) -> dict[str, str]:
+    if not isinstance(values, dict):
+        return {}
+    out: dict[str, str] = {}
+    for key, value in values.items():
+        normalized = _normalize_effort(key)
+        if normalized and value is not None:
+            out[normalized] = str(value)
+    return out
+
+
+def api_reasoning_effort(profile: "ModelProfile") -> str | None:
+    if not profile.reasoning_effort:
+        return None
+    return profile.api_effort_values.get(profile.reasoning_effort, profile.reasoning_effort)
 
 
 @dataclass(frozen=True)
@@ -67,6 +97,7 @@ class ModelProfile:
     thinking: bool = False
     reasoning_effort: str | None = None
     effort_options: tuple[str, ...] = ()
+    api_effort_values: dict[str, str] = field(default_factory=dict)
     extra_body: dict = field(default_factory=dict)
     context_window: int = 0
 
@@ -83,6 +114,7 @@ def _load_catalog() -> tuple[str, list[dict]]:
                 "thinking": False,
                 "reasoning_effort": None,
                 "effort_options": [],
+                "api_effort_values": {},
                 "extra_body": {},
                 "context_window": 1_000_000,
             }
@@ -104,6 +136,7 @@ def _load_catalog() -> tuple[str, list[dict]]:
                 "thinking": bool(entry.get("thinking")),
                 "reasoning_effort": _normalize_effort(entry.get("reasoning_effort")),
                 "effort_options": _normalize_effort_options(entry.get("effort_options")),
+                "api_effort_values": _normalize_api_effort_values(entry.get("api_effort_values")),
                 "extra_body": entry.get("extra_body") or {},
                 "context_window": int(entry.get("context_window") or 0),
             }
@@ -133,6 +166,8 @@ def _profile_from_entry(entry: dict) -> ModelProfile:
         api_model=entry.get("api_model", entry["id"]),
         thinking=bool(entry.get("thinking")),
         reasoning_effort=entry.get("reasoning_effort"),
+        effort_options=tuple(entry.get("effort_options") or ()),
+        api_effort_values=dict(entry.get("api_effort_values") or {}),
         extra_body=dict(entry.get("extra_body") or {}),
         context_window=int(entry.get("context_window") or 0),
     )
@@ -160,6 +195,7 @@ def initialize_model(override: str | None = None) -> str:
                     "thinking": False,
                     "reasoning_effort": None,
                     "effort_options": [],
+                    "api_effort_values": {},
                     "extra_body": {},
                     "context_window": 0,
                 }
@@ -195,6 +231,8 @@ def get_model_profile(model_id: str | None = None) -> ModelProfile:
             provider="deepseek",
             api_model=mid,
             reasoning_effort=_current_effort,
+            effort_options=(),
+            api_effort_values={},
             extra_body={},
             context_window=0,
         )
@@ -320,7 +358,7 @@ def get_reasoning_effort() -> str | None:
 
 def set_reasoning_effort(effort: str | None) -> str:
     global _current_effort
-    value = str(effort or "").strip().lower()
+    value = str(effort or "").strip().lower().replace("_", "-")
     normalized = _normalize_effort(value)
 
     with _lock:
@@ -339,7 +377,7 @@ def set_reasoning_effort(effort: str | None) -> str:
             )
         if normalized not in options:
             return (
-                f"Effort '{normalized}' is not supported by {profile.id}. "
+                f"Effort '{_effort_display(normalized)}' is not supported by {profile.id}. "
                 f"Available: off, {_effort_options_text(options)}"
             )
         _current_effort = normalized
@@ -348,7 +386,8 @@ def set_reasoning_effort(effort: str | None) -> str:
 
 def format_effort_list() -> str:
     profile = get_model_profile()
-    current = get_reasoning_effort() or "model default"
+    current = get_reasoning_effort()
+    current_display = _effort_display(current) if current else "model default"
     lines = [
         f"Reasoning effort options for {profile.id}:",
         "  off  — model default / no override",
@@ -356,11 +395,11 @@ def format_effort_list() -> str:
     if profile.effort_options:
         for effort in profile.effort_options:
             marker = " *" if current == effort else "  "
-            lines.append(f"{marker} {effort:<7} — {EFFORT_DETAILS.get(effort, '')}")
+            lines.append(f"{marker} {_effort_display(effort):<10} — {EFFORT_DETAILS.get(effort, '')}")
     else:
         lines.append("  (this model has no declared reasoning_effort options)")
     lines.append("")
-    lines.append(f"Current: {current}")
+    lines.append(f"Current: {current_display}")
     lines.append("Configure per-model options in config/models.json via effort_options.")
     return "\n".join(lines)
 
@@ -379,7 +418,7 @@ def list_efforts() -> list[dict]:
         {"id": "off", "label": "Model default", "detail": "no override", "current": current == "off"},
     ]
     for effort in profile.effort_options:
-        label = "XHigh" if effort == "xhigh" else effort.title()
+        label = "Extra High" if effort == "xhigh" else effort.title()
         items.append({
             "id": effort,
             "label": label,

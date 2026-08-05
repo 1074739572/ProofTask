@@ -11,10 +11,17 @@ export type TodoItem = {
 export type PickerItem = {id: string; label: string; detail?: string};
 export type PickerState = {id: string; title: string; items: PickerItem[]; selected: number};
 
+export type WelcomeState = {
+  art: string[];
+  quote: string;
+  date: string;
+};
+
 export type UiEvent =
   | { type: 'ready'; seq?: number; ts?: number }
   | { type: 'exit'; seq?: number; ts?: number }
   | { type: 'ui_clear'; seq?: number; ts?: number }
+  | { type: 'welcome'; seq?: number; ts?: number; art?: string[]; quote?: string; date?: string }
   | { type: 'session_status'; seq?: number; ts?: number; model?: string; mode?: string; cwd?: string; session_id?: string; running?: boolean; session_source?: string }
   | { type: 'user_message'; seq?: number; ts?: number; text: string }
   | { type: 'local_user_message'; seq?: number; ts?: number; text: string }
@@ -100,4 +107,5 @@ export type AppState = {
   tools: ToolRecord[];
   tasks: TodoItem[];
   picker: PickerState | null;
+  welcome: WelcomeState;
 };

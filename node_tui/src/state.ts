@@ -12,6 +12,7 @@ export const initialState: AppState = {
   tools: [],
   tasks: [],
   picker: null,
+  welcome: {art: [], quote: '', date: ''},
 };
 
 const MAX_ITEMS = 300;
@@ -61,6 +62,15 @@ export function reduceEvent(state: AppState, event: UiEvent): AppState {
   switch (event.type) {
     case 'ready':
       return {...state, ready: true};
+    case 'welcome':
+      return {
+        ...state,
+        welcome: {
+          art: Array.isArray(event.art) ? event.art : [],
+          quote: event.quote ?? '',
+          date: event.date ?? '',
+        },
+      };
     case 'ui_clear':
       return {...state, items: [], tools: [], phase: 'idle'};
     case 'session_status':

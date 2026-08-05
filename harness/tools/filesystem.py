@@ -9,6 +9,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 from harness.settings import WORKDIR, get_workdir
@@ -151,6 +152,110 @@ def _kill_process_tree(process: subprocess.Popen, *, graceful: float = _GRACE_SE
                 pass
 
 
+def _wait_with_escalation(
+    proc: subprocess.Popen,
+    timeout_s: float,
+    collected: list[str],
+    lock: threading.Lock,
+    *,
+    max_extensions: int = 2,
+    quiet_window: float = 15.0,
+) -> dict:
+    """Wait for a process with progress-aware timeout escalation.
+
+    Instead of a hard cut at the timeout, this polls the process and its
+    output stream:
+
+    - If the process exits -> done (return exit code).
+    - If the deadline passes but output is still growing (recent progress),
+      extend the deadline (up to `max_extensions` times).
+    - If the deadline passes with no progress -> timed out; caller decides.
+
+    Returns a dict: {timed_out, exit_code, elapsed, extensions}.
+    """
+    start = time.monotonic()
+    deadline = start + timeout_s
+    extensions = 0
+    last_len = 0
+    last_output_at: float | None = None  # None = 从未产生输出
+
+    while True:
+        code = proc.poll()
+        if code is not None:
+            return {
+                "timed_out": False,
+                "exit_code": code,
+                "elapsed": time.monotonic() - start,
+                "extensions": extensions,
+            }
+        now = time.monotonic()
+        with lock:
+            cur_len = len(collected)
+        if cur_len > last_len:
+            last_len = cur_len
+            last_output_at = now
+        if now >= deadline:
+            # 只有真正产生过新输出（且近期仍在增长）才算有进展；
+            # 从未输出/长期静默的进程直接判定超时，不做无谓延长。
+            recent_progress = (
+                last_output_at is not None
+                and (now - last_output_at) < quiet_window
+            )
+            if recent_progress and extensions < max_extensions:
+                extension = min(timeout_s * 0.5, 60.0)
+                deadline += extension
+                extensions += 1
+                continue
+            return {
+                "timed_out": True,
+                "exit_code": None,
+                "elapsed": now - start,
+                "extensions": extensions,
+            }
+        time.sleep(0.2)
+
+
+def _timeout_diagnosis(
+    command: str,
+    timeout_s: float,
+    info: dict,
+    collected: list[str],
+    lock: threading.Lock,
+) -> str:
+    """Build a structured, actionable timeout message.
+
+    The old message ("Error: Timeout (Ns)...") told the model nothing about
+    where it got stuck, which is why it blindly retried with different shapes
+    (foreground -> background -> new scripts) many times. This version reports
+    the phase (starting vs executing), the last output seen before the kill,
+    and concrete next steps so the model can make an informed decision.
+    """
+    with lock:
+        full = "\n".join(collected)
+    tail = full[-800:].strip()
+    if tail:
+        phase = "executing"
+        phase_hint = "命令已开始执行，卡在等待输出/结果阶段"
+    else:
+        phase = "starting"
+        phase_hint = "命令未产生任何输出，大概率卡在启动或连接阶段（如 ssh/scp 握手）"
+    progress_note = (
+        f"检测到输出仍在增长，曾自动延长超时 {info['extensions']} 次"
+        if info["extensions"]
+        else "超时前无输出进展"
+    )
+    return (
+        f"Error: Timeout ({int(timeout_s)}s, elapsed {info['elapsed']:.0f}s). "
+        f"{progress_note}。\n"
+        f"  phase: {phase} —— {phase_hint}\n"
+        f"  last_output: {tail or '(none)'}\n"
+        f"  建议：\n"
+        f"  - 若属网络/连接类命令（ssh/scp/ping/下载），先探测目标连通性（如 ping、nc）再重试，不要盲目重跑\n"
+        f"  - 若命令确实需要更久，用更大的 timeout（毫秒，上限 {MAX_BASH_TIMEOUT_MS}）或 run_in_background: true\n"
+        f"  - 禁止多行 python -c：Windows cmd 会拆断换行导致挂起，请写入临时 .py 文件再执行"
+    )
+
+
 def run_bash(
     command: str,
     cwd: Path | None = None,
@@ -168,14 +273,35 @@ def run_bash(
         "text": True,
         "encoding": "utf-8",
         "errors": "replace",
+        # Critical: the harness process may run under a TUI/event-stream
+        # backend whose stdin carries JSON commands. Inheriting that pipe makes
+        # child python processes sit in "waiting for input" (CPU 0, no output)
+        # or worse, steal commands meant for the backend. Always close stdin.
+        "stdin": subprocess.DEVNULL,
     }
     if sys.platform != "win32":
         kwargs["start_new_session"] = True
     proc = subprocess.Popen(command, **kwargs)
     job = _assign_windows_job(proc) if sys.platform == "win32" else None
-    try:
-        out, err = proc.communicate(timeout=timeout_s)
-    except subprocess.TimeoutExpired:
+
+    collected: list[str] = []
+    lock = threading.Lock()
+
+    def pump(stream) -> None:
+        for raw in iter(stream.readline, ""):
+            line = raw.rstrip("\n")
+            if not line:
+                continue
+            with lock:
+                collected.append(line)
+
+    reader_out = threading.Thread(target=pump, args=(proc.stdout,), daemon=True)
+    reader_err = threading.Thread(target=pump, args=(proc.stderr,), daemon=True)
+    reader_out.start()
+    reader_err.start()
+
+    info = _wait_with_escalation(proc, timeout_s, collected, lock)
+    if info["timed_out"]:
         if job is not None:
             ctypes.windll.kernel32.TerminateJobObject(job, 1)
             ctypes.windll.kernel32.CloseHandle(job)
@@ -183,19 +309,18 @@ def run_bash(
         else:
             _kill_process_tree(proc)
         try:
-            proc.communicate()  # drain pipes after the tree is gone
+            proc.wait(timeout=10)
         except Exception:
             pass
-        return (
-            f"Error: Timeout ({int(timeout_s)}s). The command did not finish "
-            f"within the timeout. If it is expected to take longer, retry with "
-            f"a larger `timeout` (in milliseconds, up to {MAX_BASH_TIMEOUT_MS}) "
-            f"or pass `run_in_background: true`."
-        )
-    finally:
-        if job is not None:
-            ctypes.windll.kernel32.CloseHandle(job)
-    output = (out + err).strip()
+    reader_out.join(timeout=2)
+    reader_err.join(timeout=2)
+    if job is not None:
+        ctypes.windll.kernel32.CloseHandle(job)
+
+    with lock:
+        output = "\n".join(collected).strip()
+    if info["timed_out"]:
+        return _timeout_diagnosis(command, timeout_s, info, collected, lock)
     return output[:50000] if output else "(no output)"
 
 
@@ -224,6 +349,8 @@ def run_bash_streaming(
         "text": True,
         "encoding": "utf-8",
         "errors": "replace",
+        # See run_bash(): never inherit the backend's stdin pipe.
+        "stdin": subprocess.DEVNULL,
     }
     if sys.platform != "win32":
         kwargs["start_new_session"] = True
@@ -250,33 +377,27 @@ def run_bash_streaming(
     reader_out.start()
     reader_err.start()
 
-    timed_out = False
-    try:
-        proc.wait(timeout=timeout_s)
-    except subprocess.TimeoutExpired:
-        timed_out = True
+    info = _wait_with_escalation(proc, timeout_s, collected, lock)
+    if info["timed_out"]:
         if job is not None:
             ctypes.windll.kernel32.TerminateJobObject(job, 1)
             ctypes.windll.kernel32.CloseHandle(job)
             job = None
         else:
             _kill_process_tree(proc)
-        proc.wait(timeout=10)
-    finally:
-        if job is not None:
-            ctypes.windll.kernel32.CloseHandle(job)
+        try:
+            proc.wait(timeout=10)
+        except Exception:
+            pass
     reader_out.join(timeout=2)
     reader_err.join(timeout=2)
+    if job is not None:
+        ctypes.windll.kernel32.CloseHandle(job)
 
     with lock:
         output = "\n".join(collected).strip()
-    if timed_out:
-        return (
-            f"Error: Timeout ({int(timeout_s)}s). The command did not finish "
-            f"within the timeout. If it is expected to take longer, retry with "
-            f"a larger `timeout` (in milliseconds, up to {MAX_BASH_TIMEOUT_MS}) "
-            f"or pass `run_in_background: true`."
-        )
+    if info["timed_out"]:
+        return _timeout_diagnosis(command, timeout_s, info, collected, lock)
     return output[:50000] if output else "(no output)"
 
 
