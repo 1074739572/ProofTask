@@ -404,7 +404,7 @@ structured     → HARNESS.md + progress.md + feature_list.json
 | L3 验证门控 | ✅ 已完成 | 2026-08-05 | `harness/verification/` + V001–V008 |
 | L4 清洁状态 | ✅ 已完成 | 2026-08-05 | `harness/clean/` + W001–W007 |
 | L5 独立 evaluator | ✅ 已完成 | 2026-08-05 | `harness/evaluation/` + E001–E007 |
-| L6 /goal | 未开始 | — | |
+| L6 /goal | 🔶 规格已完成（MVP），待实现 | 2026-08-05 | `docs/goal-mode-mvp-spec.md`（G001–G022 测试计划） |
 
 ### 执行约定
 
