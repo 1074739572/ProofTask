@@ -49,6 +49,19 @@ def _json_dumps(payload: Any) -> str:
 _INSTANT_SLASH_PREFIXES = ("/model", "/effort", "/mode", "/models", "/usage", "/help")
 
 
+def _is_goal_control_command(query: str) -> bool:
+    """True for /goal status|pause|cancel — instant while the goal runs.
+
+    /goal start/resume require the normal turn queue (no ordinary turn may be
+    running), so they are deliberately NOT classified as instant here.
+    """
+    try:
+        from harness.goal.commands import parse_goal_subcommand
+    except ImportError:
+        return False
+    return parse_goal_subcommand(query) in ("status", "pause", "cancel")
+
+
 def _is_instant_slash_command(query: str) -> bool:
     """True when `query` is an instant configuration switch (model/mode/effort).
 
@@ -237,8 +250,16 @@ def _handle_slash_command(query: str, history: list, binding) -> tuple[str | Non
     if _match_cli_command(query, "/rag"):
         return run_rag_cli_command(query), binding
     if _match_cli_command(query, "/clear"):
+        from harness.goal.runner import is_goal_running
+
+        if is_goal_running():
+            return "Cannot /clear while a goal is running — use /goal pause or /goal cancel first.", binding
         return run_project_clear(clear_project=False), binding
     if _match_cli_command(query, "/resume"):
+        from harness.goal.runner import is_goal_running
+
+        if is_goal_running():
+            return "Cannot /resume while a goal is running — use /goal pause or /goal cancel first.", binding
         from harness.project.session_registry import visible_session_summaries
         from harness.project.resume import run_resume_command
 
@@ -273,6 +294,9 @@ def _handle_slash_command(query: str, history: list, binding) -> tuple[str | Non
         return (
             "TUI commands:\n"
             "  /open <directory>  — switch workspace (instant, no restart)\n"
+            "  /goal --verify \"<cmd>\" -- <target>  — start an autonomous goal\n"
+            "  /goal status|pause|resume|cancel  — control the goal\n"
+            "  /init  — scan repo & create/improve HARNESS.md handbook\n"
             "  @path + Tab        — complete file/dir path\n"
             "  /model <id>  — switch model (use /models to list)\n"
             "  /effort      — choose reasoning effort\n"
@@ -303,6 +327,15 @@ def _run_user_turn(query: str, history: list, context: dict, binding, *, echo_us
     # Emits `workspace_switched` so the TUI can refresh the header; the process
     # keeps running with zero SDK re-imports.
     if _match_cli_command(query, "/open"):
+        from harness.goal.runner import is_goal_running
+
+        if is_goal_running():
+            emit(
+                "log",
+                level="warn",
+                text="Cannot /open while a goal is running — use /goal pause or /goal cancel first.",
+            )
+            return context, False, binding
         note, target, list_mode = _handle_open_workspace(query)
         if list_mode:
             _emit_workspace_list()
@@ -337,7 +370,30 @@ def _run_user_turn(query: str, history: list, context: dict, binding, *, echo_us
         return context, False, binding
 
     if query.strip().startswith("/"):
-        command_note, new_binding = _handle_slash_command(query, history, binding)
+        if _match_cli_command(query, "/goal"):
+            from harness.goal.commands import handle_goal_command
+
+            command_note = handle_goal_command(query, history, context, binding)
+            new_binding = binding
+        elif _match_cli_command(query, "/init"):
+            from harness.goal.runner import is_goal_running
+
+            if is_goal_running():
+                command_note = (
+                    "Cannot /init while a goal is running — "
+                    "use /goal pause or /goal cancel first."
+                )
+            else:
+                from harness.prompts.init_md import handle_init_command
+
+                emit("log", level="plain", text="Scanning repository and writing HARNESS.md …")
+                try:
+                    command_note = handle_init_command()
+                except Exception as exc:
+                    command_note = f"/init failed: {exc}"
+            new_binding = binding
+        else:
+            command_note, new_binding = _handle_slash_command(query, history, binding)
     else:
         command_note, new_binding = None, binding
     if command_note is not None:
@@ -350,6 +406,12 @@ def _run_user_turn(query: str, history: list, context: dict, binding, *, echo_us
 
     from harness.modes import get_mode, note_user_query_for_mode
     from harness.rag.file_mode import handle_file_mode_turn, is_file_mode
+
+    from harness.goal.runner import is_goal_running
+
+    if is_goal_running():
+        emit("log", level="warn", text="Goal is running. Use /goal status|pause|cancel.")
+        return context, False, binding
 
     if is_file_mode() or get_mode() == "file":
         answer = handle_file_mode_turn(query)
@@ -499,9 +561,17 @@ def run_event_stream() -> None:
                 text = str(command.get("text") or command.get("command") or "").strip()
                 if not text:
                     continue
-                # Non-interactive control commands (model/mode/effort switches)
-                # run instantly — even while the agent is busy. They need no
-                # LLM round and never flip the UI into the "running" state.
+                # Non-interactive control commands (model/mode/effort switches
+                # and /goal status|pause|cancel) run instantly — even while the
+                # agent is busy. They need no LLM round and never flip the UI
+                # into the "running" state.
+                if _is_goal_control_command(text):
+                    from harness.goal.commands import handle_goal_command
+
+                    note = handle_goal_command(text, history, context, binding)
+                    if note:
+                        emit("log", level="plain", text=note)
+                    continue
                 if _is_instant_slash_command(text):
                     note, _new_binding = _handle_slash_command(text, history, binding)
                     if note:

@@ -122,6 +122,27 @@ def permission_hook(block):
         _hook_print(f"  {decision.resource}")
     if decision.external_resource:
         _hook_print(f"  external: {decision.external_resource}")
+    # /goal ACTs run non-interactively: an `ask` is returned as a rejection
+    # (never blocks on stdin / the TUI permission flow) and the runner pauses
+    # with stop_reason=permission_wait. Thread-local, so normal foreground
+    # turns keep the interactive ask behavior.
+    from harness.goal.runner import is_goal_noninteractive, mark_goal_permission_pending
+
+    if is_goal_noninteractive():
+        mark_goal_permission_pending()
+        audit_permission(
+            {
+                "event": "goal_noninteractive_deny",
+                "tool": name,
+                "resource": decision.resource,
+                "reason": "goal ACT is non-interactive; human approval required",
+            }
+        )
+        return (
+            f"Permission denied: {name} needs human approval, but the goal "
+            "runner is non-interactive. The goal will pause (permission_wait); "
+            "approve it in config and /goal resume."
+        )
     if events.is_enabled():
         from harness.ui.permission_events import request_permission
         choice = request_permission(name, decision.resource or name, f"Allow {name}?")

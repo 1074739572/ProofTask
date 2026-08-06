@@ -103,6 +103,9 @@ def _resolve_open_directory(query: str) -> tuple[Path | None, str]:
 def _help_text() -> str:
     return """Commands:
   /open <directory>        switch workspace in-process (instant, no restart)
+  /goal --verify "<cmd>" -- <target>   start an autonomous goal
+  /goal status|pause|resume|cancel     control the running goal
+  /init                    scan repo & create/improve HARNESS.md handbook
   /model                   pick model (↑↓ Enter) or /model <id>
   /mode [id]               pick mode (↑↓ Enter): direct|plan|orchestrate|file|grill
   /mode file               文档问答：每句检索 files/；进模式时选指定/全部文档
@@ -262,7 +265,39 @@ def run_cli() -> None:
             break
         if query.strip().lower() in ("q", "exit", ""):
             break
+        if _match_cli_command(query, "/goal"):
+            from harness.goal.commands import handle_goal_command
+
+            renderer.plain(handle_goal_command(query, history, context, binding))
+            print()
+            continue
+        if _match_cli_command(query, "/init"):
+            from harness.goal.runner import is_goal_running as _goal_running
+            from harness.prompts.init_md import handle_init_command
+
+            if _goal_running():
+                renderer.warn(
+                    "Cannot /init while a goal is running — use /goal pause or /goal cancel first."
+                )
+                print()
+                continue
+            renderer.plain("Scanning repository and writing HARNESS.md …")
+            with agent_lock:
+                try:
+                    renderer.plain(handle_init_command())
+                except Exception as exc:
+                    renderer.error(f"/init failed: {exc}")
+            print()
+            continue
         if _match_cli_command(query, "/open"):
+            from harness.goal.runner import is_goal_running as _goal_running
+
+            if _goal_running():
+                renderer.warn(
+                    "Cannot /open while a goal is running — use /goal pause or /goal cancel first."
+                )
+                print()
+                continue
             # In-process workspace switch (same semantics as the TUI bridge):
             # bare `/open` lists recent projects, `/open N` picks by index,
             # `/open <dir>` switches.  No process restart.
@@ -335,6 +370,14 @@ def run_cli() -> None:
             print()
             continue
         if _match_cli_command(query, "/resume"):
+            from harness.goal.runner import is_goal_running as _goal_running
+
+            if _goal_running():
+                renderer.warn(
+                    "Cannot /resume while a goal is running — use /goal pause or /goal cancel first."
+                )
+                print()
+                continue
             parts = query.strip().split(maxsplit=1)
             sub = parts[1] if len(parts) > 1 else ""
             if not sub:
@@ -382,6 +425,14 @@ def run_cli() -> None:
             print()
             continue
         if _match_cli_command(query, "/clear"):
+            from harness.goal.runner import is_goal_running as _goal_running
+
+            if _goal_running():
+                renderer.warn(
+                    "Cannot /clear while a goal is running — use /goal pause or /goal cancel first."
+                )
+                print()
+                continue
             parts = query.strip().split(maxsplit=1)
             sub = parts[1].lower() if len(parts) > 1 else ""
             keep_project = sub in ("session", "chat", "history")
@@ -460,6 +511,13 @@ def run_cli() -> None:
             continue
         from harness.modes import get_mode, note_user_query_for_mode
         from harness.rag.file_mode import handle_file_mode_turn, is_file_mode
+
+        from harness.goal.runner import is_goal_running as _goal_running
+
+        if _goal_running():
+            renderer.warn("Goal is running. Use /goal status|pause|cancel.")
+            print()
+            continue
 
         # File mode: every normal message is document Q&A (RAG → answer).
         if is_file_mode() or get_mode() == "file":

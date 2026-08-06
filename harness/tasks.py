@@ -15,11 +15,31 @@ from pathlib import Path
 
 from harness.settings import TASKS_DIR
 
+#: Import-time snapshot of TASKS_DIR so tests that patch the module global
+#: (mock.patch.object(tasks_mod, "TASKS_DIR", ...)) keep working while the
+#: default follows the ACTIVE workspace across /open switches.
+_ORIGINAL_TASKS_DIR = TASKS_DIR
+
+
+def _tasks_dir() -> Path:
+    """Active tasks dir — computed at call time.
+
+    Follows ``get_workspace_paths().tasks_dir`` so /open switches never write
+    tasks to the startup workspace. When tests patched the module-level
+    ``TASKS_DIR`` global, that override wins (backward compatible with the
+    F006-style tests).
+    """
+    if TASKS_DIR != _ORIGINAL_TASKS_DIR:
+        return TASKS_DIR
+    from harness.settings import get_workspace_paths
+
+    return get_workspace_paths().tasks_dir
+
 
 def _archive_dir() -> Path:
     """Archive directory — computed at call time so tests that patch
     TASKS_DIR (or a workspace switch) never write to a stale path."""
-    return TASKS_DIR / "archive"
+    return _tasks_dir() / "archive"
 
 
 @dataclass
@@ -40,7 +60,7 @@ class Task:
 
 
 def _active_path(task_id: str) -> Path:
-    return TASKS_DIR / f"{task_id}.json"
+    return _tasks_dir() / f"{task_id}.json"
 
 
 def _archive_path(task_id: str) -> Path:
@@ -98,7 +118,7 @@ def list_tasks(*, include_archived: bool = False) -> list[Task]:
     """Active board only by default — completed tasks live under archive/."""
     tasks = [
         _load_task_from_path(path)
-        for path in sorted(TASKS_DIR.glob("task_*.json"))
+        for path in sorted(_tasks_dir().glob("task_*.json"))
     ]
     if include_archived and _archive_dir().exists():
         tasks.extend(
@@ -286,7 +306,7 @@ def complete_task(task_id: str) -> str:
 def reconcile_task_board() -> int:
     """Move legacy completed files still on the active board into archive/."""
     moved = 0
-    for path in list(TASKS_DIR.glob("task_*.json")):
+    for path in list(_tasks_dir().glob("task_*.json")):
         task = _load_task_from_path(path)
         if task.status != "completed":
             continue
@@ -299,7 +319,7 @@ def reconcile_task_board() -> int:
 
 def scan_unclaimed_tasks() -> list[dict]:
     unclaimed = []
-    for path in sorted(TASKS_DIR.glob("task_*.json")):
+    for path in sorted(_tasks_dir().glob("task_*.json")):
         task = json.loads(path.read_text(encoding="utf-8"))
         if (
             task.get("status") == "pending"
@@ -312,7 +332,7 @@ def scan_unclaimed_tasks() -> list[dict]:
 
 def clear_active_tasks(*, archive: bool = True) -> str:
     """Remove all tasks from the active board (optional archive before delete)."""
-    paths = list(TASKS_DIR.glob("task_*.json"))
+    paths = list(_tasks_dir().glob("task_*.json"))
     if not paths:
         return "Active task board is already empty."
     if archive:

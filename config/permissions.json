@@ -42,14 +42,22 @@
       ".features": "deny",
       ".features/*": "deny",
       "**/.features": "deny",
-      "**/.features/*": "deny"
+      "**/.features/*": "deny",
+      ".project/goal.json": "deny",
+      ".project/goal-history/*": "deny",
+      "**/.project/goal.json": "deny",
+      "**/.project/goal-history/*": "deny"
     },
     "edit_file": {
       "*": "allow",
       ".features": "deny",
       ".features/*": "deny",
       "**/.features": "deny",
-      "**/.features/*": "deny"
+      "**/.features/*": "deny",
+      ".project/goal.json": "deny",
+      ".project/goal-history/*": "deny",
+      "**/.project/goal.json": "deny",
+      "**/.project/goal-history/*": "deny"
     },
     "bash": {
       "*": "ask",
@@ -61,6 +69,8 @@
       "git log*": "allow",
       "python -c *": "allow",
       "*.features*": "deny",
+      "*.project/goal.json*": "deny",
+      "*.project/goal-history*": "deny",
       "rm *": "deny",
       "del *": "ask",
       "sudo *": "deny",

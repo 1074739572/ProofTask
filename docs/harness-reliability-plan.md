@@ -388,7 +388,7 @@ structured     → HARNESS.md + progress.md + feature_list.json
 - **L3 确定性验证门控**（✅ 已实施，2026-08-05，详见 §5 L3 实施记录）：`harness/verification/`（policy/runner/evidence/__init__）；agent 请求验证 → 权限与命令策略检查 → 受控执行 → 记录 exit code/stdout/证据 → 更新 feature 状态。优先确定性信号：静态检查→单测→集成→启动健康→端到端。
 - **L4 清洁状态与交接**（✅ 已实施，2026-08-05，详见 §5 L4 实施记录）：`harness/clean/`（checker + 三模式 off/warn/enforce，`HARNESS_CLEAN_MODE` 环境变量）；触发点 = complete_task（未挂 Stop hook）；检查临时工件 / feature 状态一致性（passing 无证据）/ git 未提交变更（软信息）；enforce 模式硬检查失败阻止任务完成；只报告不自动删除，不动用户文件。
 - **L5 独立 evaluator**（✅ 已实施，2026-08-05，详见 §5 L5 实施记录）：`config/agents.json` 增加只读 `evaluator` 角色（mimo-v2.5-pro，无写工具）；`harness/evaluation/`（inputs/parser/runner）；输入含原始需求/feature 验收/diff/确定性验证结果/评分标准；输出结构化 findings（含证据）；简单任务不启用（requires_evaluation 启发式）；有限返修轮次留待 L6（已暂缓）。
-- **L6 /goal 自主循环**：显式状态机 INITIALIZE→SELECT_FEATURE→CLAIM→ACT→VERIFY→CLEAN_CHECK→…→DONE；goal 状态落盘；硬停止（max rounds/时间/token/连续失败/无进展/重复调用/权限等待/需人工决策/环境不可恢复）；停止判断顺序：机器验证 > feature 状态 > evaluator > agent 自报；WIP=1；优先 worktree；支持 /goal status|pause|resume|cancel。
+- **L6 /goal 自主循环**（✅ 已实施，2026-08-06，详见 §5 L6 实施记录与 `docs/goal-mode-mvp-spec.md`）：显式状态机 INITIALIZE→SELECT_FEATURE→CLAIM→ACT→VERIFY→(EVALUATE?)→CLEAN_CHECK→…→DONE；goal 状态原子落盘（`.project/goal.json` + history）；硬停止（max rounds/attempts/连续失败/时长/无进展/权限等待/workspace 变化等，stop_reason 可追溯）；停止判断顺序：机器验证 > feature 状态 > evaluator > agent 自报；WIP=1（一 goal 一 task 一 feature）；ACT 隐藏编排工具 + 线程局部非交互权限；支持 /goal status|pause|resume|cancel。
 
 ---
 
@@ -404,7 +404,7 @@ structured     → HARNESS.md + progress.md + feature_list.json
 | L3 验证门控 | ✅ 已完成 | 2026-08-05 | `harness/verification/` + V001–V008 |
 | L4 清洁状态 | ✅ 已完成 | 2026-08-05 | `harness/clean/` + W001–W007 |
 | L5 独立 evaluator | ✅ 已完成 | 2026-08-05 | `harness/evaluation/` + E001–E007 |
-| L6 /goal | 🔶 规格已完成（MVP），待实现 | 2026-08-05 | `docs/goal-mode-mvp-spec.md`（G001–G022 测试计划） |
+| L6 /goal | ✅ 已完成（MVP v1） | 2026-08-06 | `docs/goal-mode-mvp-spec.md`；`harness/goal/`（models/store/policy/engine/runner/prompt/commands）；G001–G023 + 污染守护全 pass；`python -m evals` fail=0 |
 
 ### 执行约定
 
@@ -544,6 +544,57 @@ structured     → HARNESS.md + progress.md + feature_list.json
 - [x] 简单任务不启用（E007）
 - [x] 评估不直接改 feature 状态（E006）
 - [ ] 有限返修轮次——留待 L6 /goal（已按用户要求暂缓）
+
+### L6 实施记录（2026-08-06，MVP v1）
+
+规格：[`docs/goal-mode-mvp-spec.md`](./goal-mode-mvp-spec.md)（按 §13 顺序实施）。
+
+**产出**：
+
+1. **`harness/goal/`（新模块）**：
+   - `models.py`：`GoalState` + `GoalPhase/GoalStatus/StopReason`（字符串 Enum，JSON 直存）+ `GoalRequest`；
+   - `store.py`：原子写（temp + os.replace）、`.project/goal.json` 单槽 + `goal-history/<id>.json` 归档、
+     corrupt/unsupported-schema 检测（`GoalStoreError`，不覆盖原文件）、路径随 `get_workspace_paths()` 动态计算；
+   - `policy.py`：`validate_limits` + 纯函数 `check_stop`（停止顺序：cancel → permission → duration →
+     attempts → consecutive failures → rounds → no progress；VERIFY/EVALUATE/CLEAN_CHECK 阶段不提前熔断）；
+   - `engine.py`：纯状态机 `GoalEngine.transition/initialize/next_phase`，非法转移抛 `GoalTransitionError`；
+     所有非终态可转 PAUSED/CANCELLED/FAILED；transition_log 封顶 100 条；
+   - `runner.py`：后台线程编排 INITIALIZE→SELECT_FEATURE→CLAIM→ACT→VERIFY→(EVALUATE?)→CLEAN_CHECK→DONE；
+     `RLock + Event` 管理 pause/cancel（ACT 入口双检查后 `clear_cancel()`，避免覆盖刚设置的 pause）；
+     ACT 独占 `agent_lock`、使用 `disabled_tools` 限制编排工具、线程局部非交互权限（ask → 拒绝 + PAUSED/permission_wait）；
+     no_progress 检测（feature mtime + last_error + git snapshot，连续 2 次 → FAILED）；workspace generation 变化 → FAILED；
+     resume 前置检查（workspace 匹配 / 依赖缺失 → missing_dependency）；
+   - `prompt.py`：ACT 单 feature 指令（WIP=1、不声称完成、不手工改 .features、验证由 runner 执行）；
+   - `commands.py`：确定性解析（shlex + `--` 后全为目标文本），裸 `/goal <target>` 返回用法错误（MVP 不推断验证命令）；
+     启动前置条件（git HEAD、`check_verification_command`、无 running goal、agent_lock 空闲）。
+2. **核心扩展（向后兼容）**：
+   - `harness/loop.py`：`LoopStats`（interrupted/llm_rounds/stop_reason）+ `agent_loop(disabled_tools=, stats=)`；
+   - `harness/tools/registry.py`：`get_tool_pool(disabled_tools=)` 同时过滤 schema 与 handler；
+   - `harness/hooks.py`：permission ask 分支检查 goal 非交互上下文（线程局部）→ 拒绝 + 标记 permission_wait；
+   - `harness/tasks.py`：`TASKS_DIR` 活动路径动态化（跟随 `/open`，测试 patch 全局仍兼容，G023 回归）；
+   - `config/permissions.json`：deny `.project/goal.json` / `goal-history/*` 写入（write/edit/bash）。
+3. **G 系列评测（`evals/cases/goal.py`，零 LLM，已注册）**：G001–G023 + 污染守护（真实 workspace
+   goal.json/tasks-archive/features 前后不变）。
+
+**修复的关键 bug（实施中红→绿）**：
+
+1. 重验证 passing feature：`verify_feature(passed=True)` 不允许 `passing→passing` → VERIFY 前先 `reopen_feature`；
+2. `max_attempts` 在 CLEAN_CHECK 阶段误触发（最后一次验证通过后被阻止收尾）→ 收尾阶段不参与 attempt 熔断；
+3. cancel 误走 FAILED → 独立 `_cancel`（CANCELLED 终态）；
+4. `_drive` 循环未把 PAUSED 当退出条件（pause 后继续 step）→ 补上；
+5. permission_pending 线程局部残留 → 消费信号后清除（否则影响同线程后续 goal）；
+6. INITIALIZE/等阶段失败无法 FAILED（LEGAL 表缺转义）→ 所有非终态可转 PAUSED/CANCELLED/FAILED；
+7. status 在 goal 运行时误显示 paused（load_goal 跨进程归一化的进程内副作用）→ 活跃 runner 优先读内存状态。
+
+**回归结果**：`python -m evals` = **95 pass / 0 fail / 2 skip（live）**；G001–G023 + pollution guard 全 pass；
+`pytest` 相关改动模块 43 项通过（`tests/test_subagent_ui.py` 挂起与本次无关，stash 基线复现）。
+
+**受控 live 冒烟**（可选，不进默认 CI）：临时 git fixture（`work.run()` 41→42，`python check.py` 验证），
+`max_attempts=1 / max_rounds=5 / timeout=120s`，真实 LLM → agent 修复 → VERIFY 通过 → DONE，task 归档。
+无预授权时遇工具 ask 按设计转 PAUSED/permission_wait（非交互不挂起）。
+
+**L6 MVP 完成标准自查（DoD）**：全部满足（见规格 §14；G022 覆盖"不采信 agent 自报完成"，
+G012 覆盖 stale passing 重开，G023 覆盖 tasks 目录跟随 workspace）。
 
 ### M008：非交互控制命令（2026-08-05，红→绿）
 

@@ -11,6 +11,7 @@ from evals.cases import compact as compact_cases
 from evals.cases import clean as clean_cases
 from evals.cases import evaluation as eval_cases
 from evals.cases import features as feat_cases
+from evals.cases import goal as goal_cases
 from evals.cases import live as live_cases
 from evals.cases import mechanisms as mech_cases
 from evals.cases import modes as mode_cases
@@ -36,6 +37,7 @@ def all_cases() -> list[EvalCase]:
         *mech_cases.CASES,
         *feat_cases.CASES,
         *ver_cases.CASES,
+        *goal_cases.CASES,
         *project_md_cases.CASES,
         *live_cases.CASES,
     ]

@@ -1,13 +1,18 @@
-"""Static checks for the HARNESS.md routing page (L1).
+"""Static checks for the HARNESS.md routing page (L1) + /init generator (I).
 
 The routing page is the agent's landing page: it must stay short, contain
 the key sections, and only link to files that actually exist. These checks
 fail loudly when the page drifts from a usable state.
+
+I-series (/init, zero-LLM): the scanning subagent is mocked; the harness
+write/backup/merge behavior is what is asserted. Runs in temp workspaces.
 """
 
 from __future__ import annotations
 
+import tempfile
 from pathlib import Path
+from unittest import mock
 
 from evals.errors import EvalWarn
 from evals.types import EvalCase
@@ -89,6 +94,111 @@ def case_harness_md_has_real_commands() -> None:
     )
 
 
+# --- I-series: /init generator (zero-LLM, mocked agent) -----------------------
+
+_FAKE_HANDBOOK = (
+    "# Demo Project\n"
+    "## Commands\n"
+    "- Test: pytest -q\n"
+    "## Layout\n"
+    "- src/ core code\n"
+)
+
+
+def _tmp_workspace() -> tuple[tempfile.TemporaryDirectory, Path]:
+    tmp = tempfile.TemporaryDirectory()
+    ws = Path(tmp.name) / "proj"
+    ws.mkdir()
+    return tmp, ws
+
+
+def _fake_runner(*args, **kwargs):
+    return f"[explore / mock] scanned (1 tools, 0.0s)\n\n{_FAKE_HANDBOOK}"
+
+
+def case_i001_init_creates_handbook() -> None:
+    """/init creates HARNESS.md when none exists (agent output written)."""
+    from harness.prompts.init_md import run_init
+
+    tmp, ws = _tmp_workspace()
+    try:
+        result = run_init(ws, agent_runner=_fake_runner)
+        assert result.created
+        target = ws / "HARNESS.md"
+        assert target.exists()
+        assert target.read_text(encoding="utf-8") == _FAKE_HANDBOOK.strip()
+        assert result.path == target
+        assert result.backup_path is None
+    finally:
+        tmp.cleanup()
+
+
+def case_i002_init_improves_in_place() -> None:
+    """/init improves an existing HARNESS.md in place and backs it up."""
+    from harness.prompts.init_md import run_init
+
+    tmp, ws = _tmp_workspace()
+    try:
+        existing = "# Old Project\n\n## Commands\n- Test: old\n"
+        (ws / "HARNESS.md").write_text(existing, encoding="utf-8")
+        result = run_init(ws, agent_runner=_fake_runner)
+        assert not result.created
+        assert result.backup_path is not None
+        assert result.backup_path.exists()
+        assert result.backup_path.read_text(encoding="utf-8") == existing
+        # The new content replaced the old one, and the old text is preserved
+        # in the backup.
+        written = (ws / "HARNESS.md").read_text(encoding="utf-8")
+        assert written == _FAKE_HANDBOOK.strip()
+    finally:
+        tmp.cleanup()
+
+
+def case_i003_init_prompt_includes_existing() -> None:
+    """The improvement prompt feeds the existing handbook back to the agent."""
+    from harness.prompts.init_md import build_init_prompt
+
+    captured = {}
+
+    def spy_runner(description, prompt, agent_type, *, cwd=None):
+        captured["prompt"] = prompt
+        return _fake_runner()
+
+    from harness.prompts.init_md import run_init
+
+    tmp, ws = _tmp_workspace()
+    try:
+        existing = "# Old\n\n## Commands\n- Test: pytest -q\n"
+        (ws / "HARNESS.md").write_text(existing, encoding="utf-8")
+        run_init(ws, agent_runner=spy_runner)
+        prompt = captured["prompt"]
+        assert "KEEP everything" in prompt
+        assert existing in prompt
+        assert "Current handbook" in prompt
+    finally:
+        tmp.cleanup()
+
+
+def case_i004_init_empty_result_rejected() -> None:
+    """An empty agent result must not clobber an existing handbook."""
+    from harness.prompts.init_md import run_init
+
+    tmp, ws = _tmp_workspace()
+    try:
+        existing = "# Old\n\n## Commands\n- Test: pytest -q\n"
+        (ws / "HARNESS.md").write_text(existing, encoding="utf-8")
+        try:
+            run_init(ws, agent_runner=lambda *a, **k: "[explore / mock] nothing (0 tools, 0.0s)")
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("empty agent output must raise")
+        # Existing handbook untouched.
+        assert (ws / "HARNESS.md").read_text(encoding="utf-8") == existing
+    finally:
+        tmp.cleanup()
+
+
 CASES = [
     EvalCase(
         "project_md.exists",
@@ -119,5 +229,29 @@ CASES = [
         "HARNESS.md has real runnable commands",
         "project_md",
         case_harness_md_has_real_commands,
+    ),
+    EvalCase(
+        "init.creates_handbook",
+        "I001: /init creates HARNESS.md when none exists",
+        "project_md",
+        case_i001_init_creates_handbook,
+    ),
+    EvalCase(
+        "init.improves_in_place",
+        "I002: /init improves existing HARNESS.md in place with a backup",
+        "project_md",
+        case_i002_init_improves_in_place,
+    ),
+    EvalCase(
+        "init.prompt_includes_existing",
+        "I003: improvement prompt feeds the existing handbook back",
+        "project_md",
+        case_i003_init_prompt_includes_existing,
+    ),
+    EvalCase(
+        "init.empty_result_rejected",
+        "I004: empty agent output never clobbers an existing handbook",
+        "project_md",
+        case_i004_init_empty_result_rejected,
     ),
 ]

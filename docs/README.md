@@ -19,6 +19,7 @@
 | RAG 从纯文本到 PDF 图表的演进与选型 | [rag-evolution.md](./rag-evolution.md) |
 | RAG 解析、检索、回答怎么分层评测 | [rag-evaluation.md](./rag-evaluation.md) |
 | 项目说明书 HARNESS.md | [project-instructions.md](./project-instructions.md) |
+| 指令文件初始化/知识沉淀：各家 agent 调研与落地设计（未实现） | [agent-knowledge-design.md](./agent-knowledge-design.md) |
 | 工具注册 / 调用 / 权限 | [tools.md](./tools.md) |
 | 队友生命周期 | [teammate-lifecycle.md](./teammate-lifecycle.md) |
 | 2026-07-07 大改总览 | [CHANGELOG-2026-07-07.md](./CHANGELOG-2026-07-07.md) |

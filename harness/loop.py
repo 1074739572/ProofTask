@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import threading
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from harness.agent.background import (
@@ -48,6 +49,20 @@ from harness.ui.renderer import renderer
 from harness.ui.turn_summary import TurnMutationTracker
 
 agent_lock = threading.RLock()
+
+
+@dataclass
+class LoopStats:
+    """Minimal per-run statistics for callers like the /goal runner.
+
+    ``stop_reason`` is one of: completed / max_rounds / cancelled / error /
+    max_tokens. Backward compatible: existing callers keep receiving the
+    boolean return value.
+    """
+
+    interrupted: bool = False
+    llm_rounds: int = 0
+    stop_reason: str = "completed"
 
 
 def _append_assistant(messages: list, content) -> None:
@@ -110,6 +125,8 @@ def agent_loop(
     turn_start: int | None = None,
     max_rounds: int | None = None,
     binding = None,
+    disabled_tools: set[str] | None = None,
+    stats: LoopStats | None = None,
 ) -> bool:
     """Run until the agent finishes or cancel is requested. Returns True if interrupted.
 
@@ -117,6 +134,9 @@ def agent_loop(
     read from HARNESS_MAX_LLM_ROUNDS (default 40) so an agent looping on tools
     cannot spin forever; pass max_rounds=0 to disable the cap entirely.
     binding: optional SessionBinding for persisting compact boundaries.
+    disabled_tools: optional tool-name set hidden from the model this run
+    (both schema and handler are filtered — /goal ACT mode).
+    stats: optional LoopStats filled with interrupt/round/stop-reason info.
     """
     from harness.prompts.ephemeral import reset_ephemeral_cache
 
@@ -138,14 +158,18 @@ def agent_loop(
     writing_guard = WritingGuard(active=bool(context.get("writing_mode")))
     mutations = TurnMutationTracker()
 
-    def _finish(interrupted: bool) -> bool:
+    def _finish(interrupted: bool, reason: str = "completed") -> bool:
         if mutations.paths:
             renderer.files_changed(mutations.paths)
+        if stats is not None:
+            stats.interrupted = interrupted
+            stats.llm_rounds = llm_rounds
+            stats.stop_reason = reason
         return interrupted
 
     while True:
         if is_cancelled():
-            return _finish(True)
+            return _finish(True, "cancelled")
 
         if max_rounds is not None and llm_rounds >= max_rounds:
             note = (
@@ -161,7 +185,7 @@ def agent_loop(
                 }
             )
             trigger_hooks("Stop", messages)
-            return _finish(False)
+            return _finish(False, "max_rounds")
 
         fired = consume_cron_queue()
         for job in fired:
@@ -178,7 +202,7 @@ def agent_loop(
         prepare_context(messages)
         repair_tool_pairing(messages)
         context = update_context(context, messages)
-        tools, handlers = get_tool_pool()
+        tools, handlers = get_tool_pool(disabled_tools=disabled_tools)
 
         # Auto-route: when enabled, classify and dispatch the latest user
         # message to a sub-agent before the lead model sees it.
@@ -188,14 +212,14 @@ def agent_loop(
             if route_user_message(messages):
                 # Routing happened; re-prepare context with the injected result.
                 context = update_context(context, messages)
-                tools, handlers = get_tool_pool()
+                tools, handlers = get_tool_pool(disabled_tools=disabled_tools)
 
         try:
             llm_rounds += 1
             response = call_llm(messages, context, tools, state, max_tokens)
         except Exception as exc:
             if is_cancelled():
-                return _finish(True)
+                return _finish(True, "cancelled")
             if is_prompt_too_long_error(exc) and not state.has_attempted_reactive_compact:
                 messages[:] = reactive_compact(messages)
                 state.has_attempted_reactive_compact = True
@@ -232,7 +256,7 @@ def agent_loop(
                         {"role": "assistant", "content": [{"type": "text", "text": fallback_text}]}
                     )
                     renderer.error(fallback_text)
-                    return _finish(False)
+                    return _finish(False, "error")
             else:
                 fallback_text = _local_failure_summary(
                     messages,
@@ -243,10 +267,10 @@ def agent_loop(
                     {"role": "assistant", "content": [{"type": "text", "text": fallback_text}]}
                 )
                 renderer.error(fallback_text)
-                return _finish(False)
+                return _finish(False, "error")
 
         if is_cancelled():
-            return _finish(True)
+            return _finish(True, "cancelled")
 
         if response.stop_reason == "max_tokens":
             if not state.has_escalated:
@@ -259,7 +283,7 @@ def agent_loop(
                 messages.append({"role": "user", "content": CONTINUATION_PROMPT})
                 state.recovery_count += 1
                 continue
-            return _finish(False)
+            return _finish(False, "max_tokens")
 
         max_tokens = DEFAULT_MAX_TOKENS
         state.has_escalated = False
@@ -427,7 +451,7 @@ def agent_loop(
                 # Esc during Allow? [y/N] sets cancel — exit the turn now.
                 if is_cancelled():
                     finalize_cancelled_tool_round(messages, response.content, results)
-                    return _finish(True)
+                    return _finish(True, "cancelled")
                 continue
 
             if should_run_background(name, tool_input):
@@ -498,7 +522,7 @@ def agent_loop(
 
         if is_cancelled():
             finalize_cancelled_tool_round(messages, response.content, results)
-            return _finish(True)
+            return _finish(True, "cancelled")
 
         if not had_todo_write:
             note_llm_round_without_todo_update()

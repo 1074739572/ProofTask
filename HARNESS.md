@@ -16,6 +16,8 @@ Agent harness（基于 shareAI-lab/learn-claude-code s20 拆包改进）。CLI �
 - **TUI 入口（推荐，日常使用）**：
   - 前端：`node_tui\run.bat`
 - 命令行入口：`python main.py`（Rich 行式 CLI）
+- **自主目标（L6）**：`/goal --verify "pytest -q" -- <目标>` 启动；
+  `/goal status|pause|resume|cancel` 控制；状态落盘 `.project/goal.json`（见 `docs/goal-mode-mvp-spec.md`）
 - 基础回归评测：`python -m evals`（`--live` 跑真 LLM 冒烟）
 - 可靠性评测：`python -m evals.harness_reliability --task H001 --variant baseline --runs 1`
 - 单元测试：`python -m pytest tests -q`

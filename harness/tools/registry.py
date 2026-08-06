@@ -735,7 +735,7 @@ BUILTIN_HANDLERS = {
 }
 
 
-def get_tool_pool() -> tuple[list[dict], dict]:
+def get_tool_pool(disabled_tools: set[str] | None = None) -> tuple[list[dict], dict]:
     tools = [
         tool
         for tool in BUILTIN_TOOLS
@@ -753,4 +753,14 @@ def get_tool_pool() -> tuple[list[dict], dict]:
         ) + 1
         tools.insert(insert_at, build_task_tool_schema())
         handlers["task"] = run_agent_task
-    return assemble_tool_pool(tools, handlers)
+    tools, handlers = assemble_tool_pool(tools, handlers)
+    if disabled_tools:
+        # Hide both schema AND handler — the model can never call a disabled
+        # tool (goal orchestration tools stay out of reach during ACT).
+        tools = [tool for tool in tools if tool.get("name") not in disabled_tools]
+        handlers = {
+            name: handler
+            for name, handler in handlers.items()
+            if name not in disabled_tools
+        }
+    return tools, handlers
