@@ -39,6 +39,7 @@ from harness.goal.models import (
     StopReason,
 )
 from harness.goal.policy import check_stop
+from harness.goal.planner import plan_features
 from harness.goal.store import (
     GoalStoreError,
     archive_goal,
@@ -47,7 +48,7 @@ from harness.goal.store import (
 )
 from harness.loop import LoopStats, agent_lock, agent_loop
 from harness.settings import get_workdir, workspace_generation
-from harness.verification import verify_feature_command
+from harness.verification import run_verification, verify_feature_command
 
 #: Tools hidden from the agent during ACT — the model cannot bypass the runner
 #: or mutate orchestration state (spec §7.5).
@@ -118,11 +119,39 @@ def format_goal_status(state: GoalState) -> str:
     lines = [
         f"Goal {state.id} [{state.phase}] ({state.status})",
         f"  Target: {state.target[:80]}",
-        f"  Feature: {state.feature_id or '-'}",
-        f"  Attempt: {state.attempts}/{state.max_attempts}",
-        f"  Elapsed: {int(elapsed)}s / {state.max_duration_seconds}s",
-        f"  Consecutive failures: {state.consecutive_failures}/{state.max_consecutive_failures}",
     ]
+    feature_ids = list(state.feature_ids) if state.feature_ids else ([state.feature_id] if state.feature_id else [])
+    if feature_ids:
+        from harness.features import get_feature
+
+        done = 0
+        marks: list[str] = []
+        for fid in feature_ids:
+            try:
+                feature = get_feature(fid, workspace=Path(state.workspace))
+                status = feature.state
+                name = feature.name
+                verify = feature.verification
+            except Exception:
+                status, name, verify = "missing", "?", ""
+            if status == "passing":
+                done += 1
+                marks.append(f"    \u2713 {fid} [{status}] {name[:40]}")
+            elif fid == state.feature_id:
+                marks.append(f"    \u2192 {fid} [{status}] {name[:40]}")
+            else:
+                marks.append(f"    \u00b7 {fid} [{status}] {name[:40]}")
+            if verify:
+                marks.append(f"        verify: {verify[:80]}")
+        lines.append(f"  Features: {done}/{len(feature_ids)} done")
+        lines.extend(marks)
+        if state.phase == GoalPhase.PAUSED.value and any(
+            t["reason"] == "plan_ready" for t in state.transition_log
+        ):
+            lines.append("  Plan ready — review it, then /goal resume to approve execution")
+    lines.append(f"  Attempt: {state.attempts}/{state.max_attempts}")
+    lines.append(f"  Elapsed: {int(elapsed)}s / {state.max_duration_seconds}s")
+    lines.append(f"  Consecutive failures: {state.consecutive_failures}/{state.max_consecutive_failures}")
     if state.last_phase and state.last_phase != state.phase:
         lines.append(f"  Last transition: {state.last_phase} -> {state.phase}")
     if state.last_error:
@@ -447,6 +476,7 @@ class GoalRunner(threading.Thread):
             if state.phase not in (
                 GoalPhase.VERIFY.value,
                 GoalPhase.EVALUATE.value,
+                GoalPhase.FULL_VERIFY.value,
             ):
                 decision = check_stop(
                     state,
@@ -490,6 +520,8 @@ class GoalRunner(threading.Thread):
             self._verify(state)
         elif phase == GoalPhase.EVALUATE.value:
             self._evaluate(state)
+        elif phase == GoalPhase.FULL_VERIFY.value:
+            self._full_verify(state)
         elif phase == GoalPhase.CLEAN_CHECK.value:
             self._clean_check(state)
         else:
@@ -501,21 +533,59 @@ class GoalRunner(threading.Thread):
 
         short = state.target.strip()[:40] or "goal"
         task = create_task(subject=f"Goal: {short}", description=state.target)
-        feature = create_feature(
-            name=short,
-            behavior=state.target,
-            verification=state.verification,
-            workspace=Path(state.workspace),
-            task_id=task.id,
-            evaluation_required=state.evaluation_required,
-        )
-        attach_feature(task.id, feature.id)
         claim_task(task.id, owner=f"goal:{state.id}")
         state.task_id = task.id
-        state.feature_id = feature.id
         state.workspace = str(Path(state.workspace))
         save_goal(state)
+
+        # L6 v2: decompose the goal into a feature plan (dependency DAG).
+        plans = plan_features(state.target, state.verification, Path(state.workspace))
+        name_to_id: dict[str, str] = {}
+        created: list[str] = []
+        for plan in plans:
+            # Deps only reference earlier plans (parse_plan enforces this),
+            # so their ids are already resolved here.
+            deps = [name_to_id[dep] for dep in plan.depends_on if dep in name_to_id]
+            feature = create_feature(
+                name=plan.name,
+                behavior=plan.behavior,
+                verification=plan.verification or state.verification,
+                workspace=Path(state.workspace),
+                task_id=task.id,
+                evaluation_required=state.evaluation_required,
+                depends_on=deps,
+            )
+            name_to_id[plan.name] = feature.id
+            created.append(feature.id)
+            attach_feature(task.id, feature.id)
+
+        state.feature_ids = created
+        state.feature_id = created[0] if created else None
+        save_goal(state)
+        if len(created) > 1:
+            # L6 v2 confirmation gate: a decomposed plan pauses for approval —
+            # /goal status shows the plan, /goal resume approves execution.
+            self._apply(state, GoalPhase.PAUSED, "plan_ready")
+            return
         self._apply(state, GoalPhase.SELECT_FEATURE, "initialize_complete")
+
+    def _feature_ids(self, state: GoalState) -> list[str]:
+        if state.feature_ids:
+            return list(state.feature_ids)
+        return [state.feature_id] if state.feature_id else []
+
+    def _unmet_dependency(self, state: GoalState, feature: Any) -> str | None:
+        """First depends_on id that is not passing-and-fresh, or None."""
+        from harness.features import feature_is_stale, get_feature
+
+        for dep_id in feature.depends_on:
+            try:
+                dep = get_feature(dep_id, workspace=Path(state.workspace))
+            except FileNotFoundError:
+                return dep_id
+            if dep.state != "passing" or feature_is_stale(dep):
+                return dep_id
+        return None
 
     def _select_feature(self, state: GoalState) -> None:
         from harness.features import feature_is_stale, get_feature, reopen_feature
@@ -530,29 +600,61 @@ class GoalRunner(threading.Thread):
                 f"task {state.task_id} is missing",
             )
             return
-        try:
-            feature = get_feature(state.feature_id, workspace=Path(state.workspace))
-        except FileNotFoundError:
-            self._fail(
-                state,
-                StopReason.missing_dependency,
-                f"feature {state.feature_id} is missing",
-            )
+
+        for fid in self._feature_ids(state):
+            try:
+                feature = get_feature(fid, workspace=Path(state.workspace))
+            except FileNotFoundError:
+                self._fail(
+                    state,
+                    StopReason.missing_dependency,
+                    f"feature {fid} is missing",
+                )
+                return
+            if feature.state == "passing":
+                if feature_is_stale(feature):
+                    state.feature_id = fid
+                    reopen_feature(fid, workspace=Path(state.workspace))
+                    self._apply(state, GoalPhase.ACT, "reopen_stale")
+                    return
+                continue  # done — next feature
+            unmet = self._unmet_dependency(state, feature)
+            if unmet is not None:
+                self._fail(
+                    state,
+                    StopReason.missing_dependency,
+                    f"feature {fid} depends on incomplete feature {unmet}",
+                )
+                return
+            if fid != state.feature_id:
+                # L6 v2: per-feature budgets — a new feature starts with a
+                # fresh attempt/no-progress allowance.
+                state.attempts = 0
+                state.no_progress_count = 0
+            state.feature_id = fid
+            if feature.state in ("active", "failing", "blocked"):
+                if feature.state == "blocked":
+                    reopen_feature(fid, workspace=Path(state.workspace))
+                self._apply(state, GoalPhase.ACT, "resume_existing_work")
+            else:
+                self._apply(state, GoalPhase.CLAIM, "feature_not_started")
             return
 
-        if feature.state == "passing":
-            if feature_is_stale(feature):
-                reopen_feature(state.feature_id, workspace=Path(state.workspace))
-                self._apply(state, GoalPhase.ACT, "reopen_stale")
-            else:
-                self._apply(state, GoalPhase.CLEAN_CHECK, "already_passing")
+        # Every feature is passing and fresh.
+        if len(self._feature_ids(state)) > 1:
+            self._apply(state, GoalPhase.FULL_VERIFY, "all_features_passing")
+        else:
+            self._apply(state, GoalPhase.CLEAN_CHECK, "already_passing")
+
+    def _full_verify(self, state: GoalState) -> None:
+        """Whole-goal gate after a decomposed goal: run the user's --verify
+        command across everything (read-only, policy-gated)."""
+        result = run_verification(state.verification, workspace=Path(state.workspace))
+        if result.passed:
+            self._apply(state, GoalPhase.CLEAN_CHECK, "full_verification_passed")
             return
-        if feature.state in ("active", "failing", "blocked"):
-            if feature.state == "blocked":
-                reopen_feature(state.feature_id, workspace=Path(state.workspace))
-            self._apply(state, GoalPhase.ACT, "resume_existing_work")
-            return
-        self._apply(state, GoalPhase.CLAIM, "feature_not_started")
+        error = result.error or f"full verification failed with exit code {result.exit_code}"
+        self._fail(state, StopReason.full_verification_failed, error)
 
     def _claim(self, state: GoalState) -> None:
         from harness.features import claim_feature
@@ -624,6 +726,19 @@ class GoalRunner(threading.Thread):
             return
         self._apply(state, GoalPhase.VERIFY, "agent_loop_finished")
 
+    def _has_pending_feature(self, state: GoalState) -> bool:
+        """True when any goal feature is not passing-and-fresh."""
+        from harness.features import feature_is_stale, get_feature
+
+        for fid in self._feature_ids(state):
+            try:
+                feature = get_feature(fid, workspace=Path(state.workspace))
+            except FileNotFoundError:
+                return True
+            if feature.state != "passing" or feature_is_stale(feature):
+                return True
+        return False
+
     def _verify(self, state: GoalState) -> None:
         from harness.features import get_feature, reopen_feature
 
@@ -639,9 +754,21 @@ class GoalRunner(threading.Thread):
         )
         if feature.state == "passing":
             state.consecutive_failures = 0
+            # L6 v2 per-feature budgets: a decomposed goal resets the spent
+            # attempt / no-progress allowance when a feature finishes so the
+            # next feature starts fresh (single-feature goals keep the MVP
+            # cumulative semantics).
+            if len(self._feature_ids(state)) > 1:
+                state.attempts = 0
+                state.no_progress_count = 0
             state.last_error = None
             if feature.evaluation_required:
                 self._apply(state, GoalPhase.EVALUATE, "verification_passed")
+            elif self._has_pending_feature(state):
+                # L6 v2: move on to the next feature in the plan.
+                self._apply(state, GoalPhase.SELECT_FEATURE, "verification_passed")
+            elif len(self._feature_ids(state)) > 1:
+                self._apply(state, GoalPhase.FULL_VERIFY, "all_features_passing")
             else:
                 self._apply(state, GoalPhase.CLEAN_CHECK, "verification_passed")
             return
@@ -662,7 +789,10 @@ class GoalRunner(threading.Thread):
                 state.last_error = str(feature.evaluation["error"])[:300]
         except Exception as exc:
             state.last_error = f"evaluation failed: {exc}"
-        self._apply(state, GoalPhase.CLEAN_CHECK, "evaluation_done")
+        if self._has_pending_feature(state):
+            self._apply(state, GoalPhase.SELECT_FEATURE, "evaluation_done")
+        else:
+            self._apply(state, GoalPhase.CLEAN_CHECK, "evaluation_done")
 
     def _clean_check(self, state: GoalState) -> None:
         from harness.tasks import complete_task
@@ -690,6 +820,10 @@ class GoalRunner(threading.Thread):
             or state.attempts >= state.max_attempts
         ):
             self._fail(state, StopReason.clean_check_failed, report.summary())
+            return
+        if len(self._feature_ids(state)) > 1:
+            # L6 v2: a clean failure re-evaluates the whole feature plan.
+            self._apply(state, GoalPhase.SELECT_FEATURE, "clean_check_failed", error=state.last_error)
             return
         self._apply(state, GoalPhase.ACT, "clean_check_failed", error=state.last_error)
 
@@ -759,6 +893,31 @@ class GoalRunner(threading.Thread):
         reason_value = (
             reason.value if isinstance(reason, StopReason) else str(reason)
         )
+        # L6 v2: in a decomposed goal, per-feature retry fuses are attributed
+        # to the feature (stop_reason=feature_failed) so it is clear WHICH
+        # feature exhausted its budget.
+        if (
+            len(self._feature_ids(state)) > 1
+            and state.feature_id
+            and reason_value
+            in {
+                StopReason.max_attempts.value,
+                StopReason.max_consecutive_failures.value,
+                StopReason.no_progress.value,
+                StopReason.max_rounds.value,
+            }
+        ):
+            try:
+                from harness.features import get_feature
+
+                feature = get_feature(state.feature_id, workspace=Path(state.workspace))
+                detail = (
+                    f"feature {state.feature_id} ({feature.name}) failed: "
+                    f"{detail or reason_value}"
+                )
+            except Exception:
+                detail = f"feature {state.feature_id} failed: {detail or reason_value}"
+            reason_value = StopReason.feature_failed.value
         if detail:
             state.last_error = detail
         self._apply(

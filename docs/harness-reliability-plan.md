@@ -405,6 +405,7 @@ structured     → HARNESS.md + progress.md + feature_list.json
 | L4 清洁状态 | ✅ 已完成 | 2026-08-05 | `harness/clean/` + W001–W007 |
 | L5 独立 evaluator | ✅ 已完成 | 2026-08-05 | `harness/evaluation/` + E001–E007 |
 | L6 /goal | ✅ 已完成（MVP v1） | 2026-08-06 | `docs/goal-mode-mvp-spec.md`；`harness/goal/`（models/store/policy/engine/runner/prompt/commands）；G001–G023 + 污染守护全 pass；`python -m evals` fail=0 |
+| L6 /goal v2 | ✅ 已完成（目标自动拆解 + 依赖图） | 2026-08-06 | `harness/goal/planner.py`；Feature.depends_on / GoalState.feature_ids；FULL_VERIFY 全量兜底；per-feature 尝试预算；G024–G028；真实 LLM 冒烟 3-feature 拆解 PASS |
 
 ### 执行约定
 
@@ -595,6 +596,45 @@ structured     → HARNESS.md + progress.md + feature_list.json
 
 **L6 MVP 完成标准自查（DoD）**：全部满足（见规格 §14；G022 覆盖"不采信 agent 自报完成"，
 G012 覆盖 stale passing 重开，G023 覆盖 tasks 目录跟随 workspace）。
+
+### L6 v2 实施记录（2026-08-06，目标自动拆解 + 依赖图）
+
+规格 v2 路线第 1 项（`docs/goal-mode-mvp-spec.md` §15.1）。决策：特征级验证 + 全量兜底（用户确认）；拆解后自动执行不确认（用户确认）。
+
+**产出**：
+
+1. **`harness/goal/planner.py`（新模块）**：只读 `explore` 子代理按目标拆解为 feature 计划（JSON 数组：
+   name/behavior/verification/depends_on，依赖按名互引、计划序即 DAG 序）；`parse_plan` 容错解析
+   （镜像 evaluation/parser.py：提取 JSON 数组、剥离 `run_agent_task` 头部、校验字段/前向依赖/数量上限 8）；
+   每个 feature 的验证命令必须过 `check_verification_command` 策略，不过则回退用户全量 `--verify`；
+   任何解析失败降级为单 feature（目标绝不因规划失败而死）。
+2. **数据模型**：`Feature.depends_on[]`（id 边）；`GoalState.feature_ids[]`（计划序，空=兼容单 feature）；
+   `StopReason.feature_failed / full_verification_failed`。
+3. **runner 编排**：
+   - INITIALIZE：调 planner → 按序 create_feature（依赖边已解析 id）→ attach 全部到 task；
+   - SELECT_FEATURE：按计划序找第一个未完成 feature，检查依赖全部 passing-and-fresh；
+   - VERIFY passing → 还有未完成 feature → 回 SELECT_FEATURE；全部完成 → `FULL_VERIFY`（跑用户全量
+     `--verify`，受控只读执行）→ CLEAN_CHECK → DONE；
+   - **per-feature 尝试预算**：feature 切换/通过时重置 attempts 与 no_progress（单 feature 保持 MVP 累计语义）；
+   - 多 feature 场景任一 feature 熔断 → `FAILED/feature_failed`（last_error 带 feature 名）；
+   - ACT prompt 增补：feature 序号（i/N）、最近一次验证输出 tail（前 12 行，帮 agent 定位失败原因）。
+4. **G024–G029 评测（零 LLM）**：拆解创建+依赖边落盘 / 依赖序执行 / 解析容错（含 agent 头部回归）/
+   全量兜底失败 / 单 feature 熔断终止后续 / **拆解确认闸**（拆解后 PAUSED 等批准，批准前零执行，resume 后完成）。
+5. **拆解确认闸**（用户确认加入）：多 feature 拆解完成后自动转 `PAUSED`（transition reason=plan_ready），
+   `/goal status` 展示计划（features + 验证命令 + 依赖），`/goal resume` 批准后才开始执行；
+   单 feature（含降级）保持自动执行。
+
+**真实 LLM 冒烟**（临时仓库，3 独立模块 bug）：planner 拆出 3 features（各自 `pytest tests/test_X.py -q`），
+逐 feature 修复 → 全量 `pytest -q` 兜底 → DONE。
+
+**实施中发现并修复的 bug**：
+1. `parse_plan` 未剥离 `run_agent_task` 头部（`[explore / ...]` 的 `[` 使 JSON 数组提取失败 → 真实拆解
+   静默降级为单 feature）；补回归断言；
+2. 多 feature 场景 attempts 全局共享导致后序 feature 无预算 → per-feature 重置（注意单 feature 保持
+   累计语义，G013 回归保护）；
+3. feature 用尽预算但验证通过后 attempts 未归零 → 下一个 feature 在 SELECT_FEATURE 被误熔断；
+4. 特征级验证命令的 fixture 前提：`pytest <file>`（非 `python -m pytest`）不把 cwd 加入 sys.path，
+   模块在根/测试在 tests/ 时需 conftest.py（冒烟 fixture 补齐；真实项目常规布局不受影响）。
 
 ### M008：非交互控制命令（2026-08-05，红→绿）
 

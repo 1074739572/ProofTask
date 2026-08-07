@@ -806,7 +806,12 @@ python -m evals --live --category goal
 
 ## 15. 已知限制与 v2 路线
 
-MVP 验证后再考虑：
+**v2 第 1 项已实现（2026-08-06）：目标自动拆解成多个 feature + 依赖图**
+（`harness/goal/planner.py` + runner 依赖序编排 + FULL_VERIFY 全量兜底 + per-feature 预算 +
+**拆解确认闸**（多 feature 拆解后 PAUSED 等 `/goal resume` 批准）；G024–G029；
+详见 reliability plan L6 v2 实施记录）。
+
+MVP 验证后再考虑（其余项）：
 
 1. 目标自动拆解成多个 feature + 依赖图；
 2. worktree 自动创建/恢复/合并；

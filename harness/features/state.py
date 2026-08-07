@@ -86,6 +86,7 @@ def create_feature(
     workspace: str | Path | None = None,
     task_id: str | None = None,
     evaluation_required: bool = False,
+    depends_on: list[str] | None = None,
 ) -> Feature:
     """Create a feature in ``not_started`` state."""
     feature = Feature.new(
@@ -95,6 +96,7 @@ def create_feature(
         workspace=str(features_dir(workspace).parent),
         task_id=task_id,
         evaluation_required=evaluation_required,
+        depends_on=depends_on or [],
     )
     _save(feature)
     return feature

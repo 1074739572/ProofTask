@@ -14,7 +14,7 @@ Agent harness（基于 shareAI-lab/learn-claude-code s20 拆包改进）。CLI �
 
 - 安装依赖：`pip install -r requirements.txt`（后端）；`cd node_tui && npm install`（前端）
 - **TUI 入口（推荐，日常使用）**：
-  - 前端：`node_tui\run.bat`
+  - `node_tui\run.bat`
 - 命令行入口：`python main.py`（Rich 行式 CLI）
 - **自主目标（L6）**：`/goal --verify "pytest -q" -- <目标>` 启动；
   `/goal status|pause|resume|cancel` 控制；状态落盘 `.project/goal.json`（见 `docs/goal-mode-mvp-spec.md`）

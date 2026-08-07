@@ -146,6 +146,32 @@ def _mock_verify_fail(feature_id, workspace=None, **kw):
     )
 
 
+def _single_plan(*args, **kwargs):
+    """Zero-LLM planner stub: fall back to a single whole-goal feature."""
+    from harness.goal.planner import FeaturePlan
+
+    target = kwargs.get("target") or (args[0] if args else "goal")
+    return [
+        FeaturePlan(
+            name=(str(target).strip()[:40] or "goal"),
+            behavior=str(target),
+            verification="",
+            depends_on=(),
+        )
+    ]
+
+
+def _multi_plan(*args, **kwargs):
+    """Zero-LLM planner stub: a 3-feature chain with dependencies."""
+    from harness.goal.planner import FeaturePlan
+
+    return [
+        FeaturePlan(name="feat-a", behavior="first feature", verification="", depends_on=()),
+        FeaturePlan(name="feat-b", behavior="second feature", verification="", depends_on=("feat-a",)),
+        FeaturePlan(name="feat-c", behavior="third feature", verification="", depends_on=("feat-b",)),
+    ]
+
+
 # --- G001: legal transitions --------------------------------------------------
 
 def case_g001_legal_transitions() -> None:
@@ -217,6 +243,7 @@ def _drive_goal(state, ws, *, verify=_mock_verify_pass, agent=None, clean=None):
     patches = [
         mock.patch.object(runner, "agent_loop", fake_agent),
         mock.patch.object(runner, "verify_feature_command", verify),
+        mock.patch.object(runner, "plan_features", _single_plan),
     ]
     if clean is not None:
         patches.append(mock.patch.object(runner, "run_clean_check", clean))
@@ -274,6 +301,7 @@ def case_g002_initialize_creates_graph() -> None:
         with _MultiPatch([
             mock.patch.object(runner, "agent_loop", fake_agent),
             mock.patch.object(runner, "verify_feature_command", _mock_verify_pass),
+            mock.patch.object(runner, "plan_features", _single_plan),
             mock.patch.object(feat_mod, "claim_feature", tracking_claim),
         ]):
             r = runner.GoalRunner(state=state, history=[], context={}, binding=None)
@@ -439,7 +467,8 @@ def case_g008_pause_resume() -> None:
             kw["stats"].llm_rounds = 2
             return True
 
-        with mock.patch.object(runner, "agent_loop", blocking_agent):
+        with mock.patch.object(runner, "agent_loop", blocking_agent), \
+             mock.patch.object(runner, "plan_features", _single_plan):
             r = runner.GoalRunner(state=state, history=[], context={}, binding=None)
             r.start()
             assert started.wait(5), "ACT did not start"
@@ -482,7 +511,8 @@ def case_g009_cancel() -> None:
             kw["stats"].llm_rounds = 1
             return True
 
-        with mock.patch.object(runner, "agent_loop", blocking_agent):
+        with mock.patch.object(runner, "agent_loop", blocking_agent), \
+             mock.patch.object(runner, "plan_features", _single_plan):
             r = runner.GoalRunner(state=state, history=[], context={}, binding=None)
             r.start()
             assert started.wait(5)
@@ -564,6 +594,7 @@ def case_g011_wip_one() -> None:
                 _mock_agent_writes(ws, {"n": 0}),
             ),
             mock.patch.object(runner, "verify_feature_command", _mock_verify_pass),
+            mock.patch.object(runner, "plan_features", _single_plan),
         ]):
             r = runner.GoalRunner(state=state, history=[], context={}, binding=None)
             r.run()
@@ -673,6 +704,7 @@ def case_g014_evaluator_advisory() -> None:
 
         with _MultiPatch([
             mock.patch.object(runner, "agent_loop", _mock_agent_writes(ws, {"n": 0})),
+            mock.patch.object(runner, "plan_features", _single_plan),
             mock.patch.object(runner, "verify_feature_command", _mock_verify_pass),
             mock.patch.object(runner, "run_evaluation", fake_eval),
         ]):
@@ -908,6 +940,7 @@ def case_g020_noninteractive_permission_ask() -> None:
 
         with _MultiPatch([
             mock.patch.object(runner, "agent_loop", ask_triggering_agent),
+            mock.patch.object(runner, "plan_features", _single_plan),
             mock.patch("harness.hooks.evaluate_permission", fake_eval),
             mock.patch(
                 "harness.ui.permission_prompt.ask_permission",
@@ -1030,6 +1063,269 @@ def case_g_pollution_guard() -> None:
     )
 
 
+# --- G024–G028: L6 v2 decomposition --------------------------------------------
+
+def _drive_multi(state, ws, *, verify=_mock_verify_pass, agent=None, full_verify=None, approve_plan=True):
+    """Drive a runner with the 3-feature planner stub (dependency chain).
+
+    ``approve_plan=False`` stops at the plan confirmation gate (PAUSED).
+    """
+    from harness.goal import runner
+
+    calls = {"n": 0}
+    recorded = []
+    fake_agent = agent or _mock_agent_writes(ws, calls)
+
+    def recording_agent(messages, context, **kw):
+        prompt = ""
+        for msg in messages:
+            if msg.get("role") == "user" and isinstance(msg.get("content"), str):
+                prompt = msg["content"]
+        recorded.append(prompt)
+        return fake_agent(messages, context, **kw)
+
+    patches = [
+        mock.patch.object(runner, "agent_loop", recording_agent),
+        mock.patch.object(runner, "verify_feature_command", verify),
+        mock.patch.object(runner, "plan_features", _multi_plan),
+    ]
+    if full_verify is not None:
+        patches.append(mock.patch.object(runner, "run_verification", full_verify))
+    with _MultiPatch(patches):
+        r = runner.GoalRunner(state=state, history=[], context={}, binding=None)
+        r.run()
+        if (
+            approve_plan
+            and state.status == "paused"
+            and any(t["reason"] == "plan_ready" for t in state.transition_log)
+        ):
+            from harness.goal.engine import GoalEngine
+
+            GoalEngine().transition(state, "select_feature", "resumed")
+            runner.save_goal(state)
+            r = runner.GoalRunner(state=state, history=[], context={}, binding=None)
+            r.run()
+    return calls, recorded
+
+
+def _full_verify_pass(command, workspace=None, **kw):
+    from harness.verification.runner import VerificationRunResult
+
+    return VerificationRunResult(
+        command=command, exit_code=0, stdout="ok", timed_out=False, duration_ms=1.0
+    )
+
+
+def _full_verify_fail(command, workspace=None, **kw):
+    from harness.verification.runner import VerificationRunResult
+
+    return VerificationRunResult(
+        command=command, exit_code=1, stdout="boom", timed_out=False, duration_ms=1.0
+    )
+
+
+def case_g024_initialize_decomposes() -> None:
+    """A decomposed goal creates one feature per plan item with dependency edges."""
+    import harness.tasks as tasks_mod
+    from harness.features import get_feature, list_features
+    from harness.goal import runner
+
+    tmp, ws = _tmp_workspace()
+    _git_init(ws)
+    with _active_workspace(ws):
+        state = _new_state(ws)
+        with _MultiPatch([
+            mock.patch.object(runner, "agent_loop", _mock_agent_writes(ws, {"n": 0})),
+            mock.patch.object(runner, "verify_feature_command", _mock_verify_pass),
+            mock.patch.object(runner, "plan_features", _multi_plan),
+            mock.patch.object(runner, "run_verification", _full_verify_pass),
+        ]):
+            r = runner.GoalRunner(state=state, history=[], context={}, binding=None)
+            r.run()
+            if state.status == "paused" and any(
+                t["reason"] == "plan_ready" for t in state.transition_log
+            ):
+                from harness.goal.engine import GoalEngine
+
+                GoalEngine().transition(state, "select_feature", "resumed")
+                runner.save_goal(state)
+                r = runner.GoalRunner(state=state, history=[], context={}, binding=None)
+                r.run()
+
+        assert state.status == "done", (state.status, state.stop_reason, state.last_error)
+        assert len(state.feature_ids) == 3
+        features = {f.name: f for f in list_features(workspace=ws)}
+        assert set(features) == {"feat-a", "feat-b", "feat-c"}
+        assert features["feat-a"].depends_on == []
+        assert features["feat-b"].depends_on == [features["feat-a"].id]
+        assert features["feat-c"].depends_on == [features["feat-b"].id]
+        # Task links all features.
+        task = tasks_mod.load_task(state.task_id)
+        assert set(task.feature_ids) == set(state.feature_ids)
+        assert task.status == "completed"
+        # Whole-goal gate ran for a decomposed goal.
+        assert any(t["reason"] == "full_verification_passed" for t in state.transition_log)
+    tmp.cleanup()
+
+
+def case_g025_dependency_order() -> None:
+    """Features execute in dependency order (feat-a -> feat-b -> feat-c)."""
+    import re
+
+    from harness.goal import runner
+
+    tmp, ws = _tmp_workspace()
+    _git_init(ws)
+    with _active_workspace(ws):
+        state = _new_state(ws)
+        calls, recorded = _drive_multi(state, ws, full_verify=_full_verify_pass)
+        assert state.status == "done", (state.status, state.stop_reason, state.last_error)
+        assert len(state.feature_ids) == 3
+
+        # Extract the feature *name* each ACT prompt was scoped to.
+        order = []
+        for prompt in recorded:
+            match = re.search(r"Feature: \w+ \((.+)\)", prompt)
+            if match:
+                order.append(match.group(1))
+        assert order == ["feat-a", "feat-b", "feat-c"], f"wrong execution order: {order}"
+
+        # Every feature ended passing; the whole-goal gate ran once.
+        from harness.features import get_feature
+
+        for fid in state.feature_ids:
+            assert get_feature(fid, workspace=ws).state == "passing"
+        assert any(t["reason"] == "full_verification_passed" for t in state.transition_log)
+    tmp.cleanup()
+
+
+def case_g026_plan_parse_fault_tolerant() -> None:
+    """Malformed plans degrade to a single feature; policy-rejected
+    verification commands fall back to the full command."""
+    from harness.goal.planner import FeaturePlan, parse_plan, plan_features
+
+    # Valid chain parses.
+    plans = parse_plan(
+        '[{"name": "a", "behavior": "x", "verification": "pytest tests/a.py -q", "depends_on": []},'
+        '{"name": "b", "behavior": "y", "verification": "", "depends_on": ["a"]}]'
+    )
+    assert plans is not None and len(plans) == 2
+    assert plans[0].verification == "pytest tests/a.py -q"
+    assert plans[1].depends_on == ("a",)
+
+    # run_agent_task prefixes the output with a header line — must be stripped
+    # before JSON extraction (regression: the header's '[' broke parsing and
+    # silently degraded real decompositions to a single feature).
+    plans = parse_plan(
+        "[explore / mock] decompose goal into verifiable features (8 tools, 18.6s)\n\n"
+        '[{"name": "a", "behavior": "x", "verification": "", "depends_on": []},'
+        '{"name": "b", "behavior": "y", "verification": "", "depends_on": ["a"]}]'
+    )
+    assert plans is not None and len(plans) == 2, f"header must be stripped: {plans}"
+
+    # Policy-rejected verification falls back to "" (full verify covers it).
+    plans = parse_plan('[{"name": "a", "behavior": "x", "verification": "rm -rf /", "depends_on": []}]')
+    assert plans is not None and plans[0].verification == ""
+
+    # Garbage / empty / forward deps / missing fields -> None.
+    assert parse_plan("no json here") is None
+    assert parse_plan("[]") is None
+    assert parse_plan('[{"name": "a", "behavior": "x", "depends_on": ["later"]}]') is None
+    assert parse_plan('[{"name": "a", "behavior": "x", "verification": "rm -rf /", "depends_on": []},'
+                      '{"name": "b", "behavior": "", "depends_on": []}]') is None
+
+    # planner falls back to a single feature when the agent output is garbage.
+    plans = plan_features("target", "pytest -q", ws := Path(tempfile.mkdtemp()),
+                          planner_runner=lambda *a, **k: "[explore] nothing here")
+    assert len(plans) == 1
+    assert plans[0].name == "target"
+    assert plans[0].verification == ""
+
+
+def case_g027_full_verification_gate() -> None:
+    """Whole-goal --verify gate failure -> FAILED/full_verification_failed."""
+    from harness.goal import runner
+
+    tmp, ws = _tmp_workspace()
+    _git_init(ws)
+    with _active_workspace(ws):
+        state = _new_state(ws)
+        _drive_multi(state, ws, full_verify=_full_verify_fail)
+        assert state.status == "failed"
+        assert state.stop_reason == "full_verification_failed"
+    tmp.cleanup()
+
+
+def case_g028_feature_fuse_stops_goal() -> None:
+    """A feature that exhausts its retry budget fails the goal (feature_failed)
+    and later features never run."""
+    from harness.goal import runner
+
+    tmp, ws = _tmp_workspace()
+    _git_init(ws)
+    with _active_workspace(ws):
+        state = _new_state(ws, max_attempts=10, max_consecutive_failures=2)
+        # First feature passes, second keeps failing -> fuse on feat-b.
+        fail_for = {"feat-b"}
+
+        def feature_aware_verify(feature_id, workspace=None, **kw):
+            from harness.features import get_feature, verify_feature
+
+            feature = get_feature(feature_id, workspace)
+            if feature.name in fail_for:
+                return verify_feature(
+                    feature_id, False, error="verification failed with exit code 1",
+                    workspace=workspace,
+                )
+            from harness.features.schema import VerificationEvidence
+
+            return verify_feature(
+                feature_id, True,
+                VerificationEvidence(command="python check.py", exit_code=0, verified_by="harness"),
+                workspace=workspace,
+            )
+
+        calls, recorded = _drive_multi(state, ws, verify=feature_aware_verify)
+        assert state.status == "failed"
+        assert state.stop_reason == "feature_failed"
+        assert "feat-b" in str(state.last_error)
+        # feat-a worked, feat-b burned its budget, feat-c never ran.
+        prompts = "\n".join(recorded)
+        assert "feat-a" in prompts and "feat-b" in prompts
+        assert "feat-c" not in prompts
+    tmp.cleanup()
+
+
+def case_g029_plan_confirmation_gate() -> None:
+    """A decomposed goal pauses at the plan gate until approved; nothing runs
+    before approval; resume proceeds with the plan."""
+    from harness.features import get_feature
+    from harness.goal import runner
+
+    tmp, ws = _tmp_workspace()
+    _git_init(ws)
+    with _active_workspace(ws):
+        state = _new_state(ws)
+        calls, recorded = _drive_multi(state, ws, approve_plan=False)
+        assert state.status == "paused", (state.status, state.stop_reason)
+        assert any(t["reason"] == "plan_ready" for t in state.transition_log)
+        assert calls["n"] == 0, "nothing may run before plan approval"
+        assert recorded == []
+        for fid in state.feature_ids:
+            assert get_feature(fid, workspace=ws).state == "not_started"
+
+        # Plan is visible in status output.
+        status = runner.get_goal_status()
+        assert "Plan ready" in status
+        assert f"{len(state.feature_ids)}" in status.split("Features:")[1].split("\n")[0]
+
+        # Approving (resume) runs the plan to completion.
+        calls, recorded = _drive_multi(state, ws, approve_plan=True, full_verify=_full_verify_pass)
+        assert state.status == "done", (state.status, state.stop_reason, state.last_error)
+        assert any(t["reason"] == "resumed" for t in state.transition_log)
+    tmp.cleanup()
+
+
 CASES = [
     EvalCase("g001.legal_transitions", "G001: legal goal transitions pass; illegal raise GoalTransitionError", "goal", case_g001_legal_transitions),
     EvalCase("g002.initialize_creates_graph", "G002: initialize creates exactly 1 task + 1 feature (WIP=1, restricted tools)", "goal", case_g002_initialize_creates_graph),
@@ -1054,5 +1350,11 @@ CASES = [
     EvalCase("g021.model_switch_during_goal", "G021: model switch is instant and does not cancel the goal", "goal", case_g021_model_switch_during_goal),
     EvalCase("g022.no_agent_self_completion", "G022: agent self-reported done never completes the goal", "goal", case_g022_no_agent_self_completion),
     EvalCase("g023.tasks_dir_follows_workspace", "G023: tasks dir follows the active workspace", "goal", case_g023_tasks_dir_follows_workspace),
+    EvalCase("g024.initialize_decomposes", "G024: /goal decomposes into a dependency-ordered feature plan", "goal", case_g024_initialize_decomposes),
+    EvalCase("g025.dependency_order", "G025: features execute in dependency order, whole-goal gate runs", "goal", case_g025_dependency_order),
+    EvalCase("g026.plan_parse_fault_tolerant", "G026: malformed plans degrade to a single feature; policy-filtered verify", "goal", case_g026_plan_parse_fault_tolerant),
+    EvalCase("g027.full_verification_gate", "G027: whole-goal --verify gate failure -> FAILED/full_verification_failed", "goal", case_g027_full_verification_gate),
+    EvalCase("g028.feature_fuse_stops_goal", "G028: a feature that exhausts its budget fails the goal; later features never run", "goal", case_g028_feature_fuse_stops_goal),
+    EvalCase("g029.plan_confirmation_gate", "G029: decomposed plan pauses at the confirmation gate until /goal resume", "goal", case_g029_plan_confirmation_gate),
     EvalCase("g999.pollution_guard", "G-pollution: real workspace goal/task/feature data untouched", "goal", case_g_pollution_guard),
 ]

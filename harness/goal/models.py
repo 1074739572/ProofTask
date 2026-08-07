@@ -29,6 +29,7 @@ class GoalPhase(str, Enum):
     VERIFY = "verify"
     EVALUATE = "evaluate"  # conditional; MVP runs at most once
     CLEAN_CHECK = "clean_check"
+    FULL_VERIFY = "full_verify"  # L6 v2: whole-goal verification gate
     DONE = "done"
     PAUSED = "paused"
     CANCELLED = "cancelled"
@@ -57,6 +58,9 @@ class StopReason(str, Enum):
     verification_policy_rejected = "verification_policy_rejected"
     clean_check_failed = "clean_check_failed"
     workspace_changed = "workspace_changed"
+    # L6 v2: a decomposed feature failed or the full-verification gate failed.
+    feature_failed = "feature_failed"
+    full_verification_failed = "full_verification_failed"
     internal_error = "internal_error"
 
 
@@ -77,6 +81,9 @@ class GoalState:
     workspace: str = ""
     task_id: str | None = None
     feature_id: str | None = None
+    # L6 v2 decomposition: all features of this goal, in plan order.
+    # Empty = legacy single-feature goal (feature_id is the one feature).
+    feature_ids: list[str] = field(default_factory=list)
 
     max_rounds_per_attempt: int = DEFAULT_MAX_ROUNDS_PER_ATTEMPT
     max_total_rounds: int = DEFAULT_MAX_ROUNDS_PER_ATTEMPT * DEFAULT_MAX_ATTEMPTS

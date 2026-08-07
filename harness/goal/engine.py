@@ -39,12 +39,13 @@ def _with_terminal_escapes(legal: dict[str, set[str]]) -> dict[str, set[str]]:
 LEGAL: dict[str, set[str]] = _with_terminal_escapes(
     {
         GoalPhase.INITIALIZE.value: {GoalPhase.SELECT_FEATURE.value},
-        GoalPhase.SELECT_FEATURE.value: {GoalPhase.CLAIM.value, GoalPhase.ACT.value, GoalPhase.CLEAN_CHECK.value},
+        GoalPhase.SELECT_FEATURE.value: {GoalPhase.CLAIM.value, GoalPhase.ACT.value, GoalPhase.CLEAN_CHECK.value, GoalPhase.FULL_VERIFY.value},
         GoalPhase.CLAIM.value: {GoalPhase.ACT.value},
         GoalPhase.ACT.value: {GoalPhase.VERIFY.value},
-        GoalPhase.VERIFY.value: {GoalPhase.ACT.value, GoalPhase.EVALUATE.value, GoalPhase.CLEAN_CHECK.value},
-        GoalPhase.EVALUATE.value: {GoalPhase.CLEAN_CHECK.value},
-        GoalPhase.CLEAN_CHECK.value: {GoalPhase.DONE.value, GoalPhase.ACT.value},
+        GoalPhase.VERIFY.value: {GoalPhase.ACT.value, GoalPhase.EVALUATE.value, GoalPhase.CLEAN_CHECK.value, GoalPhase.SELECT_FEATURE.value, GoalPhase.FULL_VERIFY.value},
+        GoalPhase.EVALUATE.value: {GoalPhase.CLEAN_CHECK.value, GoalPhase.SELECT_FEATURE.value},
+        GoalPhase.CLEAN_CHECK.value: {GoalPhase.DONE.value, GoalPhase.ACT.value, GoalPhase.SELECT_FEATURE.value},
+        GoalPhase.FULL_VERIFY.value: {GoalPhase.CLEAN_CHECK.value},
         GoalPhase.PAUSED.value: {GoalPhase.SELECT_FEATURE.value},
         GoalPhase.DONE.value: set(),
         GoalPhase.CANCELLED.value: set(),
@@ -60,6 +61,7 @@ _STATUS_FOR_PHASE: dict[str, str] = {
     GoalPhase.VERIFY.value: GoalStatus.RUNNING.value,
     GoalPhase.EVALUATE.value: GoalStatus.RUNNING.value,
     GoalPhase.CLEAN_CHECK.value: GoalStatus.RUNNING.value,
+    GoalPhase.FULL_VERIFY.value: GoalStatus.RUNNING.value,
     GoalPhase.DONE.value: GoalStatus.DONE.value,
     GoalPhase.PAUSED.value: GoalStatus.PAUSED.value,
     GoalPhase.CANCELLED.value: GoalStatus.CANCELLED.value,
@@ -153,7 +155,12 @@ class GoalEngine:
             if feature is None:
                 return GoalPhase.CLAIM
             if feature.state == "passing":
-                return GoalPhase.ACT if feature_stale else GoalPhase.CLEAN_CHECK
+                if feature_stale:
+                    return GoalPhase.ACT
+                # All features done: decomposed goals run the whole-goal gate.
+                if len(state.feature_ids) > 1:
+                    return GoalPhase.FULL_VERIFY
+                return GoalPhase.CLEAN_CHECK
             if feature.state in ("active", "failing", "blocked"):
                 return GoalPhase.ACT
             return GoalPhase.CLAIM
@@ -170,6 +177,8 @@ class GoalEngine:
                 )
             return GoalPhase.ACT
         if current == GoalPhase.EVALUATE.value:
+            return GoalPhase.CLEAN_CHECK
+        if current == GoalPhase.FULL_VERIFY.value:
             return GoalPhase.CLEAN_CHECK
         if current == GoalPhase.CLEAN_CHECK.value:
             return (

@@ -73,6 +73,9 @@ class Feature:
     state: str = "not_started"
     workspace: str = ""
     task_id: str | None = None
+    # L6 v2: dependency edges between goal features (ids of features that must
+    # be passing before this one starts).
+    depends_on: list[str] = field(default_factory=list)
     evidence: list[dict[str, Any]] = field(default_factory=list)
     attempts: int = 0
     last_error: str | None = None
@@ -94,6 +97,7 @@ class Feature:
         workspace: str = "",
         task_id: str | None = None,
         evaluation_required: bool = False,
+        depends_on: list[str] | None = None,
     ) -> "Feature":
         now = time.time()
         return cls(
@@ -104,6 +108,7 @@ class Feature:
             workspace=str(workspace or ""),
             task_id=task_id,
             evaluation_required=evaluation_required,
+            depends_on=depends_on or [],
             created_at=now,
             updated_at=now,
         )
