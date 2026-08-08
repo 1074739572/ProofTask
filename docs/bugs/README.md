@@ -26,6 +26,8 @@
 | [012](./012-pie-menus-lookup-throttle.md) | Pie Menus 联网护栏过紧 | 已修复+验过 | near-dup/跑题 SERP/次数硬顶掐死换源；去硬顶后 PASS |
 | [013](./013-append-only-history-cache.md) | 工具历史改写破坏缓存前缀 | 已修复+回归通过 | tool result 入场定型；阈值前历史只追加 |
 | [014](./014-long-turn-api-stall.md) | 长任务等待模型时 TUI 假死 | 已定位，延期修复 | SDK 最长等待 600 秒；Stop 无法中断阻塞请求 |
+| [015](./015%20tools_timeout.md) | 工具超时 | 已修复 | 工具卡死兜底 |
+| [016](./016-tui-transcript-order.md) | TUI 转写顺序与呈现 | 已修复（颜色待实机复核） | response 在工具后 · 展开按步 · plan 沉底 · conhost 全白 |
 
 相关能力（非 bug 单）：本地 `/usage` 用量统计；mini-eval（[evals.md](../evals.md)）；SWE-bench Lite（`python -m evals.swebench`）。
 

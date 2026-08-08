@@ -20,10 +20,19 @@ GOAL_USAGE = (
     '  /goal --verify "<command>" -- <target>      start an autonomous goal\n'
     "  /goal --verify \"<cmd>\" --max-rounds 20 --timeout 1800 --max-failures 3 -- <target>\n"
     "  /goal status     view the current goal\n"
-    "  /goal pause      pause (cooperative; current round finishes)\n"
+    "  /goal pause      pause (current round stops at the next checkpoint)\n"
     "  /goal resume     continue a paused goal\n"
     "  /goal cancel     cancel (terminal; history is kept)"
 )
+
+#: CLI limit flag -> GoalRequest field name. Keys must match the GoalRequest
+#: dataclass fields exactly (the old mapping crashed with a TypeError).
+_LIMIT_FLAGS = {
+    "--max-rounds": "max_rounds_per_attempt",
+    "--max-attempts": "max_attempts",
+    "--max-failures": "max_consecutive_failures",
+    "--timeout": "max_duration_seconds",
+}
 
 
 def parse_goal_subcommand(query: str) -> str | None:
@@ -85,7 +94,7 @@ def parse_goal_command(query: str) -> dict[str, Any]:
                 return {"action": "usage", "error": "--verify requires a command"}
             verify = opts[i + 1]
             i += 2
-        elif tok in ("--max-rounds", "--max-attempts", "--max-failures", "--timeout"):
+        elif tok in _LIMIT_FLAGS:
             if i + 1 >= len(opts):
                 return {"action": "usage", "error": f"{tok} requires a number"}
             try:
@@ -94,7 +103,7 @@ def parse_goal_command(query: str) -> dict[str, Any]:
                 return {"action": "usage", "error": f"{tok} requires an integer, got {opts[i + 1]!r}"}
             if value <= 0:
                 return {"action": "usage", "error": f"{tok} must be positive"}
-            limits[tok[2:].replace("-", "_")] = value  # --max-rounds -> max_rounds
+            limits[_LIMIT_FLAGS[tok]] = value
             i += 2
         else:
             return {"action": "usage", "error": f"unknown option {tok!r}"}
@@ -139,8 +148,8 @@ def handle_goal_command(query: str, history: list, context: dict, binding: Any) 
 def _handle_pause(runner) -> str:
     state = runner.pause_goal()
     return (
-        f"Goal paused [paused]\n"
-        f"  Phase: {state.phase} (current round finishes, then it stops)\n"
+        f"Goal pausing [pausing]\n"
+        f"  Phase: {state.phase} (current round stops at the next checkpoint)\n"
         f"  Resume: /goal resume"
     )
 

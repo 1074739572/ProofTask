@@ -3,6 +3,8 @@ import {test} from 'node:test';
 
 import {buildSections} from '../src-open/sections.ts';
 
+const todo = (id: string, status: 'pending' | 'in_progress' | 'completed') => ({id, content: id, status, activeForm: id});
+
 test('src-open keeps running subagent in a bordered section', () => {
   const sections = buildSections([
     {id: 's1', kind: 'subagent', text: 'scan ui path', agentType: 'explore', model: 'mimo', status: 'running', rounds: ['Round 1 · "looking"'], tools: [{id: 't1', name: 'glob', summary: 'src-open/**', status: 'running'}]},
@@ -12,6 +14,16 @@ test('src-open keeps running subagent in a bordered section', () => {
   assert.equal(sections[0].kind, 'subagent');
   assert.equal(sections[0].entry.id, 's1');
   assert.equal(sections[0].entry.tools.length, 1);
+});
+
+test('src-open keeps the live plan as a stable visible section', () => {
+  const first = buildSections([{id: 'tasks:current', kind: 'tasks', text: '计划', tasks: [todo('inspect', 'in_progress'), todo('verify', 'pending')]}]);
+  const second = buildSections([{id: 'tasks:current', kind: 'tasks', text: '计划', tasks: [todo('inspect', 'completed'), todo('verify', 'in_progress')]}]);
+
+  assert.equal(first[0].kind, 'tasks');
+  assert.equal(second[0].kind, 'tasks');
+  assert.equal(first[0].id, second[0].id);
+  assert.equal((second[0] as any).tasks[0].status, 'completed');
 });
 
 test('src-open folds completed subagent into expandable turn summary', () => {
@@ -24,7 +36,8 @@ test('src-open folds completed subagent into expandable turn summary', () => {
 
   const summary = sections.find((section: any) => section.kind === 'summary') as any;
   assert.ok(summary, 'summary exists');
-  assert.equal(summary.subagents.length, 1);
-  assert.equal(summary.subagents[0].agentType, 'code');
+  const subagentSteps = summary.steps.filter((step: any) => step.type === 'subagent');
+  assert.equal(subagentSteps.length, 1);
+  assert.equal(subagentSteps[0].entry.agentType, 'code');
   assert.equal(sections.some((section: any) => section.kind === 'actions'), false);
 });

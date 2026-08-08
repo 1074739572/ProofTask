@@ -8,6 +8,7 @@ the state machine legal and appends to ``transition_log``.
 from __future__ import annotations
 
 import time
+import uuid
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Any
@@ -119,7 +120,10 @@ class GoalState:
         **limits: int,
     ) -> "GoalState":
         state = cls(
-            id=f"goal_{int(time.time())}",
+            # Second-granularity ids collide when a goal is restarted within
+            # the same second (overwriting the history archive) — add a short
+            # random suffix for uniqueness.
+            id=f"goal_{int(time.time())}_{uuid.uuid4().hex[:4]}",
             target=target,
             verification=verification,
             workspace=workspace,
@@ -129,7 +133,12 @@ class GoalState:
         for key, value in limits.items():
             if hasattr(state, key):
                 setattr(state, key, value)
-        if state.max_total_rounds <= 0:
+        if "max_total_rounds" in limits:
+            if state.max_total_rounds <= 0:
+                state.max_total_rounds = state.max_rounds_per_attempt * state.max_attempts
+        elif "max_rounds_per_attempt" in limits or "max_attempts" in limits:
+            # The total-round budget must scale with the user's per-attempt
+            # limits, not stay pinned to the 20*3 default.
             state.max_total_rounds = state.max_rounds_per_attempt * state.max_attempts
         return state
 

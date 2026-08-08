@@ -50,6 +50,8 @@
 | [012](./bugs/012-pie-menus-lookup-throttle.md) | Pie Menus 联网护栏过紧 | 已修复+验过 |
 | [013](./bugs/013-append-only-history-cache.md) | 工具历史改写破坏缓存前缀 | 已修复+回归通过 |
 | [014](./bugs/014-long-turn-api-stall.md) | 长任务等待模型时 TUI 假死 | 已定位，延期修复 |
+| [015](./bugs/015%20tools_timeout.md) | 工具超时 | 已修复 |
+| [016](./bugs/016-tui-transcript-order.md) | TUI 转写顺序与呈现（response 在后 · 展开按步 · plan 沉底 · 全白） | 已修复（颜色待实机复核） |
 
 五条线的关系见 [bugs/README.md](./bugs/README.md) 里的关系图（含 006 终答可见）。
 

@@ -197,18 +197,13 @@ def _reap_runner() -> None:
 
 
 def is_goal_running() -> bool:
+    # Only the live in-process runner counts as "running". A running/pausing
+    # goal found on disk is normalized to paused by load_goal() (process
+    # restart recovery) and must be explicitly resumed — checking it here
+    # would be dead code.
     with _runner_lock:
         runner = _runner
-        if runner is not None and runner.is_alive() and runner.is_running():
-            return True
-    try:
-        state = load_goal()
-    except GoalStoreError:
-        return False
-    return state is not None and state.status in (
-        GoalStatus.RUNNING.value,
-        GoalStatus.PAUSING.value,
-    )
+        return runner is not None and runner.is_alive() and runner.is_running()
 
 
 def start_goal(
@@ -280,6 +275,13 @@ def resume_goal(*, history: list, context: dict, binding: Any) -> GoalState:
                 )
         except OSError:
             pass
+        # State hygiene on resume: drop the old stop reason / pause timestamp,
+        # and exclude paused time from the duration budget (max_duration must
+        # count only active execution, not time spent paused).
+        state.stop_reason = None
+        if state.paused_at is not None:
+            state.started_at += time.time() - state.paused_at
+        state.paused_at = None
         engine = GoalEngine()
         state = engine.transition(state, GoalPhase.SELECT_FEATURE, "resumed")
         save_goal(state)
@@ -668,25 +670,27 @@ class GoalRunner(threading.Thread):
 
         before = self._progress_snapshot(state)
         feature = get_feature(state.feature_id, workspace=Path(state.workspace))
-        self._history.append(
-            {"role": "user", "content": build_goal_act_prompt(state, feature)}
-        )
-
-        with self._lock:
-            if self._cancel_event.is_set() or self._pause_event.is_set():
-                return
-            clear_cancel()
-            if self._cancel_event.is_set() or self._pause_event.is_set():
-                return
-            self._act_in_flight = True
-            state.status = GoalStatus.RUNNING.value
-            save_goal(state)
 
         stats = LoopStats()
         try:
             clear_goal_permission_flags()
             set_goal_noninteractive(True)
             with agent_lock:
+                # The prompt append lives inside the lock region: it must never
+                # race with a normal turn (history is shared) and must not leave
+                # a stray message when the goal was cancelled/paused meanwhile.
+                with self._lock:
+                    if self._cancel_event.is_set() or self._pause_event.is_set():
+                        return
+                    clear_cancel()
+                    if self._cancel_event.is_set() or self._pause_event.is_set():
+                        return
+                    self._act_in_flight = True
+                    state.status = GoalStatus.RUNNING.value
+                    save_goal(state)
+                    self._history.append(
+                        {"role": "user", "content": build_goal_act_prompt(state, feature)}
+                    )
                 agent_loop(
                     self._history,
                     self._context,
@@ -808,7 +812,11 @@ class GoalRunner(threading.Thread):
                     f"task {state.task_id} is missing",
                 )
                 return
-            if str(result).startswith("Cannot complete"):
+            # complete_task returns human-readable strings; success means the
+            # task reached the completed status.
+            if not (
+                result.startswith("Completed") or "already completed" in result
+            ):
                 self._fail(state, StopReason.clean_check_failed, result)
                 return
             self._apply(state, GoalPhase.DONE, "clean_checks_passed")

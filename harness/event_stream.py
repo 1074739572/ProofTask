@@ -315,6 +315,20 @@ def _handle_slash_command(query: str, history: list, binding) -> tuple[str | Non
     return None, binding
 
 
+def _run_instant_slash_command(text: str, context: dict, history: list, binding, *, running: bool) -> None:
+    """Run an instant (non-interactive) slash command, then push a status refresh.
+
+    Model/mode/effort switches change runtime config but only produce a log
+    note; the extra ``session_status`` makes the TUI's model/mode label refresh
+    immediately instead of waiting for the next real turn. ``running`` must be
+    the true agent state so a busy agent doesn't look idle.
+    """
+    note, _new_binding = _handle_slash_command(text, history, binding)
+    if note:
+        emit("log", level="plain", text=note)
+    _emit_status(context, binding, history, running=running)
+
+
 def _run_user_turn(query: str, history: list, context: dict, binding, *, echo_user: bool = True) -> tuple[dict, bool, object]:
     """Run one user turn. Returns (possibly updated context, interrupted, binding)."""
     # Slash commands are internal instructions: never echo them as transcript
@@ -573,9 +587,12 @@ def run_event_stream() -> None:
                         emit("log", level="plain", text=note)
                     continue
                 if _is_instant_slash_command(text):
-                    note, _new_binding = _handle_slash_command(text, history, binding)
-                    if note:
-                        emit("log", level="plain", text=note)
+                    # Model/mode/effort switches change runtime config but only
+                    # emit a log note — push a fresh session_status so the TUI's
+                    # model/mode label refreshes immediately instead of on the
+                    # next real turn. Keep the true running flag so a busy agent
+                    # doesn't look idle.
+                    _run_instant_slash_command(text, context, history, binding, running=running.is_set())
                     continue
                 if running.is_set() or not turn_queue.empty():
                     emit("log", level="warn", text="Agent is already running. Press Ctrl+C to interrupt before sending another message.")

@@ -119,6 +119,66 @@ def test_completion_request_bad_cursor_falls_back(fake_workdir):
     assert payload["candidates"][0].endswith("alpha" + os.sep)
 
 
+# ---------- instant slash commands (model/mode/effort switches) ----------
+
+def test_instant_model_switch_emits_session_status(monkeypatch):
+    """TUI: /model switch must push a session_status carrying the new model.
+
+    Regression: instant slash commands only emitted a log note, so the TUI's
+    bottom model/mode label (fed by session_status) stayed stale until the
+    next real user turn.
+    """
+    from harness import models as models_mod
+    from harness.event_stream import _run_instant_slash_command
+
+    catalog = models_mod.list_models()
+    assert len(catalog) >= 2, "need >=2 configured models for this test"
+    first, second = catalog[0]["id"], catalog[1]["id"]
+
+    # No real API keys in tests — skip the key gate.
+    monkeypatch.setattr(models_mod, "resolve_api_key", lambda provider: True)
+    models_mod.set_model(first)
+
+    emitted: list[tuple] = []
+
+    def fake_emit(event_type: str, **payload):
+        emitted.append((event_type, payload))
+
+    monkeypatch.setattr("harness.event_stream.emit", fake_emit)
+    _run_instant_slash_command(f"/model {second}", {}, [], None, running=False)
+
+    statuses = [(t, p) for (t, p) in emitted if t == "session_status"]
+    assert statuses, "expected a session_status event after /model switch"
+    assert statuses[-1][1]["model"] == second, (
+        f"session_status model should be {second}, got {statuses[-1][1]['model']!r}"
+    )
+    assert models_mod.get_model() == second
+
+
+def test_instant_model_switch_preserves_running_flag(monkeypatch):
+    """session_status pushed by an instant switch must keep the running flag."""
+    from harness import models as models_mod
+    from harness.event_stream import _run_instant_slash_command
+
+    catalog = models_mod.list_models()
+    first = catalog[0]["id"]
+
+    monkeypatch.setattr(models_mod, "resolve_api_key", lambda provider: True)
+    models_mod.set_model(first)
+
+    emitted: list[tuple] = []
+
+    def fake_emit(event_type: str, **payload):
+        emitted.append((event_type, payload))
+
+    monkeypatch.setattr("harness.event_stream.emit", fake_emit)
+    _run_instant_slash_command(f"/model {first}", {}, [], None, running=True)
+
+    statuses = [(t, p) for (t, p) in emitted if t == "session_status"]
+    assert statuses, "expected a session_status event after /model switch"
+    assert statuses[-1][1]["running"] is True, "busy agent must not look idle"
+
+
 def test_completion_request_empty_text_no_crash(fake_workdir):
     payload = _handle_completion_request({"text": "", "request_id": "r5"})
     assert payload["candidates"] == []

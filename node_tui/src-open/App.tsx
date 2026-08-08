@@ -5,7 +5,7 @@ import {spawn} from 'node:child_process';
 import readline from 'node:readline';
 import {alwaysSeparate, setPreLayoutSiblingMargin} from './layout.ts';
 import {buildSections} from './sections.ts';
-import type {ActionRow, Entry, Section, SubagentStatus} from './sections.ts';
+import type {ActionRow, Entry, Section, SubagentStatus, SummaryStep} from './sections.ts';
 import {C} from './theme.ts';
 import {WelcomeView} from './Welcome.tsx';
 
@@ -134,6 +134,27 @@ const markdownSyntax = SyntaxStyle.fromStyles({
   type: {fg: C.primary},
   operator: {fg: C.secondary},
   punctuation: {fg: C.textMuted},
+  // Markdown structure styles. The <markdown> renderer resolves these exact
+  // group names (falling back to the bare "markup" base), so without them
+  // headings/bold/links/quotes/lists all collapse to `default` (near-white).
+  // Note: tree-sitter emits heading depth groups as "markup.heading.N", so
+  // the bare "markup.heading" never matches — register the depth variants.
+  markup: {fg: C.textMuted},
+  'markup.heading.1': {fg: C.primary, bold: true},
+  'markup.heading.2': {fg: C.primary, bold: true},
+  'markup.heading.3': {fg: C.primary, bold: true},
+  'markup.heading.4': {fg: C.primary, bold: true},
+  'markup.heading.5': {fg: C.primary, bold: true},
+  'markup.heading.6': {fg: C.primary, bold: true},
+  'markup.strong': {fg: C.text, bold: true},
+  'markup.italic': {fg: C.text, italic: true},
+  'markup.strikethrough': {fg: C.textMuted, italic: true},
+  'markup.link': {fg: C.info},
+  'markup.link.label': {fg: C.info},
+  'markup.link.url': {fg: C.info, underline: true},
+  'markup.raw': {fg: C.warning},
+  'markup.quote': {fg: C.textMuted, italic: true},
+  'markup.list': {fg: C.textMuted},
 });
 
 function subagentColor(status?: SubagentStatus): string {
@@ -205,15 +226,15 @@ function SectionView(props: {section: Section; frame: () => string; now: () => n
     }}
   >
     <Show when={props.section.kind === 'prompt'}>
-      <box flexDirection="row" minWidth={0}>
-        <text fg={C.primary}>│ › </text>
-        <text fg={C.primary} wrapMode="word">{props.section.kind === 'prompt' ? props.section.text : ''}</text>
+      <box flexDirection="row" minWidth={0} gap={1}>
+        <text fg={C.primary}>│</text>
+        <text fg={C.primary} wrapMode="word">› {props.section.kind === 'prompt' ? props.section.text : ''}</text>
       </box>
     </Show>
     <Show when={props.section.kind === 'response'}>
       <box flexDirection="row" minWidth={0}>
-        <text fg={C.success}>│ </text>
-        <box flexGrow={1} minWidth={0}>
+        <text fg={C.success}>│</text>
+        <box flexGrow={1} minWidth={0} paddingLeft={1}>
           <markdown
             syntaxStyle={markdownSyntax}
             streaming
@@ -232,6 +253,24 @@ function SectionView(props: {section: Section; frame: () => string; now: () => n
         <text fg={C.info} wrapMode="word">{(props.section as any).text}</text>
       </box>
     </Show>
+    <Show when={props.section.kind === 'tasks'}>
+      <box flexDirection="column" minWidth={0} border borderStyle="rounded" borderColor={C.info} paddingX={1}>
+        <box flexDirection="row" minWidth={0} gap={1}>
+          <text fg={C.info}><strong>计划</strong></text>
+          <text fg={C.textMuted} wrapMode="none" truncate>
+            {(() => { const tasks = (props.section as any).tasks || []; const done = tasks.filter((task: any) => task.status === 'completed').length; return `${done}/${tasks.length} 已完成`; })()}
+          </text>
+        </box>
+        <For each={(props.section as any).tasks || []}>{(task: any) =>
+          <box flexDirection="row" minWidth={0}>
+            <text fg={task.status === 'completed' ? C.success : task.status === 'in_progress' ? C.warning : C.textMuted} wrapMode="none">
+              {task.status === 'completed' ? '✓ ' : task.status === 'in_progress' ? '› ' : '· '}
+            </text>
+            <text fg={task.status === 'in_progress' ? C.text : C.textMuted} wrapMode="word">{task.content}</text>
+          </box>
+        }</For>
+      </box>
+    </Show>
     <Show when={props.section.kind === 'summary'}>
       <box
         flexDirection="column"
@@ -244,8 +283,8 @@ function SectionView(props: {section: Section; frame: () => string; now: () => n
           <Show when={(props.section as any).toolCount > 0}>
             <text fg={C.textMuted} wrapMode="none" truncate selectable={false}>· {(props.section as any).toolCount} 工具</text>
           </Show>
-          <Show when={(props.section as any).subagents?.length > 0}>
-            <text fg={C.textMuted} wrapMode="none" truncate selectable={false}>· {(props.section as any).subagents.length} 子 agent</text>
+          <Show when={((props.section as any).steps || []).filter((s: any) => s.type === 'subagent').length > 0}>
+            <text fg={C.textMuted} wrapMode="none" truncate selectable={false}>· {((props.section as any).steps || []).filter((s: any) => s.type === 'subagent').length} 子 agent</text>
           </Show>
           <Show when={(props.section as any).elapsed > 0}>
             <text fg={C.textMuted} wrapMode="none" truncate selectable={false}>{(formatElapsed(Date.now() - (props.section as any).elapsed, Date.now()))}</text>
@@ -279,36 +318,51 @@ function SectionView(props: {section: Section; frame: () => string; now: () => n
             <text fg={C.textMuted} wrapMode="none" truncate>· 思考链/工具调用已收起</text>
           </Show>
         </box>
-        <Show when={(props.section as any).expanded && (props.section as any).intents?.length > 0}>
-          <box flexDirection="column" minWidth={0} paddingLeft={1}>
-            <For each={(props.section as any).intents}>{text =>
-              <box flexDirection="row" minWidth={0}>
-                <text fg={C.info} selectable={false}>💭 </text>
-                <text fg={C.info} wrapMode="word" selectable={false}>{text}</text>
-              </box>
-            }</For>
-          </box>
-        </Show>
-        <Show when={(props.section as any).expanded && (props.section as any).subagents?.length > 0}>
-          <box flexDirection="column" minWidth={0} paddingLeft={1}>
-            <For each={(props.section as any).subagents}>{agent => <SubagentCard agent={agent} frame={props.frame} compact={false} />}</For>
-          </box>
-        </Show>
-        <Show when={(props.section as any).expanded && (props.section as any).rows?.length > 0}>
+        {/* Expanded view: every step of the turn in the order it happened —
+            one line per thinking note, per individual tool call (merged
+            "Called N times" rows unfold back into single calls), per subagent.
+            Grouping by type would pile same-kind rows together and hide the
+            actual sequence, which is exactly what this list must show. */}
+        <Show when={(props.section as any).expanded && (props.section as any).steps?.length > 0}>
           <box flexDirection="column" minWidth={0} paddingLeft={2}>
-            <text fg={C.textMuted} wrapMode="none">工具调用</text>
-            <For each={(props.section as any).rows}>{row => {
+            <text fg={C.textMuted} wrapMode="none">过程 · {(props.section as any).steps.length} 步</text>
+            <For each={(props.section as any).steps}>{(step: any, index: () => number) => {
+              const no = () => `${index() + 1}. `;
+              if (step.type === 'intent') {
+                return <box flexDirection="row" minWidth={0}>
+                  <text fg={C.textMuted} wrapMode="none" selectable={false}>{no()}</text>
+                  <text fg={C.info} selectable={false}>💭 </text>
+                  <text fg={C.info} wrapMode="word" selectable={false}>{step.text}</text>
+                </box>;
+              }
+              if (step.type === 'subagent') {
+                const agent = step.entry;
+                const status = () => (agent.status || (agent.done ? 'done' : 'running')) as SubagentStatus;
+                const stats = () => {
+                  const toolCount = agent.toolCount ?? agent.tools?.length ?? 0;
+                  const elapsed = agent.elapsed != null ? ` · ${agent.elapsed.toFixed(1)}s` : '';
+                  return `${toolCount} tools${elapsed}`;
+                };
+                return <box flexDirection="row" minWidth={0}>
+                  <text fg={C.textMuted} wrapMode="none" selectable={false}>{no()}</text>
+                  <text fg={subagentColor(status())} wrapMode="word" selectable={false}>
+                    {`${subagentIcon(status(), props.frame())} subagent ${agent.agentType || 'agent'} · ${agent.model || 'model'} · ${stats()}${agent.summary ? ` — ${agent.summary}` : ''}`}
+                  </text>
+                </box>;
+              }
+              const row = step.row;
               const color = () => row.done ? (row.ok ? C.success : C.error) : C.warning;
               const icon = () => row.done ? (row.ok ? '✓' : '✕') : props.frame();
               const elapsed = () => formatElapsed(row.start, row.end, props.now());
-              const head = () => row.count && row.count > 1
-                ? `${icon()} ${row.name} · Called ${row.count} times${elapsed()}`
-                : `${icon()} ${row.name}${row.summary && row.summary !== 'completed' ? `  ${row.summary}` : ''}${elapsed()}`;
+              const showSummary = () => (!row.done || row.ok) && row.summary && row.summary !== 'completed';
               return <>
-                <text fg={color()} wrapMode="word">{head()}</text>
+                <box flexDirection="row" minWidth={0}>
+                  <text fg={C.textMuted} wrapMode="none" selectable={false}>{no()}</text>
+                  <text fg={color()} wrapMode="word" selectable={false}>{`${icon()} ${row.name}${showSummary() ? `  ${row.summary}` : ''}${elapsed()}`}</text>
+                </box>
                 <Show when={row.done && !row.ok && row.summary}>
-                  <box flexDirection="row" minWidth={0} paddingLeft={2}>
-                    <text fg={C.error} wrapMode="word">└ {row.summary}</text>
+                  <box flexDirection="row" minWidth={0} paddingLeft={4}>
+                    <text fg={C.error} wrapMode="word" selectable={false}>└ {row.summary}</text>
                   </box>
                 </Show>
               </>;
@@ -392,6 +446,13 @@ function SectionView(props: {section: Section; frame: () => string; now: () => n
   </box>;
 }
 
+function stepSig(step: SummaryStep): string {
+  if (step.type === 'intent') return `i:${step.text}`;
+  if (step.type === 'tool') return `t:${step.row.name}|${step.row.summary}|${step.row.done}|${step.row.ok}|${step.row.start ?? ''}|${step.row.end ?? ''}`;
+  const a = step.entry;
+  return `g:${a.id}|${a.status}|${a.text}|${a.agentType}|${a.model}|${a.toolCount ?? 0}|${a.elapsed ?? ''}|${a.summary ?? ''}|${(a.rounds || []).join('\u0004')}|${(a.tools || []).map(t => `${t.id}:${t.name}:${t.summary}:${t.status}`).join('\u0005')}`;
+}
+
 function sectionSig(section: Section): string {
   switch (section.kind) {
     case 'prompt': return `p:${section.text}`;
@@ -399,7 +460,8 @@ function sectionSig(section: Section): string {
     case 'blocked': return `b:${section.text}`;
     case 'log': return `l:${section.text}|${section.detail}`;
     case 'intent': return `i:${section.text}`;
-    case 'summary': return `s:${section.text}|${section.toolCount}|${section.elapsed}|${section.paths.join('\u0001')}|${section.tokens.inp}|${section.tokens.out}|${section.tokens.cache}|${section.intents.join('\u0002')}|${section.rows.map(r => `${r.name}|${r.summary}|${r.done}|${r.ok}`).join('\u0003')}|${section.subagents.map(a => `${a.id}|${a.status}|${a.text}|${a.agentType}|${a.model}|${a.toolCount ?? 0}|${a.elapsed ?? ''}|${a.summary ?? ''}|${(a.rounds || []).join('\u0004')}|${(a.tools || []).map(t => `${t.id}:${t.name}:${t.summary}:${t.status}`).join('\u0005')}`).join('\u0006')}|${section.expanded ? 'x' : '-'}`;
+    case 'tasks': return `t:${section.tasks.map(task => `${task.content}|${task.activeForm || ''}|${task.status}`).join('\u0001')}`;
+    case 'summary': return `s:${section.text}|${section.toolCount}|${section.elapsed}|${section.paths.join('\u0001')}|${section.tokens.inp}|${section.tokens.out}|${section.tokens.cache}|${section.steps.map(stepSig).join('\u0002')}|${section.expanded ? 'x' : '-'}`;
     case 'subagent': return `g:${section.entry.id}|${section.entry.status}|${section.entry.text}|${section.entry.agentType}|${section.entry.model}|${section.entry.toolCount ?? 0}|${section.entry.elapsed ?? ''}|${section.entry.summary ?? ''}|${(section.entry.rounds || []).join('\u0002')}|${(section.entry.tools || []).map(t => `${t.id}:${t.name}:${t.summary}:${t.status}`).join('\u0003')}`;
     case 'files': return `f:${section.paths.join('\u0001')}`;
     case 'actions': return `a:${section.rows.map(row =>
@@ -494,8 +556,9 @@ export function App(props?: {debugEntries?: Entry[]; debugOverlay?: Overlay; deb
   const [toast, setToast] = createSignal<{text: string; time: number} | null>(null);
   // Tracks whether the user has started a conversation. The welcome panel stays
   // visible until the first real submit — background backend logs must not
-  // dismiss it, which is why this is not keyed off entries().length.
-  const [userStarted, setUserStarted] = createSignal(false);
+  // dismiss it, which is why this is not keyed off entries().length. Debug
+  // renders inject a transcript directly, so they skip the welcome panel.
+  const [userStarted, setUserStarted] = createSignal(props?.debugEntries != null);
   // Backend readiness. The welcome panel renders immediately with a local
   // quote; when the backend's first event lands we mark it ready and swap in
   // the real daily quote. Nothing blocks on startup. Debug renders inject
@@ -653,13 +716,20 @@ export function App(props?: {debugEntries?: Entry[]; debugOverlay?: Overlay; deb
       case 'thinking_end': if (running()) setPhase('working'); break;
       case 'assistant_delta': { const delta = value(event, 'text'); if (!responseId) { begin('responding'); responseId = `response-${Date.now()}`; add({id: responseId, kind: 'response', text: ''}); } else { setPhase('responding'); } queueDelta(delta); break; }
       case 'assistant_message': clearDeltas(); begin('responding'); if (!responseId) { responseId = `response-${Date.now()}`; add({id: responseId, kind: 'response', text: ''}); } update(responseId, x => ({...x, text: value(event, 'text')})); break;
-      case 'tool_start': { begin('running tool'); turnToolCount += 1; const id = value(event, 'id', 'call_id', 'tool_call_id') || `action-${++actionCounter}`; const ts = Number(event.ts || 0) * 1000 || Date.now(); add({id, kind: 'action', text: value(event, 'name') || 'tool', detail: value(event, 'summary') || 'running…', start: ts, output: []}); break; }
+      case 'tool_start': { flushDeltasNow(); responseId = ''; begin('running tool'); turnToolCount += 1; const id = value(event, 'id', 'call_id', 'tool_call_id') || `action-${++actionCounter}`; const ts = Number(event.ts || 0) * 1000 || Date.now(); add({id, kind: 'action', text: value(event, 'name') || 'tool', detail: value(event, 'summary') || 'running…', start: ts, output: []}); break; }
       case 'tool_output': { const id = value(event, 'id', 'call_id', 'tool_call_id'); const line = value(event, 'line'); if (!line) break; queueOutput(id || 'unknown', line); break; }
       case 'tool_end': { const id = value(event, 'id', 'call_id', 'tool_call_id'); const ts = Number(event.ts || 0) * 1000 || Date.now(); if (outputFlushTimer) { clearTimeout(outputFlushTimer); outputFlushTimer = null; flushOutputs(); } const target = (id ? entries().find(x => x.id === id) : [...entries()].reverse().find(x => x.kind === 'action' && !x.done)); if (target) update(target.id, x => ({...x, detail: value(event, 'summary') || (event.ok ? 'completed' : 'failed'), done: true, ok: Boolean(event.ok), end: ts})); break; }
-      case 'subagent_start': { begin('subagent'); const id = value(event, 'id') || `subagent-${++actionCounter}`; const ts = Number(event.ts || 0) * 1000 || Date.now(); add({id, kind: 'subagent', text: value(event, 'description') || 'subagent task', agentType: value(event, 'agent_type') || 'agent', model: value(event, 'model') || 'model', status: 'running', rounds: [], tools: [], start: ts, expanded: true}); break; }
+      case 'subagent_start': { flushDeltasNow(); responseId = ''; begin('subagent'); const id = value(event, 'id') || `subagent-${++actionCounter}`; const ts = Number(event.ts || 0) * 1000 || Date.now(); add({id, kind: 'subagent', text: value(event, 'description') || 'subagent task', agentType: value(event, 'agent_type') || 'agent', model: value(event, 'model') || 'model', status: 'running', rounds: [], tools: [], start: ts, expanded: true}); break; }
       case 'subagent_round': { const id = value(event, 'id'); const roundText = value(event, 'text'); const label = roundText ? `Round ${Number(event.round || 0)} · "${roundText}"` : `Round ${Number(event.round || 0)}`; update(id, x => x.kind === 'subagent' ? {...x, rounds: [...(x.rounds || []), label]} : x); break; }
       case 'subagent_tool': { const id = value(event, 'id'); const toolId = value(event, 'tool_use_id') || `${value(event, 'name')}-${Date.now()}`; const status = event.ok === null || event.ok === undefined ? 'running' : (event.ok ? 'done' : 'failed'); const name = value(event, 'name') || 'tool'; const summary = value(event, 'summary'); update(id, x => { if (x.kind !== 'subagent') return x; const tools = x.tools || []; const idx = tools.findIndex(tool => tool.id === toolId); const nextTool = {id: toolId, name, summary, status: status as SubagentStatus}; const nextTools = idx >= 0 ? tools.map((tool, i) => i === idx ? {...tool, ...nextTool} : tool) : [...tools, nextTool]; return {...x, tools: nextTools, toolCount: nextTools.length}; }); break; }
       case 'subagent_end': { const id = value(event, 'id'); const ts = Number(event.ts || 0) * 1000 || Date.now(); update(id, x => x.kind === 'subagent' ? {...x, status: event.ok ? 'done' : 'failed', done: true, ok: Boolean(event.ok), end: ts, toolCount: Number(event.tools || x.toolCount || 0), elapsed: Number(event.elapsed || 0), summary: value(event, 'summary')} : x); break; }
+      case 'task_update': {
+        const tasks = Array.isArray(event.tasks) ? event.tasks : [];
+        const existing = entries().find(entry => entry.id === 'tasks:current');
+        if (existing) update(existing.id, entry => ({...entry, tasks}));
+        else add({id: 'tasks:current', kind: 'tasks', text: '计划', tasks});
+        break;
+      }
       case 'files_changed': { const paths = (event.paths || []).filter(Boolean); turnFiles = [...new Set([...turnFiles, ...paths])]; add({id: `files-${Date.now()}`, kind: 'files', text: 'Files Changed', detail: paths.join('\n')}); break; }
       case 'error': clearDeltas(); add({id: `blocked-${Date.now()}`, kind: 'blocked', text: value(event, 'text'), detail: 'Blocked'}); setRunning(false); setPhase('blocked'); setStartedAt(0); responseId = ''; break;
       case 'agent_end': {

@@ -160,7 +160,6 @@ def parse_plan(raw: str) -> list[FeaturePlan] | None:
             return None
         if name in names:
             return None
-        names.add(name)
         verification = str(entry.get("verification") or "").strip()
         if verification:
             decision = check_verification_command(verification)
@@ -170,10 +169,12 @@ def parse_plan(raw: str) -> list[FeaturePlan] | None:
         dep_names = tuple(
             str(dep).strip() for dep in deps if isinstance(dep, str) and str(dep).strip()
         )
-        # A dependency must reference a known earlier feature (plan order = DAG).
+        # A dependency must reference an earlier feature — check BEFORE adding
+        # this name so self-dependencies and forward references are rejected.
         for dep in dep_names:
             if dep not in names:
                 return None
+        names.add(name)
         plans.append(
             FeaturePlan(
                 name=name[:80],
@@ -201,12 +202,17 @@ def plan_features(
 
     root = (workspace or get_workdir()).resolve()
     runner = planner_runner or _default_runner
-    raw = runner(
-        description="decompose goal into verifiable features",
-        prompt=build_plan_prompt(target, full_verification),
-        agent_type=PLANNER_AGENT,
-        cwd=str(root),
-    )
+    try:
+        raw = runner(
+            description="decompose goal into verifiable features",
+            prompt=build_plan_prompt(target, full_verification),
+            agent_type=PLANNER_AGENT,
+            cwd=str(root),
+        )
+    except Exception:
+        # A crashed planner must never kill the goal: fall back to a single
+        # whole-goal feature, same as unparseable output.
+        raw = ""
     plans = parse_plan(raw)
     if plans:
         return plans
