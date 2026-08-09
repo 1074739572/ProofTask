@@ -472,6 +472,22 @@ function sectionSig(section: Section): string {
 
 function LogView(props: {entries: () => Entry[]; now: () => number; active: () => boolean; composerEmpty: () => boolean; height: number; focusId: () => string | null; onCycleFocus: (dir: 1 | -1) => void; onToggleExpand: (id: string) => void; onClearFocus: () => void; onSummaryClick: (id: string) => void}) {
   let scroll: ScrollBoxRenderable | undefined;
+  const [atBottom, setAtBottom] = createSignal(true);
+  // Track scroll position: OpenTUI's ScrollBox natively stops following the
+  // bottom when the user scrolls away and re-engages when they return to the
+  // bottom (recalculateBarProps -> syncManualScrollState). We mirror that with
+  // a cheap "back to bottom" hint so the user knows the log is paused.
+  const updateAtBottom = () => {
+    const s = scroll;
+    if (!s) return;
+    const max = Math.max(0, s.scrollHeight - s.viewport.height);
+    setAtBottom(s.scrollTop >= max - 1);
+  };
+  createEffect(() => {
+    props.entries();
+    props.now();
+    updateAtBottom();
+  });
   // Stable-key cache: sections whose content did not change keep the SAME object
   // reference, so <For> (keyed by reference) reuses the mounted subtree instead
   // of remounting everything — that remount is what made the screen flash on
@@ -490,7 +506,7 @@ function LogView(props: {entries: () => Entry[]; now: () => number; active: () =
     return out;
   });
   const frame = () => ['|', '/', '-', '\\'][Math.floor(props.now() / 180) % 4];
-  const scrollBy = (rows: number) => scroll?.scrollBy(rows);
+  const scrollBy = (rows: number) => { scroll?.scrollBy(rows); updateAtBottom(); };
   useKeyboard((event: any) => {
     if (!props.active()) return;
     const name = String(event?.name || '').toLowerCase();
@@ -498,25 +514,34 @@ function LogView(props: {entries: () => Entry[]; now: () => number; active: () =
     const page = Math.max(1, props.height - 2);
     if (name === 'pageup') { scrollBy(-page); event.preventDefault?.(); }
     else if (name === 'pagedown') { scrollBy(page); event.preventDefault?.(); }
-    else if (name === 'end') { scroll?.scrollTo({x: 0, y: scroll.scrollHeight}); event.preventDefault?.(); }
+    else if (name === 'end') { scroll?.scrollTo({x: 0, y: scroll.scrollHeight}); setAtBottom(true); event.preventDefault?.(); }
     else if (props.composerEmpty() && name === 'up') { scrollBy(-1); event.preventDefault?.(); }
     else if (props.composerEmpty() && name === 'down') { scrollBy(1); event.preventDefault?.(); }
     else if (props.composerEmpty() && name === 'tab') { props.onCycleFocus(1); event.preventDefault?.(); }
     else if (props.composerEmpty() && (name === 'return' || name === 'enter') && props.focusId()) { props.onToggleExpand(props.focusId()!); event.preventDefault?.(); }
     else if (props.composerEmpty() && name === 'escape' && props.focusId()) { props.onClearFocus(); event.preventDefault?.(); }
   });
-  return <scrollbox
-    ref={(element: ScrollBoxRenderable) => { scroll = element; }}
-    height={props.height}
-    flexShrink={0}
-    minHeight={0}
-    stickyScroll
-    stickyStart="bottom"
-    viewportOptions={{paddingRight: 1}}
-    verticalScrollbarOptions={{visible: true}}
-  >
-    <For each={sections()}>{section => <SectionView section={section} frame={frame} now={props.now} focusId={props.focusId} onSummaryClick={props.onSummaryClick} />}</For>
-  </scrollbox>;
+  const jumpToBottom = () => { scroll?.scrollTo({x: 0, y: scroll.scrollHeight}); setAtBottom(true); };
+  return <box flexDirection="column">
+    <scrollbox
+      ref={(element: ScrollBoxRenderable) => { scroll = element; updateAtBottom(); }}
+      height={props.height - 1}
+      flexShrink={0}
+      minHeight={0}
+      stickyScroll
+      stickyStart="bottom"
+      viewportOptions={{paddingRight: 1}}
+      verticalScrollbarOptions={{visible: true}}
+      onMouseScroll={() => { setTimeout(updateAtBottom, 0); }}
+    >
+      <For each={sections()}>{section => <SectionView section={section} frame={frame} now={props.now} focusId={props.focusId} onSummaryClick={props.onSummaryClick} />}</For>
+    </scrollbox>
+    <box height={1} flexShrink={0} paddingX={1} onMouseUp={(event: any) => { if (event?.button === 0) jumpToBottom(); }}>
+      <Show when={!atBottom()}>
+        <text fg={C.info} wrapMode="none" truncate>↓ 回到底部 (End)</text>
+      </Show>
+    </box>
+  </box>;
 }
 
 export function App(props?: {debugEntries?: Entry[]; debugOverlay?: Overlay; debugUsage?: {input: number; output: number; cacheRead: number; contextUsed?: number; contextWindow?: number}; debugEffort?: {value: string; label: string; options: OverlayOption[]}; debugWelcome?: {quote: string; art: string[]}}) {
@@ -580,7 +605,19 @@ export function App(props?: {debugEntries?: Entry[]; debugOverlay?: Overlay; deb
     const wrapped = Math.ceil(v.length / width);
     return Math.max(1, Math.min(MAX_COMPOSER_LINES, Math.max(explicit, wrapped)));
   };
-  const timer = setInterval(() => setNow(Date.now()), 250); onCleanup(() => clearInterval(timer));
+  // Only tick the clock while a turn is running (spinner / elapsed need it).
+  // Previously this timer ran unconditionally at 250ms, forcing a full-tree
+  // re-render every 250ms even with zero new content — that periodic repaint
+  // was the main source of the screen flashing on Windows terminals.
+  let nowTimer: ReturnType<typeof setInterval> | null = null;
+  createEffect(() => {
+    if (running()) {
+      if (!nowTimer) nowTimer = setInterval(() => setNow(Date.now()), 250);
+    } else if (nowTimer) {
+      clearInterval(nowTimer);
+      nowTimer = null;
+    }
+  });
   // Fixed layout budget: usage header with border(3), composer(1..5) + status(1), overlay(var).
   const viewportHeight = () => {
     const h = dims().height;
@@ -607,16 +644,19 @@ export function App(props?: {debugEntries?: Entry[]; debugOverlay?: Overlay; deb
     const start = Math.max(0, Math.min(overlayIndex() - Math.floor(rows / 2), Math.max(0, total - rows)));
     return {options: o.options.slice(start, start + rows), start, rows, total};
   });
-  // Auto-dismiss toast after 2.5s
-  createEffect(() => {
-    const t = toast();
-    if (t && now() - t.time > 2500) setToast(null);
-  });
+  // Auto-dismiss toast after 2.5s via an independent timer. The clock-based
+  // effect below would never fire while idle (now() only ticks when running).
+  let toastTimer: ReturnType<typeof setTimeout> | null = null;
+  const showToast = (text: string) => {
+    setToast({text, time: Date.now()});
+    if (toastTimer) clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => setToast(null), 2500);
+  };
   const add = (entry: Entry) => setEntries(prev => [...prev, entry].slice(-1000));
   const update = (id: string, fn: (entry: Entry) => Entry) => setEntries(prev => prev.map(x => x.id === id ? fn(x) : x));
   // Tool output throttling: bash streams one tool_output event per line, which
   // can be hundreds per second for chatty commands. Buffering them and flushing
-  // on a ~80ms timer collapses those into ~12 renders/s instead of one full
+  // on a ~150ms timer collapses those into ~6-7 renders/s instead of one full
   // reactive pass per line — that per-line pass is what made the screen flash.
   const outputBuffer = new Map<string, string[]>();
   let outputFlushTimer: ReturnType<typeof setTimeout> | null = null;
@@ -635,16 +675,18 @@ export function App(props?: {debugEntries?: Entry[]; debugOverlay?: Overlay; deb
     const list = outputBuffer.get(id);
     if (list) list.push(line);
     else outputBuffer.set(id, [line]);
-    if (!outputFlushTimer) outputFlushTimer = setTimeout(flushOutputs, 80);
+    if (!outputFlushTimer) outputFlushTimer = setTimeout(flushOutputs, 150);
   };
   onCleanup(() => {
     if (outputFlushTimer) clearTimeout(outputFlushTimer);
     if (deltaFlushTimer) clearTimeout(deltaFlushTimer);
+    if (nowTimer) clearInterval(nowTimer);
+    if (toastTimer) clearTimeout(toastTimer);
   });
   // Streaming-response throttling: assistant_delta arrives per token/segment.
   // Re-rendering and re-parsing the full markdown on every token makes the
-  // screen stutter, so deltas are buffered and flushed on a ~66ms cadence,
-  // collapsing N token updates into ~15 renders/s (same pattern as tool output).
+  // screen stutter, so deltas are buffered and flushed on a ~150ms cadence,
+  // collapsing N token updates into ~6-7 renders/s (same pattern as tool output).
   let deltaBuffer = '';
   let deltaFlushTimer: ReturnType<typeof setTimeout> | null = null;
   const flushDeltas = () => {
@@ -666,7 +708,7 @@ export function App(props?: {debugEntries?: Entry[]; debugOverlay?: Overlay; deb
   const queueDelta = (text: string) => {
     if (!text) return;
     deltaBuffer += text;
-    if (!deltaFlushTimer) deltaFlushTimer = setTimeout(flushDeltas, 66);
+    if (!deltaFlushTimer) deltaFlushTimer = setTimeout(flushDeltas, 150);
   };
   const begin = (nextPhase: string) => { setPhase(nextPhase); setRunning(true); if (!startedAt()) setStartedAt(Date.now()); };
   const openEffortPicker = () => {
@@ -751,6 +793,13 @@ export function App(props?: {debugEntries?: Entry[]; debugOverlay?: Overlay; deb
       case 'log': if (event.level === 'warn' || event.level === 'plain') add({id: `log-${Date.now()}`, kind: 'log', text: value(event, 'text')}); break;
       case 'show_picker': setOverlay({kind: 'picker', id: event.id, pickerId: event.id, title: event.title, options: (event.items || []).map((x: any) => ({name: x.label, description: x.detail || '', value: x.id}))}); setOverlayIndex(0); break;
       case 'permission_request': setOverlay({kind: 'permission', id: event.id, title: event.title || `Allow ${event.tool}?`, options: [{name: 'Allow once', description: event.resource || '', value: 'allow'}, {name: 'Allow session', description: 'Remember until this TUI exits', value: 'session'}, {name: 'Deny', description: 'Block this tool call', value: 'deny'}]}); setOverlayIndex(0); break;
+      case 'permission_auto_approved': {
+        // Backend approved the pending prompt after the auto-approve timeout;
+        // close the matching overlay and tell the user what happened.
+        if (overlay()?.kind === 'permission' && overlay()?.id === event.id) { setOverlay(null); setOverlayIndex(0); }
+        showToast(`Auto-approved: ${value(event, 'tool')}`);
+        break;
+      }
     }} catch { /* stdout is JSONL; malformed diagnostics are ignored */ } });
   }
   const selectOverlay = (index?: number) => {
@@ -761,12 +810,12 @@ export function App(props?: {debugEntries?: Entry[]; debugOverlay?: Overlay; deb
     if (!option) return;
     if (current.kind === 'permission') {
       send({type: 'permission_response', id: current.id, decision: option.value});
-      setToast({text: option.name, time: Date.now()});
+      showToast(option.name);
     } else {
       const command = current.pickerId === 'model' ? `/model ${option.value}` : current.pickerId === 'resume' ? `/resume ${option.value}` : current.pickerId === 'effort' ? `/effort ${option.value}` : `/mode ${option.value}`;
       if (current.pickerId === 'effort') { setEffort(String(option.value || 'off')); setEffortLabel(option.name || 'Model default'); }
       send({type: 'user_message', text: command, silent: true});
-      setToast({text: `Switched: ${option.name}`, time: Date.now()});
+      showToast(`Switched: ${option.name}`);
     }
     setOverlay(null); setOverlayIndex(0);
   };
