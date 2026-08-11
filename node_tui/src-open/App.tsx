@@ -233,7 +233,7 @@ function SubagentCard(props: {agent: Entry; frame: () => string; compact?: boole
   </box>;
 }
 
-function SectionView(props: {section: Section; frame: () => string; now: () => number; focusId: () => string | null; onSummaryClick: (id: string) => void}) {
+function SectionView(props: {section: Section; frame: () => string; now: () => number; focusId: () => string | null; onToggleExpand: (id: string) => void}) {
   return <box
     flexShrink={0}
     minWidth={0}
@@ -269,14 +269,42 @@ function SectionView(props: {section: Section; frame: () => string; now: () => n
       </box>
     </Show>
     <Show when={props.section.kind === 'tasks'}>
-      <box flexDirection="row" minWidth={0} gap={1} paddingLeft={1}>
-        <text fg={C.info} wrapMode="none">▸ 计划</text>
-        <text fg={C.textMuted} wrapMode="none" truncate>
-          {(() => { const tasks = (props.section as any).tasks || []; const done = tasks.filter((task: any) => task.status === 'completed').length; return `${done}/${tasks.length}`; })()}
-        </text>
-        <text fg={C.warning} flexGrow={1} wrapMode="none" truncate>
-          {(() => { const tasks = (props.section as any).tasks || []; const active = tasks.find((task: any) => task.status === 'in_progress') || tasks.find((task: any) => task.status === 'pending'); return active?.activeForm || active?.content || '已完成'; })()}
-        </text>
+      <box flexDirection="column" minWidth={0} paddingLeft={1}>
+        <box
+          flexDirection="row"
+          minWidth={0}
+          gap={1}
+          onMouseUp={(event: any) => {
+            if (event?.button === 0) props.onToggleExpand((props.section as any).entryId);
+          }}
+        >
+          <text fg={props.focusId() === (props.section as any).entryId ? C.primary : C.info} wrapMode="none" selectable={false}>{(props.section as any).expanded ? 'v' : '>'}</text>
+          <text fg={C.info} wrapMode="none" selectable={false}>Todo</text>
+          <text fg={C.textMuted} wrapMode="none" truncate selectable={false}>
+            {(() => { const tasks = (props.section as any).tasks || []; const done = tasks.filter((task: any) => task.status === 'completed').length; return `${done}/${tasks.length}`; })()}
+          </text>
+          <Show when={!((props.section as any).expanded)}>
+            <text fg={C.warning} flexGrow={1} wrapMode="none" truncate selectable={false}>
+              {(() => { const tasks = (props.section as any).tasks || []; const active = tasks.find((task: any) => task.status === 'in_progress') || tasks.find((task: any) => task.status === 'pending'); return active?.activeForm || active?.content || 'Complete'; })()}
+            </text>
+          </Show>
+          <text fg={C.textMuted} wrapMode="none" truncate selectable={false}>Tab / Enter</text>
+        </box>
+        <Show when={(props.section as any).expanded}>
+          <box flexDirection="column" minWidth={0} paddingLeft={2}>
+            <For each={(props.section as any).tasks || []}>{(task: any) => {
+              const completed = () => task.status === 'completed';
+              const active = () => task.status === 'in_progress';
+              const marker = () => completed() ? '[x]' : active() ? '[~]' : '[ ]';
+              const label = () => active() ? task.activeForm || task.content : task.content;
+              const color = () => completed() ? C.textMuted : active() ? C.warning : C.text;
+              return <box flexDirection="row" minWidth={0} gap={1}>
+                <text fg={color()} wrapMode="none" selectable={false}>{marker()}</text>
+                <text fg={color()} flexGrow={1} wrapMode="word" selectable={false}>{label()}</text>
+              </box>;
+            }}</For>
+          </box>
+        </Show>
       </box>
     </Show>
     <Show when={props.section.kind === 'summary'}>
@@ -305,7 +333,7 @@ function SectionView(props: {section: Section; frame: () => string; now: () => n
             truncate
             selectable={false}
             onMouseUp={(event: any) => {
-              if (event?.button === 0) props.onSummaryClick((props.section as any).entryId || props.section.id);
+              if (event?.button === 0) props.onToggleExpand((props.section as any).entryId || props.section.id);
             }}
           >
             {(props.section as any).expanded ? '收起过程' : '展开过程'}
@@ -455,7 +483,7 @@ function SectionView(props: {section: Section; frame: () => string; now: () => n
   </box>;
 }
 
-function LogView(props: {entries: () => Entry[]; now: () => number; active: () => boolean; composerEmpty: () => boolean; height: number; focusId: () => string | null; onCycleFocus: (dir: 1 | -1) => void; onToggleExpand: (id: string) => void; onClearFocus: () => void; onSummaryClick: (id: string) => void}) {
+function LogView(props: {entries: () => Entry[]; now: () => number; active: () => boolean; composerEmpty: () => boolean; height: number; focusId: () => string | null; onCycleFocus: (dir: 1 | -1) => void; onToggleExpand: (id: string) => void; onClearFocus: () => void}) {
   let scroll: ScrollBoxRenderable | undefined;
   const [atBottom, setAtBottom] = createSignal(true);
   // Track scroll position: OpenTUI's ScrollBox natively stops following the
@@ -508,7 +536,7 @@ function LogView(props: {entries: () => Entry[]; now: () => number; active: () =
       verticalScrollbarOptions={{visible: true}}
       onMouseScroll={() => { setTimeout(updateAtBottom, 0); }}
     >
-      <For each={sections}>{section => <SectionView section={section} frame={frame} now={props.now} focusId={props.focusId} onSummaryClick={props.onSummaryClick} />}</For>
+      <For each={sections}>{section => <SectionView section={section} frame={frame} now={props.now} focusId={props.focusId} onToggleExpand={props.onToggleExpand} />}</For>
     </scrollbox>
     <box height={1} flexShrink={0} paddingX={1} onMouseUp={(event: any) => { if (event?.button === 0) jumpToBottom(); }}>
       <Show when={!atBottom()}>
@@ -541,7 +569,7 @@ export function App(props?: {debugEntries?: DebugEntries; debugRunning?: DebugFl
   // toggle a hidden action and look like the UI is not interactive.
   const [focusId, setFocusId] = createSignal<string | null>(null);
   const focusableIds = () => buildSections(displayedEntries()).flatMap(section => {
-    if (section.kind === 'summary') return [section.entryId];
+    if (section.kind === 'summary' || section.kind === 'tasks') return [section.entryId];
     if (section.kind === 'actions') return section.rows.map(row => row.id);
     return [];
   });
@@ -554,7 +582,6 @@ export function App(props?: {debugEntries?: DebugEntries; debugRunning?: DebugFl
     setFocusId(ids[next]);
   };
   const toggleExpand = (id: string) => update(id, x => ({...x, expanded: !x.expanded}));
-  const toggleSummaryExpand = (id: string) => update(id, x => ({...x, expanded: !x.expanded}));
   const [phase, setPhase] = createSignal('idle'); const [running, setRunning] = createSignal(false); const [startedAt, setStartedAt] = createSignal(0); const [now, setNow] = createSignal(Date.now()); const [overlay, setOverlay] = createSignal<Overlay | null>(props?.debugOverlay ?? null);
   const [overlayIndex, setOverlayIndex] = createSignal(0);
   // Input history
@@ -769,7 +796,7 @@ export function App(props?: {debugEntries?: DebugEntries; debugRunning?: DebugFl
         const tasks = Array.isArray(event.tasks) ? event.tasks : [];
         const existing = entries().find(entry => entry.id === 'tasks:current');
         if (existing) update(existing.id, entry => ({...entry, tasks}));
-        else add({id: 'tasks:current', kind: 'tasks', text: '计划', tasks});
+        else add({id: 'tasks:current', kind: 'tasks', text: '计划', tasks, expanded: true});
         break;
       }
       case 'files_changed': { const paths = (event.paths || []).filter(Boolean); turnFiles = [...new Set([...turnFiles, ...paths])]; add({id: `files-${Date.now()}`, kind: 'files', text: 'Files Changed', detail: paths.join('\n')}); break; }
@@ -889,7 +916,7 @@ export function App(props?: {debugEntries?: DebugEntries; debugRunning?: DebugFl
   };
   return <box width={dims().width} height={dims().height} flexDirection="column">
     <Show when={showWelcome()} fallback={
-      <LogView entries={displayedEntries} now={now} height={viewportHeight()} active={() => !overlay()} composerEmpty={() => !overlay() && input() === ''} focusId={focusId} onCycleFocus={cycleFocus} onToggleExpand={toggleExpand} onClearFocus={() => setFocusId(null)} onSummaryClick={toggleSummaryExpand} />
+      <LogView entries={displayedEntries} now={now} height={viewportHeight()} active={() => !overlay()} composerEmpty={() => !overlay() && input() === ''} focusId={focusId} onCycleFocus={cycleFocus} onToggleExpand={toggleExpand} onClearFocus={() => setFocusId(null)} />
     }>
       <WelcomeView width={dims().width} height={viewportHeight()} quote={welcomeQuote()} />
     </Show>

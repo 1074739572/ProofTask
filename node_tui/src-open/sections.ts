@@ -25,7 +25,7 @@ export type Section =
   | {kind: 'blocked'; id: string; text: string}
   | {kind: 'log'; id: string; text: string; detail: string}
   | {kind: 'intent'; id: string; text: string}
-  | {kind: 'tasks'; id: string; tasks: TodoItem[]}
+  | {kind: 'tasks'; id: string; entryId: string; tasks: TodoItem[]; expanded: boolean}
   | {kind: 'summary'; id: string; entryId: string; text: string; toolCount: number; elapsed: number; paths: string[]; tokens: {inp: number; out: number; cache: number}; steps: SummaryStep[]; expanded: boolean};
 
 // A merged row unfolds back into one step per recorded call, in call order.
@@ -139,7 +139,15 @@ export function buildSections(entries: Entry[]): Section[] {
   }
   flushActions(); flushFiles();
   if (latestTasks && (latestTasks.tasks || []).length > 0) {
-    out.push({kind: 'tasks', id: `tasks:${latestTasks.id}`, tasks: latestTasks.tasks || []});
+    out.push({
+      kind: 'tasks',
+      id: `tasks:${latestTasks.id}`,
+      entryId: latestTasks.id,
+      tasks: latestTasks.tasks || [],
+      // A live plan is useful context while work is running, so show its
+      // individual items until the user explicitly folds it.
+      expanded: latestTasks.expanded !== false,
+    });
   }
   return out;
 }

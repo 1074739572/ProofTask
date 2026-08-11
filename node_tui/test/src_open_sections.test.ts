@@ -121,3 +121,18 @@ test('plan panel is pinned to the bottom and empty plans render nothing', () => 
   ]);
   assert.equal(empty.some((section: any) => section.kind === 'tasks'), false);
 });
+
+test('plan panel starts expanded and retains an explicit collapsed state', () => {
+  const expanded = buildSections([
+    {id: 'tasks:current', kind: 'tasks', text: '计划', tasks: [todo('a', 'in_progress')]},
+  ]);
+  const collapsed = buildSections([
+    {id: 'tasks:current', kind: 'tasks', text: '计划', tasks: [todo('a', 'in_progress')], expanded: false},
+  ]);
+
+  assert.equal(expanded[0].kind, 'tasks');
+  assert.equal(collapsed[0].kind, 'tasks');
+  assert.equal(expanded[0].expanded, true);
+  assert.equal(collapsed[0].expanded, false);
+  assert.equal(expanded[0].entryId, 'tasks:current');
+});
