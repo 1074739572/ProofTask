@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import time
 import uuid
+from functools import partial
+from pathlib import Path
 
 from harness.agents.registry import get_agent_profile, validate_agent_model
 from harness.hooks import trigger_hooks
 from harness.llm import create_message
 from harness.messages.blocks import block_field, is_tool_use
 from harness.project.session import serialize_messages
-from harness.settings import WORKDIR
+from harness.settings import get_workdir
 from harness.tools.dispatch import call_tool_handler, extract_text, has_tool_use
 from harness.tools.filesystem import run_bash, run_edit, run_glob, run_read, run_write
 from harness.ui.renderer import renderer
@@ -72,6 +74,25 @@ _BASE_TOOL_DEFS = {
             "required": ["pattern"],
         },
     },
+    "rag_search": {
+        "name": "rag_search",
+        "description": "Search the local RAG index.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "top_k": {"type": "integer"},
+                "source": {"type": "string"},
+                "chapter": {"type": "string"},
+            },
+            "required": ["query"],
+        },
+    },
+    "rag_status": {
+        "name": "rag_status",
+        "description": "Show local RAG index status.",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
 }
 
 _BASE_HANDLERS = {
@@ -83,9 +104,30 @@ _BASE_HANDLERS = {
 }
 
 
-def _tools_for_agent(allowed: list[str]) -> tuple[list[dict], dict]:
-    tools = [_BASE_TOOL_DEFS[name] for name in allowed if name in _BASE_TOOL_DEFS]
-    handlers = {name: _BASE_HANDLERS[name] for name in allowed if name in _BASE_HANDLERS}
+def _tools_for_agent(
+    allowed: list[str], cwd: Path | None = None
+) -> tuple[list[dict], dict]:
+    unknown = sorted(set(allowed) - set(_BASE_TOOL_DEFS))
+    if unknown:
+        raise ValueError(f"agent profile declares unknown tools: {', '.join(unknown)}")
+    bound_cwd = (cwd or get_workdir()).resolve()
+    tools = [_BASE_TOOL_DEFS[name] for name in allowed]
+    handlers = {
+        "bash": partial(run_bash, cwd=bound_cwd),
+        "read_file": partial(run_read, cwd=bound_cwd),
+        "write_file": partial(run_write, cwd=bound_cwd),
+        "edit_file": partial(run_edit, cwd=bound_cwd),
+        "glob": partial(run_glob, cwd=bound_cwd),
+    }
+    if "rag_search" in allowed:
+        from harness.rag.tools import run_rag_search
+
+        handlers["rag_search"] = run_rag_search
+    if "rag_status" in allowed:
+        from harness.rag.tools import run_rag_status
+
+        handlers["rag_status"] = run_rag_status
+    handlers = {name: handlers[name] for name in allowed}
     return tools, handlers
 
 
@@ -103,8 +145,15 @@ def run_agent_task(
     profile = get_agent_profile(agent_type)
     assert profile is not None
 
-    tools, handlers = _tools_for_agent(profile.tools)
-    workdir = str(cwd) if cwd else str(WORKDIR)
+    base_workdir = get_workdir().resolve()
+    agent_cwd = Path(cwd).resolve() if cwd else base_workdir
+    if not agent_cwd.is_relative_to(base_workdir):
+        return f"Error: agent working directory escapes workspace: {agent_cwd}"
+    try:
+        tools, handlers = _tools_for_agent(profile.tools, agent_cwd)
+    except ValueError as exc:
+        return f"Error: {exc}"
+    workdir = str(agent_cwd)
     system = f"{profile.system}\n\nWorking directory: {workdir}"
     messages = [{"role": "user", "content": prompt}]
 

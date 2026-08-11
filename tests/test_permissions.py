@@ -27,6 +27,28 @@ def test_bash_last_matching_rule_wins():
     assert evaluate_permission("bash", {"command": "git push origin main"}, rules=rules).effect == "deny"
 
 
+def test_specific_mcp_rule_beats_wildcard_rule_regardless_of_order():
+    rules = {
+        "mcp__playwright__browser_tabs": "ask",
+        "mcp__*": "allow",
+    }
+    assert evaluate_permission("mcp__playwright__browser_tabs", {}, rules=rules).effect == "ask"
+
+
+def test_compound_bash_command_never_inherits_prefix_allow_rule():
+    rules = {"bash": {"dir *": "allow", "*": "ask"}}
+    decision = evaluate_permission("bash", {"command": "dir . & del important.txt"}, rules=rules)
+    assert decision.effect == "ask"
+    assert decision.source == "safety"
+
+
+def test_windows_file_paths_use_the_same_protected_path_rules():
+    rules = {"write_file": {"*": "allow", ".features/*": "deny"}}
+    assert evaluate_permission(
+        "write_file", {"path": ".features\\f001.json"}, rules=rules
+    ).effect == "deny"
+
+
 def test_file_resource_rules_can_deny_env_but_allow_example():
     rules = {
         "read_file": {
@@ -164,3 +186,8 @@ def test_permission_hook_persists_always_approval():
         )
         assert permission_hook(block) is None
     add_persistent.assert_called_once_with("bash", "npm test*", "allow")
+
+
+def test_permission_hook_rejects_model_controlled_bash_cwd():
+    block = {"name": "bash", "input": {"command": "dir", "cwd": "C:/Users"}}
+    assert "execution-owned" in permission_hook(block)

@@ -740,7 +740,11 @@ def case_g015_command_parsing() -> None:
     cmd = parse_goal_command('/goal --verify "pytest -q" --max-rounds 20 --timeout 1800 --max-failures 3 -- 修复分页边界')
     assert cmd["action"] == "start"
     assert cmd["verify"] == "pytest -q"
-    assert cmd["limits"] == {"max_rounds": 20, "timeout": 1800, "max_failures": 3}
+    assert cmd["limits"] == {
+        "max_rounds_per_attempt": 20,
+        "max_duration_seconds": 1800,
+        "max_consecutive_failures": 3,
+    }
     assert cmd["target"] == "修复分页边界"
 
     # Everything after `--` is target text, even flag-like tokens.

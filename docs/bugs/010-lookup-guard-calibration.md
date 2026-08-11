@@ -3,6 +3,8 @@
 **状态**：已修复（产品路径）  
 **暴露场景**：GAIA L1 fish-bag（模式 B）+ Doctor Who（模式 D）
 
+> Archive note: the described `lookup_guard.py` implementation was removed and is not wired into the current runtime. This document records prior behavior only; current lookup safety relies on permissions and `RepeatGuard`.
+
 ## 症状
 
 1. **模式 B**：单个 PDF `404` / `robots` 被算进「连续 stale」，两次后全局禁网。换源（Wikipedia / 其它站）也被拦。

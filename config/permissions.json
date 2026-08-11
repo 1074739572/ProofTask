@@ -35,7 +35,7 @@
     "mcp__playwright__browser_wait_for": "allow",
     "mcp__playwright__browser_resize": "allow",
     "mcp__playwright__browser_tabs": "ask",
-    "mcp__*": "allow",
+    "mcp__*": "ask",
     "verify_command": "allow",
     "write_file": {
       "*": "allow",
@@ -62,12 +62,11 @@
     "bash": {
       "*": "ask",
       "dir *": "allow",
-      "type *": "allow",
       "where *": "allow",
       "git status*": "allow",
       "git diff*": "allow",
       "git log*": "allow",
-      "python -c *": "allow",
+      "python -c *": "ask",
       "*.features*": "deny",
       "*.project/goal.json*": "deny",
       "*.project/goal-history*": "deny",

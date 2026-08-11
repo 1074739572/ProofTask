@@ -321,7 +321,8 @@ def run_bash(
         output = "\n".join(collected).strip()
     if info["timed_out"]:
         return _timeout_diagnosis(command, timeout_s, info, collected, lock)
-    return output[:50000] if output else "(no output)"
+    result = output[:50000] if output else "(no output)"
+    return f"[exit_code={info['exit_code']}]\n{result}"
 
 
 def run_bash_streaming(
@@ -398,7 +399,8 @@ def run_bash_streaming(
         output = "\n".join(collected).strip()
     if info["timed_out"]:
         return _timeout_diagnosis(command, timeout_s, info, collected, lock)
-    return output[:50000] if output else "(no output)"
+    result = output[:50000] if output else "(no output)"
+    return f"[exit_code={info['exit_code']}]\n{result}"
 
 
 MAX_READ_CHARS = 400_000  # hard cap for full-file reads; page with limit/offset
@@ -447,12 +449,15 @@ def run_read(
             limit = None
 
         total = _count_lines_bytes(target)
-        if limit is not None and offset >= total:
+        if offset > 0 and offset >= total:
             return f"{total} lines total (offset {offset} is past the end of {path})"
         encoding = _pick_encoding(target)
         with target.open("r", encoding=encoding, errors="replace") as fh:
             if limit is None:
-                raw_lines = fh.read().splitlines()
+                raw_lines = [
+                    ln.rstrip("\r\n")
+                    for ln in itertools.islice(fh, offset, None)
+                ]
             else:
                 raw_lines = [
                     ln.rstrip("\r\n")
@@ -472,10 +477,13 @@ def run_read(
 
         shown = len(raw_lines)
         end = offset + shown
-        out = [f"{total} lines total" + (f", showing {offset + 1}-{end}" if limit is not None else "")]
+        out = [
+            f"{total} lines total"
+            + (f", showing {offset + 1}-{end}" if offset or limit is not None else "")
+        ]
         for i, line in enumerate(raw_lines, start=offset + 1):
             out.append(f"{i:>6} | {line}")
-        if limit is not None and end < total:
+        if end < total:
             out.append(f"... ({total - end} more lines)")
         elif truncated:
             out.append(f"... (truncated after {MAX_READ_CHARS} chars; use limit/offset to page)")

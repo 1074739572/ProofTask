@@ -100,6 +100,19 @@ def build_prompt(task: ReliabilityTask, variant: HarnessVariant, *, session: int
             )
         return base
 
+    if session == 3:
+        base = task.prompt_session3 or task.prompt
+        if variant.id == "structured":
+            base += (
+                "\n\nWork rules:\n"
+                "- Start by reading progress.md to see what sessions 1-2 did.\n"
+                "- Work on ONE feature at a time (WIP=1).\n"
+                "- Before claiming completion, run the verification command "
+                "`python -m pytest tests -q` and make sure it passes.\n"
+                "- Update progress.md before finishing."
+            )
+        return base
+
     base = task.prompt
     if variant.id == "instructions":
         base += (
@@ -173,15 +186,22 @@ def run_single(
         with mock.patch("builtins.input", return_value="y"):
             agent_loop(messages, ctx, max_rounds=task.max_rounds, binding=binding)
 
-        # --- multi-session tasks: run session 2 in the same workspace ------
+        # --- multi-session tasks: run session 2/3 in the same workspace ------
         if task.requires_multi_session:
-            messages2 = [{"role": "user", "content": build_prompt(task, variant, session=2)}]
-            ctx2 = update_context({}, messages2)
-            if variant.project_instructions:
-                apply_project_instructions(ctx2, start=workspace)
-            with mock.patch("builtins.input", return_value="y"):
-                agent_loop(messages2, ctx2, max_rounds=task.max_rounds, binding=binding)
-            messages.extend(messages2)
+            for session_no in (2, 3):
+                if session_no == 2:
+                    prompt = build_prompt(task, variant, session=2)
+                elif task.prompt_session3:
+                    prompt = build_prompt(task, variant, session=3)
+                else:
+                    continue
+                messages_n = [{"role": "user", "content": prompt}]
+                ctx_n = update_context({}, messages_n)
+                if variant.project_instructions:
+                    apply_project_instructions(ctx_n, start=workspace)
+                with mock.patch("builtins.input", return_value="y"):
+                    agent_loop(messages_n, ctx_n, max_rounds=task.max_rounds, binding=binding)
+                messages.extend(messages_n)
 
         # --- evidence collection -------------------------------------------
         run.claimed_complete = _claimed_complete(messages)

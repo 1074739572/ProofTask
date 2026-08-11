@@ -48,6 +48,23 @@ def _path_value(tool_name: str, data: dict) -> str:
     return ""
 
 
+def _normalize_resource(tool_name: str, resource: str) -> str:
+    """Normalize filesystem separators before matching policy rules.
+
+    Rules are stored with forward slashes, while Windows callers commonly use
+    backslashes. Matching the raw input let the same protected file have two
+    different permission outcomes.
+    """
+    if tool_name in ("read_file", "write_file", "edit_file", "glob", "bash"):
+        return resource.replace("\\", "/")
+    return resource
+
+
+def _pattern_specificity(pattern: str) -> int:
+    """Prefer an explicit rule over a broad wildcard rule."""
+    return len(pattern.replace("*", "").replace("?", ""))
+
+
 def _external_resource_for_path(path_text: str) -> str | None:
     if not path_text:
         return None
@@ -70,11 +87,19 @@ def context_for_tool(tool_name: str, tool_input: dict | None) -> ToolPermissionC
     data = tool_input or {}
     external = _external_resource_for_path(_path_value(tool_name, data))
     if tool_name == "bash":
-        return ToolPermissionContext(tool_name, str(data.get("command") or ""))
+        return ToolPermissionContext(
+            tool_name, _normalize_resource(tool_name, str(data.get("command") or ""))
+        )
     if tool_name in ("read_file", "write_file", "edit_file"):
-        return ToolPermissionContext(tool_name, str(data.get("path") or ""), external)
+        return ToolPermissionContext(
+            tool_name,
+            _normalize_resource(tool_name, str(data.get("path") or "")),
+            external,
+        )
     if tool_name == "glob":
-        return ToolPermissionContext(tool_name, str(data.get("pattern") or ""))
+        return ToolPermissionContext(
+            tool_name, _normalize_resource(tool_name, str(data.get("pattern") or ""))
+        )
     if tool_name == "web_search":
         return ToolPermissionContext(tool_name, str(data.get("query") or ""))
     if tool_name == "rag_search":
@@ -108,22 +133,44 @@ def _evaluate_config_rules(
 ) -> tuple[PermissionEffect | None, str]:
     effect: PermissionEffect | None = None
     matched = ""
+    best_tool_score = -1
+    best_resource_score = -1
     for tool_pattern, rule in rules.items():
         if not _match(tool_pattern, tool_name):
             continue
-        matched = tool_pattern
         if isinstance(rule, str):
-            effect = rule
+            score = _pattern_specificity(tool_pattern)
+            if score > best_tool_score or (score == best_tool_score and rule == "deny"):
+                effect = rule
+                matched = tool_pattern
+                best_tool_score = score
+                best_resource_score = 0
             continue
         nested_effect: PermissionEffect | None = None
         nested_pattern = ""
+        nested_score = -1
         for resource_pattern, candidate in rule.items():
             if _match(resource_pattern, resource):
-                nested_effect = candidate
-                nested_pattern = resource_pattern
+                score = _pattern_specificity(resource_pattern)
+                if score > nested_score or (score == nested_score and candidate == "deny"):
+                    nested_effect = candidate
+                    nested_pattern = resource_pattern
+                    nested_score = score
         if nested_effect is not None:
-            effect = nested_effect
-            matched = f"{tool_pattern}:{nested_pattern}"
+            tool_score = _pattern_specificity(tool_pattern)
+            if (
+                tool_score > best_tool_score
+                or (tool_score == best_tool_score and nested_score > best_resource_score)
+                or (
+                    tool_score == best_tool_score
+                    and nested_score == best_resource_score
+                    and nested_effect == "deny"
+                )
+            ):
+                effect = nested_effect
+                matched = f"{tool_pattern}:{nested_pattern}"
+                best_tool_score = tool_score
+                best_resource_score = nested_score
     return effect, matched
 
 
@@ -231,6 +278,18 @@ def evaluate_permission(
     ``external_directory`` gate before the tool's own permission.
     """
     ctx = context_for_tool(tool_name, tool_input)
+    if tool_name == "bash" and any(token in ctx.resource for token in ("&", "|", ">", "<", "\n", "\r")):
+        # A prefix allow-list cannot safely authorize a compound shell command.
+        # It may contain an unrelated destructive command after the separator.
+        return PermissionDecision(
+            effect="ask",
+            tool=tool_name,
+            resource=ctx.resource,
+            reason="compound shell command requires explicit approval",
+            save_tool=tool_name,
+            save_resource=ctx.resource,
+            source="safety",
+        )
     if ctx.external_resource:
         external_decision = evaluate_single_permission(
             "external_directory",

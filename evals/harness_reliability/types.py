@@ -28,6 +28,7 @@ class ReliabilityTask:
     max_rounds: int = 25
     requires_multi_session: bool = False
     prompt_session2: str = ""  # required when requires_multi_session=True
+    prompt_session3: str = ""  # optional third session (continuity-loss eval)
     allowed_paths: tuple[str, ...] = ()  # files the agent may modify
     oracle_timeout_s: int = 120
     check_script: str = ""  # name under checks/; independent behavior oracle

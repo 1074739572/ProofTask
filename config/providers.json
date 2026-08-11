@@ -14,7 +14,7 @@
   "anzhiyu": {
     "label": "鱼鱼API",
     "type": "openai",
-    "base_url": "https://sub.anzhiyu.com/v1",
+    "base_url": "https://api.aijws.com/v1",
     "api_key_env": "ANZHIYU_API_KEY"
   }
 }

@@ -2,23 +2,23 @@
 
 from __future__ import annotations
 
-import os
-
 from harness.prompts.dynamic import build_session_context
 
 EPHEMERAL_MARKER = "<session-context>"
 EphemeralPolicy = str  # "always" | "if_unchanged"
 
-_last_session_body: str | None = None
-
-
 def ephemeral_policy() -> str:
-    return os.getenv("HARNESS_EPHEMERAL_POLICY", "if_unchanged").strip().lower()
+    """Compatibility accessor for callers that inspect the old setting.
+
+    Dynamic state is part of every stateless API request. Omitting it after a
+    matching previous body made tool-loop and recovery calls forget the mode,
+    project rules, and todos.
+    """
+    return "always"
 
 
 def reset_ephemeral_cache() -> None:
-    global _last_session_body
-    _last_session_body = None
+    """Compatibility no-op; ephemeral context is intentionally uncached."""
 
 
 def is_ephemeral_session_message(message: dict) -> bool:
@@ -45,17 +45,9 @@ def messages_with_ephemeral_context(
     policy: str | None = None,
 ) -> list:
     """Shallow copy of messages with session context appended for a single API call."""
-    global _last_session_body
-
     body = build_session_context(context).strip()
     if not body:
         return list(messages)
-
-    active_policy = (policy or ephemeral_policy()).lower()
-    if active_policy == "if_unchanged" and body == _last_session_body:
-        return list(messages)
-
-    _last_session_body = body
     ephemeral = build_ephemeral_user_message(context)
     if not ephemeral:
         return list(messages)

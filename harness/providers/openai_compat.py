@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 import threading
 import uuid
 from typing import TYPE_CHECKING, Any
@@ -225,10 +226,46 @@ def create_openai_message(
 
     if on_delta is not None:
         kwargs["stream"] = True
-        return _stream_openai(client, kwargs, on_delta)
+        try:
+            return _stream_openai(client, kwargs, on_delta)
+        except Exception as exc:
+            # Some OpenAI-compatible relays (e.g. 鱼鱼API / aijws) return
+            # "Upstream service temporarily unavailable" for streaming while
+            # non-stream works fine. Fall back to a single non-streaming
+            # request so the turn still completes. Safe because such failures
+            # occur before any chunk is emitted.
+            if not _is_stream_recoverable(exc):
+                raise
+            print(
+                f"  \033[33m[llm] stream unstable ({exc}); retrying non-stream\033[0m",
+                file=sys.stderr,
+            )
+            kwargs.pop("stream", None)
+            completion = client.chat.completions.create(**kwargs)
+            resp = openai_response_to_anthropic(completion)
+            # replay text to the TUI so output is still visible
+            for _block in resp.content:
+                _txt = getattr(_block, "text", None)
+                if _txt:
+                    on_delta(_txt, "text_delta")
+            return resp
 
     completion = client.chat.completions.create(**kwargs)
     return openai_response_to_anthropic(completion)
+
+
+def _is_stream_recoverable(exc: Exception) -> bool:
+    """True if a streaming failure looks like a transient upstream/network issue
+    that a non-streaming retry can likely recover from. Authentication errors,
+    model-not-found, and other deterministic 4xx are NOT recoverable."""
+    msg = str(exc).lower()
+    keywords = (
+        "temporarily unavailable", "upstream", "connection reset",
+        "remote end closed", "timeout", "timed out",
+        "502", "503", "504", "bad gateway", "incomplete chunked",
+        "connection aborted", "connection broken",
+    )
+    return any(k in msg for k in keywords)
 
 
 def _stream_openai(client: OpenAI, kwargs: dict, on_delta: callable) -> MessageResponse:

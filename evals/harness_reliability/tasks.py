@@ -177,6 +177,43 @@ TASKS: list[ReliabilityTask] = [
                        "tests/", "HARNESS.md", "progress.md", "feature_list.json"),
         check_script="h007_refactor_check.py",
     ),
+    ReliabilityTask(
+        id="H008",
+        name="three-session task store (continuity loss)",
+        category="multi_session",
+        prompt=(
+            "Implement the task store's core features.\n"
+            "Requirements:\n"
+            "- `add_task(title)` stores a task and returns it with a unique "
+            "int `id` and `done=False`\n"
+            "- `list_tasks()` returns all tasks in insertion order\n\n"
+            "Verify with `python -m pytest tests -q` before finishing."
+        ),
+        prompt_session2=(
+            "Continue the task store work from the previous session.\n"
+            "Requirements (not yet implemented):\n"
+            "- `complete_task(task_id)` marks a task done\n"
+            "- `delete_task(task_id)` removes a task\n"
+            "- Add tests for these methods\n\n"
+            "Do not re-implement what already exists. "
+            "Verify with `python -m pytest tests -q` before claiming completion."
+        ),
+        prompt_session3=(
+            "Continue the task store work from the previous sessions.\n"
+            "Requirement (not yet implemented):\n"
+            "- `stats()` returns a dict with `total`, `completed`, `pending` "
+            "counts reflecting the current store state\n"
+            "- Add tests for it\n\n"
+            "Do not re-implement what already exists. "
+            "Verify with `python -m pytest tests -q` before claiming completion."
+        ),
+        fixture="task_store3",
+        max_rounds=25,
+        requires_multi_session=True,
+        allowed_paths=("app.py", "tests/", "HARNESS.md",
+                       "progress.md", "feature_list.json"),
+        check_script="h008_stats_check.py",
+    ),
 ]
 
 

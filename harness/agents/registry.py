@@ -6,7 +6,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-from harness.models import get_model_profile
+from harness.models import get_model_profile, list_models
 from harness.providers.config import get_provider, resolve_api_key
 
 PACKAGE_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -66,8 +66,20 @@ def validate_agent_model(agent_type: str) -> str | None:
     profile = get_agent_profile(agent_type)
     if profile is None:
         return f"Unknown agent_type '{agent_type}'. Available: {', '.join(list_agent_types())}"
+    known_models = {str(model.get("id")) for model in list_models()}
+    if profile.model_id not in known_models:
+        return (
+            f"Agent '{agent_type}' references unknown model '{profile.model_id}'. "
+            "Add it to config/models.json before using this agent."
+        )
     model_profile = get_model_profile(profile.model_id)
-    provider = get_provider(model_profile.provider)
+    try:
+        provider = get_provider(model_profile.provider)
+    except KeyError:
+        return (
+            f"Agent '{agent_type}' uses model {profile.model_id} with unknown "
+            f"provider '{model_profile.provider}'."
+        )
     if not resolve_api_key(provider):
         return (
             f"Agent '{agent_type}' needs model {profile.model_id} "

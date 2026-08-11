@@ -65,6 +65,8 @@ def permission_hook(block):
     tool_input = block_field(block, "input", {}) or {}
 
     if name == "bash":
+        if "cwd" in tool_input:
+            return "Permission denied: bash working directory is execution-owned and cannot be set by the model"
         command = tool_input.get("command", "")
         for pattern in DENY_LIST:
             if pattern in command:
@@ -204,33 +206,9 @@ def large_output_hook(block, output):
 
 def user_prompt_hook(query: str):
     from harness.ui.tool_display import hooks_verbose
-    from harness.prompts.goal_stickiness import augment_if_needed
-    from harness.prompts.lookup import augment_query as augment_lookup
-    from harness.prompts.lookup import is_lookup_active
-    from harness.prompts.writing import augment_query as augment_writing
-    from harness.prompts.writing import is_writing_query
 
-    sticky = augment_if_needed(query)
-    if sticky is not None:
-        # Sticky augment can stack with lookup/writing when both apply.
-        base = sticky
-    else:
-        base = None
-
-    # Activate lookup when keywords trigger OR the user is in /mode lookup.
-    if is_lookup_active(query):
-        # Silent for the user: constraint is for the model only.
-        looked = augment_lookup(query if base is None else base)
-        return looked if looked is not None else base
-
-    if is_writing_query(query):
-        # Silent for the user: workflow hint is for the model only.
-        written = augment_writing(query if base is None else base)
-        return written if written is not None else base
-
-    if base is not None:
-        return base
-
+    # User history must remain verbatim. Per-turn routing constraints are
+    # assembled into ephemeral context by the CLI/event-stream entrypoints.
     if not hooks_verbose():
         return None
     _hook_print(f"[HOOK] UserPromptSubmit: {get_workdir()}")

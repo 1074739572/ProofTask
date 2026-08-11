@@ -26,13 +26,12 @@
       "context_window": 1000000
     },
     {
-      "id": "gpt-5.6-luna",
+      "id": "gpt-5.6",
       "provider": "anzhiyu",
-      "label": "GPT-5.6 Luna",
-      "api_model": "gpt-5.6-luna",
+      "label": "GPT-5.6",
+      "api_model": "gpt-5.6",
       "context_window": 1000000,
-      "effort_options": ["medium", "high", "xhigh", "max", "ultra"],
-      "api_effort_values": {"xhigh": "xhigh"}
+      "effort_options": ["medium", "high", "xhigh", "max"]
     },
     {
       "id": "gpt-5.6-terra",
@@ -40,8 +39,7 @@
       "label": "GPT-5.6 Terra",
       "api_model": "gpt-5.6-terra",
       "context_window": 1000000,
-      "effort_options": ["medium", "high", "xhigh", "max", "ultra"],
-      "api_effort_values": {"xhigh": "xhigh"}
+      "effort_options": ["medium", "high", "xhigh", "max"]
     },
     {
       "id": "gpt-5.6-sol",
@@ -50,8 +48,7 @@
       "api_model": "gpt-5.6-sol",
       "context_window": 1000000,
       "reasoning_effort": "high",
-      "effort_options": ["medium", "high", "xhigh", "max", "ultra"],
-      "api_effort_values": {"xhigh": "xhigh"}
+      "effort_options": ["medium", "high", "xhigh", "max"]
     }
   ]
 }

@@ -10,6 +10,7 @@ from harness.tools.filesystem import (
     run_read,
     run_write,
     safe_path,
+    run_bash,
 )
 
 
@@ -39,6 +40,20 @@ def test_read_offset_past_end(tmp_path):
     assert "past the end" in out
 
 
+def test_read_offset_without_limit_skips_prior_lines(tmp_path):
+    (tmp_path / "a.txt").write_text("l1\nl2\nl3\n", encoding="utf-8")
+    out = run_read("a.txt", offset=1, cwd=tmp_path)
+    assert "showing 2-3" in out
+    assert "     2 | l2" in out
+    assert "     1 | l1" not in out
+
+
+def test_bash_reports_nonzero_exit_code(tmp_path):
+    command = "cmd /c exit 7" if __import__("sys").platform == "win32" else "sh -c 'exit 7'"
+    out = run_bash(command, cwd=tmp_path)
+    assert out.startswith("[exit_code=7]")
+
+
 def test_read_directory_rejected(tmp_path):
     (tmp_path / "sub").mkdir()
     out = run_read("sub", cwd=tmp_path)
@@ -65,8 +80,7 @@ def test_read_empty_file(tmp_path):
 
 
 def test_read_escape_rejected(tmp_path):
-    with pytest.raises(ValueError):
-        run_read("../outside.txt", cwd=tmp_path)
+    assert "Path escapes workspace" in run_read("../outside.txt", cwd=tmp_path)
 
 
 def test_read_full_file_truncation_cap(tmp_path):
@@ -147,6 +161,6 @@ def test_glob_no_recursive_match_without_starstar(tmp_path):
 
 def test_safe_path_allows_inside_blocks_outside(tmp_path):
     inside = safe_path("sub/x.txt", cwd=tmp_path)
-    assert str(inside).endswith("sub/x.txt")
+    assert inside.parts[-2:] == ("sub", "x.txt")
     with pytest.raises(ValueError):
         safe_path(str(tmp_path.parent / "x.txt"), cwd=tmp_path)

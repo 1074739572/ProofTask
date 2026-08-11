@@ -98,3 +98,8 @@ ocr_win.ps1
 _task_outputs/
 harness-engineering-review-*.png
 preview_harness_review.jpg
+
+# Personal / third-party reference material (not part of this repo)
+resume/
+resume_source.pdf
+_ref/codex/

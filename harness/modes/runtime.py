@@ -168,6 +168,12 @@ def mode_prompt_section() -> str:
     if profile is None:
         return ""
     text = profile.prompt
+    if profile.id == "lookup":
+        text += (
+            "\n\nRuntime note: LookupGuard is not installed in this build. "
+            "Do not claim a hidden guard will block requests; use the supplied "
+            "tool permissions and RepeatGuard, then stop once the evidence is sufficient."
+        )
     if profile.confirm_before_execute:
         if is_execute_unlocked():
             text += (
@@ -210,7 +216,10 @@ def mode_disables_tool(tool_name: str) -> bool:
     profile = get_current_mode_profile()
     if profile is None:
         return False
-    if tool_name not in profile.disable_tools:
+    disabled = profile.disable_tools
+    if tool_name not in disabled and not (
+        tool_name.startswith("mcp__") and "mcp__*" in disabled
+    ):
         return False
     # Confirm-gated modes list locked tools in disable_tools; unlock clears them.
     if profile.confirm_before_execute and is_execute_unlocked():

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from harness.todos.state import get_todos, rounds_since_todo_update
+from harness.todos import state
 
 
 def _status_icon(status: str) -> str:
@@ -15,7 +15,7 @@ def _status_icon(status: str) -> str:
 
 def format_todos_for_cli(todos: list[dict[str, str]] | None = None) -> str:
     """Human-readable todo list for /resume and similar CLI output."""
-    todos = todos if todos is not None else get_todos()
+    todos = todos if todos is not None else state.get_todos()
     if not todos:
         return ""
     status_zh = {"completed": "已完成", "in_progress": "进行中", "pending": "待办"}
@@ -30,7 +30,7 @@ def format_todos_for_cli(todos: list[dict[str, str]] | None = None) -> str:
 
 
 def format_todos_for_prompt(todos: list[dict[str, str]] | None = None) -> str:
-    todos = todos if todos is not None else get_todos()
+    todos = todos if todos is not None else state.get_todos()
     if not todos:
         return ""
     lines = [
@@ -65,19 +65,19 @@ def format_todos_tool_result(todos: list[dict[str, str]]) -> str:
 
 
 def format_todo_reminder() -> str:
-    todos = get_todos()
+    todos = state.get_todos()
     body = format_todos_for_prompt(todos) if todos else "(no todos yet — create the list with todo_write)"
     return (
         "<reminder>\n"
         "Update your session todos with todo_write. Pass the complete list every time.\n"
-        f"Rounds since last todo_write: {rounds_since_todo_update}\n\n"
+        f"Rounds since last todo_write: {state.rounds_since_todo_update}\n\n"
         f"{body}\n"
         "</reminder>"
     )
 
 
 def format_todos_welcome_line(todos: list[dict[str, str]] | None = None) -> str | None:
-    todos = todos if todos is not None else get_todos()
+    todos = todos if todos is not None else state.get_todos()
     if not todos:
         return None
     done = sum(1 for item in todos if item["status"] == "completed")

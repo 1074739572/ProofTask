@@ -31,7 +31,7 @@ const fakeEntries: Entry[] = [
   {id: 'sa1', kind: 'subagent', text: '搜索 main.py 入口', agentType: 'explore', model: 'mimo-v2.5-pro', status: 'done', toolCount: 2, elapsed: 3.2, summary: '找到入口 main.py:88', rounds: ['Round 1 · "先看项目结构"', 'Round 2 · "读取 main.py"'], tools: [{id: 'st1', name: 'glob', summary: '**/*.py', status: 'done'}, {id: 'st2', name: 'read_file', summary: 'main.py', status: 'done'}]},
   {id: 'f1', kind: 'files', text: 'Files Changed', detail: 'backend/app.py\nbackend/routes.py'},
   {id: 'r1b', kind: 'response', text: '问题定位到了：`routes.py` 的异常处理把 404 也包成了 500。已修复。'},
-  {id: 's1', kind: 'summary', text: 'Turn complete', start: nowMs - 23000, end: nowMs - 19000, toolCount: 3, paths: ['backend/app.py', 'backend/routes.py'], tokens: {inp: 12400, out: 2100, cache: 8000}, expanded: false},
+  {id: 's1', kind: 'summary', text: '已完成 3 项操作', start: nowMs - 23000, end: nowMs - 19000, toolCount: 3, paths: ['backend/app.py', 'backend/routes.py'], tokens: {inp: 12400, out: 2100, cache: 8000}, expanded: false},
   {id: 'b1', kind: 'blocked', text: '需要权限：运行 npm install -g xxx', detail: 'Blocked'},
   {id: 'l1', kind: 'log', text: 'Backend', detail: 'warn: token usage 1234'},
   // Turn 2: running tools with output + a merged pair + a failure, then the
@@ -43,9 +43,9 @@ const fakeEntries: Entry[] = [
   {id: 'a5', kind: 'action', text: 'bash', detail: 'pytest backend/tests/e2e', done: true, ok: true, start: nowMs - 7600, end: nowMs - 6800},
   {id: 'a6', kind: 'action', text: 'npm_install', detail: 'npm ERR! EACCES permission denied, open /usr/lib/node_modules/xxx', done: true, ok: false, start: nowMs - 6200, end: nowMs - 5300},
   {id: 'r2', kind: 'response', text: '回归测试全部通过；npm 全局安装被权限拦住了，换成本地安装即可。'},
-  {id: 's2', kind: 'summary', text: 'Turn complete', start: nowMs - 9800, end: nowMs - 5000, toolCount: 4, paths: ['backend/app.py'], tokens: {inp: 30100, out: 4300, cache: 21000}, expanded: true},
+  {id: 's2', kind: 'summary', text: '已完成 4 项操作', start: nowMs - 9800, end: nowMs - 5000, toolCount: 4, paths: ['backend/app.py'], tokens: {inp: 30100, out: 4300, cache: 21000}, expanded: true},
   // Turn 3: short exchange + a live running subagent at the bottom.
-  {id: 'p3', kind: 'prompt', text: '测试滚动条和长文本'},
+  {id: 'p3', kind: 'prompt', text: '测试滚动条和长文本\n这是一条多行用户问题，用来确认问题卡片在窄屏下仍可完整换行。'},
   {id: 'r3', kind: 'response', text: '这是一段很长的回复，用来测试换行行为是否正常。这一行应该会被 word 模式换行而不是横向溢出把布局撑乱，从而验证 wrapMode=word 在日志区的表现。底部内容，用于确认粘性滚动到底部时能看到最新消息。'},
   {id: 'p4', kind: 'prompt', text: '更多条目'},
   {id: 'r4', kind: 'response', text: '最后一条。'},

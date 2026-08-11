@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import re
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 from harness.mcp.base import MCPClientProtocol, MockMCPClient
 from harness.mcp.client import create_real_client
@@ -13,6 +15,17 @@ mcp_clients: dict[str, MCPClientProtocol] = {}
 mcp_tool_meta: dict[str, dict] = {}
 
 _DISALLOWED_CHARS = re.compile(r"[^a-zA-Z0-9_-]")
+
+# Background bootstrap state: startup no longer blocks on MCP. Servers connect
+# in a daemon thread (parallel), and the *first* agent turn waits briefly
+# (ensure_mcp_ready) so the tool pool is ready before the first LLM call.
+_bootstrap_lock = threading.Lock()
+_bootstrap_done = threading.Event()
+_bootstrap_results: list[str] = []
+_bootstrap_started = False
+_barrier_lock = threading.Lock()
+_barrier_consumed = False
+_warnings_consumed = False
 
 
 def normalize_mcp_name(name: str) -> str:
@@ -73,6 +86,83 @@ def connect_mcp(name: str) -> str:
 def bootstrap_mcp_servers() -> list[str]:
     """Connect every server in mcp.json. Returns status lines (success + failures)."""
     return [connect_mcp(name) for name in load_mcp_config()]
+
+
+def bootstrap_mcp_servers_async() -> None:
+    """Start connecting every server in mcp.json in the background (non-blocking).
+
+    Results feed the first-turn barrier (ensure_mcp_ready) and the one-shot
+    warnings (take_mcp_bootstrap_warnings). Servers connect in parallel.
+    """
+    global _bootstrap_started
+    with _bootstrap_lock:
+        if _bootstrap_started:
+            return
+        _bootstrap_started = True
+        names = load_mcp_config()
+    if not names:
+        _bootstrap_done.set()
+        return
+    threading.Thread(
+        target=_bootstrap_worker,
+        args=(names,),
+        daemon=True,
+        name="mcp-bootstrap",
+    ).start()
+
+
+def _bootstrap_worker(names: list[str]) -> None:
+    with ThreadPoolExecutor(max_workers=max(2, len(names))) as pool:
+        results = list(pool.map(connect_mcp, names))
+    with _bootstrap_lock:
+        _bootstrap_results[:] = results
+    _bootstrap_done.set()
+
+
+def wait_mcp_bootstrap(timeout: float = 3.0) -> list[str]:
+    """Block until the background bootstrap finishes or *timeout* seconds elapse.
+
+    Returns the results collected so far (partial if the timeout won).
+    """
+    _bootstrap_done.wait(timeout)
+    with _bootstrap_lock:
+        return list(_bootstrap_results)
+
+
+def ensure_mcp_ready(timeout: float = 3.0) -> None:
+    """First-use barrier: wait up to *timeout* for the background bootstrap.
+
+    Called at the start of the first agent turn; later turns return instantly.
+    If the bootstrap never started (e.g. tests that skip the CLI entrypoint)
+    this returns immediately.
+    """
+    global _barrier_consumed
+    with _barrier_lock:
+        if _barrier_consumed:
+            return
+        _barrier_consumed = True
+    with _bootstrap_lock:
+        started = _bootstrap_started
+    if not started:
+        return
+    _bootstrap_done.wait(timeout)
+
+
+def take_mcp_bootstrap_warnings() -> list[str]:
+    """Return bootstrap failure/skip warnings exactly once, once finished.
+
+    Startup prints nothing while MCP connects; the first turn absorbs the
+    wait, then surfaces any failures/skips (successes stay quiet).
+    """
+    global _warnings_consumed
+    with _barrier_lock:
+        if _warnings_consumed:
+            return []
+        if not _bootstrap_done.is_set():
+            return []
+        _warnings_consumed = True
+        results = list(_bootstrap_results)
+    return mcp_bootstrap_warnings(results)
 
 
 def mcp_bootstrap_warnings(results: list[str]) -> list[str]:

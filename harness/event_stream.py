@@ -436,16 +436,29 @@ def _run_user_turn(query: str, history: list, context: dict, binding, *, echo_us
     if gate_note:
         emit("log", level="muted", text=gate_note)
 
-    hook_result = trigger_hooks("UserPromptSubmit", query)
-    model_query = hook_result if isinstance(hook_result, str) else query
+    trigger_hooks("UserPromptSubmit", query)
+    model_query = query
 
     touch_session_title_from_query(query, binding=binding)
     repair_tool_pairing(history)
     turn_start = len(history)
     history.append({"role": "user", "content": model_query})
     context["latest_user_query"] = query
-    context["lookup_mode"] = is_lookup_active(query)
-    context["writing_mode"] = is_writing_query(query) and not context["lookup_mode"]
+    lookup_active = is_lookup_active(query)
+    context["writing_mode"] = is_writing_query(query) and not lookup_active
+    from harness.prompts.goal_stickiness import augment_if_needed
+    from harness.prompts.lookup import LOOKUP_CONSTRAINT
+    from harness.prompts.writing import WRITING_CONSTRAINT
+
+    constraints = []
+    sticky = augment_if_needed(query)
+    if sticky:
+        constraints.append(sticky[len(query):].strip())
+    if lookup_active:
+        constraints.append(LOOKUP_CONSTRAINT.strip())
+    elif context["writing_mode"]:
+        constraints.append(WRITING_CONSTRAINT.strip())
+    context["turn_constraints"] = "\n\n".join(item for item in constraints if item)
     context.pop("rag_bootstrap", None)
     if context["writing_mode"]:
         boot = ensure_rag_indexed("files")

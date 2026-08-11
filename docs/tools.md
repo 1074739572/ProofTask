@@ -9,6 +9,10 @@
 
 ---
 
+## Current Runtime Status
+
+`LookupGuard` is not installed in the current runtime. Historical references in this document do not describe an active guard; lookup behavior is enforced by tool permissions, prompt constraints, and `RepeatGuard`.
+
 ## 一、流程
 
 ### 1.1 总览

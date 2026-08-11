@@ -1,6 +1,6 @@
 # Teammate Lifecycle
 
-`harness/teams/teammate.py` runs each teammate in a daemon thread with an isolated LLM message history. It communicates with the lead through the append-only JSONL mailbox under `.mailboxes/`.
+`harness/teams/teammate.py` runs each teammate in a daemon thread and delegates execution to `harness.agents.runner.run_agent_task`. The typed runner owns model binding, role tool allow-lists, workspace binding, and `PreToolUse` permission checks. Teammates communicate with the lead through the append-only JSONL mailbox under `.mailboxes/`.
 
 ## Terminal Outcomes
 

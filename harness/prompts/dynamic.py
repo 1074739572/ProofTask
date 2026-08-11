@@ -65,7 +65,7 @@ def _format_time(*, granularity: TimeGranularity) -> str:
 
 
 def default_time_granularity() -> TimeGranularity:
-    """Minute by default so ephemeral context can skip unchanged turns."""
+    """Minute by default to avoid needless timestamp churn."""
     raw = os.getenv("HARNESS_TIME_GRANULARITY", "minute").strip().lower()
     if raw in ("seconds", "second", "s"):
         return "seconds"
@@ -166,6 +166,10 @@ def build_session_context(
             "Working goal with that choice. Do not explore `harness/` or "
             "`main.py` unless the user asked to change this agent runtime."
         )
+
+    turn_constraints = (context.get("turn_constraints") or "").strip()
+    if turn_constraints:
+        sections.append(f"Turn constraints (internal, not a user message):\n{turn_constraints}")
 
     rag_boot = (context.get("rag_bootstrap") or "").strip()
     if rag_boot:

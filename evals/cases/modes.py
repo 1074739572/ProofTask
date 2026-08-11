@@ -47,10 +47,10 @@ def case_orchestrate_enables_task() -> None:
 
 
 def case_plan_mcp_gap() -> None:
-    """Document known gap: plan mode does not strip mcp__* tools."""
+    """PLAN hides MCP and connection schemas after pool assembly."""
     set_mode("plan")
     try:
-        assert not mode_disables_tool("connect_mcp")
+        assert mode_disables_tool("connect_mcp")
         disabled = {
             "write_file",
             "edit_file",
@@ -67,8 +67,10 @@ def case_plan_mcp_gap() -> None:
 
         profile = get_current_mode_profile()
         mcp_disabled = [t for t in profile.disable_tools if t.startswith("mcp__")]
-        if mcp_disabled:
-            raise AssertionError("unexpected mcp disables present")
+        assert "mcp__*" in mcp_disabled
+        assert mode_disables_tool("mcp__fetch__fetch")
+        assert not any(name.startswith("mcp__") for name in _tool_names())
+        return
         raise EvalWarn(
             "plan mode does not disable mcp__* tools — known permission gap"
         )
@@ -96,10 +98,9 @@ CASES = [
         case_orchestrate_enables_task,
     ),
     EvalCase(
-        "mode.plan_mcp_gap",
-        "plan mode MCP tools not gated (gap)",
+        "mode.plan_mcp_gated",
+        "plan mode hides MCP and connect tools",
         "modes",
         case_plan_mcp_gap,
-        notes="known gap",
     ),
 ]

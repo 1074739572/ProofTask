@@ -44,7 +44,10 @@ def looks_like_correction(query: str) -> bool:
     return bool(_CORRECTION_RE.search(query or ""))
 
 
-def looks_like_slot_fill(query: str) -> bool:
+def looks_like_slot_fill(query: str, *, has_pending_question: bool = False) -> bool:
+    """Recognize a short answer only when the harness has a pending question."""
+    if not has_pending_question:
+        return False
     text = (query or "").strip()
     if not text or len(text) > 60:
         return False
@@ -58,11 +61,13 @@ def looks_like_slot_fill(query: str) -> bool:
     return False
 
 
-def augment_if_needed(query: str) -> str | None:
+def augment_if_needed(query: str, *, has_pending_question: bool = False) -> str | None:
     """Return query + stickiness constraint, or None when not needed."""
     text = (query or "").strip()
     if not text:
         return None
-    if looks_like_correction(text) or looks_like_slot_fill(text):
+    if looks_like_correction(text) or looks_like_slot_fill(
+        text, has_pending_question=has_pending_question
+    ):
         return text + _STICKINESS_TAIL
     return None

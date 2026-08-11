@@ -141,8 +141,7 @@ def _build_agent_prompt(agent_type: str, user_message: str) -> str:
         f"## User Request\n{user_message}\n\n"
         f"## Instructions\n"
         f"1. Complete the task above to the best of your ability.\n"
-        f"2. When finished, call **send_message(to='lead')** with a concise summary "
-        f"of what you did and what you found.\n"
+        f"2. When finished, return a concise summary of what you did and what you found.\n"
         f"3. Do NOT ask for confirmation before taking action.\n"
         f"4. Do NOT spawn sub-agents yourself."
     )
@@ -190,7 +189,7 @@ def route_user_message(messages: list) -> bool:
     prompt = _build_agent_prompt(agent_type, last_user)
     name = _teammate_name(agent_type)
 
-    spawn_teammate_thread(name, f"{agent_type} worker", prompt)
+    spawn_teammate_thread(name, f"{agent_type} worker", prompt, agent_type=agent_type)
 
     # Poll BUS for a terminal outcome. Progress messages refresh the idle clock;
     # the absolute cap remains bounded so a healthy-but-never-ending worker cannot

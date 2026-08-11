@@ -591,10 +591,10 @@ class GoalRunner(threading.Thread):
 
     def _select_feature(self, state: GoalState) -> None:
         from harness.features import feature_is_stale, get_feature, reopen_feature
-        from harness.tasks import load_task
+        from harness.tasks import attach_feature, claim_task, load_task
 
         try:
-            load_task(state.task_id)
+            task = load_task(state.task_id)
         except FileNotFoundError:
             self._fail(
                 state,
@@ -602,6 +602,24 @@ class GoalRunner(threading.Thread):
                 f"task {state.task_id} is missing",
             )
             return
+
+        # Resumed/legacy goal records can predate the task-feature link created
+        # by _initialize(). Restore that invariant before progressing so a
+        # freshly re-verified feature can complete its owning task.
+        if task.status == "pending":
+            claim_task(task.id, owner=f"goal:{state.id}")
+            task = load_task(task.id)
+        for fid in self._feature_ids(state):
+            if fid not in task.feature_ids:
+                try:
+                    attach_feature(task.id, fid)
+                except FileNotFoundError:
+                    self._fail(
+                        state,
+                        StopReason.missing_dependency,
+                        f"task {task.id} is not on the active board",
+                    )
+                    return
 
         for fid in self._feature_ids(state):
             try:

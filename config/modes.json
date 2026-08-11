@@ -18,6 +18,8 @@
         "write_file",
         "edit_file",
         "bash",
+        "mcp__*",
+        "connect_mcp",
         "task",
         "spawn_teammate",
         "create_worktree",

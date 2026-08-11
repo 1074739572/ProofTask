@@ -1,6 +1,7 @@
 """Tests for lookup-mode detection."""
 
 from harness.prompts.lookup import augment_query, is_lookup_query
+from harness.prompts.goal_stickiness import looks_like_slot_fill
 
 
 def test_plain_lookup_triggers():
@@ -37,3 +38,11 @@ def test_augment_noop_for_non_lookup():
     q = "给 hooks.py 加一个 lookup 检测"
     out = augment_query(q)
     assert out == q
+
+
+def test_generic_code_review_question_does_not_trigger_lookup():
+    assert not is_lookup_query("这个函数是否线程安全")
+
+
+def test_short_reply_is_not_a_slot_fill_without_pending_question():
+    assert not looks_like_slot_fill("你好")

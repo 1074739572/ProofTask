@@ -754,6 +754,12 @@ def get_tool_pool(disabled_tools: set[str] | None = None) -> tuple[list[dict], d
         tools.insert(insert_at, build_task_tool_schema())
         handlers["task"] = run_agent_task
     tools, handlers = assemble_tool_pool(tools, handlers)
+    # MCP tools are appended during pool assembly, so apply mode visibility a
+    # second time to make wildcard mode rules (for example PLAN's mcp__*) real.
+    tools = [tool for tool in tools if not mode_disables_tool(tool.get("name", ""))]
+    handlers = {
+        name: handler for name, handler in handlers.items() if not mode_disables_tool(name)
+    }
     if disabled_tools:
         # Hide both schema AND handler — the model can never call a disabled
         # tool (goal orchestration tools stay out of reach during ACT).

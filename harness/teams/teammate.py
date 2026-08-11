@@ -73,7 +73,7 @@ def idle_poll(
     return "timeout"
 
 
-def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
+def _spawn_legacy_teammate_thread(name: str, role: str, prompt: str) -> str:
     if name in active_teammates:
         return f"Teammate '{name}' already exists"
 
@@ -379,3 +379,50 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
     active_teammates[name] = True
     threading.Thread(target=run, daemon=True).start()
     return f"Teammate '{name}' spawned as {role}"
+
+
+def spawn_teammate_thread(
+    name: str,
+    role: str,
+    prompt: str,
+    *,
+    agent_type: str | None = None,
+) -> str:
+    """Spawn a role-bound teammate through the typed subagent executor.
+
+    The former teammate loop maintained a second, unrestricted tool registry.
+    Keeping one executor makes model binding, tool allow-lists, and
+    ``PreToolUse`` permission hooks apply to every worker path.
+    """
+    if name in active_teammates:
+        return f"Teammate '{name}' already exists"
+
+    resolved_type = agent_type or role.strip().split(maxsplit=1)[0]
+    from harness.agents.registry import get_agent_profile
+    from harness.agents.runner import run_agent_task
+
+    if get_agent_profile(resolved_type) is None:
+        return f"Error: unknown teammate role '{role}'; use a configured agent type"
+
+    def run() -> None:
+        started_at = time.monotonic()
+        BUS.send(name, "lead", f"started: {resolved_type} worker", "progress")
+        try:
+            BUS.send(name, "lead", "thinking: requesting model response", "progress")
+            summary = run_agent_task(role, prompt, resolved_type)
+            outcome_type = "error" if summary.startswith("Error:") else "result"
+        except Exception as exc:
+            summary = f"Worker failed: {type(exc).__name__}: {exc}"
+            outcome_type = "error"
+        BUS.send(
+            name,
+            "lead",
+            summary,
+            outcome_type,
+            {"elapsed_seconds": round(time.monotonic() - started_at, 1)},
+        )
+        active_teammates.pop(name, None)
+
+    active_teammates[name] = True
+    threading.Thread(target=run, daemon=True).start()
+    return f"Teammate '{name}' spawned as {resolved_type}"

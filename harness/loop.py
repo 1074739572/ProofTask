@@ -29,6 +29,7 @@ from harness.agent.writing_guard import WritingGuard
 from harness.context import update_context
 from harness.hooks import trigger_hooks
 from harness.llm import create_message
+from harness.mcp.pool import ensure_mcp_ready, take_mcp_bootstrap_warnings
 from harness.messages.blocks import block_field, block_text, has_displayable_text, is_text, is_tool_use
 from harness.messages.repair import finalize_cancelled_tool_round, repair_tool_pairing
 from harness.models import get_model
@@ -44,7 +45,7 @@ from harness.settings import (
 from harness.tools.dispatch import call_tool_handler, has_tool_use
 from harness.tools.registry import get_tool_pool
 from harness.todos.format import format_todo_reminder
-from harness.todos.state import note_llm_round_without_todo_update, rounds_since_todo_update
+from harness.todos import state as todo_state
 from harness.ui.renderer import renderer
 from harness.ui.turn_summary import TurnMutationTracker
 
@@ -140,6 +141,13 @@ def agent_loop(
     """
     from harness.prompts.ephemeral import reset_ephemeral_cache
 
+    # MCP connects in the background at startup; the first turn waits briefly
+    # so the tool pool includes MCP tools before the first LLM call. Failures
+    # are surfaced here (once), not during startup.
+    ensure_mcp_ready()
+    for line in take_mcp_bootstrap_warnings():
+        renderer.warn(line)
+
     if max_rounds is None:
         raw = os.getenv("HARNESS_MAX_LLM_ROUNDS", "40").strip()
         try:
@@ -194,7 +202,7 @@ def agent_loop(
 
         inject_background_notifications(messages)
 
-        if rounds_since_todo_update >= 3:
+        if todo_state.rounds_since_todo_update >= 3:
             messages.append(
                 {"role": "user", "content": format_todo_reminder()}
             )
@@ -525,6 +533,6 @@ def agent_loop(
             return _finish(True, "cancelled")
 
         if not had_todo_write:
-            note_llm_round_without_todo_update()
+            todo_state.note_llm_round_without_todo_update()
 
         messages.append({"role": "user", "content": build_user_content(results)})

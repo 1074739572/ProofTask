@@ -71,11 +71,13 @@ def case_mcp_destructive_confirm() -> None:
     name = "mcp__deploy__deploy_app"
     mcp_tool_meta[name] = {"destructive": True, "server": "deploy", "tool": "deploy_app"}
     try:
-        # permissions.json has `mcp__*: allow`, so destructive MCP tools are
-        # currently allowed WITHOUT confirmation. This test pins that real
-        # behavior (and would need updating if the config tightens).
-        denied = permission_hook(_block(name, {"env": "prod"}))
-        assert denied is None, f"expected allow under mcp__* rule, got: {denied}"
+        # Unknown MCP tools default to ask. They only run after a user approval.
+        with mock.patch(
+            "harness.hooks.ask_permission",
+            return_value=PermissionResponse("test", "allow"),
+        ):
+            allowed = permission_hook(_block(name, {"env": "prod"}))
+        assert allowed is None, allowed
     finally:
         mcp_tool_meta.pop(name, None)
 
@@ -119,7 +121,7 @@ CASES = [
     ),
     EvalCase(
         "perm.mcp_destructive",
-        "MCP destructiveHint requires confirm",
+        "unknown MCP tools require confirmation",
         "permissions",
         case_mcp_destructive_confirm,
     ),

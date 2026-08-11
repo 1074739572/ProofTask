@@ -34,6 +34,16 @@ _IMPLEMENTMENT_HINTS = [
     "write_file", "edit_file", "loop.py", "hooks.py",
 ]
 
+_CODE_CONTEXT_HINTS = (
+    "code", ".py", "function", "class ", "thread-safe", "bug", "review",
+    "\u4ee3\u7801", "\u51fd\u6570", "\u5ba1\u67e5", "\u7ebf\u7a0b\u5b89\u5168",
+)
+
+_EXPLICIT_RESEARCH_HINTS = (
+    "lookup", "search", "find paper", "search for", "can you crawl",
+    "can you scrape", "can you fetch", "\u67e5\u627e", "\u641c\u7d22", "\u8bba\u6587",
+)
+
 
 def is_lookup_query(query: str) -> bool:
     """True when a user message looks like a lookup/feasibility question.
@@ -47,6 +57,12 @@ def is_lookup_query(query: str) -> bool:
     low = query.lower()
     has_lookup = any(k in low for k in _LOOKUP_HINTS)
     if not has_lookup:
+        return False
+    # Generic feasibility words (\"is there\" / \"\u662f\u5426\" / \"\u6709\u6ca1\u6709\") are
+    # common in code-review questions. They are not enough to activate web mode.
+    if any(k in low for k in _CODE_CONTEXT_HINTS) and not any(
+        k in low for k in _EXPLICIT_RESEARCH_HINTS
+    ):
         return False
     # If the message is clearly about modifying code, don't hijack it.
     impl_hits = sum(1 for k in _IMPLEMENTMENT_HINTS if k in low)
