@@ -54,6 +54,57 @@ test('live actions view still collapses consecutive same-name calls', () => {
   assert.equal(rows[0].calls.length, 2);
 });
 
+test('live action group keeps its id while matching calls are appended', () => {
+  const first = buildSections([
+    {id: 'a1', kind: 'action', text: 'bash', detail: 'cmd1', done: false, ok: false},
+  ]);
+  const second = buildSections([
+    {id: 'a1', kind: 'action', text: 'bash', detail: 'cmd1', done: true, ok: true},
+    {id: 'a2', kind: 'action', text: 'bash', detail: 'cmd2', done: false, ok: false},
+  ]);
+
+  assert.equal(first[0].kind, 'actions');
+  assert.equal(second[0].kind, 'actions');
+  assert.equal(first[0].id, second[0].id);
+});
+
+test('response sections preserve their streaming completion state', () => {
+  const streaming = buildSections([{id: 'r1', kind: 'response', text: 'partial', streaming: true}]);
+  const complete = buildSections([{id: 'r1', kind: 'response', text: 'final', streaming: false}]);
+
+  assert.equal(streaming[0].kind, 'response');
+  assert.equal(complete[0].kind, 'response');
+  assert.equal(streaming[0].streaming, true);
+  assert.equal(complete[0].streaming, false);
+});
+
+test('multiline user prompt remains one distinct conversation section', () => {
+  const sections = buildSections([
+    {id: 'p1', kind: 'prompt', text: '第一行问题\n第二行补充'},
+    {id: 'r1', kind: 'response', text: 'answer'},
+  ]);
+
+  assert.equal(sections[0].kind, 'prompt');
+  assert.equal((sections[0] as any).text, '第一行问题\n第二行补充');
+  assert.equal(sections[1].kind, 'response');
+});
+
+test('activity summary is a compact result marker before the final answer', () => {
+  const sections = buildSections([
+    {id: 'p1', kind: 'prompt', text: 'inspect the UI'},
+    {id: 'i1', kind: 'intent', text: '先读取会话组件'},
+    {id: 'a1', kind: 'action', text: 'read_file', detail: 'App.tsx', done: true, ok: true},
+    {id: 'r1', kind: 'response', text: '问题是中间文本被当成回答渲染。'},
+    {id: 'sum1', kind: 'summary', text: '已完成 1 项操作', toolCount: 1, paths: [], tokens: {inp: 0, out: 0, cache: 0}, expanded: false},
+  ]);
+
+  const summaryIndex = sections.findIndex(section => section.kind === 'summary');
+  const responseIndex = sections.findIndex(section => section.kind === 'response');
+  assert.equal((sections[summaryIndex] as any).text, '已完成 1 项操作');
+  assert.ok(summaryIndex >= 0 && summaryIndex < responseIndex);
+  assert.equal((sections[summaryIndex] as any).steps.length, 2);
+});
+
 test('plan panel is pinned to the bottom and empty plans render nothing', () => {
   const sections = buildSections([
     {id: 'tasks:current', kind: 'tasks', text: '计划', tasks: [todo('a', 'in_progress'), todo('b', 'pending')]},

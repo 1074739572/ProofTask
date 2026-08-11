@@ -3,7 +3,7 @@ import type {TodoItem} from '../src/types.js';
 export type EntryKind = 'prompt' | 'response' | 'action' | 'blocked' | 'files' | 'log' | 'intent' | 'tasks' | 'summary' | 'subagent';
 export type SubagentStatus = 'running' | 'done' | 'failed';
 export type SubagentToolRow = {id: string; name: string; summary: string; status: SubagentStatus};
-export type Entry = {id: string; kind: EntryKind; text: string; detail?: string; done?: boolean; ok?: boolean; start?: number; end?: number; output?: string[]; expanded?: boolean; toolCount?: number; paths?: string[]; tasks?: TodoItem[]; tokens?: {inp: number; out: number; cache: number}; agentType?: string; model?: string; status?: SubagentStatus; rounds?: string[]; tools?: SubagentToolRow[]; summary?: string; elapsed?: number};
+export type Entry = {id: string; kind: EntryKind; text: string; detail?: string; done?: boolean; ok?: boolean; start?: number; end?: number; output?: string[]; expanded?: boolean; streaming?: boolean; toolCount?: number; paths?: string[]; tasks?: TodoItem[]; tokens?: {inp: number; out: number; cache: number}; agentType?: string; model?: string; status?: SubagentStatus; rounds?: string[]; tools?: SubagentToolRow[]; summary?: string; elapsed?: number};
 // One recorded invocation inside a merged action row. Consecutive same-name
 // calls collapse into a single live row ("Called N times", Claude Code style),
 // but each call keeps its own summary/timing so the expanded turn summary can
@@ -18,7 +18,7 @@ export type SummaryStep =
   | {type: 'subagent'; entry: Entry};
 export type Section =
   | {kind: 'prompt'; id: string; text: string}
-  | {kind: 'response'; id: string; text: string}
+  | {kind: 'response'; id: string; text: string; streaming: boolean}
   | {kind: 'actions'; id: string; rows: ActionRow[]}
   | {kind: 'subagent'; id: string; entry: Entry}
   | {kind: 'files'; id: string; paths: string[]}
@@ -43,7 +43,9 @@ export function buildSections(entries: Entry[]): Section[] {
   let latestTasks: Entry | null = null;
   const flushActions = () => {
     if (pendingActions.length > 0) {
-      out.push({kind: 'actions', id: `actions:${pendingActions.map(row => row.id).join(',')}`, rows: pendingActions});
+      // Keep the group id fixed as matching calls are appended. A changing id
+      // would force Solid to remount the whole live tool group on every update.
+      out.push({kind: 'actions', id: `actions:${pendingActions[0].id}`, rows: pendingActions});
       pendingActions = [];
     }
   };
@@ -86,7 +88,7 @@ export function buildSections(entries: Entry[]): Section[] {
         pendingFiles.push(...(entry.detail || '').split('\n').filter(Boolean));
         break;
       case 'prompt': flushActions(); flushFiles(); out.push({kind: 'prompt', id: entry.id, text: entry.text}); break;
-      case 'response': flushActions(); flushFiles(); out.push({kind: 'response', id: entry.id, text: entry.text}); break;
+      case 'response': flushActions(); flushFiles(); out.push({kind: 'response', id: entry.id, text: entry.text, streaming: Boolean(entry.streaming)}); break;
       case 'subagent': flushActions(); flushFiles(); out.push({kind: 'subagent', id: entry.id, entry}); break;
       case 'blocked': flushActions(); flushFiles(); out.push({kind: 'blocked', id: entry.id, text: entry.text}); break;
       case 'log': flushActions(); flushFiles(); out.push({kind: 'log', id: entry.id, text: entry.text, detail: entry.detail || ''}); break;

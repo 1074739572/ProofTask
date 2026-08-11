@@ -12,7 +12,7 @@ const entries: Entry[] = [
   {id: 'a1', kind: 'action', text: 'bash', detail: 'grep -rn "500" backend/app.py', done: false, start},
 ];
 
-const setup = await testRender(() => <App debugEntries={entries} debugUsage={{input: 1, output: 1, cacheRead: 0}} />, {width: W, height: H});
+const setup = await testRender(() => <App debugEntries={entries} debugRunning debugStartedAt={start} debugUsage={{input: 1, output: 1, cacheRead: 0}} />, {width: W, height: H});
 await setup.flush({maxPasses: 5});
 await setup.renderOnce();
 await setup.waitForVisualIdle({quietFrames: 2, maxFrames: 30});
@@ -20,7 +20,7 @@ const frameA = setup.captureCharFrame();
 const rowA = frameA.split('\n').find(l => l.includes('bash'));
 console.log('FRAME A:', rowA);
 
-// wait ~700ms so `now` ticks (250ms interval) and the spinner advances
+// wait ~700ms so the live tick advances the spinner and elapsed counter
 await new Promise(r => setTimeout(r, 700));
 await setup.flush({maxPasses: 5});
 await setup.renderOnce();

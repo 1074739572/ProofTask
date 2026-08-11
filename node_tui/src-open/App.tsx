@@ -1,11 +1,12 @@
 import {BoxRenderable, ScrollBoxRenderable, SyntaxStyle} from '@opentui/core';
-import {createSignal, createEffect, createMemo, For, Show, onCleanup} from 'solid-js';
+import {batch, createSignal, createEffect, createMemo, For, Show, onCleanup} from 'solid-js';
+import {createStore, reconcile} from 'solid-js/store';
 import {useTerminalDimensions, useKeyboard} from '@opentui/solid';
 import {spawn} from 'node:child_process';
 import readline from 'node:readline';
 import {alwaysSeparate, setPreLayoutSiblingMargin} from './layout.ts';
 import {buildSections} from './sections.ts';
-import type {ActionRow, Entry, Section, SubagentStatus, SummaryStep} from './sections.ts';
+import type {ActionRow, Entry, Section, SubagentStatus} from './sections.ts';
 import {C} from './theme.ts';
 import {WelcomeView} from './Welcome.tsx';
 
@@ -24,6 +25,21 @@ const repoRoot = process.cwd().replace(/[\\/]node_tui$/, '');
 // of a placeholder that only updates once the backend's first session_status
 // arrives (~1.5s later). The backend keeps being the source of truth and will
 // overwrite this on the first status event.
+function terminalColumns(text: string): number {
+  let width = 0;
+  for (const ch of Array.from(text)) {
+    const code = ch.codePointAt(0) || 0;
+    // East Asian wide characters and emoji occupy two terminal cells.
+    width += code >= 0x1100 ? 2 : 1;
+  }
+  return width;
+}
+
+function composerVisualLines(text: string, width: number): number {
+  const columns = Math.max(20, width);
+  return text.split('\n').reduce((sum, line) => sum + Math.max(1, Math.ceil(terminalColumns(line) / columns)), 0);
+}
+
 function readDefaultModel(): string {
   const envModel = (process.env.MODEL_ID || '').trim();
   try {
@@ -116,6 +132,14 @@ function headerText(width: number, used: number, window: number, today: number, 
   return prefix + context;
 }
 
+// Codex keeps passive status deliberately terse: a footer is orientation, not a dashboard.
+function footerStatusText(width: number, model: string, effort: string, used: number, window: number, today: number): string {
+  const context = window > 0 ? `ctx ${formatTokens(used)}/${formatTokens(window)} ${Math.round((used / window) * 100)}%` : `ctx ${formatTokens(used)}`;
+  if (width >= 100) return `${model} · ${effort} · ${context} · today ${formatTokens(today)} · Ctrl+Shift+C 复制`;
+  if (width >= 76) return `${model} · ${context} · Ctrl+Shift+C 复制`;
+  return 'Ctrl+Shift+C 复制 · Ctrl+K 中断';
+}
+
 function formatElapsed(start?: number, end?: number, now = 0): string {
   if (start == null) return '';
   const ms = Math.max(0, (end ?? now) - start);
@@ -178,22 +202,17 @@ function SubagentCard(props: {agent: Entry; frame: () => string; compact?: boole
     const elapsed = a.elapsed != null ? ` · ${a.elapsed.toFixed(1)}s` : '';
     return `${toolCount} tools${elapsed}`;
   };
-  return <box
-    flexDirection="column"
-    minWidth={0}
-    border
-    borderStyle="rounded"
-    borderColor={subagentColor(status())}
-    paddingX={1}
-    title={` subagent ${subagentIcon(status(), props.frame())} `}
-  >
+  return <box flexDirection="column" minWidth={0} paddingLeft={1}>
     <box flexDirection="row" minWidth={0} gap={1}>
+      <text fg={subagentColor(status())} wrapMode="none">•</text>
       <text fg={subagentColor(status())} wrapMode="none">{subagentIcon(status(), props.frame())}</text>
       <text fg={C.secondary} wrapMode="none" truncate>{agent().agentType || 'agent'}</text>
       <text fg={C.textMuted} wrapMode="none" truncate>· {agent().model || 'model'}</text>
       <text fg={C.textMuted} wrapMode="none" truncate>· {stats()}</text>
     </box>
-    <text fg={C.text} wrapMode="word">{agent().text}</text>
+    <box minWidth={0} paddingLeft={2}>
+      <text fg={C.text} wrapMode="word">{agent().text}</text>
+    </box>
     <Show when={!props.compact && status() === 'running' && (agent().rounds?.length || 0) > 0}>
       <box flexDirection="column" minWidth={0} paddingLeft={1}>
         <For each={agent().rounds || []}>{round => <text fg={C.textMuted} wrapMode="word">│ {round}</text>}</For>
@@ -226,49 +245,38 @@ function SectionView(props: {section: Section; frame: () => string; now: () => n
     }}
   >
     <Show when={props.section.kind === 'prompt'}>
-      <box flexDirection="row" minWidth={0} gap={1}>
-        <text fg={C.primary}>│</text>
-        <text fg={C.primary} wrapMode="word">› {props.section.kind === 'prompt' ? props.section.text : ''}</text>
+      <box minWidth={0} backgroundColor={C.userCard} paddingLeft={2} paddingRight={1}>
+        <text fg={C.text} wrapMode="word">{props.section.kind === 'prompt' ? props.section.text : ''}</text>
       </box>
     </Show>
     <Show when={props.section.kind === 'response'}>
-      <box flexDirection="row" minWidth={0}>
-        <text fg={C.success}>│</text>
-        <box flexGrow={1} minWidth={0} paddingLeft={1}>
-          <markdown
-            syntaxStyle={markdownSyntax}
-            streaming
-            internalBlockMode="top-level"
-            tableOptions={{style: 'grid'}}
-            content={props.section.kind === 'response' ? props.section.text : ''}
-            fg={C.text}
-            conceal
-          />
-        </box>
+      <box minWidth={0} paddingLeft={1}>
+        <markdown
+          syntaxStyle={markdownSyntax}
+          streaming={props.section.kind === 'response' && props.section.streaming}
+          internalBlockMode="top-level"
+          tableOptions={{style: 'grid'}}
+          content={props.section.kind === 'response' ? props.section.text : ''}
+          fg={C.text}
+          conceal
+        />
       </box>
     </Show>
     <Show when={props.section.kind === 'intent'}>
       <box flexDirection="row" minWidth={0} paddingLeft={1}>
-        <text fg={C.info}>💭 </text>
-        <text fg={C.info} wrapMode="word">{(props.section as any).text}</text>
+        <text fg={C.textMuted}>• </text>
+        <text fg={C.textMuted} wrapMode="word">{(props.section as any).text}</text>
       </box>
     </Show>
     <Show when={props.section.kind === 'tasks'}>
-      <box flexDirection="column" minWidth={0} border borderStyle="rounded" borderColor={C.info} paddingX={1}>
-        <box flexDirection="row" minWidth={0} gap={1}>
-          <text fg={C.info}><strong>计划</strong></text>
-          <text fg={C.textMuted} wrapMode="none" truncate>
-            {(() => { const tasks = (props.section as any).tasks || []; const done = tasks.filter((task: any) => task.status === 'completed').length; return `${done}/${tasks.length} 已完成`; })()}
-          </text>
-        </box>
-        <For each={(props.section as any).tasks || []}>{(task: any) =>
-          <box flexDirection="row" minWidth={0}>
-            <text fg={task.status === 'completed' ? C.success : task.status === 'in_progress' ? C.warning : C.textMuted} wrapMode="none">
-              {task.status === 'completed' ? '✓ ' : task.status === 'in_progress' ? '› ' : '· '}
-            </text>
-            <text fg={task.status === 'in_progress' ? C.text : C.textMuted} wrapMode="word">{task.content}</text>
-          </box>
-        }</For>
+      <box flexDirection="row" minWidth={0} gap={1} paddingLeft={1}>
+        <text fg={C.info} wrapMode="none">▸ 计划</text>
+        <text fg={C.textMuted} wrapMode="none" truncate>
+          {(() => { const tasks = (props.section as any).tasks || []; const done = tasks.filter((task: any) => task.status === 'completed').length; return `${done}/${tasks.length}`; })()}
+        </text>
+        <text fg={C.warning} flexGrow={1} wrapMode="none" truncate>
+          {(() => { const tasks = (props.section as any).tasks || []; const active = tasks.find((task: any) => task.status === 'in_progress') || tasks.find((task: any) => task.status === 'pending'); return active?.activeForm || active?.content || '已完成'; })()}
+        </text>
       </box>
     </Show>
     <Show when={props.section.kind === 'summary'}>
@@ -292,7 +300,7 @@ function SectionView(props: {section: Section; frame: () => string; now: () => n
         </box>
         <box flexDirection="row" minWidth={0} gap={1} paddingLeft={2}>
           <text
-            fg={props.focusId() === (props.section as any).entryId ? C.primary : C.info}
+            fg={props.focusId() === (props.section as any).entryId ? C.primary : C.textMuted}
             wrapMode="none"
             truncate
             selectable={false}
@@ -300,24 +308,25 @@ function SectionView(props: {section: Section; frame: () => string; now: () => n
               if (event?.button === 0) props.onSummaryClick((props.section as any).entryId || props.section.id);
             }}
           >
-            {(props.section as any).expanded ? '[ 收起过程 ]' : '[ 展开过程 ]'}
+            {(props.section as any).expanded ? '收起过程' : '展开过程'}
           </text>
-          <text fg={C.textMuted} wrapMode="none" truncate selectable={false}>Tab 选中 · Enter 切换</text>
-        </box>
-        <box flexDirection="row" minWidth={0} gap={1} paddingLeft={2}>
-          <Show when={((props.section as any).tokens?.inp || 0) > 0}>
-            <text fg={C.textMuted} wrapMode="none" truncate>输入 {formatTokens((props.section as any).tokens.inp)}</text>
-          </Show>
-          <Show when={((props.section as any).tokens?.out || 0) > 0}>
-            <text fg={C.textMuted} wrapMode="none" truncate>· 输出 {formatTokens((props.section as any).tokens.out)}</text>
-          </Show>
-          <Show when={((props.section as any).tokens?.cache || 0) > 0}>
-            <text fg={C.textMuted} wrapMode="none" truncate>· 缓存 {formatPercent((props.section as any).tokens.cache, (props.section as any).tokens.inp || 1)}</text>
-          </Show>
-          <Show when={!(props.section as any).expanded}>
-            <text fg={C.textMuted} wrapMode="none" truncate>· 思考链/工具调用已收起</text>
+          <Show when={!((props.section as any).expanded)}>
+            <text fg={C.textMuted} wrapMode="none" truncate selectable={false}>· Tab / Enter</text>
           </Show>
         </box>
+        <Show when={(props.section as any).expanded}>
+          <box flexDirection="row" minWidth={0} gap={1} paddingLeft={2}>
+            <Show when={((props.section as any).tokens?.inp || 0) > 0}>
+              <text fg={C.textMuted} wrapMode="none" truncate>输入 {formatTokens((props.section as any).tokens.inp)}</text>
+            </Show>
+            <Show when={((props.section as any).tokens?.out || 0) > 0}>
+              <text fg={C.textMuted} wrapMode="none" truncate>· 输出 {formatTokens((props.section as any).tokens.out)}</text>
+            </Show>
+            <Show when={((props.section as any).tokens?.cache || 0) > 0}>
+              <text fg={C.textMuted} wrapMode="none" truncate>· 缓存 {formatPercent((props.section as any).tokens.cache, (props.section as any).tokens.inp || 1)}</text>
+            </Show>
+          </box>
+        </Show>
         {/* Expanded view: every step of the turn in the order it happened —
             one line per thinking note, per individual tool call (merged
             "Called N times" rows unfold back into single calls), per subagent.
@@ -446,30 +455,6 @@ function SectionView(props: {section: Section; frame: () => string; now: () => n
   </box>;
 }
 
-function stepSig(step: SummaryStep): string {
-  if (step.type === 'intent') return `i:${step.text}`;
-  if (step.type === 'tool') return `t:${step.row.name}|${step.row.summary}|${step.row.done}|${step.row.ok}|${step.row.start ?? ''}|${step.row.end ?? ''}`;
-  const a = step.entry;
-  return `g:${a.id}|${a.status}|${a.text}|${a.agentType}|${a.model}|${a.toolCount ?? 0}|${a.elapsed ?? ''}|${a.summary ?? ''}|${(a.rounds || []).join('\u0004')}|${(a.tools || []).map(t => `${t.id}:${t.name}:${t.summary}:${t.status}`).join('\u0005')}`;
-}
-
-function sectionSig(section: Section): string {
-  switch (section.kind) {
-    case 'prompt': return `p:${section.text}`;
-    case 'response': return `r:${section.text}`;
-    case 'blocked': return `b:${section.text}`;
-    case 'log': return `l:${section.text}|${section.detail}`;
-    case 'intent': return `i:${section.text}`;
-    case 'tasks': return `t:${section.tasks.map(task => `${task.content}|${task.activeForm || ''}|${task.status}`).join('\u0001')}`;
-    case 'summary': return `s:${section.text}|${section.toolCount}|${section.elapsed}|${section.paths.join('\u0001')}|${section.tokens.inp}|${section.tokens.out}|${section.tokens.cache}|${section.steps.map(stepSig).join('\u0002')}|${section.expanded ? 'x' : '-'}`;
-    case 'subagent': return `g:${section.entry.id}|${section.entry.status}|${section.entry.text}|${section.entry.agentType}|${section.entry.model}|${section.entry.toolCount ?? 0}|${section.entry.elapsed ?? ''}|${section.entry.summary ?? ''}|${(section.entry.rounds || []).join('\u0002')}|${(section.entry.tools || []).map(t => `${t.id}:${t.name}:${t.summary}:${t.status}`).join('\u0003')}`;
-    case 'files': return `f:${section.paths.join('\u0001')}`;
-    case 'actions': return `a:${section.rows.map(row =>
-      `${row.name}|${row.summary}|${row.done}|${row.ok}|${row.count ?? 1}|${row.start ?? ''}|${row.end ?? ''}|${row.expanded ? 'x' : '-'}|${(row.output || []).join('\u0002')}`,
-    ).join('\u0001')}`;
-  }
-}
-
 function LogView(props: {entries: () => Entry[]; now: () => number; active: () => boolean; composerEmpty: () => boolean; height: number; focusId: () => string | null; onCycleFocus: (dir: 1 | -1) => void; onToggleExpand: (id: string) => void; onClearFocus: () => void; onSummaryClick: (id: string) => void}) {
   let scroll: ScrollBoxRenderable | undefined;
   const [atBottom, setAtBottom] = createSignal(true);
@@ -485,25 +470,14 @@ function LogView(props: {entries: () => Entry[]; now: () => number; active: () =
   };
   createEffect(() => {
     props.entries();
-    props.now();
     updateAtBottom();
   });
-  // Stable-key cache: sections whose content did not change keep the SAME object
-  // reference, so <For> (keyed by reference) reuses the mounted subtree instead
-  // of remounting everything — that remount is what made the screen flash on
-  // every tool state change.
-  const sectionCache = new Map<string, Section>();
-  const sections = createMemo(() => {
-    const built = buildSections(props.entries());
-    const out: Section[] = [];
-    for (const section of built) {
-      const prev = sectionCache.get(section.id);
-      const same = prev && sectionSig(prev) === sectionSig(section);
-      if (same && prev) out.push(prev);
-      else { sectionCache.set(section.id, section); out.push(section); }
-    }
-    for (const key of sectionCache.keys()) if (!out.some(s => s.id === key)) sectionCache.delete(key);
-    return out;
+  // Reconcile by section id instead of replacing section objects. Solid's <For>
+  // keys rows by identity, so this keeps the mounted Markdown renderer alive and
+  // lets its native incremental parser retain the stable response prefix.
+  const [sections, setSections] = createStore<Section[]>([]);
+  createEffect(() => {
+    setSections(reconcile(buildSections(props.entries()), {key: 'id', merge: true}));
   });
   const frame = () => ['|', '/', '-', '\\'][Math.floor(props.now() / 180) % 4];
   const scrollBy = (rows: number) => { scroll?.scrollBy(rows); updateAtBottom(); };
@@ -534,7 +508,7 @@ function LogView(props: {entries: () => Entry[]; now: () => number; active: () =
       verticalScrollbarOptions={{visible: true}}
       onMouseScroll={() => { setTimeout(updateAtBottom, 0); }}
     >
-      <For each={sections()}>{section => <SectionView section={section} frame={frame} now={props.now} focusId={props.focusId} onSummaryClick={props.onSummaryClick} />}</For>
+      <For each={sections}>{section => <SectionView section={section} frame={frame} now={props.now} focusId={props.focusId} onSummaryClick={props.onSummaryClick} />}</For>
     </scrollbox>
     <box height={1} flexShrink={0} paddingX={1} onMouseUp={(event: any) => { if (event?.button === 0) jumpToBottom(); }}>
       <Show when={!atBottom()}>
@@ -544,9 +518,18 @@ function LogView(props: {entries: () => Entry[]; now: () => number; active: () =
   </box>;
 }
 
-export function App(props?: {debugEntries?: Entry[]; debugOverlay?: Overlay; debugUsage?: {input: number; output: number; cacheRead: number; contextUsed?: number; contextWindow?: number}; debugEffort?: {value: string; label: string; options: OverlayOption[]}; debugWelcome?: {quote: string; art: string[]}}) {
+type DebugEntries = Entry[] | (() => Entry[]);
+type DebugFlag = boolean | (() => boolean);
+
+function resolveDebugValue<T>(value: T | (() => T) | undefined): T | undefined {
+  return typeof value === 'function' ? (value as () => T)() : value;
+}
+
+export function App(props?: {debugEntries?: DebugEntries; debugRunning?: DebugFlag; debugStartedAt?: number; debugOverlay?: Overlay; debugUsage?: {input: number; output: number; cacheRead: number; contextUsed?: number; contextWindow?: number}; debugEffort?: {value: string; label: string; options: OverlayOption[]}; debugWelcome?: {quote: string; art: string[]}}) {
   const dims = useTerminalDimensions();
-  const [entries, setEntries] = createSignal<Entry[]>(props?.debugEntries ?? []); const [input, setInput] = createSignal('');
+  const initialDebugEntries = resolveDebugValue(props?.debugEntries) ?? [];
+  const [entries, setEntries] = createSignal<Entry[]>(initialDebugEntries); const [input, setInput] = createSignal('');
+  const displayedEntries = () => resolveDebugValue(props?.debugEntries) ?? entries();
   const [model, setModel] = createSignal(readDefaultModel()); const [mode, setMode] = createSignal(readDefaultMode()); const [cwd, setCwd] = createSignal(''); const [session, setSession] = createSignal('');
   const [effort, setEffort] = createSignal(props?.debugEffort?.value ?? 'off'); const [effortLabel, setEffortLabel] = createSignal(props?.debugEffort?.label ?? 'Model default'); const [effortOptions, setEffortOptions] = createSignal<OverlayOption[]>(props?.debugEffort?.options ?? []);
   // Welcome panel data mirrored from the CLI startup (daily quote only).
@@ -557,7 +540,7 @@ export function App(props?: {debugEntries?: Entry[]; debugOverlay?: Overlay; deb
   // Folded tool entries are intentionally excluded, otherwise Enter would
   // toggle a hidden action and look like the UI is not interactive.
   const [focusId, setFocusId] = createSignal<string | null>(null);
-  const focusableIds = () => buildSections(entries()).flatMap(section => {
+  const focusableIds = () => buildSections(displayedEntries()).flatMap(section => {
     if (section.kind === 'summary') return [section.entryId];
     if (section.kind === 'actions') return section.rows.map(row => row.id);
     return [];
@@ -590,7 +573,7 @@ export function App(props?: {debugEntries?: Entry[]; debugOverlay?: Overlay; deb
   // entries directly and have no real backend, so they start ready.
   const [backendReady, setBackendReady] = createSignal(props?.debugEntries != null);
   let turnStart = 0; let turnToolCount = 0; let turnFiles: string[] = []; let turnTokens = {inp: 0, out: 0, cache: 0};
-  let responseId = ''; let pendingPrompt = ''; let actionCounter = 0; let firstEvent = true;
+  let responseId = ''; let pendingPrompt = ''; let actionCounter = 0; let firstEvent = true; let lastIntentText = '';
   // Reference to the multiline composer so programmatic edits (history recall,
   // clearing after submit) can update its buffer directly.
   let textareaRef: any = null;
@@ -600,28 +583,19 @@ export function App(props?: {debugEntries?: Entry[]; debugOverlay?: Overlay; deb
   const composerLines = () => {
     const v = input();
     if (!v) return 1;
-    const explicit = v.split('\n').length;
     const width = Math.max(20, dims().width - 12);
-    const wrapped = Math.ceil(v.length / width);
-    return Math.max(1, Math.min(MAX_COMPOSER_LINES, Math.max(explicit, wrapped)));
+    return Math.max(1, Math.min(MAX_COMPOSER_LINES, composerVisualLines(v, width)));
   };
-  // Only tick the clock while a turn is running (spinner / elapsed need it).
-  // Previously this timer ran unconditionally at 250ms, forcing a full-tree
-  // re-render every 250ms even with zero new content — that periodic repaint
-  // was the main source of the screen flashing on Windows terminals.
+  // One 30 FPS tick drives the live tail: spinner/elapsed updates and buffered
+  // text/tool output commit together, so a busy turn produces one coalesced
+  // terminal frame instead of independent flush timers racing each other.
+  const LIVE_TICK_MS = 33;
   let nowTimer: ReturnType<typeof setInterval> | null = null;
-  createEffect(() => {
-    if (running()) {
-      if (!nowTimer) nowTimer = setInterval(() => setNow(Date.now()), 250);
-    } else if (nowTimer) {
-      clearInterval(nowTimer);
-      nowTimer = null;
-    }
-  });
-  // Fixed layout budget: usage header with border(3), composer(1..5) + status(1), overlay(var).
+  // Codex-style layout: transcript owns the screen; only the composer and its
+  // contextual footer reserve permanent space.
   const viewportHeight = () => {
     const h = dims().height;
-    let used = 3 + 1 + composerLines() + 1; // +1 fixed startup indicator row
+    let used = composerLines() + 1; // composer + one contextual footer row
     if (overlay()) {
       const o = overlay()!;
       const rows = Math.min(o.options.length, 8);
@@ -654,14 +628,10 @@ export function App(props?: {debugEntries?: Entry[]; debugOverlay?: Overlay; deb
   };
   const add = (entry: Entry) => setEntries(prev => [...prev, entry].slice(-1000));
   const update = (id: string, fn: (entry: Entry) => Entry) => setEntries(prev => prev.map(x => x.id === id ? fn(x) : x));
-  // Tool output throttling: bash streams one tool_output event per line, which
-  // can be hundreds per second for chatty commands. Buffering them and flushing
-  // on a ~150ms timer collapses those into ~6-7 renders/s instead of one full
-  // reactive pass per line — that per-line pass is what made the screen flash.
+  // Bash can emit hundreds of output lines per second. Accumulate them until
+  // the next live tick instead of rebuilding the active tool row per line.
   const outputBuffer = new Map<string, string[]>();
-  let outputFlushTimer: ReturnType<typeof setTimeout> | null = null;
   const flushOutputs = () => {
-    outputFlushTimer = null;
     if (outputBuffer.size === 0) return;
     const batch = new Map(outputBuffer);
     outputBuffer.clear();
@@ -675,40 +645,70 @@ export function App(props?: {debugEntries?: Entry[]; debugOverlay?: Overlay; deb
     const list = outputBuffer.get(id);
     if (list) list.push(line);
     else outputBuffer.set(id, [line]);
-    if (!outputFlushTimer) outputFlushTimer = setTimeout(flushOutputs, 150);
   };
-  onCleanup(() => {
-    if (outputFlushTimer) clearTimeout(outputFlushTimer);
-    if (deltaFlushTimer) clearTimeout(deltaFlushTimer);
-    if (nowTimer) clearInterval(nowTimer);
-    if (toastTimer) clearTimeout(toastTimer);
-  });
-  // Streaming-response throttling: assistant_delta arrives per token/segment.
-  // Re-rendering and re-parsing the full markdown on every token makes the
-  // screen stutter, so deltas are buffered and flushed on a ~150ms cadence,
-  // collapsing N token updates into ~6-7 renders/s (same pattern as tool output).
+  // Assistant deltas arrive per token/segment. Appending them at the live tick
+  // keeps render work bounded while retaining a smooth visible cadence.
   let deltaBuffer = '';
-  let deltaFlushTimer: ReturnType<typeof setTimeout> | null = null;
   const flushDeltas = () => {
-    deltaFlushTimer = null;
     if (!deltaBuffer || !responseId) return;
     const batch = deltaBuffer;
     deltaBuffer = '';
     const id = responseId;
     setEntries(prev => prev.map(x => (x.id === id && x.kind === 'response' ? {...x, text: x.text + batch} : x)));
   };
-  const flushDeltasNow = () => {
-    if (deltaFlushTimer) { clearTimeout(deltaFlushTimer); deltaFlushTimer = null; }
+  const flushLiveBuffers = () => batch(() => {
+    flushOutputs();
     flushDeltas();
-  };
-  const clearDeltas = () => {
-    if (deltaFlushTimer) { clearTimeout(deltaFlushTimer); deltaFlushTimer = null; }
-    deltaBuffer = '';
-  };
+  });
+  const flushDeltasNow = flushLiveBuffers;
+  const clearDeltas = () => { deltaBuffer = ''; };
   const queueDelta = (text: string) => {
     if (!text) return;
     deltaBuffer += text;
-    if (!deltaFlushTimer) deltaFlushTimer = setTimeout(flushDeltas, 150);
+  };
+  const runLiveTick = () => batch(() => {
+    flushOutputs();
+    flushDeltas();
+    setNow(Date.now());
+  });
+  createEffect(() => {
+    const debugRunning = resolveDebugValue(props?.debugRunning);
+    if (debugRunning === undefined) return;
+    setRunning(debugRunning);
+    if (debugRunning && !startedAt()) setStartedAt(props?.debugStartedAt ?? Date.now());
+    if (!debugRunning && startedAt()) setStartedAt(0);
+  });
+  createEffect(() => {
+    if (running()) {
+      if (!nowTimer) nowTimer = setInterval(runLiveTick, LIVE_TICK_MS);
+    } else if (nowTimer) {
+      clearInterval(nowTimer);
+      nowTimer = null;
+    }
+  });
+  onCleanup(() => {
+    if (nowTimer) clearInterval(nowTimer);
+    if (toastTimer) clearTimeout(toastTimer);
+  });
+  // A model round that goes on to call a tool is progress narration, not a
+  // user-facing answer. Convert its live response in place so a streamed
+  // sentence and assistant_intent never render as duplicate chat messages.
+  const promoteResponseToIntent = (preferred = '') => {
+    flushDeltasNow();
+    const id = responseId;
+    const current = id ? entries().find(entry => entry.id === id && entry.kind === 'response') : undefined;
+    const text = (preferred || current?.text || '').trim();
+    if (!text) return false;
+    const sameAsPrevious = Boolean(lastIntentText) && (text === lastIntentText || text.startsWith(lastIntentText) || lastIntentText.startsWith(text));
+    if (current) {
+      if (sameAsPrevious) setEntries(prev => prev.filter(entry => entry.id !== id));
+      else update(id, entry => ({...entry, kind: 'intent', text}));
+    } else if (!sameAsPrevious) {
+      add({id: `intent-${Date.now()}-${actionCounter}`, kind: 'intent', text});
+    }
+    responseId = '';
+    lastIntentText = text;
+    return !sameAsPrevious;
   };
   const begin = (nextPhase: string) => { setPhase(nextPhase); setRunning(true); if (!startedAt()) setStartedAt(Date.now()); };
   const openEffortPicker = () => {
@@ -752,16 +752,16 @@ export function App(props?: {debugEntries?: Entry[]; debugOverlay?: Overlay; deb
         break;
       }
       case 'user_message': if (!event.silent) { const prompt = value(event, 'text'); responseId = ''; if (pendingPrompt === prompt) pendingPrompt = ''; else add({id: `prompt-${Date.now()}`, kind: 'prompt', text: prompt}); } break;
-      case 'agent_start': begin(value(event, 'phase') || 'thinking'); turnStart = Date.now(); turnToolCount = 0; turnFiles = []; turnTokens = {inp: 0, out: 0, cache: 0}; break;
-      case 'assistant_intent': { const text = value(event, 'text'); if (text) add({id: `intent-${Date.now()}-${actionCounter}`, kind: 'intent', text}); break; }
+      case 'agent_start': begin(value(event, 'phase') || 'thinking'); turnStart = Date.now(); turnToolCount = 0; turnFiles = []; turnTokens = {inp: 0, out: 0, cache: 0}; lastIntentText = ''; break;
+      case 'assistant_intent': { const text = value(event, 'text'); if (text) promoteResponseToIntent(text); break; }
       case 'thinking_start': if (!responseId) begin(value(event, 'phase') || 'thinking'); else setPhase(value(event, 'phase') || 'thinking'); break;
       case 'thinking_end': if (running()) setPhase('working'); break;
-      case 'assistant_delta': { const delta = value(event, 'text'); if (!responseId) { begin('responding'); responseId = `response-${Date.now()}`; add({id: responseId, kind: 'response', text: ''}); } else { setPhase('responding'); } queueDelta(delta); break; }
-      case 'assistant_message': clearDeltas(); begin('responding'); if (!responseId) { responseId = `response-${Date.now()}`; add({id: responseId, kind: 'response', text: ''}); } update(responseId, x => ({...x, text: value(event, 'text')})); break;
-      case 'tool_start': { flushDeltasNow(); responseId = ''; begin('running tool'); turnToolCount += 1; const id = value(event, 'id', 'call_id', 'tool_call_id') || `action-${++actionCounter}`; const ts = Number(event.ts || 0) * 1000 || Date.now(); add({id, kind: 'action', text: value(event, 'name') || 'tool', detail: value(event, 'summary') || 'running…', start: ts, output: []}); break; }
+      case 'assistant_delta': { const delta = value(event, 'text'); if (!delta) break; if (!responseId) { begin('responding'); responseId = `response-${Date.now()}`; add({id: responseId, kind: 'response', text: delta, streaming: true}); } else { setPhase('responding'); queueDelta(delta); } break; }
+      case 'assistant_message': clearDeltas(); begin('responding'); if (!responseId) { responseId = `response-${Date.now()}`; add({id: responseId, kind: 'response', text: value(event, 'text'), streaming: false}); } else update(responseId, x => ({...x, text: value(event, 'text'), streaming: false})); break;
+      case 'tool_start': { promoteResponseToIntent(); begin('running tool'); turnToolCount += 1; const id = value(event, 'id', 'call_id', 'tool_call_id') || `action-${++actionCounter}`; const ts = Number(event.ts || 0) * 1000 || Date.now(); add({id, kind: 'action', text: value(event, 'name') || 'tool', detail: value(event, 'summary') || 'running…', start: ts, output: []}); break; }
       case 'tool_output': { const id = value(event, 'id', 'call_id', 'tool_call_id'); const line = value(event, 'line'); if (!line) break; queueOutput(id || 'unknown', line); break; }
-      case 'tool_end': { const id = value(event, 'id', 'call_id', 'tool_call_id'); const ts = Number(event.ts || 0) * 1000 || Date.now(); if (outputFlushTimer) { clearTimeout(outputFlushTimer); outputFlushTimer = null; flushOutputs(); } const target = (id ? entries().find(x => x.id === id) : [...entries()].reverse().find(x => x.kind === 'action' && !x.done)); if (target) update(target.id, x => ({...x, detail: value(event, 'summary') || (event.ok ? 'completed' : 'failed'), done: true, ok: Boolean(event.ok), end: ts})); break; }
-      case 'subagent_start': { flushDeltasNow(); responseId = ''; begin('subagent'); const id = value(event, 'id') || `subagent-${++actionCounter}`; const ts = Number(event.ts || 0) * 1000 || Date.now(); add({id, kind: 'subagent', text: value(event, 'description') || 'subagent task', agentType: value(event, 'agent_type') || 'agent', model: value(event, 'model') || 'model', status: 'running', rounds: [], tools: [], start: ts, expanded: true}); break; }
+      case 'tool_end': { const id = value(event, 'id', 'call_id', 'tool_call_id'); const ts = Number(event.ts || 0) * 1000 || Date.now(); flushLiveBuffers(); const target = (id ? entries().find(x => x.id === id) : [...entries()].reverse().find(x => x.kind === 'action' && !x.done)); if (target) update(target.id, x => ({...x, detail: value(event, 'summary') || (event.ok ? 'completed' : 'failed'), done: true, ok: Boolean(event.ok), end: ts})); break; }
+      case 'subagent_start': { promoteResponseToIntent(); begin('subagent'); const id = value(event, 'id') || `subagent-${++actionCounter}`; const ts = Number(event.ts || 0) * 1000 || Date.now(); add({id, kind: 'subagent', text: value(event, 'description') || 'subagent task', agentType: value(event, 'agent_type') || 'agent', model: value(event, 'model') || 'model', status: 'running', rounds: [], tools: [], start: ts, expanded: true}); break; }
       case 'subagent_round': { const id = value(event, 'id'); const roundText = value(event, 'text'); const label = roundText ? `Round ${Number(event.round || 0)} · "${roundText}"` : `Round ${Number(event.round || 0)}`; update(id, x => x.kind === 'subagent' ? {...x, rounds: [...(x.rounds || []), label]} : x); break; }
       case 'subagent_tool': { const id = value(event, 'id'); const toolId = value(event, 'tool_use_id') || `${value(event, 'name')}-${Date.now()}`; const status = event.ok === null || event.ok === undefined ? 'running' : (event.ok ? 'done' : 'failed'); const name = value(event, 'name') || 'tool'; const summary = value(event, 'summary'); update(id, x => { if (x.kind !== 'subagent') return x; const tools = x.tools || []; const idx = tools.findIndex(tool => tool.id === toolId); const nextTool = {id: toolId, name, summary, status: status as SubagentStatus}; const nextTools = idx >= 0 ? tools.map((tool, i) => i === idx ? {...tool, ...nextTool} : tool) : [...tools, nextTool]; return {...x, tools: nextTools, toolCount: nextTools.length}; }); break; }
       case 'subagent_end': { const id = value(event, 'id'); const ts = Number(event.ts || 0) * 1000 || Date.now(); update(id, x => x.kind === 'subagent' ? {...x, status: event.ok ? 'done' : 'failed', done: true, ok: Boolean(event.ok), end: ts, toolCount: Number(event.tools || x.toolCount || 0), elapsed: Number(event.elapsed || 0), summary: value(event, 'summary')} : x); break; }
@@ -780,12 +780,15 @@ export function App(props?: {debugEntries?: Entry[]; debugOverlay?: Overlay; deb
         if (interrupted) {
           setEntries(prev => prev.filter(entry => entry.id !== responseId));
           add({id: `log-${Date.now()}`, kind: 'log', text: 'Turn interrupted', detail: 'partial response discarded'});
-        } else if (turnToolCount > 0 || turnFiles.length > 0) {
+        } else {
+          if (responseId) update(responseId, entry => entry.kind === 'response' ? {...entry, streaming: false} : entry);
+        if (turnToolCount > 0 || turnFiles.length > 0) {
           // Fold the whole turn (thinking + tool calls) into a collapsible
           // summary block; clicking/Entering it expands the full transcript.
           const start = turnStart || Date.now();
           const end = Date.now();
-          add({id: `summary-${Date.now()}`, kind: 'summary', text: interrupted ? 'Turn interrupted' : 'Turn complete', start, end, toolCount: turnToolCount, paths: turnFiles, tokens: {...turnTokens}, expanded: false});
+          add({id: `summary-${Date.now()}`, kind: 'summary', text: `已完成 ${turnToolCount} 项操作`, start, end, toolCount: turnToolCount, paths: turnFiles, tokens: {...turnTokens}, expanded: false});
+        }
         }
         setRunning(false); setPhase(interrupted ? 'interrupted' : 'idle'); setStartedAt(0); responseId = ''; pendingPrompt = '';
          break;
@@ -831,7 +834,9 @@ export function App(props?: {debugEntries?: Entry[]; debugOverlay?: Overlay; deb
     }
     if (event?.ctrl && name === 'q') { send({type: 'exit'}); child?.kill?.(); process.exit(0); }
     if (event?.ctrl && name === 'e') { openEffortPicker(); event.preventDefault?.(); return; }
-    if (event?.ctrl && name === 'c') send({type: 'interrupt'});
+    // Do not consume Ctrl+C: terminals and IDEs use it to copy a mouse selection.
+    // Ctrl+Shift+C is handled by OpenTUI as copy-selection; Ctrl+K interrupts a run.
+    if (event?.ctrl && name === 'k') { send({type: 'interrupt'}); event.preventDefault?.(); return; }
     if (event?.ctrl && name === 'l') { setEntries([]); setUserStarted(false); send({type: 'clear'}); }
     // Input history: with an empty composer, ↑ recalls past commands and ↓
     // walks back toward the newest, past the end clears the input. When the
@@ -866,7 +871,7 @@ export function App(props?: {debugEntries?: Entry[]; debugOverlay?: Overlay; deb
     const text = input().trim();
     if (!text) return;
     if (running()) {
-      add({id: `log-${Date.now()}`, kind: 'log', text: 'Agent is already running', detail: 'press Ctrl-C to interrupt first'});
+      add({id: `log-${Date.now()}`, kind: 'log', text: 'Agent is already running', detail: 'press Ctrl+K to interrupt first'});
       return;
     }
     // Slash commands are internal instructions; they must not appear in the
@@ -883,21 +888,8 @@ export function App(props?: {debugEntries?: Entry[]; debugOverlay?: Overlay; deb
     setHistoryIdx(-1);
   };
   return <box width={dims().width} height={dims().height} flexDirection="column">
-    {/* Single-line usage header: today's totals plus current context pressure. */}
-    <box height={3} flexShrink={0} border borderStyle="rounded" borderColor={C.accent} paddingX={1}>
-      <text fg={contextWindow() > 0 && contextUsed() / contextWindow() >= 0.95 ? C.error : contextWindow() > 0 && contextUsed() / contextWindow() >= 0.8 ? C.warning : C.primary} wrapMode="none" truncate>
-        {headerText(dims().width, contextUsed(), contextWindow(), todayInput() + todayOutput(), todayCacheRead(), todayInput(), cwd())}
-      </text>
-    </box>
-    {/* Startup indicator: stays one row so the welcome panel never jumps when
-        the backend's first event lands (~1.5-2s). */}
-    <box height={1} flexShrink={0} paddingX={1}>
-      <Show when={!backendReady()}>
-        <text fg={C.warning}>Starting backend...</text>
-      </Show>
-    </box>
     <Show when={showWelcome()} fallback={
-      <LogView entries={entries} now={now} height={viewportHeight()} active={() => !overlay()} composerEmpty={() => !overlay() && input() === ''} focusId={focusId} onCycleFocus={cycleFocus} onToggleExpand={toggleExpand} onClearFocus={() => setFocusId(null)} onSummaryClick={toggleSummaryExpand} />
+      <LogView entries={displayedEntries} now={now} height={viewportHeight()} active={() => !overlay()} composerEmpty={() => !overlay() && input() === ''} focusId={focusId} onCycleFocus={cycleFocus} onToggleExpand={toggleExpand} onClearFocus={() => setFocusId(null)} onSummaryClick={toggleSummaryExpand} />
     }>
       <WelcomeView width={dims().width} height={viewportHeight()} quote={welcomeQuote()} />
     </Show>
@@ -907,7 +899,7 @@ export function App(props?: {debugEntries?: Entry[]; debugOverlay?: Overlay; deb
           const absoluteIndex = () => (overlayWindow()?.start ?? 0) + i();
           const active = () => absoluteIndex() === overlayIndex();
           return <box flexDirection="row" onMouseUp={(event: any) => { if (event?.button === 0) { setOverlayIndex(absoluteIndex()); selectOverlay(absoluteIndex()); } }}>
-            <text fg={active() ? C.success : C.textMuted}>{active() ? '▶ ' : '  '}{option.name}</text>
+            <text fg={active() ? C.primary : C.textMuted}>{active() ? '▶ ' : '  '}{option.name}</text>
             {option.description ? <text fg={C.textMuted}>  {option.description}</text> : null}
           </box>;
         }}</For>
@@ -927,13 +919,16 @@ export function App(props?: {debugEntries?: Entry[]; debugOverlay?: Overlay; deb
         </Show>
       </box>
       <Show when={running()}>
-        <text fg={C.textMuted} wrapMode="none" truncate>{phase()} · {spinner()} {elapsed()}</text>
+        <text fg={C.warning} wrapMode="none" truncate>• {phase()} · {spinner()} {elapsed()} · Ctrl+K 中断</text>
       </Show>
       <Show when={!running() && toast()}>
         <text fg={C.success} wrapMode="none" truncate>{toast()?.text}</text>
       </Show>
-      <Show when={!running() && !toast() && !overlay()}>
-        <text fg={C.textMuted} wrapMode="none" truncate>{dims().width >= 76 ? 'Enter 提交 · Shift+Enter 换行 · Ctrl+E 选择推理档位 · 空输入 ↑↓ 历史' : 'Enter 提交 · Shift+Enter 换行 · Ctrl+E 档位 · ↑↓ 历史'}</text>
+      <Show when={!running() && !toast() && !overlay() && !backendReady()}>
+        <text fg={C.warning} wrapMode="none" truncate>• 正在连接后端…</text>
+      </Show>
+      <Show when={!running() && !toast() && !overlay() && backendReady()}>
+        <text fg={C.textMuted} wrapMode="none" truncate>{footerStatusText(dims().width, model(), effortShortLabel(effortLabel(), effort()), contextUsed(), contextWindow(), todayInput() + todayOutput())}</text>
       </Show>
     </box>
   </box>;
