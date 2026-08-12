@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from typing import Literal, TypeAlias
 
-from harness.settings import PERMISSIONS_CONFIG_PATH
+from harness.settings import get_permissions_config_path
 
 PermissionEffect: TypeAlias = Literal["allow", "ask", "deny"]
 PermissionRule: TypeAlias = PermissionEffect | dict[str, PermissionEffect]
@@ -97,10 +97,11 @@ def _normalize_rules(raw: object) -> dict[str, PermissionRule]:
 
 
 def load_permission_rules() -> dict[str, PermissionRule]:
-    if not PERMISSIONS_CONFIG_PATH.exists():
+    path = get_permissions_config_path()
+    if not path.exists():
         return dict(DEFAULT_PERMISSIONS)
     try:
-        data = json.loads(PERMISSIONS_CONFIG_PATH.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return dict(DEFAULT_PERMISSIONS)
     return _normalize_rules(data)

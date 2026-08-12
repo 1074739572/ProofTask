@@ -29,6 +29,8 @@ rules are ignored; the policy allowlist is the only positive grant.
 
 from __future__ import annotations
 
+import ctypes
+import os
 import shlex
 from dataclasses import dataclass
 
@@ -123,6 +125,28 @@ class VerificationDecision:
     reason: str = ""
 
 
+def split_verification_command(command: str) -> list[str]:
+    """Split an argv command using the host platform's quoting rules.
+
+    ``shlex`` implements POSIX rules and corrupts Windows paths such as
+    ``.\\tests\\test_goal.py``.  Verification commands are executed with
+    ``shell=False``, so their policy parser and subprocess argv must agree.
+    """
+    if os.name != "nt":
+        return shlex.split(command)
+    argc = ctypes.c_int(0)
+    command_line_to_argv = ctypes.windll.shell32.CommandLineToArgvW
+    command_line_to_argv.argtypes = [ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_int)]
+    command_line_to_argv.restype = ctypes.POINTER(ctypes.c_wchar_p)
+    argv = command_line_to_argv(command, ctypes.byref(argc))
+    if not argv:
+        raise ValueError("unparseable Windows command line")
+    try:
+        return [argv[index] for index in range(argc.value)]
+    finally:
+        ctypes.windll.kernel32.LocalFree(argv)
+
+
 def _leading_program(tokens: list[str]) -> str:
     if not tokens:
         return ""
@@ -143,7 +167,7 @@ def check_verification_command(command: str) -> VerificationDecision:
             False, f"command too long ({len(stripped)} > {MAX_VERIFICATION_COMMAND_LEN})"
         )
     try:
-        tokens = shlex.split(stripped)
+        tokens = split_verification_command(stripped)
     except ValueError as exc:
         return VerificationDecision(False, f"unparseable command: {exc}")
     if not tokens:

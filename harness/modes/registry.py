@@ -19,6 +19,7 @@ class ModeProfile:
     lead_model_hint: str | None
     enable_task: bool
     disable_tools: frozenset[str]
+    allowed_tools: frozenset[str] | None = None
     builtin_skills: tuple[str, ...] = ()
     confirm_before_execute: bool = False
     auto_route: bool = False
@@ -77,6 +78,11 @@ def get_mode_profile(mode_id: str) -> ModeProfile | None:
         lead_model_hint=hint if hint else None,
         enable_task=bool(entry.get("enable_task", False)),
         disable_tools=frozenset(entry.get("disable_tools") or []),
+        allowed_tools=(
+            frozenset(str(name).strip() for name in entry.get("allowed_tools", []) if str(name).strip())
+            if "allowed_tools" in entry
+            else None
+        ),
         builtin_skills=tuple(str(name).strip() for name in skills if str(name).strip()),
         confirm_before_execute=bool(entry.get("confirm_before_execute", False)),
         auto_route=bool(entry.get("auto_route", False)),
@@ -103,6 +109,8 @@ def format_mode_catalog() -> str:
             lines.append(f"    builtin skills: {', '.join(profile.builtin_skills)}")
         if profile.disable_tools:
             lines.append(f"    disabled tools: {', '.join(sorted(profile.disable_tools))}")
+        if profile.allowed_tools is not None:
+            lines.append(f"    allowed tools: {', '.join(sorted(profile.allowed_tools))}")
     lines.append("\nSwitch: /mode <id>  or  /mode (picker)")
     lines.append("Template: config/modes.example.json")
     return "\n".join(lines)

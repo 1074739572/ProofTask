@@ -216,6 +216,17 @@ def mode_disables_tool(tool_name: str) -> bool:
     profile = get_current_mode_profile()
     if profile is None:
         return False
+    if profile.allowed_tools is not None and not (
+        profile.confirm_before_execute and is_execute_unlocked()
+    ):
+        allowed = profile.allowed_tools
+        wildcard_allowed = any(
+            tool_name.startswith(pattern[:-1])
+            for pattern in allowed
+            if pattern.endswith("*")
+        )
+        if tool_name not in allowed and not wildcard_allowed:
+            return True
     disabled = profile.disable_tools
     if tool_name not in disabled and not (
         tool_name.startswith("mcp__") and "mcp__*" in disabled

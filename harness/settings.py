@@ -14,7 +14,8 @@ PACKAGE_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(PACKAGE_ROOT / ".env")
 load_dotenv(override=True)
 
-SKILLS_DIR = PACKAGE_ROOT / "skills"
+BUILTIN_SKILLS_DIR = PACKAGE_ROOT / "skills"
+BUILTIN_CONFIG_DIR = PACKAGE_ROOT / "config"
 CONFIG_DIR = PACKAGE_ROOT / "config"
 MCP_CONFIG_PATH = CONFIG_DIR / "mcp.json"
 PERMISSIONS_CONFIG_PATH = CONFIG_DIR / "permissions.json"
@@ -211,9 +212,27 @@ PERMISSION_AUTO_APPROVE_TIMEOUT = _permission_timeout()
 
 # Skills catalog directory: project-level `skills/` next to the workspace root
 # (same layout as the built-in worktree skills and Claude Code's skills dir).
-SKILLS_DIR = WORKDIR / "skills"
+SKILLS_DIR = BUILTIN_SKILLS_DIR
 
-# Declarative config files under `config/`.
-CONFIG_DIR = WORKDIR / "config"
-MCP_CONFIG_PATH = CONFIG_DIR / "mcp.json"
-PERMISSIONS_CONFIG_PATH = CONFIG_DIR / "permissions.json"
+
+def get_project_config_dir() -> Path:
+    """Return the active workspace's project configuration directory."""
+    return get_workdir() / "config"
+
+
+def get_mcp_config_path() -> Path:
+    project = get_project_config_dir() / "mcp.json"
+    return project if project.exists() else BUILTIN_CONFIG_DIR / "mcp.json"
+
+
+def get_permissions_config_path() -> Path:
+    project = get_project_config_dir() / "permissions.json"
+    return project if project.exists() else BUILTIN_CONFIG_DIR / "permissions.json"
+
+
+def get_global_skills_dir() -> Path:
+    return Path.home() / ".harness" / "skills"
+
+
+def get_project_skills_dir() -> Path:
+    return get_workdir() / "skills"

@@ -6,7 +6,7 @@ import json
 import os
 import re
 
-from harness.settings import MCP_CONFIG_PATH
+from harness.settings import get_mcp_config_path
 
 _ENV_REF = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$")
 
@@ -36,10 +36,11 @@ def resolve_server_env(server_cfg: dict) -> dict | None:
 
 
 def load_mcp_config() -> dict[str, dict]:
-    if not MCP_CONFIG_PATH.exists():
+    path = get_mcp_config_path()
+    if not path.exists():
         return {}
     try:
-        data = json.loads(MCP_CONFIG_PATH.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return {}
     return data.get("mcpServers", {})

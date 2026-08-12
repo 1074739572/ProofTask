@@ -57,6 +57,9 @@ class Task:
     feature_ids: list[str] = field(default_factory=list)
     attempts: int = 0
     last_error: str | None = None
+    # Optional owner for durable workflow projections such as /goal. It lets a
+    # restarted runner reconcile a task created just before goal.json was saved.
+    goal_id: str | None = None
 
 
 def _active_path(task_id: str) -> Path:
@@ -88,6 +91,8 @@ def create_task(
     subject: str,
     description: str = "",
     blockedBy: list[str] | None = None,
+    *,
+    goal_id: str | None = None,
 ) -> Task:
     task = Task(
         id=f"task_{int(time.time())}_{random.randint(0, 9999):04d}",
@@ -96,6 +101,7 @@ def create_task(
         status="pending",
         owner=None,
         blockedBy=blockedBy or [],
+        goal_id=goal_id,
     )
     save_task(task)
     return task

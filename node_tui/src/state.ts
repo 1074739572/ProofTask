@@ -58,6 +58,10 @@ function updateSubagent(state: AppState, id: string, updater: (agent: SubagentRe
   return {...state, items};
 }
 
+function goalIsActive(status: string): boolean {
+  return status === 'running' || status === 'pausing' || status === 'cancelling';
+}
+
 export function reduceEvent(state: AppState, event: UiEvent): AppState {
   switch (event.type) {
     case 'ready':
@@ -205,6 +209,27 @@ export function reduceEvent(state: AppState, event: UiEvent): AppState {
         elapsed: event.elapsed,
         summary: event.summary,
       }));
+    case 'goal_started':
+      return pushItem(
+        {...state, running: true, phase: 'preparing'},
+        {kind: 'log', level: 'plain', text: `Goal ${event.id}: ${event.phase}`, ts: event.ts},
+      );
+    case 'goal_status':
+    case 'goal_phase': {
+      const active = goalIsActive(event.status);
+      const detail = event.type === 'goal_phase' && event.feature_id
+        ? ` feature ${event.feature_id}${event.attempt !== undefined ? ` attempt ${event.attempt}` : ''}`
+        : '';
+      return pushItem(
+        {...state, running: active, phase: active ? 'tool_running' : 'idle'},
+        {kind: 'log', level: 'plain', text: `Goal ${event.id}: ${event.phase}${detail}`, ts: event.ts},
+      );
+    }
+    case 'goal_stopped':
+      return pushItem(
+        clearThinking({...state, running: false, phase: event.status === 'cancelled' ? 'interrupted' : 'idle'}),
+        {kind: 'log', level: 'plain', text: `Goal ${event.id} ${event.status}${event.stop_reason ? `: ${event.stop_reason}` : ''}`, ts: event.ts},
+      );
     case 'task_update':
       return pushItem({...state, tasks: event.tasks}, {kind: 'tasks', tasks: event.tasks, ts: event.ts});
     case 'files_changed':

@@ -13,6 +13,7 @@ from harness.mcp.mock import MOCK_SERVERS
 
 mcp_clients: dict[str, MCPClientProtocol] = {}
 mcp_tool_meta: dict[str, dict] = {}
+mcp_pool_warnings: list[str] = []
 
 _DISALLOWED_CHARS = re.compile(r"[^a-zA-Z0-9_-]")
 
@@ -188,19 +189,31 @@ def assemble_tool_pool(
     tools = list(builtin_tools)
     handlers = dict(builtin_handlers)
     mcp_tool_meta.clear()
+    mcp_pool_warnings.clear()
+    seen_names = {str(tool.get("name", "")) for tool in tools}
 
     for server_name, mcp_client in mcp_clients.items():
         safe_server = normalize_mcp_name(server_name)
         for tool_def in mcp_client.tools:
             safe_tool = normalize_mcp_name(tool_def["name"])
             prefixed = f"mcp__{safe_server}__{safe_tool}"
+            if prefixed in seen_names:
+                mcp_pool_warnings.append(
+                    f"Skipped MCP tool name collision: {prefixed} ({server_name}/{tool_def['name']})"
+                )
+                continue
+            schema = tool_def.get("inputSchema", {})
+            if not isinstance(schema, dict) or schema.get("type", "object") != "object":
+                mcp_pool_warnings.append(f"Skipped MCP tool with invalid inputSchema: {prefixed}")
+                continue
             tools.append(
                 {
                     "name": prefixed,
                     "description": tool_def.get("description", ""),
-                    "input_schema": tool_def.get("inputSchema", {}),
+                    "input_schema": schema,
                 }
             )
+            seen_names.add(prefixed)
             mcp_tool_meta[prefixed] = {
                 "destructive": bool(tool_def.get("destructive")),
                 "readOnly": bool(tool_def.get("readOnly")),

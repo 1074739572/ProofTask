@@ -114,12 +114,32 @@ def load_goal(workspace: str | Path | None = None) -> GoalState | None:
     except (TypeError, ValueError, KeyError) as exc:
         raise GoalStoreError("goal_state_corrupt", f"invalid goal state in {path}: {exc}") from exc
 
+    # A durable cancellation request is final even if the process exited before
+    # the worker reached its next checkpoint.
+    if state.status == GoalStatus.CANCELLING.value:
+        previous = state.phase
+        state.last_phase = previous
+        state.status = GoalStatus.CANCELLED.value
+        state.phase = GoalPhase.CANCELLED.value
+        state.completed_at = state.completed_at or time.time()
+        state.stop_reason = StopReason.cancelled_by_user.value
+        state.transition_log.append(
+            {
+                "from": previous,
+                "to": GoalPhase.CANCELLED.value,
+                "at": time.time(),
+                "reason": "cancel_recovered_after_restart",
+                "attempt": state.attempts,
+            }
+        )
     # Process-restart recovery: a running/pausing goal cannot be assumed to
     # still be executing after a restart — require an explicit /goal resume.
-    if state.status in (GoalStatus.RUNNING.value, GoalStatus.PAUSING.value):
+    elif state.status in (GoalStatus.RUNNING.value, GoalStatus.PAUSING.value):
         state.status = GoalStatus.PAUSED.value
         state.phase = GoalPhase.PAUSED.value
-        state.paused_at = state.paused_at or time.time()
+        # The last durable checkpoint is the best available pause boundary.
+        # This excludes process downtime from the active-duration budget.
+        state.paused_at = state.paused_at or state.updated_at or time.time()
         if state.stop_reason is None:
             state.stop_reason = StopReason.process_restarted.value
     return state

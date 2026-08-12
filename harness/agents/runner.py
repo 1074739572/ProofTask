@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import time
 import uuid
+from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
+from typing import Callable
 
+from harness.agent.cancel import is_cancelled
 from harness.agents.registry import get_agent_profile, validate_agent_model
 from harness.hooks import trigger_hooks
 from harness.llm import create_message
@@ -104,6 +107,15 @@ _BASE_HANDLERS = {
 }
 
 
+@dataclass
+class AgentTaskStats:
+    """Bounded subagent execution facts for workflow orchestrators."""
+
+    llm_rounds: int = 0
+    interrupted: bool = False
+    stop_reason: str = "completed"  # completed | cancelled | deadline | max_rounds
+
+
 def _tools_for_agent(
     allowed: list[str], cwd: Path | None = None
 ) -> tuple[list[dict], dict]:
@@ -137,6 +149,10 @@ def run_agent_task(
     agent_type: str,
     *,
     cwd: str | Path | None = None,
+    max_rounds: int = 30,
+    cancel_check: Callable[[], bool] | None = None,
+    deadline: float | None = None,
+    stats: AgentTaskStats | None = None,
 ) -> str:
     error = validate_agent_model(agent_type)
     if error:
@@ -167,7 +183,23 @@ def run_agent_task(
     round_num = 0
     final_text: str | None = None
 
-    for _ in range(30):
+    def interrupted() -> str | None:
+        if cancel_check is not None and cancel_check():
+            return "cancelled"
+        if is_cancelled():
+            return "cancelled"
+        if deadline is not None and time.monotonic() >= deadline:
+            return "deadline"
+        return None
+
+    for _ in range(max(1, max_rounds)):
+        reason = interrupted()
+        if reason:
+            if stats is not None:
+                stats.interrupted = True
+                stats.stop_reason = reason
+            renderer.subagent_end(run_id, f"stopped: {reason}", tool_count, time.time() - started, max_len=50)
+            return f"[{agent_type}] stopped: {reason}"
         round_num += 1
         response = create_message(
             model_id=profile.model_id,
@@ -176,6 +208,8 @@ def run_agent_task(
             tools=tools,
             max_tokens=8000,
         )
+        if stats is not None:
+            stats.llm_rounds += 1
 
         # Extract thinking text for this round (truncated to 50 chars)
         thinking_text = extract_text(response.content) or ""
@@ -191,6 +225,13 @@ def run_agent_task(
 
         results = []
         for block in response.content:
+            reason = interrupted()
+            if reason:
+                if stats is not None:
+                    stats.interrupted = True
+                    stats.stop_reason = reason
+                renderer.subagent_end(run_id, f"stopped: {reason}", tool_count, time.time() - started, max_len=50)
+                return f"[{agent_type}] stopped: {reason}"
             if not is_tool_use(block):
                 continue
             tool_count += 1
@@ -217,6 +258,9 @@ def run_agent_task(
         messages.append({"role": "user", "content": results})
 
     elapsed = time.time() - started
+
+    if stats is not None and final_text is None:
+        stats.stop_reason = "max_rounds"
 
     # If we didn't capture a final_text (loop ran 30 rounds), extract it now
     if final_text is None:

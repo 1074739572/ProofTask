@@ -49,7 +49,11 @@ export type UiEvent =
   | { type: 'subagent_start'; seq?: number; ts?: number; id: string; agent_type: string; description: string; model: string; cwd?: string }
   | { type: 'subagent_round'; seq?: number; ts?: number; id: string; round: number; text: string }
   | { type: 'subagent_tool'; seq?: number; ts?: number; id: string; tool_use_id?: string; name: string; summary: string; ok?: boolean | null }
-  | { type: 'subagent_end'; seq?: number; ts?: number; id: string; ok: boolean; tools: number; elapsed: number; summary: string };
+  | { type: 'subagent_end'; seq?: number; ts?: number; id: string; ok: boolean; tools: number; elapsed: number; summary: string }
+  | { type: 'goal_started'; seq?: number; ts?: number; id: string; phase: string; status: string }
+  | { type: 'goal_status'; seq?: number; ts?: number; id: string; phase: string; status: string }
+  | { type: 'goal_phase'; seq?: number; ts?: number; id: string; phase: string; status: string; feature_id?: string; attempt?: number }
+  | { type: 'goal_stopped'; seq?: number; ts?: number; id: string; status: string; stop_reason?: string };
 
 export type ToolRecord = {
   key: string;

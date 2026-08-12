@@ -792,6 +792,10 @@ export function App(props?: {debugEntries?: DebugEntries; debugRunning?: DebugFl
       case 'subagent_round': { const id = value(event, 'id'); const roundText = value(event, 'text'); const label = roundText ? `Round ${Number(event.round || 0)} · "${roundText}"` : `Round ${Number(event.round || 0)}`; update(id, x => x.kind === 'subagent' ? {...x, rounds: [...(x.rounds || []), label]} : x); break; }
       case 'subagent_tool': { const id = value(event, 'id'); const toolId = value(event, 'tool_use_id') || `${value(event, 'name')}-${Date.now()}`; const status = event.ok === null || event.ok === undefined ? 'running' : (event.ok ? 'done' : 'failed'); const name = value(event, 'name') || 'tool'; const summary = value(event, 'summary'); update(id, x => { if (x.kind !== 'subagent') return x; const tools = x.tools || []; const idx = tools.findIndex(tool => tool.id === toolId); const nextTool = {id: toolId, name, summary, status: status as SubagentStatus}; const nextTools = idx >= 0 ? tools.map((tool, i) => i === idx ? {...tool, ...nextTool} : tool) : [...tools, nextTool]; return {...x, tools: nextTools, toolCount: nextTools.length}; }); break; }
       case 'subagent_end': { const id = value(event, 'id'); const ts = Number(event.ts || 0) * 1000 || Date.now(); update(id, x => x.kind === 'subagent' ? {...x, status: event.ok ? 'done' : 'failed', done: true, ok: Boolean(event.ok), end: ts, toolCount: Number(event.tools || x.toolCount || 0), elapsed: Number(event.elapsed || 0), summary: value(event, 'summary')} : x); break; }
+      case 'goal_started': begin('goal planning'); add({id: `goal-${value(event, 'id')}-${Date.now()}`, kind: 'log', text: 'Goal', detail: `${value(event, 'id')} ${value(event, 'phase')}`}); break;
+      case 'goal_status':
+      case 'goal_phase': { const status = value(event, 'status'); const active = status === 'running' || status === 'pausing' || status === 'cancelling'; setRunning(active); setPhase(active ? `goal: ${value(event, 'phase')}` : 'idle'); if (!active) setStartedAt(0); add({id: `goal-${value(event, 'id')}-${Date.now()}`, kind: 'log', text: 'Goal', detail: `${value(event, 'phase')} (${status})`}); break; }
+      case 'goal_stopped': setRunning(false); setPhase(value(event, 'status') === 'cancelled' ? 'interrupted' : 'idle'); setStartedAt(0); add({id: `goal-${value(event, 'id')}-${Date.now()}`, kind: 'log', text: 'Goal', detail: `${value(event, 'status')}${value(event, 'stop_reason') ? `: ${value(event, 'stop_reason')}` : ''}`}); break;
       case 'task_update': {
         const tasks = Array.isArray(event.tasks) ? event.tasks : [];
         const existing = entries().find(entry => entry.id === 'tasks:current');
@@ -897,7 +901,8 @@ export function App(props?: {debugEntries?: DebugEntries; debugRunning?: DebugFl
   const submit = () => {
     const text = input().trim();
     if (!text) return;
-    if (running()) {
+    const isGoalControl = /^\/goal\s+(?:status|pause|cancel)\s*$/i.test(text);
+    if (running() && !isGoalControl) {
       add({id: `log-${Date.now()}`, kind: 'log', text: 'Agent is already running', detail: 'press Ctrl+K to interrupt first'});
       return;
     }

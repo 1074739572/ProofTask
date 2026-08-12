@@ -40,6 +40,7 @@ class GoalPhase(str, Enum):
 class GoalStatus(str, Enum):
     RUNNING = "running"
     PAUSING = "pausing"
+    CANCELLING = "cancelling"
     PAUSED = "paused"
     DONE = "done"
     FAILED = "failed"
@@ -85,6 +86,10 @@ class GoalState:
     # L6 v2 decomposition: all features of this goal, in plan order.
     # Empty = legacy single-feature goal (feature_id is the one feature).
     feature_ids: list[str] = field(default_factory=list)
+    # Planner output is persisted before task/feature projections are created,
+    # so an interrupted INITIALIZE phase can be replayed idempotently.
+    feature_plan: list[dict[str, Any]] = field(default_factory=list)
+    initialization_complete: bool = False
 
     max_rounds_per_attempt: int = DEFAULT_MAX_ROUNDS_PER_ATTEMPT
     max_total_rounds: int = DEFAULT_MAX_ROUNDS_PER_ATTEMPT * DEFAULT_MAX_ATTEMPTS
@@ -101,6 +106,7 @@ class GoalState:
     updated_at: float = field(default_factory=time.time)
     completed_at: float | None = None
     paused_at: float | None = None
+    cancellation_requested_at: float | None = None
 
     last_phase: str | None = None
     last_error: str | None = None
@@ -148,6 +154,13 @@ class GoalState:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "GoalState":
         data = dict(data)
+        # Goals written before durable planning did not have this marker. A
+        # linked task plus at least one feature is already a complete graph.
+        if "initialization_complete" not in data:
+            data["initialization_complete"] = bool(
+                data.get("task_id")
+                and (data.get("feature_ids") or data.get("feature_id"))
+            )
         for key in list(data):
             if key not in cls.__dataclass_fields__:
                 data.pop(key, None)

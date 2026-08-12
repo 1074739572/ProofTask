@@ -156,6 +156,12 @@ def _handle_pause(runner) -> str:
 
 def _handle_cancel(runner) -> str:
     state = runner.cancel_goal()
+    if state.status != GoalStatus.CANCELLED.value:
+        return (
+            "Goal cancellation requested [cancelling]\n"
+            f"  Phase: {state.phase}\n"
+            "  The current operation will stop at its next checkpoint."
+        )
     return (
         f"Goal stopped [cancelled]\n"
         f"  Reason: {state.stop_reason}\n"
@@ -181,7 +187,11 @@ def _start_precondition_note(request: Any) -> str | None:
     from harness.settings import get_workdir
     from harness.verification import check_verification_command
 
-    if agent_lock.locked():
+    # ``threading.RLock.locked()`` is unavailable on supported Python 3.11.
+    acquired = agent_lock.acquire(blocking=False)
+    if acquired:
+        agent_lock.release()
+    else:
         return (
             "Cannot start /goal while an agent turn is running — "
             "wait for it to finish first."

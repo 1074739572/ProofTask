@@ -104,3 +104,11 @@ resume/
 resume_source.pdf
 _ref/codex/
 _ref/
+
+# Playwright MCP screenshots
+.playwright-mcp/
+# Scratch scripts (other-project exploration)
+_chunk.py
+_parse_flow.py
+_parser_defs.py
+_strat*.py

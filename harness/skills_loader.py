@@ -2,11 +2,18 @@
 
 from __future__ import annotations
 
+import threading
+from pathlib import Path
+
 import yaml
 
-from harness.settings import SKILLS_DIR
+from harness import settings
 
 SKILL_REGISTRY: dict[str, dict] = {}
+_REGISTRY_LOCK = threading.RLock()
+_registry_generation = -1
+MAX_SKILL_BODY_BYTES = 8_000
+MAX_SKILL_DESCRIPTION_CHARS = 1_024
 
 # User-role injection when the human forces a skill into the session ( /skill ).
 SKILL_LOADED_PREFIX = "[Skill loaded:"
@@ -20,33 +27,67 @@ def _parse_frontmatter(text: str) -> tuple[dict, str]:
         return {}, text
     try:
         meta = yaml.safe_load(parts[1]) or {}
+        if not isinstance(meta, dict):
+            meta = {}
     except yaml.YAMLError:
         meta = {}
     return meta, parts[2].strip()
 
 
+def skill_roots() -> list[tuple[str, Path]]:
+    """Return skill roots from lowest to highest precedence."""
+    roots = [("builtin", settings.BUILTIN_SKILLS_DIR), ("global", settings.get_global_skills_dir()), ("project", settings.get_project_skills_dir())]
+    seen: set[Path] = set()
+    result = []
+    for source, root in roots:
+        root = root.resolve()
+        if root not in seen:
+            result.append((source, root))
+            seen.add(root)
+    return result
+
+
 def scan_skills() -> None:
-    SKILL_REGISTRY.clear()
-    if not SKILLS_DIR.exists():
-        return
-    for directory in sorted(SKILLS_DIR.iterdir()):
-        if not directory.is_dir():
+    global _registry_generation
+    fresh: dict[str, dict] = {}
+    for source, root in skill_roots():
+        if not root.exists():
             continue
-        manifest = directory / "SKILL.md"
-        if not manifest.exists():
+        try:
+            directories = sorted(root.iterdir())
+        except OSError:
             continue
-        raw = manifest.read_text(encoding="utf-8")
-        meta, _ = _parse_frontmatter(raw)
-        name = meta.get("name", directory.name)
-        desc = meta.get("description", raw.split("\n")[0].lstrip("#").strip())
-        SKILL_REGISTRY[name] = {
-            "name": name,
-            "description": desc,
-            "content": raw,
-        }
+        for directory in directories:
+            if not directory.is_dir():
+                continue
+            manifest = directory / "SKILL.md"
+            if not manifest.exists():
+                continue
+            try:
+                raw = manifest.read_text(encoding="utf-8")
+            except (OSError, UnicodeError):
+                continue
+            meta, _ = _parse_frontmatter(raw)
+            name = str(meta.get("name", directory.name)).strip()
+            if not name:
+                continue
+            desc = str(meta.get("description", raw.split("\n")[0].lstrip("#").strip()))
+            fresh[name] = {
+                "name": name,
+                "description": desc[:MAX_SKILL_DESCRIPTION_CHARS],
+                "content": raw,
+                "path": str(manifest),
+                "source": source,
+            }
+    with _REGISTRY_LOCK:
+        SKILL_REGISTRY.clear()
+        SKILL_REGISTRY.update(fresh)
+        _registry_generation = settings.workspace_generation()
 
 
 def list_skills() -> str:
+    if _registry_generation != settings.workspace_generation():
+        scan_skills()
     if not SKILL_REGISTRY:
         return "(no skills found)"
     return "\n".join(
@@ -57,20 +98,23 @@ def list_skills() -> str:
 
 def skill_names() -> list[str]:
     """Sorted skill ids for pickers."""
+    if _registry_generation != settings.workspace_generation():
+        scan_skills()
     return sorted(SKILL_REGISTRY.keys())
 
 
 def load_skill(name: str) -> str:
+    if _registry_generation != settings.workspace_generation():
+        scan_skills()
     skill = SKILL_REGISTRY.get(name)
     if not skill:
         available = ", ".join(SKILL_REGISTRY.keys()) or "(none)"
         return f"Skill not found: {name}. Available: {available}"
     content = skill["content"]
-    if name == "thesis-writing":
-        from harness.rag.bootstrap import bootstrap_message, ensure_rag_indexed
-
-        boot = ensure_rag_indexed("files")
-        content = content + "\n\n" + bootstrap_message(boot)
+    encoded = content.encode("utf-8")
+    if len(encoded) > MAX_SKILL_BODY_BYTES:
+        content = encoded[:MAX_SKILL_BODY_BYTES].decode("utf-8", errors="ignore")
+        content += "\n\n[skill body truncated; read the source file for the remainder]"
     return content
 
 

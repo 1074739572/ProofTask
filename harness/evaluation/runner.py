@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from harness.agents.registry import get_agent_profile, validate_agent_model
 from harness.agents.runner import run_agent_task
@@ -42,6 +42,10 @@ def requires_evaluation(feature: Feature) -> bool:
 def run_evaluation(
     feature_id: str,
     workspace: str | Path | None = None,
+    *,
+    cancel_check: Callable[[], bool] | None = None,
+    deadline: float | None = None,
+    stats=None,
 ) -> Feature:
     """Run the independent evaluator and record findings on the feature.
 
@@ -78,6 +82,9 @@ def run_evaluation(
         prompt=prompt,
         agent_type=EVALUATOR_AGENT,
         cwd=str(feature.workspace or workspace) if (feature.workspace or workspace) else None,
+        cancel_check=cancel_check,
+        deadline=deadline,
+        stats=stats,
     )
     parsed: Findings = parse_findings(raw)
 

@@ -46,7 +46,7 @@ LEGAL: dict[str, set[str]] = _with_terminal_escapes(
         GoalPhase.EVALUATE.value: {GoalPhase.CLEAN_CHECK.value, GoalPhase.SELECT_FEATURE.value},
         GoalPhase.CLEAN_CHECK.value: {GoalPhase.DONE.value, GoalPhase.ACT.value, GoalPhase.SELECT_FEATURE.value},
         GoalPhase.FULL_VERIFY.value: {GoalPhase.CLEAN_CHECK.value},
-        GoalPhase.PAUSED.value: {GoalPhase.SELECT_FEATURE.value},
+        GoalPhase.PAUSED.value: {GoalPhase.INITIALIZE.value, GoalPhase.SELECT_FEATURE.value},
         GoalPhase.DONE.value: set(),
         GoalPhase.CANCELLED.value: set(),
         GoalPhase.FAILED.value: set(),

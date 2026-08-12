@@ -21,7 +21,6 @@ Security gates before any subprocess spawns:
 from __future__ import annotations
 
 import ctypes
-import shlex
 import subprocess
 import sys
 import threading
@@ -36,7 +35,7 @@ from harness.tools.filesystem import (
     _kill_process_tree,
     _wait_with_escalation,
 )
-from harness.verification.policy import check_verification_command
+from harness.verification.policy import check_verification_command, split_verification_command
 from harness.verification.snapshot import capture_code_snapshot
 
 #: Default hard timeout for a single verification command (seconds).
@@ -137,7 +136,7 @@ def run_verification(
 
     cwd = Path(workspace).expanduser().resolve() if workspace else get_workdir()
     try:
-        argv = shlex.split(command)
+        argv = split_verification_command(command)
     except ValueError as exc:
         return _reject(f"unparseable command: {exc}")
 

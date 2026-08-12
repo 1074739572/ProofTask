@@ -22,13 +22,14 @@ import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from harness.settings import get_workdir
 from harness.verification.policy import check_verification_command
 
 #: Read-only subagent used for planning (same large-context explorer).
-PLANNER_AGENT = "explore"
+PLANNER_AGENT = "goal_planner"
+PLANNER_MAX_ROUNDS = 30
 #: Bounds on the plan size (runaway decomposition protection).
 MIN_FEATURES = 1
 MAX_FEATURES = 8
@@ -61,6 +62,15 @@ class FeaturePlan:
             "verification": self.verification,
             "depends_on": list(self.depends_on),
         }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "FeaturePlan":
+        return cls(
+            name=str(data["name"]),
+            behavior=str(data["behavior"]),
+            verification=str(data.get("verification") or ""),
+            depends_on=tuple(str(dep) for dep in (data.get("depends_on") or ())),
+        )
 
 
 def build_plan_prompt(target: str, full_verification: str) -> str:
@@ -158,6 +168,9 @@ def parse_plan(raw: str) -> list[FeaturePlan] | None:
         behavior = str(entry.get("behavior") or "").strip()
         if not name or not behavior:
             return None
+        # The stored name is capped below, so validate uniqueness after the
+        # same normalization used by the task/feature projection.
+        name = name[:80]
         if name in names:
             return None
         verification = str(entry.get("verification") or "").strip()
@@ -177,7 +190,7 @@ def parse_plan(raw: str) -> list[FeaturePlan] | None:
         names.add(name)
         plans.append(
             FeaturePlan(
-                name=name[:80],
+                name=name,
                 behavior=behavior[:MAX_BEHAVIOR_CHARS],
                 verification=verification,
                 depends_on=dep_names,
@@ -192,6 +205,9 @@ def plan_features(
     workspace: Path | None = None,
     *,
     planner_runner=None,
+    cancel_check: Callable[[], bool] | None = None,
+    deadline: float | None = None,
+    stats=None,
 ) -> list[FeaturePlan]:
     """Decompose the goal via the read-only planner subagent.
 
@@ -208,6 +224,10 @@ def plan_features(
             prompt=build_plan_prompt(target, full_verification),
             agent_type=PLANNER_AGENT,
             cwd=str(root),
+            max_rounds=PLANNER_MAX_ROUNDS,
+            cancel_check=cancel_check,
+            deadline=deadline,
+            stats=stats,
         )
     except Exception:
         # A crashed planner must never kill the goal: fall back to a single

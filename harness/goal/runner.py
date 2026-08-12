@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any
 
 from harness.agent.cancel import clear_cancel, request_cancel
+from harness.agents.runner import AgentTaskStats
 from harness.clean import run_clean_check
 from harness.evaluation import run_evaluation
 from harness.goal.engine import GoalEngine
@@ -38,8 +39,8 @@ from harness.goal.models import (
     GoalState,
     StopReason,
 )
-from harness.goal.policy import check_stop
-from harness.goal.planner import plan_features
+from harness.goal.policy import check_stop, validate_limits
+from harness.goal.planner import PLANNER_MAX_ROUNDS, plan_features
 from harness.goal.store import (
     GoalStoreError,
     archive_goal,
@@ -47,6 +48,7 @@ from harness.goal.store import (
     save_goal,
 )
 from harness.loop import LoopStats, agent_lock, agent_loop
+from harness.project.resume import checkpoint_history
 from harness.settings import get_workdir, workspace_generation
 from harness.verification import run_verification, verify_feature_command
 
@@ -221,6 +223,19 @@ def start_goal(
             raise GoalBusyError(
                 "A goal is already running. Use /goal status|pause|cancel first."
             )
+        existing = load_goal()
+        if existing is not None and existing.status not in (
+            GoalStatus.DONE.value,
+            GoalStatus.FAILED.value,
+            GoalStatus.CANCELLED.value,
+        ):
+            raise GoalBusyError(
+                f"Goal {existing.id} is {existing.status}. Resume, cancel, or finish it before starting another goal."
+            )
+        if existing is not None:
+            # The current slot will be replaced below; retain terminal runs in
+            # history even if an earlier worker could not archive them.
+            archive_goal(existing)
         state = GoalState.new(
             target=request.target,
             verification=request.verification,
@@ -232,6 +247,9 @@ def start_goal(
             max_consecutive_failures=request.max_consecutive_failures,
             max_duration_seconds=request.max_duration_seconds,
         )
+        problems = validate_limits(state)
+        if problems:
+            raise ValueError("invalid goal limits: " + "; ".join(problems))
         save_goal(state)
         _emit("goal_started", id=state.id, phase=state.phase, status=state.status)
         runner = GoalRunner(
@@ -282,8 +300,16 @@ def resume_goal(*, history: list, context: dict, binding: Any) -> GoalState:
         if state.paused_at is not None:
             state.started_at += time.time() - state.paused_at
         state.paused_at = None
+        # ``workspace_generation`` is process-local. The path check above is
+        # the durable identity test; bind a resumed run to this process.
+        state.workspace_generation = workspace_generation()
         engine = GoalEngine()
-        state = engine.transition(state, GoalPhase.SELECT_FEATURE, "resumed")
+        resume_phase = (
+            GoalPhase.SELECT_FEATURE
+            if state.initialization_complete
+            else GoalPhase.INITIALIZE
+        )
+        state = engine.transition(state, resume_phase, "resumed")
         save_goal(state)
         _emit("goal_status", id=state.id, phase=state.phase, status=state.status)
         runner = GoalRunner(
@@ -364,6 +390,7 @@ class GoalRunner(threading.Thread):
         self._pause_event = threading.Event()
         self._cancel_event = threading.Event()
         self._act_in_flight = False
+        self._phase_in_flight = False
         self._archived = False
         self.engine = GoalEngine()
 
@@ -374,6 +401,7 @@ class GoalRunner(threading.Thread):
             return self._state.status in (
                 GoalStatus.RUNNING.value,
                 GoalStatus.PAUSING.value,
+                GoalStatus.CANCELLING.value,
             )
 
     def request_pause(self) -> GoalState:
@@ -386,7 +414,7 @@ class GoalRunner(threading.Thread):
             state.status = GoalStatus.PAUSING.value
             save_goal(state)
             self._pause_event.set()
-            in_flight = self._act_in_flight
+            in_flight = self._phase_in_flight
         if in_flight:
             from harness.agent.cancel import request_cancel
 
@@ -401,10 +429,14 @@ class GoalRunner(threading.Thread):
             if state.status not in (
                 GoalStatus.RUNNING.value,
                 GoalStatus.PAUSING.value,
+                GoalStatus.CANCELLING.value,
             ):
                 raise GoalNotRunningError("Goal is not running.")
+            state.status = GoalStatus.CANCELLING.value
+            state.cancellation_requested_at = state.cancellation_requested_at or time.time()
+            save_goal(state)
             self._cancel_event.set()
-            in_flight = self._act_in_flight
+            in_flight = self._phase_in_flight
         if in_flight:
             from harness.agent.cancel import request_cancel
 
@@ -435,6 +467,7 @@ class GoalRunner(threading.Thread):
         finally:
             with self._lock:
                 self._act_in_flight = False
+                self._phase_in_flight = False
             self._archive_terminal()
 
     def _drive(self) -> None:
@@ -530,41 +563,135 @@ class GoalRunner(threading.Thread):
             raise GoalNotRunningError(f"cannot step from terminal phase {phase}")
 
     def _initialize(self, state: GoalState) -> None:
-        from harness.tasks import attach_feature, claim_task, create_task
-        from harness.features import create_feature
+        from harness.features import create_feature, get_feature, list_features
+        from harness.goal.planner import FeaturePlan
+        from harness.tasks import attach_feature, claim_task, create_task, list_tasks, load_task
+
+        workspace = Path(state.workspace)
+        if not state.feature_plan:
+            # Persist the read-only plan before creating any task/feature
+            # projection. A restart can then replay the exact same graph.
+            stats = AgentTaskStats()
+            try:
+                clear_goal_permission_flags()
+                set_goal_noninteractive(True)
+                with agent_lock:
+                    with self._lock:
+                        if self._cancel_event.is_set() or self._pause_event.is_set():
+                            return
+                        clear_cancel()
+                        self._phase_in_flight = True
+                    plans = plan_features(
+                        state.target,
+                        state.verification,
+                        workspace,
+                        cancel_check=self._phase_interrupted,
+                        deadline=self._deadline(state),
+                        stats=stats,
+                    )
+            finally:
+                set_goal_noninteractive(False)
+                with self._lock:
+                    self._phase_in_flight = False
+
+            state.total_llm_rounds += stats.llm_rounds
+            if self._handle_phase_interruption(state, stats):
+                return
+            state.feature_plan = [plan.to_dict() for plan in plans]
+            # ``max_total_rounds`` is an aggregate budget. Feature-local
+            # retries, planner work and optional evaluation all consume it.
+            per_feature = state.max_rounds_per_attempt * state.max_attempts
+            if state.evaluation_required:
+                per_feature += PLANNER_MAX_ROUNDS
+            state.max_total_rounds = max(
+                state.max_total_rounds,
+                PLANNER_MAX_ROUNDS + len(plans) * per_feature,
+            )
+            save_goal(state)
+        plans = [FeaturePlan.from_dict(item) for item in state.feature_plan]
 
         short = state.target.strip()[:40] or "goal"
-        task = create_task(subject=f"Goal: {short}", description=state.target)
-        claim_task(task.id, owner=f"goal:{state.id}")
-        state.task_id = task.id
-        state.workspace = str(Path(state.workspace))
-        save_goal(state)
+        task = None
+        if state.task_id:
+            try:
+                task = load_task(state.task_id)
+            except FileNotFoundError:
+                self._fail(
+                    state,
+                    StopReason.missing_dependency,
+                    f"task {state.task_id} is missing",
+                )
+                return
+        else:
+            # Recover the narrow crash window between create_task() and the
+            # first goal-state save by using the durable goal_id projection.
+            task = next((item for item in list_tasks() if item.goal_id == state.id), None)
+            if task is None:
+                task = create_task(
+                    subject=f"Goal: {short}",
+                    description=state.target,
+                    goal_id=state.id,
+                )
+            state.task_id = task.id
+            save_goal(state)
 
-        # L6 v2: decompose the goal into a feature plan (dependency DAG).
-        plans = plan_features(state.target, state.verification, Path(state.workspace))
+        if task.status == "pending":
+            claim_task(task.id, owner=f"goal:{state.id}")
+            task = load_task(task.id)
+        state.workspace = str(workspace)
+
+        # Recover features created just before their ids reached goal.json.
+        candidates = list_features(workspace=workspace)
+        used_ids = set(state.feature_ids)
         name_to_id: dict[str, str] = {}
-        created: list[str] = []
-        for plan in plans:
-            # Deps only reference earlier plans (parse_plan enforces this),
-            # so their ids are already resolved here.
-            deps = [name_to_id[dep] for dep in plan.depends_on if dep in name_to_id]
-            feature = create_feature(
-                name=plan.name,
-                behavior=plan.behavior,
-                verification=plan.verification or state.verification,
-                workspace=Path(state.workspace),
-                task_id=task.id,
-                evaluation_required=state.evaluation_required,
-                depends_on=deps,
-            )
-            name_to_id[plan.name] = feature.id
-            created.append(feature.id)
-            attach_feature(task.id, feature.id)
+        for index, plan in enumerate(plans):
+            feature_id = state.feature_ids[index] if index < len(state.feature_ids) else None
+            feature = None
+            if feature_id:
+                try:
+                    feature = get_feature(feature_id, workspace=workspace)
+                except FileNotFoundError:
+                    feature_id = None
+            if feature is None:
+                matches = [
+                    item
+                    for item in candidates
+                    if item.id not in used_ids
+                    and item.task_id == task.id
+                    and item.name == plan.name
+                    and item.behavior == plan.behavior
+                ]
+                if len(matches) == 1:
+                    feature = matches[0]
+                    feature_id = feature.id
+                else:
+                    deps = [name_to_id[dep] for dep in plan.depends_on]
+                    feature = create_feature(
+                        name=plan.name,
+                        behavior=plan.behavior,
+                        verification=plan.verification or state.verification,
+                        workspace=workspace,
+                        task_id=task.id,
+                        evaluation_required=state.evaluation_required,
+                        depends_on=deps,
+                    )
+                    feature_id = feature.id
+                    candidates.append(feature)
 
-        state.feature_ids = created
-        state.feature_id = created[0] if created else None
+            if index < len(state.feature_ids):
+                state.feature_ids[index] = feature_id
+            else:
+                state.feature_ids.append(feature_id)
+            used_ids.add(feature_id)
+            name_to_id[plan.name] = feature_id
+            state.feature_id = state.feature_ids[0]
+            save_goal(state)
+            attach_feature(task.id, feature_id)
+
+        state.initialization_complete = True
+        state.feature_id = state.feature_ids[0] if state.feature_ids else None
         save_goal(state)
-        if len(created) > 1:
+        if len(state.feature_ids) > 1:
             # L6 v2 confirmation gate: a decomposed plan pauses for approval —
             # /goal status shows the plan, /goal resume approves execution.
             self._apply(state, GoalPhase.PAUSED, "plan_ready")
@@ -704,6 +831,7 @@ class GoalRunner(threading.Thread):
                     if self._cancel_event.is_set() or self._pause_event.is_set():
                         return
                     self._act_in_flight = True
+                    self._phase_in_flight = True
                     state.status = GoalStatus.RUNNING.value
                     save_goal(state)
                     self._history.append(
@@ -721,8 +849,16 @@ class GoalRunner(threading.Thread):
             set_goal_noninteractive(False)
             with self._lock:
                 self._act_in_flight = False
+                self._phase_in_flight = False
 
         state.total_llm_rounds += stats.llm_rounds
+        if self._binding is not None:
+            try:
+                checkpoint_history(self._history, binding=self._binding)
+            except Exception:
+                # Checkpoints improve recovery but must not mask the actual
+                # goal result when a session backend is temporarily unavailable.
+                pass
         state.attempts += 1
         if self._progress_snapshot(state) == before:
             state.no_progress_count += 1
@@ -805,12 +941,34 @@ class GoalRunner(threading.Thread):
         self._apply(state, GoalPhase.ACT, "verification_failed", error=error)
 
     def _evaluate(self, state: GoalState) -> None:
+        stats = AgentTaskStats()
         try:
-            feature = run_evaluation(state.feature_id, workspace=state.workspace)
+            clear_goal_permission_flags()
+            set_goal_noninteractive(True)
+            with agent_lock:
+                with self._lock:
+                    if self._cancel_event.is_set() or self._pause_event.is_set():
+                        return
+                    clear_cancel()
+                    self._phase_in_flight = True
+                feature = run_evaluation(
+                    state.feature_id,
+                    workspace=state.workspace,
+                    cancel_check=self._phase_interrupted,
+                    deadline=self._deadline(state),
+                    stats=stats,
+                )
             if feature.evaluation and feature.evaluation.get("error"):
                 state.last_error = str(feature.evaluation["error"])[:300]
         except Exception as exc:
             state.last_error = f"evaluation failed: {exc}"
+        finally:
+            set_goal_noninteractive(False)
+            with self._lock:
+                self._phase_in_flight = False
+        state.total_llm_rounds += stats.llm_rounds
+        if self._handle_phase_interruption(state, stats):
+            return
         if self._has_pending_feature(state):
             self._apply(state, GoalPhase.SELECT_FEATURE, "evaluation_done")
         else:
@@ -848,12 +1006,52 @@ class GoalRunner(threading.Thread):
             self._fail(state, StopReason.clean_check_failed, report.summary())
             return
         if len(self._feature_ids(state)) > 1:
-            # L6 v2: a clean failure re-evaluates the whole feature plan.
-            self._apply(state, GoalPhase.SELECT_FEATURE, "clean_check_failed", error=state.last_error)
+            # Reopen a concrete feature and return to ACT.  Merely selecting
+            # all-passing features would otherwise cycle SELECT -> FULL_VERIFY
+            # -> CLEAN_CHECK without giving the agent the failure evidence.
+            from harness.features import reopen_feature
+
+            target_id = state.feature_id or self._feature_ids(state)[-1]
+            reopen_feature(target_id, workspace=Path(state.workspace))
+            state.feature_id = target_id
+            self._apply(state, GoalPhase.ACT, "clean_check_failed", error=state.last_error)
             return
         self._apply(state, GoalPhase.ACT, "clean_check_failed", error=state.last_error)
 
     # --- helpers -------------------------------------------------------------
+
+    def _phase_interrupted(self) -> bool:
+        """Cancellation callback for planner/evaluator subagents."""
+        return self._cancel_event.is_set() or self._pause_event.is_set()
+
+    def _deadline(self, state: GoalState) -> float:
+        remaining = max(0.0, state.max_duration_seconds - (time.time() - state.started_at))
+        return time.monotonic() + remaining
+
+    def _handle_phase_interruption(self, state: GoalState, stats: AgentTaskStats) -> bool:
+        """Apply control signals before a planner/evaluator result is used."""
+        if self._cancel_event.is_set() or stats.stop_reason == "cancelled" and self._cancel_event.is_set():
+            self._cancel(state, "user requested cancel")
+            return True
+        if self._pause_event.is_set():
+            self._pause(state, "user_pause")
+            return True
+        if stats.stop_reason == "deadline" or time.time() - state.started_at >= state.max_duration_seconds:
+            self._fail(
+                state,
+                StopReason.max_duration,
+                f"exceeded max_duration_seconds={state.max_duration_seconds}",
+            )
+            return True
+        if goal_permission_pending():
+            clear_goal_permission_flags()
+            self._pause(
+                state,
+                "permission_wait",
+                stop_reason=StopReason.permission_wait.value,
+            )
+            return True
+        return False
 
     def _progress_snapshot(self, state: GoalState) -> tuple:
         """(feature file mtime, feature last_error, code snapshot) — used for
