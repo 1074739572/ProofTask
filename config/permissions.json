@@ -60,13 +60,13 @@
       "**/.project/goal-history/*": "deny"
     },
     "bash": {
-      "*": "ask",
+      "*": "allow",
       "dir *": "allow",
       "where *": "allow",
       "git status*": "allow",
       "git diff*": "allow",
       "git log*": "allow",
-      "python -c *": "ask",
+      "python -c *": "allow",
       "*.features*": "deny",
       "*.project/goal.json*": "deny",
       "*.project/goal-history*": "deny",

@@ -82,7 +82,7 @@ class GoalRequest:
     max_attempts: int = 3
     max_consecutive_failures: int = 3
     max_duration_seconds: int = 1800
-    evaluation_required: bool = False
+    evaluation_required: bool = True
 
 
 # --- thread-local non-interactive permission context -------------------------

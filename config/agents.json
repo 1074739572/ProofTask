@@ -20,8 +20,8 @@
       "system": "You are the large-context, read-only exploration worker. Search and read all files needed for the assigned question, identify relevant paths and symbols, and return evidence-backed findings for the lead. NEVER modify files. Do not design unrelated changes or spawn subagents."
     },
     "goal_planner": {
-      "model_id": "mimo-v2.5-pro",
-      "label": "Goal planner (read-only)",
+      "model_id": "deepseek-v4-pro",
+      "label": "Goal planner (DeepSeek V4 Pro, read-only)",
       "tools": ["read_file", "glob"],
       "system": "You plan a goal into independently verifiable features. Inspect only with the provided read-only tools. Return the requested structured plan and never modify files or spawn subagents."
     },
