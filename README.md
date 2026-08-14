@@ -54,20 +54,28 @@ pip install -r requirements.txt
 python main.py
 ```
 
-启动一个自主 Goal：
+创建一个 Goal 草案：
 
 ```text
-/goal --verify "python -m pytest -q" -- 修复分页接口并补齐边界测试
+/goal 修复分页接口并补齐边界测试
 ```
 
-控制执行：
+系统会读取 `HARNESS.md`、测试配置和实际 pytest 收集结果，先提出无法从仓库判断的问题，再预览 Task、验收条件、测试方案和全局回归命令。它不会在此阶段写代码。
+
+确认与控制：
 
 ```text
+/goal preview
+/goal answer 空页也必须返回统一结构
+/goal approve   # 只允许生成测试并验证失败基线
+/goal run       # 审阅测试后，允许进入业务实现
 /goal status
 /goal pause
 /goal resume
 /goal cancel
 ```
+
+`/goal --verify "<command>" -- <需求>` 仍可手动覆盖推断出的全局回归命令。
 
 ## 验证
 

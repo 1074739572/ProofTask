@@ -14,10 +14,11 @@ Goal -> Task -> Acceptance Cases -> Test Binding -> Evidence -> Delivery
 - 启动命令行：`python main.py`
 - 运行 Goal 定向测试：`python -m pytest -q tests/test_goal_module.py tests/test_goal_task_contract.py tests/test_goal_clean_scope.py`
 - 运行完整可靠性评估：`python -m evals`
-- 启动一个 Goal：`/goal --verify "python -m pytest -q" -- 修复分页接口并补齐边界测试`
+- 创建 Goal 草案：`/goal 修复分页接口并补齐边界测试`
+- 确认 Goal：`/goal preview`、`/goal answer <回答>`、`/goal approve`、`/goal run`
 - 控制 Goal：`/goal status`、`/goal pause`、`/goal resume`、`/goal cancel`
 
-`--verify` 是所有 Task 完成后的全局回归命令；每个 Task 另有自己绑定的聚焦测试。
+`--verify` 是可选的全局回归覆盖命令；默认由 `HARNESS.md`、测试配置和实际收集结果推断。`/goal approve` 只会写测试并确认失败基线，`/goal run` 才允许业务实现。每个 Task 另有自己绑定的聚焦测试。
 
 ## Hard Constraints
 

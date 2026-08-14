@@ -62,6 +62,19 @@ def _is_goal_control_command(query: str) -> bool:
     return parse_goal_subcommand(query) in ("status", "pause", "cancel")
 
 
+def _is_goal_draft_answer(query: str) -> bool:
+    """A normal composer message answers the active clarification question."""
+    if not query.strip() or query.lstrip().startswith("/"):
+        return False
+    try:
+        from harness.goal.draft import load_draft
+
+        draft = load_draft()
+        return bool(draft and draft.status == "clarifying")
+    except ValueError:
+        return False
+
+
 def _is_instant_slash_command(query: str) -> bool:
     """True when `query` is an instant configuration switch (model/mode/effort).
 
@@ -333,7 +346,8 @@ def _handle_slash_command(query: str, history: list, binding) -> tuple[str | Non
         return (
             "TUI commands:\n"
             "  /open <directory>  — switch workspace (instant, no restart)\n"
-            "  /goal --verify \"<cmd>\" -- <target>  — start an autonomous goal\n"
+            "  /goal <target>  — clarify and preview a verified Goal\n"
+            "  /goal approve  — write approved tests and start execution\n"
             "  /goal status|pause|resume|cancel  — control the goal\n"
             "  /init  — scan repo & create/improve HARNESS.md handbook\n"
             "  @path + Tab        — complete file/dir path\n"
@@ -374,6 +388,14 @@ def _run_user_turn(query: str, history: list, context: dict, binding, *, echo_us
     # messages, regardless of echo_user. Feedback is delivered via log events.
     if echo_user and not query.strip().startswith("/"):
         emit("user_message", text=query, silent=False)
+
+    if _is_goal_draft_answer(query):
+        from harness.goal.commands import handle_goal_draft_answer
+
+        note = handle_goal_draft_answer(query)
+        if note:
+            emit("assistant_message", text=note)
+            return context, False, binding
 
     # /open switches the workspace in-process (no backend restart): validate,
     # flip the active workspace root, re-bind sessions, and reset RAG caches.
@@ -575,7 +597,7 @@ def run_event_stream() -> None:
             query, echo_user = item
             # Slash commands (handled inside _run_user_turn, no LLM round) must
             # NOT flip the UI into "running": no agent_start, no running flag.
-            is_slash = query.strip().startswith("/")
+            is_slash = query.strip().startswith("/") or _is_goal_draft_answer(query)
             if not is_slash:
                 running.set()
                 emit("agent_start", phase="preparing")

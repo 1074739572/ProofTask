@@ -63,6 +63,7 @@ class StopReason(str, Enum):
     workspace_changed = "workspace_changed"
     task_failed = "task_failed"
     test_generation_required = "test_generation_required"
+    user_approval_required = "user_approval_required"
     full_verification_failed = "full_verification_failed"
     internal_error = "internal_error"
 
@@ -112,6 +113,9 @@ class GoalState:
     # Durable machine evidence for the Goal-level regression command. Task
     # evidence proves each unit; this records the final whole-goal gate.
     final_verification: dict[str, Any] | None = None
+    # Draft-backed Goals stop after test generation and a failing baseline.
+    # Only an explicit `/goal run` permits production implementation.
+    execution_approved: bool = True
     evaluation_required: bool = False
     transition_log: list[dict[str, Any]] = field(default_factory=list)
 

@@ -1,13 +1,13 @@
 """/goal CLI command parsing and handlers (L6).
 
-Command surface (docs/goal-mode-mvp-spec.md §4):
+Command surface:
 
-    /goal --verify "<command>" [--max-rounds N] [--max-attempts N]
-          [--max-failures N] [--timeout N] -- <target>
+    /goal <target>                         create a read-only Goal draft
+    /goal preview | answer | approve | revise | discard
     /goal status | pause | resume | cancel
 
-MVP deliberately does NOT infer the verification command from HARNESS.md or
-the model: a bare ``/goal <target>`` returns a usage error.
+``--verify`` remains an optional override for the inferred global regression
+command.  Only ``approve`` starts autonomous execution.
 """
 
 from __future__ import annotations
@@ -17,8 +17,9 @@ from typing import Any
 
 GOAL_USAGE = (
     "Usage:\n"
-    '  /goal --verify "<command>" -- <target>      start an autonomous goal\n'
-    "  /goal --verify \"<cmd>\" --max-rounds 20 --timeout 1800 --max-failures 3 -- <target>\n"
+    '  /goal <target>                              create a Goal draft\n'
+    '  /goal --verify "<command>" -- <target>      override inferred regression\n'
+    "  /goal preview | answer <text> | approve | run | revise <target> | discard\n"
     "  /goal status     view the current goal\n"
     "  /goal pause      pause (current round stops at the next checkpoint)\n"
     "  /goal resume     continue a paused goal\n"
@@ -36,7 +37,7 @@ _LIMIT_FLAGS = {
 
 
 def parse_goal_subcommand(query: str) -> str | None:
-    """'status' / 'pause' / 'resume' / 'cancel' / 'start', or None when the
+    """Goal action or None when the
     query is not a /goal command."""
     text = query.strip()
     if not text.lower().startswith("/goal"):
@@ -48,16 +49,16 @@ def parse_goal_subcommand(query: str) -> str | None:
         return "usage"
     if not tokens:
         return "usage"
-    if tokens[0] in ("status", "pause", "resume", "cancel"):
+    if tokens[0] in ("status", "pause", "resume", "cancel", "preview", "approve", "run", "discard", "answer", "revise"):
         return tokens[0]
-    return "start"
+    return "draft"
 
 
 def parse_goal_command(query: str) -> dict[str, Any]:
     """Parse a /goal query into an action dict (never raises).
 
     Returns ``{"action": ...}`` with ``usage`` actions carrying an ``error``
-    message, and ``start`` actions carrying verify/limits/target.
+    message, and ``draft`` actions carrying optional verify/limits/target.
     """
     action = parse_goal_subcommand(query)
     if action is None:
@@ -70,14 +71,22 @@ def parse_goal_command(query: str) -> dict[str, Any]:
         return {"action": "usage", "error": f"unparseable arguments: {exc}"}
     if not tokens:
         return {"action": "usage", "error": GOAL_USAGE}
-    if tokens[0] in ("status", "pause", "resume", "cancel"):
+    if tokens[0] in ("status", "pause", "resume", "cancel", "preview", "approve", "run", "discard"):
         if len(tokens) > 1:
             return {"action": "usage", "error": f"/goal {tokens[0]} takes no arguments"}
         return {"action": tokens[0]}
+    if tokens[0] in ("answer", "revise"):
+        value = rest[len(tokens[0]) :].strip()
+        if not value:
+            return {"action": "usage", "error": f"/goal {tokens[0]} requires text"}
+        return {"action": tokens[0], "text": value}
 
-    # Everything after `--` is target text (even tokens that look like flags).
+    # The simple form preserves the whole tail as the user requirement. The
+    # advanced form accepts limits and an optional explicit verification.
     if "--" not in tokens:
-        return {"action": "usage", "error": GOAL_USAGE}
+        if any(token.startswith("--") for token in tokens):
+            return {"action": "usage", "error": "options require -- before the goal target"}
+        return {"action": "draft", "verify": None, "limits": {}, "target": rest}
     idx = tokens.index("--")
     opts, target_parts = tokens[:idx], tokens[idx + 1 :]
     target = " ".join(target_parts).strip()
@@ -107,10 +116,8 @@ def parse_goal_command(query: str) -> dict[str, Any]:
             i += 2
         else:
             return {"action": "usage", "error": f"unknown option {tok!r}"}
-    if not verify:
-        return {"action": "usage", "error": GOAL_USAGE}
     return {
-        "action": "start",
+        "action": "draft",
         "verify": verify,
         "limits": limits,
         "target": target,
@@ -129,19 +136,34 @@ def handle_goal_command(query: str, history: list, context: dict, binding: Any) 
         return cmd.get("error") or GOAL_USAGE
     try:
         if action == "status":
-            return runner.get_goal_status()
+            status = runner.get_goal_status()
+            return _handle_preview() if status == "No goal in this workspace." else status
         if action == "pause":
             return _handle_pause(runner)
         if action == "cancel":
             return _handle_cancel(runner)
         if action == "resume":
             return _handle_resume(runner, history, context, binding)
-        return _handle_start(runner, cmd, history, context, binding)
+        if action == "preview":
+            return _handle_preview()
+        if action == "discard":
+            return _handle_discard()
+        if action == "answer":
+            return _handle_answer(cmd["text"])
+        if action == "revise":
+            return _handle_revise(cmd["text"])
+        if action == "approve":
+            return _handle_approve(runner, history, context, binding)
+        if action == "run":
+            return _handle_run(runner, history, context, binding)
+        return _handle_draft(cmd)
     except GoalStoreError as exc:
         return f"Goal state is {exc.code}: {exc}"
     except runner.GoalNotRunningError as exc:
         return str(exc)
     except runner.GoalBusyError as exc:
+        return str(exc)
+    except ValueError as exc:
         return str(exc)
 
 
@@ -155,6 +177,8 @@ def _handle_pause(runner) -> str:
 
 
 def _handle_cancel(runner) -> str:
+    from harness.goal.models import GoalStatus
+
     state = runner.cancel_goal()
     if state.status != GoalStatus.CANCELLED.value:
         return (
@@ -222,14 +246,81 @@ def _start_precondition_note(request: Any) -> str | None:
     return None
 
 
-def _handle_start(runner, cmd: dict, history: list, context: dict, binding: Any) -> str:
+def _handle_draft(cmd: dict) -> str:
+    from harness.goal.draft import GoalDraftError, create_draft, format_draft
+
+    try:
+        draft = create_draft(cmd["target"], verification=cmd.get("verify"), limits=cmd.get("limits"))
+    except GoalDraftError as exc:
+        return str(exc)
+    return format_draft(draft)
+
+
+def _handle_preview() -> str:
+    from harness.goal.draft import format_draft, load_draft
+
+    draft = load_draft()
+    return format_draft(draft) if draft else "No Goal draft. Start with: /goal <your requirement>"
+
+
+def _handle_answer(text: str) -> str:
+    from harness.goal.draft import GoalDraftError, answer_draft, format_draft
+
+    try:
+        return format_draft(answer_draft(text))
+    except GoalDraftError as exc:
+        return str(exc)
+
+
+def _handle_revise(target: str) -> str:
+    from harness.goal.draft import GoalDraftError, create_draft, discard_draft, load_draft, format_draft
+
+    existing = load_draft()
+    if existing:
+        discard_draft()
+    try:
+        return format_draft(create_draft(target, verification=existing.verification if existing else None, limits=existing.limits if existing else None))
+    except GoalDraftError as exc:
+        return str(exc)
+
+
+def _handle_discard() -> str:
+    from harness.goal.draft import discard_draft, load_draft
+
+    if load_draft() is None:
+        return "No Goal draft to discard."
+    discard_draft()
+    return "Goal draft discarded. No tests or implementation were written."
+
+
+def handle_goal_draft_answer(text: str) -> str | None:
+    """Consume a normal TUI message only while a draft awaits an answer."""
+    from harness.goal.draft import GoalDraftError, answer_draft, format_draft, load_draft
+
+    draft = load_draft()
+    if draft is None or draft.status != "clarifying":
+        return None
+    try:
+        return format_draft(answer_draft(text))
+    except GoalDraftError as exc:
+        return str(exc)
+
+
+def _handle_approve(runner, history: list, context: dict, binding: Any) -> str:
     from harness.goal.models import GoalState
     from harness.goal.runner import GoalRequest
+    from harness.goal.draft import GoalDraftError, approve_draft
 
+    try:
+        draft = approve_draft()
+    except GoalDraftError as exc:
+        return str(exc)
     request = GoalRequest(
-        target=cmd["target"],
-        verification=cmd["verify"],
-        **cmd["limits"],
+        target=draft.target,
+        verification=draft.verification,
+        task_plan=draft.task_plan,
+        await_execution_approval=True,
+        **draft.limits,
     )
     note = _start_precondition_note(request)
     if note is not None:
@@ -237,10 +328,23 @@ def _handle_start(runner, cmd: dict, history: list, context: dict, binding: Any)
     state = runner.start_goal(request, history=history, context=context, binding=binding)
     assert isinstance(state, GoalState)
     return (
-        f"Goal started: {state.id} [INITIALIZE]\n"
+        f"Goal test preparation started: {state.id} [INITIALIZE]\n"
         f"  Target: {state.target}\n"
         f"  Verification: {state.verification}\n"
+        "  The Goal will pause after generated tests have a failing baseline.\n"
+        "  Review them, then run: /goal run\n"
         f"  Limits: rounds/attempt={state.max_rounds_per_attempt}, "
         f"attempts={state.max_attempts}, failures={state.max_consecutive_failures}, "
         f"timeout={state.max_duration_seconds}s"
     )
+
+
+def _handle_run(runner, history: list, context: dict, binding: Any) -> str:
+    from harness.goal.models import StopReason
+    from harness.goal.store import load_goal
+
+    state = load_goal()
+    if state is None or state.stop_reason != StopReason.user_approval_required.value:
+        return "No Goal is waiting for execution approval. Use /goal resume for an ordinary paused Goal."
+    resumed = runner.resume_goal(history=history, context=context, binding=binding)
+    return f"Goal execution approved: {resumed.id} [SELECT_TASK]"

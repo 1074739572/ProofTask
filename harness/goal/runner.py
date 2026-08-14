@@ -38,6 +38,10 @@ class GoalBusyError(Exception):
 class GoalRequest:
     target: str
     verification: str
+    # A user-approved draft can seed the durable Task plan. The runner still
+    # owns test generation, baselines, implementation, and every completion gate.
+    task_plan: list[dict[str, Any]] | None = None
+    await_execution_approval: bool = False
     max_rounds_per_attempt: int = 20
     max_attempts: int = 3
     max_consecutive_failures: int = 3
@@ -244,6 +248,9 @@ def start_goal(request: GoalRequest, *, history: list, context: dict, binding: A
             max_rounds_per_attempt=request.max_rounds_per_attempt, max_attempts=request.max_attempts,
             max_consecutive_failures=request.max_consecutive_failures, max_duration_seconds=request.max_duration_seconds,
         )
+        if request.task_plan:
+            state.task_plan = [dict(item) for item in request.task_plan]
+        state.execution_approved = not request.await_execution_approval
         problems = validate_limits(state)
         if problems:
             raise ValueError("invalid goal limits: " + "; ".join(problems))
@@ -263,6 +270,11 @@ def resume_goal(*, history: list, context: dict, binding: Any) -> GoalState:
             raise GoalNotRunningError("No paused goal to resume.")
         if state.stop_reason == StopReason.test_generation_required.value:
             state.phase = GoalPhase.PREPARE_TESTS.value
+            state.status = GoalStatus.RUNNING.value
+            state.stop_reason = None
+        elif state.stop_reason == StopReason.user_approval_required.value:
+            state.execution_approved = True
+            state.phase = GoalPhase.SELECT_TASK.value
             state.status = GoalStatus.RUNNING.value
             state.stop_reason = None
         elif state.phase == GoalPhase.PREPARE_TESTS.value:
@@ -408,6 +420,12 @@ class GoalRunner(threading.Thread):
         save_goal(state)
         if self._needs_test_generation(state):
             self._apply(state, GoalPhase.PREPARE_TESTS, "task_tests_required")
+        elif not state.execution_approved:
+            self._pause(
+                state,
+                "plan_ready_for_user_approval",
+                stop_reason=StopReason.user_approval_required.value,
+            )
         else:
             self._apply(state, GoalPhase.SELECT_TASK, "initialize_complete")
 
@@ -457,6 +475,13 @@ class GoalRunner(threading.Thread):
                 save_goal(state)
                 return
             bind_task_verification(task.id, VerificationSpec(adapter="pytest", command=command, test_files=tuple(item.split("::", 1)[0] for item in selectors), selectors=tuple(selectors), source="generated", collected_count=len(selectors), baseline_result="failing", confidence="high").to_dict())
+        if not state.execution_approved:
+            self._pause(
+                state,
+                "tests_ready_for_user_approval",
+                stop_reason=StopReason.user_approval_required.value,
+            )
+            return
         self._apply(state, GoalPhase.SELECT_TASK, "task_tests_bound")
 
     @staticmethod

@@ -120,6 +120,56 @@ def test_test_generation_rejects_a_passing_baseline(tmp_path, monkeypatch):
     assert "passed before implementation" in state.last_error
 
 
+def test_draft_goal_pauses_after_a_failing_test_baseline_for_user_approval(tmp_path, monkeypatch):
+    import harness.goal.runner as runner_mod
+    from harness.tasks import load_task
+
+    task, state = _needs_generation_task(tmp_path, monkeypatch)
+    state.execution_approved = False
+    monkeypatch.setattr(runner_mod, "save_goal", lambda state: None)
+    monkeypatch.setattr(runner_mod, "_emit_goal", lambda *args: None)
+    monkeypatch.setattr(runner_mod, "run_agent_task", lambda **kwargs: '{"test_selectors":["tests/test_new.py::test_new"]}')
+    monkeypatch.setattr(
+        runner_mod,
+        "collect_pytest_catalog",
+        lambda workspace: TestCatalog(selectors=("tests/test_new.py::test_new",), test_files=("tests/test_new.py",)),
+    )
+    monkeypatch.setattr(
+        runner_mod,
+        "run_verification",
+        lambda *args, **kwargs: type("Result", (), {"passed": False, "error": None, "timed_out": False})(),
+    )
+
+    GoalRunner(state=state, history=[], context={}, binding=None)._prepare_tests(state)
+
+    assert load_task(task.id).verification_spec["baseline_result"] == "failing"
+    assert state.phase == GoalPhase.PAUSED.value
+    assert state.stop_reason == "user_approval_required"
+
+
+def test_draft_goal_with_existing_tests_still_waits_for_execution_approval(tmp_path, monkeypatch):
+    import harness.tasks as tasks
+    import harness.goal.runner as runner_mod
+
+    monkeypatch.setattr(tasks, "TASKS_DIR", tmp_path / ".tasks")
+    task = tasks.create_task(
+        "existing coverage",
+        "behavior",
+        verification_spec={"source": "discovered", "command": "python -m pytest -q", "selectors": ["tests/test_x.py::test_x"]},
+    )
+    state = GoalState.new(target="behavior", verification="python -m pytest -q", workspace=str(tmp_path))
+    state.task_plan = [{"name": "existing coverage"}]
+    state.task_ids = [task.id]
+    state.execution_approved = False
+    monkeypatch.setattr(runner_mod, "save_goal", lambda state: None)
+    monkeypatch.setattr(runner_mod, "_emit_goal", lambda *args: None)
+
+    GoalRunner(state=state, history=[], context={}, binding=None)._initialize(state)
+
+    assert state.phase == GoalPhase.PAUSED.value
+    assert state.stop_reason == "user_approval_required"
+
+
 def test_goal_forces_clean_enforcement_and_reverifies_all_tasks(monkeypatch):
     import harness.goal.runner as runner_mod
 
