@@ -222,6 +222,26 @@ def record_task_evaluation(task_id: str, evaluation: dict) -> Task:
     return task
 
 
+def record_task_reverification(
+    task_id: str,
+    *,
+    passed: bool,
+    evidence: dict | None = None,
+    error: str | None = None,
+) -> Task:
+    """Append final-goal verification evidence to an active or archived Task."""
+    path = _find_task_path(task_id)
+    if path is None:
+        raise FileNotFoundError(task_id)
+    task = _load_task_from_path(path)
+    if evidence:
+        task.evidence.append(dict(evidence))
+    task.verification_state = "passing" if passed else "failing"
+    task.last_error = None if passed else (error or "final task verification failed")
+    save_task(task, archived=path.parent == _archive_dir())
+    return task
+
+
 def bind_task_verification(task_id: str, verification_spec: dict) -> Task:
     path = _active_path(task_id)
     if not path.exists():
@@ -234,7 +254,7 @@ def bind_task_verification(task_id: str, verification_spec: dict) -> Task:
     return task
 
 
-def complete_task(task_id: str) -> str:
+def complete_task(task_id: str, *, clean_check_mode: str | None = None) -> str:
     path = _active_path(task_id)
     if not path.exists():
         task = load_task(task_id)
@@ -253,8 +273,9 @@ def complete_task(task_id: str) -> str:
         candidate = get_workspace_paths().worktrees_dir / task.worktree
         if candidate.exists():
             check_ws = candidate
-    report = run_clean_check(check_ws, include_feature_consistency=False)
-    if clean_mode() == "enforce" and not report.ok:
+    mode = clean_check_mode or clean_mode()
+    report = run_clean_check(check_ws, mode=mode, include_feature_consistency=False)
+    if mode == "enforce" and not report.ok:
         return f"Cannot complete {task.id}: clean-state check failed. {report.summary()}"
 
     task.status = "completed"

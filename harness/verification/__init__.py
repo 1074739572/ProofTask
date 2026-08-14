@@ -70,6 +70,7 @@ __all__ = [
     "run_verification",
     "verify_feature_command",
     "verify_task_command",
+    "reverify_task_command",
 ]
 
 
@@ -145,16 +146,37 @@ def verify_task_command(
     from harness.tasks import load_task, set_task_verification_result
 
     task = load_task(task_id)
+    passed, evidence, error = _run_task_verification(task, workspace=workspace, timeout_s=timeout_s)
+    return set_task_verification_result(task_id, passed=passed, evidence=evidence, error=error)
+
+
+def reverify_task_command(
+    task_id: str,
+    *,
+    workspace: str | Path | None = None,
+    timeout_s: float | None = None,
+):
+    """Re-run a completed Task's binding during the final Goal gate."""
+    from harness.tasks import load_task, record_task_reverification
+
+    task = load_task(task_id)
+    passed, evidence, error = _run_task_verification(task, workspace=workspace, timeout_s=timeout_s)
+    return record_task_reverification(task_id, passed=passed, evidence=evidence, error=error)
+
+
+def _run_task_verification(
+    task,
+    *,
+    workspace: str | Path | None = None,
+    timeout_s: float | None = None,
+) -> tuple[bool, dict | None, str | None]:
+    """Execute one Task binding without assuming the Task is active."""
     spec = task.verification_spec
     command = str(spec.get("command") or "").strip()
     selectors = spec.get("selectors") or []
     collected_count = int(spec.get("collected_count") or 0)
     if not command or not selectors or collected_count <= 0:
-        return set_task_verification_result(
-            task_id,
-            passed=False,
-            error="task has no collected verification binding; generate and baseline tests first",
-        )
+        return False, None, "task has no collected verification binding; generate and baseline tests first"
     root = Path(workspace).expanduser().resolve() if workspace else None
     result = run_verification(command, workspace=root, timeout_s=timeout_s)
     error = result.error or (None if result.passed else f"verification failed with exit code {result.exit_code}")
@@ -169,4 +191,4 @@ def verify_task_command(
         if executed
         else None
     )
-    return set_task_verification_result(task_id, passed=result.passed, evidence=evidence, error=error)
+    return result.passed, evidence, error

@@ -25,10 +25,6 @@ MAX_BEHAVIOR_CHARS = 600
 MAX_ACCEPTANCE_CASES = 8
 MAX_SELECTORS_PER_TASK = 16
 
-# Backward-compatible names used by older callers and eval cases.
-MIN_FEATURES = MIN_TASKS
-MAX_FEATURES = MAX_TASKS
-
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL | re.IGNORECASE)
 _AGENT_HEADER = re.compile(r"^\[[^\]]+\] [^\n]*\n*")
 

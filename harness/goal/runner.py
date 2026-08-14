@@ -20,7 +20,7 @@ from harness.goal.store import GoalStoreError, archive_goal, load_goal, save_goa
 from harness.loop import LoopStats, agent_lock, agent_loop
 from harness.project.resume import checkpoint_history
 from harness.settings import get_workdir, workspace_generation
-from harness.verification import build_pytest_command, collect_pytest_catalog, run_verification, verify_task_command
+from harness.verification import build_pytest_command, collect_pytest_catalog, reverify_task_command, run_verification, verify_task_command
 
 ACT_DISABLED_TOOLS = frozenset({"complete_task", "clear_tasks"})
 
@@ -335,7 +335,7 @@ class GoalRunner(threading.Thread):
             stats = AgentTaskStats()
             self._phase_in_flight = True
             try:
-                raw = run_agent_task(description=f"generate tests for task {task.id}", prompt=prompt, agent_type="planner", cwd=str(root), max_rounds=PLANNER_MAX_ROUNDS, cancel_check=self._interrupted, deadline=self._deadline(state), stats=stats)
+                raw = run_agent_task(description=f"generate tests for task {task.id}", prompt=prompt, agent_type="goal_test_writer", cwd=str(root), max_rounds=PLANNER_MAX_ROUNDS, cancel_check=self._interrupted, deadline=self._deadline(state), stats=stats)
             finally:
                 self._phase_in_flight = False
             state.total_llm_rounds += stats.llm_rounds
@@ -347,7 +347,17 @@ class GoalRunner(threading.Thread):
                 return
             command = build_pytest_command(selectors)
             baseline = run_verification(command, workspace=root)
-            bind_task_verification(task.id, VerificationSpec(adapter="pytest", command=command, test_files=tuple(item.split("::", 1)[0] for item in selectors), selectors=tuple(selectors), source="generated", collected_count=len(selectors), baseline_result="passing" if baseline.passed else "failing", confidence="high").to_dict())
+            if baseline.error or baseline.timed_out or baseline.passed:
+                detail = baseline.error or (
+                    "generated tests passed before implementation; they do not prove the missing behavior"
+                    if baseline.passed
+                    else "generated test baseline timed out"
+                )
+                self._pause(state, "test_generation_baseline_failed", stop_reason=StopReason.test_generation_required.value)
+                state.last_error = f"Task {task.id} test baseline is invalid: {detail}"
+                save_goal(state)
+                return
+            bind_task_verification(task.id, VerificationSpec(adapter="pytest", command=command, test_files=tuple(item.split("::", 1)[0] for item in selectors), selectors=tuple(selectors), source="generated", collected_count=len(selectors), baseline_result="failing", confidence="high").to_dict())
         self._apply(state, GoalPhase.SELECT_TASK, "task_tests_bound")
 
     @staticmethod
@@ -436,7 +446,7 @@ class GoalRunner(threading.Thread):
     def _clean_check(self, state: GoalState) -> None:
         from harness.tasks import complete_task
 
-        result = complete_task(state.current_task_id)
+        result = complete_task(state.current_task_id, clean_check_mode="enforce")
         if result.startswith("Completed") or "already completed" in result:
             self._apply(state, GoalPhase.SELECT_TASK, "task_completed")
             return
@@ -444,6 +454,15 @@ class GoalRunner(threading.Thread):
         self._apply(state, GoalPhase.ACT, "clean_check_failed", error=result)
 
     def _full_verify(self, state: GoalState) -> None:
+        for task_id in state.task_ids:
+            task = reverify_task_command(task_id, workspace=state.workspace)
+            if task.verification_state != "passing":
+                self._fail(
+                    state,
+                    StopReason.full_verification_failed,
+                    f"Task {task_id} final binding failed: {task.last_error}",
+                )
+                return
         result = run_verification(state.verification, workspace=Path(state.workspace))
         if result.passed:
             self._apply(state, GoalPhase.DONE, "goal_verification_passed")

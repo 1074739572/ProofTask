@@ -28,13 +28,14 @@ Goal
    until it has zero-exit machine evidence.
 5. A Task without a real selector enters `needs_generation`. The dedicated
    `PREPARE_TESTS` phase asks the test-generation agent to add focused tests,
-   validates the agent-reported selectors against a fresh catalog, and only
-   then binds the generated test to the Task.
+   validates the agent-reported selectors against a fresh catalog. The baseline
+   must fail before implementation; only then does it bind the generated test
+   to the Task.
 6. ACT is WIP=1: it receives exactly one Task contract. Todo completion and
    prose completion do not move state. The runner executes the bound test,
    then the optional evaluator, then completes the Task and unlocks dependents.
-7. After every Task is complete, the Goal runs the user-provided full
-   regression command.
+7. After every Task is complete, the Goal re-runs every Task binding, then
+   runs the user-provided full regression command.
 
 ## Removed Compatibility Paths
 
@@ -60,7 +61,7 @@ mode neither creates Features nor uses `.features/` as its execution state.
 ## Verification
 
 - `python -m pytest -q tests/test_goal_module.py tests/test_goal_task_contract.py tests/test_goal_clean_scope.py`
-  - `8 passed`
+  - `11 passed`
 - `python -m evals`
   - `81 passed, 0 failed, 2 skipped`
 

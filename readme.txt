@@ -38,7 +38,7 @@ ProofTask 的目标不是增加一层漂亮的计划，而是减少“看起来�
    这些节点，不能编造测试路径、选择器或 shell 命令。
 
    如果找不到能证明某个 Task 的测试，Task 会进入 needs_generation：
-   专门的测试生成阶段先补充测试、重新收集选择器并做基线执行，再把测试
+   专门的测试生成阶段先补充测试、重新收集选择器并确认基线失败，再把测试
    绑定到 Task。没有绑定就不会进入普通实现流程。
 
 3. 机器证据是唯一完成门槛
@@ -71,12 +71,12 @@ ProofTask 的目标不是增加一层漂亮的计划，而是减少“看起来�
   Goal
     -> Planner: 生成 Task、验收标准和依赖
     -> Test Catalog: 只接受仓库中真实可收集的 pytest selector
-    -> PREPARE_TESTS: 没有测试时先生成、收集和绑定测试
+    -> PREPARE_TESTS: 没有测试时先生成、收集，基线失败后绑定测试
     -> ACT: 一次只实现一个 Task
     -> VERIFY: 执行该 Task 的绑定测试，保存证据
     -> EVALUATE: 可选的独立代码审查
     -> COMPLETE: 通过后完成 Task，解锁依赖任务
-    -> FULL VERIFY: 全部 Task 完成后运行整个 Goal 的回归命令
+    -> FULL VERIFY: 重跑全部 Task 绑定测试后运行整个 Goal 的回归命令
 
 
 与普通循环式 Agent 的区别
@@ -149,7 +149,7 @@ ProofTask 的目标不是增加一层漂亮的计划，而是减少“看起来�
 ========
 
   python -m pytest -q tests/test_goal_module.py tests/test_goal_task_contract.py tests/test_goal_clean_scope.py
-  8 passed
+  11 passed
 
   python -m evals
   81 passed, 0 failed, 2 skipped

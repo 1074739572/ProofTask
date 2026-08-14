@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from harness.goal.planner import TaskPlan, parse_plan
+from harness.goal.models import GoalPhase, GoalState
+from harness.goal.runner import GoalRunner
 from harness.verification.catalog import TestCatalog
 
 
@@ -42,3 +44,100 @@ def test_legacy_verification_command_is_not_a_task_binding():
     plans = parse_plan('[{"name":"x","behavior":"b","acceptance_cases":[{"id":"AC1","given":"input","when":"called","then":"result"}],"verification":"pytest -q","depends_on":[]}]')
     assert plans is not None
     assert plans[0].verification_spec.source == "needs_generation"
+
+
+def _needs_generation_task(tmp_path, monkeypatch):
+    import harness.tasks as tasks
+
+    monkeypatch.setattr(tasks, "TASKS_DIR", tmp_path / ".tasks")
+    task = tasks.create_task(
+        "new behavior",
+        "adds missing behavior",
+        acceptance_cases=[{"id": "AC1", "given": "input", "when": "called", "then": "new result"}],
+        verification_spec={"source": "needs_generation"},
+    )
+    state = GoalState.new(target="new behavior", verification="pytest -q", workspace=str(tmp_path))
+    state.task_ids = [task.id]
+    state.current_task_id = task.id
+    state.phase = GoalPhase.PREPARE_TESTS.value
+    return task, state
+
+
+def test_test_generation_uses_writer_and_requires_failing_baseline(tmp_path, monkeypatch):
+    import harness.goal.runner as runner_mod
+    from harness.tasks import load_task
+
+    task, state = _needs_generation_task(tmp_path, monkeypatch)
+    calls = []
+    monkeypatch.setattr(runner_mod, "save_goal", lambda state: None)
+    monkeypatch.setattr(
+        runner_mod,
+        "run_agent_task",
+        lambda **kwargs: calls.append(kwargs["agent_type"]) or '{"test_selectors":["tests/test_new.py::test_new"]}',
+    )
+    monkeypatch.setattr(
+        runner_mod,
+        "collect_pytest_catalog",
+        lambda workspace: TestCatalog(selectors=("tests/test_new.py::test_new",), test_files=("tests/test_new.py",)),
+    )
+    monkeypatch.setattr(
+        runner_mod,
+        "run_verification",
+        lambda *args, **kwargs: type("Result", (), {"passed": False, "error": None, "timed_out": False})(),
+    )
+
+    GoalRunner(state=state, history=[], context={}, binding=None)._prepare_tests(state)
+
+    bound = load_task(task.id)
+    assert calls == ["goal_test_writer"]
+    assert state.phase == GoalPhase.SELECT_TASK.value
+    assert bound.verification_spec["source"] == "generated"
+    assert bound.verification_spec["baseline_result"] == "failing"
+
+
+def test_test_generation_rejects_a_passing_baseline(tmp_path, monkeypatch):
+    import harness.goal.runner as runner_mod
+    from harness.tasks import load_task
+
+    task, state = _needs_generation_task(tmp_path, monkeypatch)
+    monkeypatch.setattr(runner_mod, "save_goal", lambda state: None)
+    monkeypatch.setattr(runner_mod, "run_agent_task", lambda **kwargs: '{"test_selectors":["tests/test_new.py::test_new"]}')
+    monkeypatch.setattr(
+        runner_mod,
+        "collect_pytest_catalog",
+        lambda workspace: TestCatalog(selectors=("tests/test_new.py::test_new",), test_files=("tests/test_new.py",)),
+    )
+    monkeypatch.setattr(
+        runner_mod,
+        "run_verification",
+        lambda *args, **kwargs: type("Result", (), {"passed": True, "error": None, "timed_out": False})(),
+    )
+
+    GoalRunner(state=state, history=[], context={}, binding=None)._prepare_tests(state)
+
+    assert state.phase == GoalPhase.PAUSED.value
+    assert load_task(task.id).verification_state == "needs_generation"
+    assert "passed before implementation" in state.last_error
+
+
+def test_goal_forces_clean_enforcement_and_reverifies_all_tasks(monkeypatch):
+    import harness.goal.runner as runner_mod
+
+    state = GoalState.new(target="x", verification="pytest -q", workspace=".")
+    state.task_ids = ["task_a", "task_b"]
+    state.current_task_id = "task_a"
+    state.phase = GoalPhase.CLEAN_CHECK.value
+    runner = GoalRunner(state=state, history=[], context={}, binding=None)
+    modes = []
+    monkeypatch.setattr(runner_mod, "save_goal", lambda state: None)
+    monkeypatch.setattr("harness.tasks.complete_task", lambda task_id, **kwargs: modes.append(kwargs["clean_check_mode"]) or "Completed " + task_id)
+    runner._clean_check(state)
+    assert modes == ["enforce"]
+
+    state.phase = GoalPhase.FULL_VERIFY.value
+    reverified = []
+    monkeypatch.setattr(runner_mod, "reverify_task_command", lambda task_id, **kwargs: reverified.append(task_id) or type("Task", (), {"verification_state": "passing", "last_error": None})())
+    monkeypatch.setattr(runner_mod, "run_verification", lambda *args, **kwargs: type("Result", (), {"passed": True, "error": None, "exit_code": 0})())
+    runner._full_verify(state)
+    assert reverified == ["task_a", "task_b"]
+    assert state.phase == GoalPhase.DONE.value
