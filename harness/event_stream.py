@@ -175,23 +175,62 @@ def _emit_workspace_list() -> None:
     emit("log", level="plain", text="\n".join(lines))
 
 
-def _handle_completion_request(command: dict) -> dict:
-    """Resolve a ``completion_request`` command into a ``completion_result`` payload.
+_SLASH_COMPLETIONS = (
+    "/clear",
+    "/effort",
+    "/goal",
+    "/help",
+    "/init",
+    "/mode",
+    "/model",
+    "/models",
+    "/open",
+    "/rag",
+    "/resume",
+    "/usage",
+)
 
-    Mirrors the CLI's readline tab completion: ``@path`` completes files and
-    directories, ``/open <path>`` completes directories only.  Uses the shared
-    pure core (``harness.path_completion``) so TUI and CLI stay in sync.
+
+def _handle_completion_request(command: dict) -> dict:
+    """Resolve a TUI autocomplete request into paths or slash commands.
+
+    ``@path`` delegates filesystem lookup to the shared CLI completion core,
+    but returns only the replacement *path* rather than a completed copy of the
+    entire composer line.  A leading slash command uses the token before the
+    cursor and never activates for slash text in ordinary prose.
     """
-    from harness.path_completion import complete_paths
+    from harness.path_completion import complete_paths, path_completion_context
     from harness.settings import get_workdir
 
     text = str(command.get("text") or "")
     cursor = command.get("cursor")
     try:
-        cursor_pos = int(cursor) if cursor is not None else None
+        cursor_pos = int(cursor) if cursor is not None else len(text)
     except (TypeError, ValueError):
-        cursor_pos = None
-    candidates = complete_paths(text, cursor_pos, cwd=get_workdir())
+        cursor_pos = len(text)
+    cursor_pos = max(0, min(cursor_pos, len(text)))
+    before_cursor = text[:cursor_pos]
+
+    candidates: list[str]
+    # Dynamic slash completion applies only to the first token at composer
+    # start. For example, "/mo keep" with cursor after /mo still suggests
+    # /model and /mode; "please /mo" never does.
+    if before_cursor.startswith("/") and not any(char.isspace() for char in before_cursor):
+        token = before_cursor.split(maxsplit=1)[0]
+        candidates = [item for item in _SLASH_COMPLETIONS if item.startswith(token.lower())]
+    else:
+        context = path_completion_context(text, cursor_pos)
+        if context is None:
+            candidates = []
+        else:
+            suffix = text[context.end :]
+            completed = complete_paths(text, cursor_pos, cwd=get_workdir())
+            # ``complete_paths`` serves readline and returns full lines. The
+            # TUI menu instead needs the selected path alone.
+            candidates = [
+                item[context.start : len(item) - len(suffix) if suffix else len(item)]
+                for item in completed
+            ]
     return {
         "request_id": str(command.get("request_id") or ""),
         "candidates": candidates,
@@ -437,7 +476,17 @@ def _run_user_turn(query: str, history: list, context: dict, binding, *, echo_us
         emit("log", level="muted", text=gate_note)
 
     trigger_hooks("UserPromptSubmit", query)
-    model_query = query
+    # The TUI submits a lightweight @path reference. Expand it only for the
+    # model-facing message; transcript/UI/history metadata retain the user's
+    # original wording. Failed or out-of-workspace references stay literal and
+    # are recorded as a muted note instead of breaking the turn.
+    from harness.mentions import expand_mentions
+    from harness.settings import get_workdir
+
+    model_query, mention_notes = expand_mentions(query, base_dir=get_workdir())
+    for note in mention_notes:
+        if not note.ok:
+            emit("log", level="warn", text=f"@引用未展开: {note.path} ({note.error or 'unknown error'})")
 
     touch_session_title_from_query(query, binding=binding)
     repair_tool_pairing(history)

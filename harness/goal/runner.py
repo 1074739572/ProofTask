@@ -77,7 +77,11 @@ def _emit(event_type: str, **payload: Any) -> None:
 
 
 def goal_event_payload(state: GoalState) -> dict[str, Any]:
-    """Build the TUI snapshot from persisted Goal and Task state."""
+    """Build the TUI snapshot from persisted Goal and Task state.
+
+    The terminal must render the same contracts that gate completion, instead
+    of inferring progress from model prose or tool-log ordering.
+    """
     from harness.tasks import load_task
 
     tasks: list[dict[str, Any]] = []

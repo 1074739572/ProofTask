@@ -96,7 +96,7 @@ def test_completion_request_at_path(fake_workdir):
     payload = _handle_completion_request({"text": "看 @src", "request_id": "r1"})
     assert payload["request_id"] == "r1"
     assert len(payload["candidates"]) == 1
-    assert payload["candidates"][0] == "看 @src" + os.sep
+    assert payload["candidates"][0] == "src" + os.sep
 
 
 def test_completion_request_open_directories_only(fake_workdir):

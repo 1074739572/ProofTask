@@ -10,6 +10,13 @@ import type {ActionRow, Entry, Section, SubagentStatus} from './sections.ts';
 import {C} from './theme.ts';
 import {WelcomeView} from './Welcome.tsx';
 import {GoalView, type GoalSnapshot} from './GoalView.tsx';
+import {
+  applyCompletionResult,
+  completionContext,
+  moveCompletionSelection,
+  shouldHandleAutocompleteKey,
+  type CompletionMenuState,
+} from '../src/autocomplete.ts';
 
 export type OverlayOption = {name: string; description: string; value: string};
 export type Overlay = {kind: 'permission' | 'picker'; id: string; title: string; pickerId?: string; options: OverlayOption[]};
@@ -629,6 +636,55 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
   // Reference to the multiline composer so programmatic edits (history recall,
   // clearing after submit) can update its buffer directly.
   let textareaRef: any = null;
+  // Non-modal composer autocomplete. Unlike global overlays, this state never
+  // unmounts the textarea: normal typing stays with the composer while only
+  // navigation/selection keys are intercepted below.
+  const [completion, setCompletion] = createSignal<CompletionMenuState>({
+    mode: null, start: 0, end: 0, query: '', requestId: 0, options: [], selected: 0,
+  });
+  let completionRequestSeq = 0;
+  let completionDebounce: ReturnType<typeof setTimeout> | null = null;
+  const closeCompletion = () => {
+    if (completionDebounce) clearTimeout(completionDebounce);
+    setCompletion(current => ({...current, mode: null, options: [], selected: 0}));
+  };
+  const refreshCompletion = (text = input()) => {
+    const cursor = textareaRef?.cursorOffset ?? text.length;
+    const context = completionContext(text, cursor);
+    if (!context) {
+      closeCompletion();
+      return;
+    }
+    if (completionDebounce) clearTimeout(completionDebounce);
+    const requestId = ++completionRequestSeq;
+    setCompletion({
+      ...context,
+      requestId,
+      options: completion().mode === context.mode ? completion().options : [],
+      selected: 0,
+    });
+    completionDebounce = setTimeout(() => {
+      send({type: 'completion_request', text, cursor, request_id: `completion-${requestId}`});
+    }, 120);
+  };
+  const handleCompletionResult = (event: any) => {
+    const requestId = String(event.request_id || '');
+    if (!requestId.startsWith('completion-')) return;
+    const seq = Number(requestId.slice('completion-'.length));
+    const raw = Array.isArray(event.candidates) ? event.candidates.map((item: unknown) => String(item)) : [];
+    setCompletion(current => applyCompletionResult(current, seq, raw));
+  };
+  const selectCompletion = () => {
+    const current = completion();
+    const option = current.options[current.selected];
+    if (!current.mode || !option) return;
+    const text = input();
+    const insertion = current.mode === 'mention' ? `@${option}` : option;
+    const next = text.slice(0, current.start) + insertion + text.slice(current.end);
+    setInput(next);
+    textareaRef?.setText?.(next);
+    closeCompletion();
+  };
   // Composer grows with content up to MAX lines (then it scrolls internally);
   // the log viewport shrinks by the same amount to keep the layout stable.
   const MAX_COMPOSER_LINES = 5;
@@ -638,6 +694,16 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
     const width = Math.max(20, dims().width - 12);
     return Math.max(1, Math.min(MAX_COMPOSER_LINES, composerVisualLines(v, width)));
   };
+  // The non-modal completion menu occupies terminal rows above the composer.
+  // It still needs to be included in the permanent layout reservation, or the
+  // transcript will render over the input row and make the composer disappear.
+  const completionMenuRows = () => {
+    const current = completion();
+    if (!current.mode || !current.options.length) return 0;
+    // option rows + footer hint + rounded border top/bottom
+    return Math.min(current.options.length, 6) + 3;
+  };
+  const composerReservedRows = () => 1 + composerLines() + completionMenuRows();
   // One 30 FPS tick drives the live tail: spinner/elapsed updates and buffered
   // text/tool output commit together, so a busy turn produces one coalesced
   // terminal frame instead of independent flush timers racing each other.
@@ -647,7 +713,7 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
   // contextual footer reserve permanent space.
   const viewportHeight = () => {
     const h = dims().height;
-    let used = composerLines() + 1; // composer + one contextual footer row
+    let used = composerReservedRows(); // completion menu + composer + footer
     if (overlay()) {
       const o = overlay()!;
       const rows = Math.min(o.options.length, 8);
@@ -870,6 +936,7 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
          break;
       }
       case 'log': if (event.level === 'warn' || event.level === 'plain') add({id: `log-${Date.now()}`, kind: 'log', text: value(event, 'text')}); break;
+      case 'completion_result': handleCompletionResult(event); break;
       case 'show_picker': setOverlay({kind: 'picker', id: event.id, pickerId: event.id, title: event.title, options: (event.items || []).map((x: any) => ({name: x.label, description: x.detail || '', value: x.id}))}); setOverlayIndex(0); break;
       case 'permission_request': setOverlay({kind: 'permission', id: event.id, title: event.title || `Allow ${event.tool}?`, options: [{name: 'Allow once', description: event.resource || '', value: 'allow'}, {name: 'Allow session', description: 'Remember until this TUI exits', value: 'session'}, {name: 'Deny', description: 'Block this tool call', value: 'deny'}]}); setOverlayIndex(0); break;
       case 'permission_auto_approved': {
@@ -906,6 +973,20 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
       else if (name === 'down') { setOverlayIndex(i => Math.min(current.options.length - 1, i + 1)); event.preventDefault?.(); }
       else if (name === 'return') selectOverlay();
       else if (name === 'escape') setOverlay(null);
+      return;
+    }
+    const activeCompletion = completion();
+    if (activeCompletion.mode && shouldHandleAutocompleteKey(name)) {
+      if (name === 'up') {
+        setCompletion(current => moveCompletionSelection(current, -1));
+      } else if (name === 'down') {
+        setCompletion(current => moveCompletionSelection(current, 1));
+      } else if (name === 'tab' || name === 'return') {
+        selectCompletion();
+      } else if (name === 'escape') {
+        closeCompletion();
+      }
+      event.preventDefault?.();
       return;
     }
     if (event?.ctrl && name === 'q') { send({type: 'exit'}); child?.kill?.(); process.exit(0); }
@@ -963,6 +1044,7 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
     send({type: 'user_message', text});
     setInput('');
     textareaRef?.setText?.('');
+    closeCompletion();
     setInputHistory(prev => [...prev.slice(-50), text]);
     setHistoryIdx(-1);
   };
@@ -989,7 +1071,17 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
         <text fg={C.textMuted}>{overlayWindow()! && overlayWindow()!.total > overlayWindow()!.rows ? `${overlayIndex() + 1}/${overlayWindow()!.total} · ` : ''}↑↓ select · Enter confirm · Esc cancel</text>
       </box>
     </Show>
-    <box height={1 + composerLines()} flexShrink={0} paddingX={1} flexDirection="column">
+    <box height={composerReservedRows()} flexShrink={0} paddingX={1} flexDirection="column">
+      <Show when={completion().mode && completion().options.length}>
+        <box border borderStyle="rounded" borderColor={C.accent} paddingX={1} flexShrink={0} flexDirection="column">
+          <For each={completion().options.slice(0, 6)}>{(option, i) => (
+            <text fg={i() === completion().selected ? C.primary : C.textMuted}>
+              {i() === completion().selected ? '▶ ' : '  '}{completion().mode === 'mention' ? '@' : ''}{option}
+            </text>
+          )}</For>
+          <text fg={C.textMuted}>{completion().mode === 'mention' ? '文件引用' : '指令'} · ↑↓ select · Tab/Enter apply · Esc close</text>
+        </box>
+      </Show>
       <box height={composerLines()} flexShrink={0} flexDirection="row">
         <text fg={C.primary} wrapMode="none" truncate>{mode()}</text>
         <text fg={C.textMuted} wrapMode="none"> · </text>
@@ -997,9 +1089,7 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
         <text fg={C.textMuted} wrapMode="none"> · </text>
         <text fg={C.info} wrapMode="none" truncate selectable={false} onMouseUp={(event: any) => { if (event?.button === 0) openEffortPicker(); }}>{effortShortLabel(effortLabel(), effort())} ▾</text>
         <text fg={C.primary}> › </text>
-        <Show when={!overlay()} fallback={<text fg={C.textMuted}>↑↓ select · Enter confirm</text>}>
-          <textarea flexGrow={1} focused height={composerLines()} placeholder={running() ? 'working…' : 'Ask anything…'} initialValue={input()} keyBindings={textareaBindings as any} onContentChange={() => { const v = textareaRef?.plainText ?? ''; if (v !== input()) setInput(v); }} onSubmit={submit as any} ref={el => { textareaRef = el as any; }} />
-        </Show>
+        <textarea flexGrow={1} focused height={composerLines()} placeholder={running() ? 'working…' : 'Ask anything…'} initialValue={input()} keyBindings={textareaBindings as any} onContentChange={() => { const v = textareaRef?.plainText ?? ''; if (v !== input()) { setInput(v); refreshCompletion(v); } }} onSubmit={submit as any} ref={el => { textareaRef = el as any; }} />
       </box>
       <Show when={running()}>
         <text fg={C.warning} wrapMode="none" truncate>• {phase()} · {spinner()} {elapsed()} · Ctrl+K 中断</text>

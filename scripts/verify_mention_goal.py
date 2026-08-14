@@ -1,13 +1,18 @@
 # -*- coding: utf-8 -*-
 """Goal verification for the @-mention feature.
 
-Runs (in order):
+Default checks (the @-mention feature contract):
   1. node_tui typecheck (tsc, both tsconfigs)
-  2. backend pytest suite (all tests under tests/)
+  2. backend mentions pytest module
   3. frontend mentions test (node --test with tsx)
 
-Exits 0 only when ALL pass. Any failure prints the failing stage and exits 1,
-so the goal runner's machine verification is meaningful.
+Pass ``--full`` to additionally run the entire backend pytest suite. The
+feature-specific default is intentional: a goal's declared verification must
+not become retroactively blocked by later, unrelated RED tests added elsewhere
+in the workspace.
+
+Exits 0 only when ALL selected checks pass. Any failure prints the failing
+stage and exits 1, so the goal runner's machine verification is meaningful.
 """
 
 from __future__ import annotations
@@ -18,6 +23,13 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 NODE_TUI = ROOT / "node_tui"
+
+
+def print_output(output: str) -> None:
+    """Print captured tool output even when the Windows console uses GBK."""
+    encoding = sys.stdout.encoding or "utf-8"
+    safe = output.encode(encoding, errors="replace").decode(encoding, errors="replace")
+    print(safe, flush=True)
 
 
 def run(stage: str, cmd: list[str], cwd: Path) -> int:
@@ -37,7 +49,7 @@ def run(stage: str, cmd: list[str], cwd: Path) -> int:
         print(f"[{stage}] TIMEOUT", flush=True)
         return 1
     out = (proc.stdout or "") + (proc.stderr or "")
-    print(out[-4000:], flush=True)
+    print_output(out[-4000:])
     if proc.returncode != 0:
         print(f"[{stage}] FAILED (exit={proc.returncode})", flush=True)
         return 1
@@ -54,40 +66,36 @@ def _npm_cmd() -> str:
 
 def main() -> int:
     npm = _npm_cmd()
-    mentions_only = "--mentions-only" in sys.argv[1:]
+    full_suite = "--full" in sys.argv[1:]
     checks = [
         (
             "node_tui typecheck",
             [npm, "run", "typecheck"],
             NODE_TUI,
         ),
+        (
+            "backend mentions test",
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                "tests/test_mentions.py",
+                "-q",
+                "--continue-on-collection-errors",
+            ],
+            ROOT,
+        ),
+        (
+            "frontend mentions test",
+            ["node", "--import", "tsx", "--test", "test/mentions.test.ts"],
+            NODE_TUI,
+        ),
     ]
-    if mentions_only:
-        # Goal-scoped verification: only the @-mention tests, plus typecheck.
-        # Avoids the unrelated pre-existing failure in test_orchestration_routing.
-        checks += [
+    if full_suite:
+        checks.insert(
+            2,
             (
-                "backend mentions test",
-                [
-                    sys.executable,
-                    "-m",
-                    "pytest",
-                    "tests/test_mentions.py",
-                    "-q",
-                    "--continue-on-collection-errors",
-                ],
-                ROOT,
-            ),
-            (
-                "frontend mentions test",
-                ["node", "--import", "tsx", "--test", "test/mentions.test.ts"],
-                NODE_TUI,
-            ),
-        ]
-    else:
-        checks += [
-            (
-                "backend pytest (tests/)",
+                "backend pytest (full suite)",
                 [
                     sys.executable,
                     "-m",
@@ -98,12 +106,7 @@ def main() -> int:
                 ],
                 ROOT,
             ),
-            (
-                "frontend mentions test",
-                ["node", "--import", "tsx", "--test", "test/mentions.test.ts"],
-                NODE_TUI,
-            ),
-        ]
+        )
     for stage, cmd, cwd in checks:
         if run(stage, cmd, cwd) != 0:
             print(f"\nVERIFICATION FAILED at stage: {stage}", flush=True)

@@ -1,5 +1,5 @@
 {
-  "deepseek": {
+  "opencode": {
     "label": "OpenCode Go (DeepSeek)",
     "type": "openai",
     "base_url": "https://opencode.ai/zen/go/v1",
@@ -16,5 +16,11 @@
     "type": "openai",
     "base_url": "https://api.aijws.com/v1",
     "api_key_env": "ANZHIYU_API_KEY"
+  },
+  "deepseek": {
+    "label": "DeepSeek",
+    "type": "openai",
+    "base_url": "https://api.deepseek.com",
+    "api_key_env": "DEEPSEEK_API_KEY"
   }
 }

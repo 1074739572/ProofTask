@@ -13,6 +13,7 @@ venv/
 .local/
 
 # Agent runtime artifacts (created in cwd when running)
+.features/
 .transcripts/
 .task_outputs/
 .tasks/
@@ -112,3 +113,9 @@ _chunk.py
 _parse_flow.py
 _parser_defs.py
 _strat*.py
+_check_*.py
+_debug_*.py
+_verify_*.js
+
+# Project overview is published despite the generic local-text rule above.
+!readme.txt

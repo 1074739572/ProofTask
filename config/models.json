@@ -3,8 +3,8 @@
   "models": [
     {
       "id": "deepseek-v4-flash",
-      "provider": "deepseek",
-      "label": "DeepSeek V4 Flash (fast)",
+      "provider": "opencode",
+      "label": "DeepSeek V4 Flash",
       "api_model": "deepseek-v4-flash",
       "context_window": 1000000,
       "effort_options": ["low", "high", "max"]
@@ -12,7 +12,7 @@
     {
       "id": "deepseek-v4-pro",
       "provider": "deepseek",
-      "label": "DeepSeek V4 Pro (stronger)",
+      "label": "DeepSeek V4 Pro",
       "api_model": "deepseek-v4-pro",
       "context_window": 1000000,
       "reasoning_effort": "high",
