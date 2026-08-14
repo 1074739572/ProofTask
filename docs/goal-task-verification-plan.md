@@ -1,8 +1,12 @@
 # Goal / Task Verification Plan
 
+> 设计主张：模型负责理解、规划和实现；机器负责验证、记录和裁定能否交付。关于长期任务中的上下文腐烂、过度完成和假完成，以及这套分工的原因，见 [`proof-task-design.md`](./proof-task-design.md)。
+
 Last updated: 2026-08-14
 
 ## Implemented
+
+Goal 的最终确认态不由模型的完成声明决定。模型声明只作为过程信息；只有绑定测试产生零退出码证据、严格 clean check 通过，并在最终阶段重新通过全部 Task 测试，状态才允许进入完成态。
 
 Goal mode now has one execution model:
 

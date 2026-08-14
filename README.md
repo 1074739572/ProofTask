@@ -75,6 +75,7 @@ python -m evals
 ## 文档
 
 - [ProofTask 工作手册](HARNESS.md)
+- [ProofTask 设计说明：问题、原则与机器判定](docs/proof-task-design.md)
 - [Goal / Task / 测试验证设计](docs/goal-task-verification-plan.md)
 - [面向使用者的完整介绍](readme.txt)
 
