@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+from collections.abc import Collection
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -82,6 +83,9 @@ class CleanCheck:
     label: str
     ok: bool
     detail: str = ""
+    # Machine-readable failures let orchestration route a failed clean gate to
+    # the feature that actually needs attention instead of guessing from text.
+    failures: list[dict[str, str]] = field(default_factory=list)
 
 
 @dataclass
@@ -147,24 +151,62 @@ def _check_temp_artifacts(workspace: Path) -> CleanCheck:
     )
 
 
-def _check_feature_consistency(workspace: Path) -> CleanCheck:
+def _check_feature_consistency(
+    workspace: Path,
+    feature_ids: Collection[str] | None = None,
+) -> CleanCheck:
     from harness.features import corrupt_feature_files, feature_is_stale, list_features
 
+    # ``None`` retains the diagnostic's historical workspace-wide behavior.
+    # A supplied collection scopes only feature-state consistency; temp-file
+    # and git-worktree checks remain workspace-wide.
+    scope = None if feature_ids is None else {str(feature_id) for feature_id in feature_ids}
     bad: list[str] = []
-    for feature in list_features(workspace=workspace):
+    failures: list[dict[str, str]] = []
+    features = list_features(workspace=workspace)
+    if scope is not None:
+        features = [feature for feature in features if feature.id in scope]
+
+    for feature in features:
         if feature.state == "passing" and not feature.evidence:
             bad.append(f"{feature.id} ({feature.name}): passing without evidence")
+            failures.append({"feature_id": feature.id, "reason": "missing_evidence"})
         elif feature.state == "passing" and feature_is_stale(feature):
             bad.append(f"{feature.id} ({feature.name}): passing but code changed (stale)")
+            failures.append({"feature_id": feature.id, "reason": "stale"})
+
     corrupt = corrupt_feature_files(workspace)
+    if scope is not None:
+        corrupt = [filename for filename in corrupt if Path(filename).stem in scope]
     if corrupt:
         bad.append("corrupt feature files: " + ", ".join(corrupt))
+        failures.extend(
+            {
+                "feature_id": Path(filename).stem,
+                "path": filename,
+                "reason": "corrupt_feature_file",
+            }
+            for filename in corrupt
+        )
+
+    if scope is not None:
+        known_ids = {feature.id for feature in features}
+        corrupt_ids = {Path(filename).stem for filename in corrupt}
+        for feature_id in sorted(scope - known_ids - corrupt_ids):
+            bad.append(f"{feature_id}: feature file is missing")
+            failures.append({"feature_id": feature_id, "reason": "missing_feature"})
+
     detail = "; ".join(bad) if bad else ""
     return CleanCheck(
         "feature_state_consistency",
-        "passing features carry fresh evidence; no corrupt files",
+        (
+            "passing features carry fresh evidence; no corrupt files"
+            if scope is None
+            else "selected passing features carry fresh evidence; selected files are valid"
+        ),
         ok=not bad,
         detail=detail,
+        failures=failures,
     )
 
 
@@ -206,16 +248,23 @@ def run_clean_check(
     workspace: Path | None = None,
     *,
     mode: str | None = None,
+    feature_ids: Collection[str] | None = None,
+    include_feature_consistency: bool = True,
 ) -> CleanReport:
-    """Run clean-state checks for a workspace (default: active workspace)."""
+    """Run clean-state checks for a workspace (default: active workspace).
+
+    ``feature_ids=None`` checks every feature in the workspace, which is the
+    right default for diagnostics. Supplying ids scopes only the feature-state
+    consistency gate to the owning task or goal, so stale historical evidence
+    cannot block unrelated work from completing.
+    """
     mode = mode or clean_mode()
     if mode == "off":
         return CleanReport(mode="off", checks=[])
 
     workspace = workspace or get_workspace_paths().root
-    checks = [
-        _check_temp_artifacts(workspace),
-        _check_feature_consistency(workspace),
-        _check_uncommitted(workspace),
-    ]
+    checks = [_check_temp_artifacts(workspace)]
+    if include_feature_consistency:
+        checks.append(_check_feature_consistency(workspace, feature_ids=feature_ids))
+    checks.append(_check_uncommitted(workspace))
     return CleanReport(mode=mode, checks=checks)

@@ -9,7 +9,7 @@ block task completion; soft info (uncommitted git changes) never blocks.
 
 Public API::
 
-    run_clean_check(workspace=None, *, mode=None) -> CleanReport
+    run_clean_check(workspace=None, *, mode=None, feature_ids=None) -> CleanReport
     clean_mode() -> str            # env HARNESS_CLEAN_MODE
     CleanReport / CleanCheck
 """

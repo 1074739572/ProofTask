@@ -1,19 +1,9 @@
-"""Goal decomposition planner (L6 v2).
+"""Goal decomposition planner with machine-checkable Task contracts.
 
-Before execution starts, a read-only subagent analyzes the repository and the
-goal target and proposes a feature plan: a list of features with behavior,
-per-feature verification suggestions, and dependency edges (a DAG).
-
-Design rules:
-
-- the plan is advisory until validated: every per-feature verification command
-  must pass ``check_verification_command`` (structural policy); anything that
-  fails validation falls back to the user's full ``--verify`` command;
-- parsing is fault-tolerant (pure function, mirroring evaluation/parser.py):
-  malformed plans degrade to a single whole-goal feature rather than failing
-  the goal;
-- dependencies are referenced by feature *name* in the plan and resolved to
-  ids after creation.
+The planning model describes Tasks and acceptance cases.  It may select only
+pytest node IDs already discovered by the system; it never gets to invent a
+test command and call that proof. Task plans are the only Goal execution
+projection.
 """
 
 from __future__ import annotations
@@ -25,19 +15,21 @@ from pathlib import Path
 from typing import Any, Callable
 
 from harness.settings import get_workdir
-from harness.verification.policy import check_verification_command
+from harness.verification.catalog import TestCatalog, build_pytest_command, collect_pytest_catalog
 
-#: Read-only subagent used for planning (same large-context explorer).
 PLANNER_AGENT = "goal_planner"
 PLANNER_MAX_ROUNDS = 30
-#: Bounds on the plan size (runaway decomposition protection).
-MIN_FEATURES = 1
-MAX_FEATURES = 8
-#: Cap on per-feature behavior text.
+MIN_TASKS = 1
+MAX_TASKS = 8
 MAX_BEHAVIOR_CHARS = 600
+MAX_ACCEPTANCE_CASES = 8
+MAX_SELECTORS_PER_TASK = 16
+
+# Backward-compatible names used by older callers and eval cases.
+MIN_FEATURES = MIN_TASKS
+MAX_FEATURES = MAX_TASKS
 
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL | re.IGNORECASE)
-#: run_agent_task prefixes results with `[agent / model] description (N tools, Xs)`.
 _AGENT_HEADER = re.compile(r"^\[[^\]]+\] [^\n]*\n*")
 
 
@@ -48,66 +40,177 @@ def _strip_agent_header(text: str) -> str:
     return stripped.strip()
 
 
+def _normalise_strings(raw: Any, *, limit: int) -> tuple[str, ...]:
+    if not isinstance(raw, (list, tuple)):
+        return ()
+    values: list[str] = []
+    seen: set[str] = set()
+    for value in raw:
+        if not isinstance(value, str):
+            continue
+        text = value.strip().replace("\\", "/")
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        values.append(text[:500])
+        if len(values) >= limit:
+            break
+    return tuple(values)
+
+
 @dataclass(frozen=True)
-class FeaturePlan:
+class AcceptanceCase:
+    """One observable behavior required for a Task to be accepted."""
+
+    id: str
+    given: str
+    when: str
+    then: str
+
+    def to_dict(self) -> dict[str, str]:
+        return {"id": self.id, "given": self.given, "when": self.when, "then": self.then}
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any], *, index: int) -> "AcceptanceCase | None":
+        case_id = str(data.get("id") or f"AC{index}").strip()[:40]
+        given = str(data.get("given") or "").strip()[:500]
+        when = str(data.get("when") or "").strip()[:500]
+        then = str(data.get("then") or data.get("expected") or "").strip()[:500]
+        if not case_id or not then:
+            return None
+        return cls(id=case_id, given=given, when=when, then=then)
+
+
+@dataclass(frozen=True)
+class VerificationSpec:
+    """A Task's evidence contract, produced and validated by the system."""
+
+    adapter: str = "command"
+    command: str = ""
+    test_files: tuple[str, ...] = ()
+    selectors: tuple[str, ...] = ()
+    source: str = "needs_generation"  # user | legacy | discovered | generated | needs_generation
+    collected_count: int = 0
+    baseline_result: str = "not_run"
+    confidence: str = "low"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "adapter": self.adapter,
+            "command": self.command,
+            "test_files": list(self.test_files),
+            "selectors": list(self.selectors),
+            "source": self.source,
+            "collected_count": self.collected_count,
+            "baseline_result": self.baseline_result,
+            "confidence": self.confidence,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "VerificationSpec":
+        data = data or {}
+        try:
+            collected_count = max(0, int(data.get("collected_count") or 0))
+        except (TypeError, ValueError):
+            collected_count = 0
+        return cls(
+            adapter=str(data.get("adapter") or "command")[:40],
+            command=str(data.get("command") or "").strip()[:1000],
+            test_files=_normalise_strings(data.get("test_files"), limit=MAX_SELECTORS_PER_TASK),
+            selectors=_normalise_strings(data.get("selectors"), limit=MAX_SELECTORS_PER_TASK),
+            source=str(data.get("source") or "needs_generation")[:40],
+            collected_count=collected_count,
+            baseline_result=str(data.get("baseline_result") or "not_run")[:80],
+            confidence=str(data.get("confidence") or "low")[:20],
+        )
+
+
+@dataclass(frozen=True)
+class TaskPlan:
+    """A durable planning unit with machine-verifiable acceptance criteria."""
+
     name: str
     behavior: str
-    verification: str = ""  # "" = fall back to the full verification command
-    depends_on: tuple[str, ...] = ()  # feature *names* this feature depends on
+    depends_on: tuple[str, ...] = ()
+    acceptance_cases: tuple[AcceptanceCase, ...] = ()
+    verification_spec: VerificationSpec = field(default_factory=VerificationSpec)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "name": self.name,
             "behavior": self.behavior,
-            "verification": self.verification,
             "depends_on": list(self.depends_on),
+            "acceptance_cases": [case.to_dict() for case in self.acceptance_cases],
+            "verification_spec": self.verification_spec.to_dict(),
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "FeaturePlan":
+    def from_dict(cls, data: dict[str, Any]) -> "TaskPlan":
+        cases = _parse_acceptance_cases(data.get("acceptance_cases"))
+        spec_raw = data.get("verification_spec")
         return cls(
             name=str(data["name"]),
             behavior=str(data["behavior"]),
-            verification=str(data.get("verification") or ""),
             depends_on=tuple(str(dep) for dep in (data.get("depends_on") or ())),
+            acceptance_cases=cases,
+            verification_spec=VerificationSpec.from_dict(spec_raw),
         )
 
 
-def build_plan_prompt(target: str, full_verification: str) -> str:
-    """Prompt for the read-only planning subagent (output: JSON array)."""
+def _parse_acceptance_cases(raw: Any) -> tuple[AcceptanceCase, ...]:
+    if raw is None:
+        return ()
+    if not isinstance(raw, list) or not raw:
+        return ()
+    cases: list[AcceptanceCase] = []
+    ids: set[str] = set()
+    for index, item in enumerate(raw[:MAX_ACCEPTANCE_CASES], start=1):
+        if not isinstance(item, dict):
+            return ()
+        case = AcceptanceCase.from_dict(item, index=index)
+        if case is None or case.id in ids:
+            return ()
+        ids.add(case.id)
+        cases.append(case)
+    return tuple(cases)
+
+
+def build_plan_prompt(
+    target: str,
+    full_verification: str,
+    test_catalog: TestCatalog | None = None,
+) -> str:
+    """Prompt for the read-only planner. Output is a JSON Task array only."""
+    catalog_text = (test_catalog or TestCatalog(error="not collected")).prompt_text()
     return (
-        "You are planning the decomposition of one goal into verifiable features.\n\n"
+        "You plan one Goal into independently verifiable Tasks. You are read-only.\n\n"
         f"Goal target: {target}\n"
-        f"Full verification command (authoritative, read-only): {full_verification}\n\n"
-        "Explore the repository with your read-only tools, then split the goal "
-        f"into {MIN_FEATURES}–{MAX_FEATURES} features:\n"
-        "- Each feature must be independently implementable and verifiable.\n"
-        "- Prefer the order that an engineer would implement them in.\n"
-        "- ``depends_on`` lists the NAMES of features that must be done first "
-        "(empty array when none).\n"
-        "- ``verification``: a concrete read-only command that proves this "
-        "feature works (e.g. ``pytest tests/test_x.py -q`` or ``python "
-        "tools/check_x.py``). It must be a single command, no shell "
-        "metacharacters (&& ; | > <), no ``python -c``, no destructive "
-        "tokens. If you cannot find a real command in the repo for a feature, "
-        "use an empty string (the full verification will cover it).\n"
-        "- If the goal is small or cannot be split meaningfully, return a "
-        "single feature.\n"
-        "- IMPORTANT: when the goal text explicitly enumerates independent "
-        "deliverables (multiple modules / functions / numbered sub-tasks, "
-        "e.g. \"fix A and B\" or \"(1) ... (2) ... (3) ...\"), split at "
-        "least one feature per listed deliverable — do NOT collapse them "
-        "into one.\n\n"
-        'Reply with ONLY a JSON array, e.g.:\n'
-        '[{"name": "paginate list", "behavior": "list endpoint returns all pages '
-        'without skipping rows", "verification": "pytest tests/test_pagination.py -q", '
-        '"depends_on": []}]\n'
-        "No prose, no code fences around the array."
+        f"Goal-level full verification command: {full_verification}\n\n"
+        "Test binding rules:\n"
+        "- The catalog below was collected by the system. A selector is valid only if it "
+        "appears there exactly.\n"
+        "- Never emit a verification command. The system builds it from test_selectors.\n"
+        "- If no catalog selector proves an acceptance case, use an empty test_selectors "
+        "array. That explicitly requests a later test-generation phase.\n"
+        "- Do not invent files, paths, commands, or selectors.\n\n"
+        f"{catalog_text}\n\n"
+        f"Split the Goal into {MIN_TASKS}-{MAX_TASKS} Tasks:\n"
+        "- Each Task is independently implementable and machine-verifiable.\n"
+        "- Each Task must include 1-8 concrete acceptance_cases using given/when/then.\n"
+        "- depends_on lists names of earlier Tasks only.\n"
+        "- Preserve separately named deliverables as separate Tasks.\n"
+        "- Use one Task only when the Goal cannot be meaningfully split.\n\n"
+        "Reply with ONLY a JSON array in this schema:\n"
+        '[{"name":"paginate list","behavior":"list returns every page",'
+        '"acceptance_cases":[{"id":"AC1","given":"more than one page",'
+        '"when":"the caller requests pages","then":"no row is skipped"}],'
+        '"test_selectors":["tests/test_pagination.py::test_all_pages"],'
+        '"depends_on":[]}]\n'
+        "No prose and no code fence."
     )
 
 
 def _extract_json_array(text: str) -> str | None:
-    """Pull the first balanced JSON array out of the text."""
     if not text or not text.strip():
         return None
     for candidate in _FENCE_RE.findall(text):
@@ -120,33 +223,52 @@ def _extract_json_array(text: str) -> str | None:
     depth = 0
     in_string = False
     escape = False
-    for i in range(start, len(text)):
-        ch = text[i]
+    for index in range(start, len(text)):
+        char = text[index]
         if in_string:
             if escape:
                 escape = False
-            elif ch == "\\":
+            elif char == "\\":
                 escape = True
-            elif ch == '"':
+            elif char == '"':
                 in_string = False
             continue
-        if ch == '"':
+        if char == '"':
             in_string = True
-        elif ch == "[":
+        elif char == "[":
             depth += 1
-        elif ch == "]":
+        elif char == "]":
             depth -= 1
             if depth == 0:
-                return text[start : i + 1]
+                return text[start : index + 1]
     return None
 
 
-def parse_plan(raw: str) -> list[FeaturePlan] | None:
-    """Parse planner output into validated FeaturePlans (never raises).
+def _spec_from_entry(entry: dict[str, Any], catalog: TestCatalog | None) -> VerificationSpec:
+    spec_data = entry.get("verification_spec") if isinstance(entry.get("verification_spec"), dict) else {}
+    requested = _normalise_strings(
+        entry.get("test_selectors", spec_data.get("selectors")),
+        limit=MAX_SELECTORS_PER_TASK,
+    )
 
-    Returns None when the output is not a usable feature array (caller falls
-    back to a single whole-goal feature).
-    """
+    # Modern planner output is grounded only against an actual Test Catalog.
+    if catalog and catalog.available and requested and all(catalog.contains(item) for item in requested):
+        files = tuple(dict.fromkeys(item.split("::", 1)[0] for item in requested))
+        return VerificationSpec(
+            adapter="pytest",
+            command=build_pytest_command(requested),
+            test_files=files,
+            selectors=requested,
+            source="discovered",
+            collected_count=len(requested),
+            baseline_result="not_run",
+            confidence="high",
+        )
+    return VerificationSpec(adapter="pytest", source="needs_generation")
+
+
+def parse_plan(raw: str, *, test_catalog: TestCatalog | None = None) -> list[TaskPlan] | None:
+    """Parse planner output into validated TaskPlans without raising."""
     block = _extract_json_array(_strip_agent_header(raw or ""))
     if block is None:
         return None
@@ -156,50 +278,38 @@ def parse_plan(raw: str) -> list[FeaturePlan] | None:
         return None
     if not isinstance(data, list) or not data:
         return None
-    if len(data) > MAX_FEATURES:
-        data = data[:MAX_FEATURES]
+    data = data[:MAX_TASKS]
 
-    plans: list[FeaturePlan] = []
+    plans: list[TaskPlan] = []
     names: set[str] = set()
     for entry in data:
         if not isinstance(entry, dict):
             return None
-        name = str(entry.get("name") or "").strip()
-        behavior = str(entry.get("behavior") or "").strip()
-        if not name or not behavior:
+        name = str(entry.get("name") or "").strip()[:80]
+        behavior = str(entry.get("behavior") or "").strip()[:MAX_BEHAVIOR_CHARS]
+        if not name or not behavior or name in names:
             return None
-        # The stored name is capped below, so validate uniqueness after the
-        # same normalization used by the task/feature projection.
-        name = name[:80]
-        if name in names:
+        cases = _parse_acceptance_cases(entry.get("acceptance_cases"))
+        if not cases:
             return None
-        verification = str(entry.get("verification") or "").strip()
-        if verification:
-            decision = check_verification_command(verification)
-            if not decision.allowed:
-                verification = ""  # policy-rejected -> fall back to full verify
-        deps = entry.get("depends_on") or []
-        dep_names = tuple(
-            str(dep).strip() for dep in deps if isinstance(dep, str) and str(dep).strip()
-        )
-        # A dependency must reference an earlier feature — check BEFORE adding
-        # this name so self-dependencies and forward references are rejected.
-        for dep in dep_names:
-            if dep not in names:
-                return None
-        names.add(name)
+        dependencies = _normalise_strings(entry.get("depends_on"), limit=MAX_TASKS)
+        if any(dependency not in names for dependency in dependencies):
+            return None
+        spec = _spec_from_entry(entry, test_catalog)
         plans.append(
-            FeaturePlan(
+            TaskPlan(
                 name=name,
-                behavior=behavior[:MAX_BEHAVIOR_CHARS],
-                verification=verification,
-                depends_on=dep_names,
+                behavior=behavior,
+                depends_on=dependencies,
+                acceptance_cases=cases,
+                verification_spec=spec,
             )
         )
+        names.add(name)
     return plans
 
 
-def plan_features(
+def plan_tasks(
     target: str,
     full_verification: str,
     workspace: Path | None = None,
@@ -208,20 +318,18 @@ def plan_features(
     cancel_check: Callable[[], bool] | None = None,
     deadline: float | None = None,
     stats=None,
-) -> list[FeaturePlan]:
-    """Decompose the goal via the read-only planner subagent.
-
-    Falls back to a single whole-goal feature on any planner failure — the
-    goal must never die because planning did.
-    """
-    from harness.agents.runner import run_agent_task as _default_runner
+    test_catalog: TestCatalog | None = None,
+) -> list[TaskPlan]:
+    """Decompose a Goal and bind only selectors the system collected."""
+    from harness.agents.runner import run_agent_task as default_runner
 
     root = (workspace or get_workdir()).resolve()
-    runner = planner_runner or _default_runner
+    catalog = test_catalog if test_catalog is not None else collect_pytest_catalog(root)
+    runner = planner_runner or default_runner
     try:
         raw = runner(
-            description="decompose goal into verifiable features",
-            prompt=build_plan_prompt(target, full_verification),
+            description="decompose goal into verifiable tasks",
+            prompt=build_plan_prompt(target, full_verification, catalog),
             agent_type=PLANNER_AGENT,
             cwd=str(root),
             max_rounds=PLANNER_MAX_ROUNDS,
@@ -230,17 +338,23 @@ def plan_features(
             stats=stats,
         )
     except Exception:
-        # A crashed planner must never kill the goal: fall back to a single
-        # whole-goal feature, same as unparseable output.
         raw = ""
-    plans = parse_plan(raw)
+    plans = parse_plan(raw, test_catalog=catalog)
     if plans:
         return plans
     return [
-        FeaturePlan(
+        TaskPlan(
             name=(target.strip()[:40] or "goal"),
             behavior=target,
-            verification="",
             depends_on=(),
+            acceptance_cases=(
+                AcceptanceCase(
+                    id="AC1",
+                    given="the Goal request",
+                    when="the Task is implemented",
+                    then="the requested behavior is available and verified",
+                ),
+            ),
+            verification_spec=VerificationSpec(adapter="pytest", source="needs_generation"),
         )
     ]

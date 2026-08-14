@@ -32,7 +32,7 @@ from harness.goal.models import (
 _PRE_ACT_PHASES = frozenset(
     {
         GoalPhase.INITIALIZE.value,
-        GoalPhase.SELECT_FEATURE.value,
+        GoalPhase.SELECT_TASK.value,
         GoalPhase.CLAIM.value,
         GoalPhase.ACT.value,
     }

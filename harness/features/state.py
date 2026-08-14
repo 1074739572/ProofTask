@@ -87,6 +87,8 @@ def create_feature(
     task_id: str | None = None,
     evaluation_required: bool = False,
     depends_on: list[str] | None = None,
+    acceptance_cases: list[dict[str, Any]] | None = None,
+    verification_spec: dict[str, Any] | None = None,
 ) -> Feature:
     """Create a feature in ``not_started`` state."""
     feature = Feature.new(
@@ -97,6 +99,8 @@ def create_feature(
         task_id=task_id,
         evaluation_required=evaluation_required,
         depends_on=depends_on or [],
+        acceptance_cases=acceptance_cases or [],
+        verification_spec=verification_spec or {},
     )
     _save(feature)
     return feature

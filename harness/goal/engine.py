@@ -8,7 +8,6 @@ runner; tests drive the engine directly.
 from __future__ import annotations
 
 import time
-from typing import Any
 
 from harness.goal.models import (
     MAX_TRANSITION_LOG,
@@ -19,7 +18,7 @@ from harness.goal.models import (
 
 #: Any non-terminal phase may be paused, cancelled, or hard-stopped (spec
 #: §5.3: ACT -> PAUSED/CANCELLED/FAILED; VERIFY -> FAILED; missing dependency
-#: during SELECT_FEATURE/INITIALIZE must be able to FAILED).
+#: during SELECT_TASK/INITIALIZE must be able to FAILED).
 _TERMINATING_TARGETS = frozenset(
     {GoalPhase.PAUSED.value, GoalPhase.CANCELLED.value, GoalPhase.FAILED.value}
 )
@@ -38,15 +37,16 @@ def _with_terminal_escapes(legal: dict[str, set[str]]) -> dict[str, set[str]]:
 #: including pause/cancel/hard-stop escape hatches on every non-terminal phase.
 LEGAL: dict[str, set[str]] = _with_terminal_escapes(
     {
-        GoalPhase.INITIALIZE.value: {GoalPhase.SELECT_FEATURE.value},
-        GoalPhase.SELECT_FEATURE.value: {GoalPhase.CLAIM.value, GoalPhase.ACT.value, GoalPhase.CLEAN_CHECK.value, GoalPhase.FULL_VERIFY.value},
+        GoalPhase.INITIALIZE.value: {GoalPhase.SELECT_TASK.value, GoalPhase.PREPARE_TESTS.value},
+        GoalPhase.PREPARE_TESTS.value: {GoalPhase.PAUSED.value, GoalPhase.SELECT_TASK.value},
+        GoalPhase.SELECT_TASK.value: {GoalPhase.CLAIM.value, GoalPhase.ACT.value, GoalPhase.CLEAN_CHECK.value, GoalPhase.FULL_VERIFY.value},
         GoalPhase.CLAIM.value: {GoalPhase.ACT.value},
         GoalPhase.ACT.value: {GoalPhase.VERIFY.value},
-        GoalPhase.VERIFY.value: {GoalPhase.ACT.value, GoalPhase.EVALUATE.value, GoalPhase.CLEAN_CHECK.value, GoalPhase.SELECT_FEATURE.value, GoalPhase.FULL_VERIFY.value},
-        GoalPhase.EVALUATE.value: {GoalPhase.CLEAN_CHECK.value, GoalPhase.SELECT_FEATURE.value},
-        GoalPhase.CLEAN_CHECK.value: {GoalPhase.DONE.value, GoalPhase.ACT.value, GoalPhase.SELECT_FEATURE.value},
-        GoalPhase.FULL_VERIFY.value: {GoalPhase.CLEAN_CHECK.value},
-        GoalPhase.PAUSED.value: {GoalPhase.INITIALIZE.value, GoalPhase.SELECT_FEATURE.value},
+        GoalPhase.VERIFY.value: {GoalPhase.ACT.value, GoalPhase.EVALUATE.value, GoalPhase.CLEAN_CHECK.value, GoalPhase.SELECT_TASK.value, GoalPhase.FULL_VERIFY.value},
+        GoalPhase.EVALUATE.value: {GoalPhase.CLEAN_CHECK.value, GoalPhase.SELECT_TASK.value},
+        GoalPhase.CLEAN_CHECK.value: {GoalPhase.DONE.value, GoalPhase.ACT.value, GoalPhase.SELECT_TASK.value},
+        GoalPhase.FULL_VERIFY.value: {GoalPhase.CLEAN_CHECK.value, GoalPhase.DONE.value},
+        GoalPhase.PAUSED.value: {GoalPhase.INITIALIZE.value, GoalPhase.PREPARE_TESTS.value, GoalPhase.SELECT_TASK.value},
         GoalPhase.DONE.value: set(),
         GoalPhase.CANCELLED.value: set(),
         GoalPhase.FAILED.value: set(),
@@ -55,7 +55,8 @@ LEGAL: dict[str, set[str]] = _with_terminal_escapes(
 
 _STATUS_FOR_PHASE: dict[str, str] = {
     GoalPhase.INITIALIZE.value: GoalStatus.RUNNING.value,
-    GoalPhase.SELECT_FEATURE.value: GoalStatus.RUNNING.value,
+    GoalPhase.SELECT_TASK.value: GoalStatus.RUNNING.value,
+    GoalPhase.PREPARE_TESTS.value: GoalStatus.RUNNING.value,
     GoalPhase.CLAIM.value: GoalStatus.RUNNING.value,
     GoalPhase.ACT.value: GoalStatus.RUNNING.value,
     GoalPhase.VERIFY.value: GoalStatus.RUNNING.value,
@@ -77,8 +78,8 @@ class GoalEngine:
     """Pure transition engine. Thread-hostile by design: the runner serializes."""
 
     def initialize(self, state: GoalState) -> GoalState:
-        """INITIALIZE -> SELECT_FEATURE (task/feature graph already created)."""
-        return self.transition(state, GoalPhase.SELECT_FEATURE, "initialize_complete")
+        """INITIALIZE -> SELECT_TASK after durable Task creation."""
+        return self.transition(state, GoalPhase.SELECT_TASK, "initialize_complete")
 
     def transition(
         self,
@@ -134,56 +135,3 @@ class GoalEngine:
         if len(state.transition_log) > MAX_TRANSITION_LOG:
             del state.transition_log[:-MAX_TRANSITION_LOG]
         return state
-
-    def next_phase(
-        self,
-        state: GoalState,
-        feature: Any | None = None,
-        clean_report: Any | None = None,
-        *,
-        feature_stale: bool = False,
-    ) -> GoalPhase:
-        """Decide the next phase from the current phase + feature state.
-
-        Used by the runner to route VERIFY/SELECT_FEATURE outcomes. Raises
-        :class:`GoalTransitionError` when the current phase has no next step.
-        """
-        current = state.phase
-        if current == GoalPhase.INITIALIZE.value:
-            return GoalPhase.SELECT_FEATURE
-        if current == GoalPhase.SELECT_FEATURE.value:
-            if feature is None:
-                return GoalPhase.CLAIM
-            if feature.state == "passing":
-                if feature_stale:
-                    return GoalPhase.ACT
-                # All features done: decomposed goals run the whole-goal gate.
-                if len(state.feature_ids) > 1:
-                    return GoalPhase.FULL_VERIFY
-                return GoalPhase.CLEAN_CHECK
-            if feature.state in ("active", "failing", "blocked"):
-                return GoalPhase.ACT
-            return GoalPhase.CLAIM
-        if current == GoalPhase.CLAIM.value:
-            return GoalPhase.ACT
-        if current == GoalPhase.ACT.value:
-            return GoalPhase.VERIFY
-        if current == GoalPhase.VERIFY.value:
-            if feature is not None and feature.state == "passing":
-                return (
-                    GoalPhase.EVALUATE
-                    if feature.evaluation_required
-                    else GoalPhase.CLEAN_CHECK
-                )
-            return GoalPhase.ACT
-        if current == GoalPhase.EVALUATE.value:
-            return GoalPhase.CLEAN_CHECK
-        if current == GoalPhase.FULL_VERIFY.value:
-            return GoalPhase.CLEAN_CHECK
-        if current == GoalPhase.CLEAN_CHECK.value:
-            return (
-                GoalPhase.DONE
-                if (clean_report is not None and getattr(clean_report, "ok", False))
-                else GoalPhase.ACT
-            )
-        raise GoalTransitionError(f"no next phase from {current}")

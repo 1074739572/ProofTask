@@ -27,6 +27,8 @@ def evidence_from_result(
     *,
     workspace: str | None = None,
     verified_by: str = "runner",
+    selectors: tuple[str, ...] | list[str] = (),
+    collected_count: int = 0,
 ) -> VerificationEvidence:
     """Build evidence from a run result. Timeouts get exit code 124."""
     if result.timed_out:
@@ -41,4 +43,6 @@ def evidence_from_result(
         duration_ms=round(result.duration_ms, 1),
         verified_by=verified_by,
         code_snapshot=capture_code_snapshot(workspace),
+        selectors=tuple(str(selector) for selector in selectors),
+        collected_count=max(0, int(collected_count)),
     )

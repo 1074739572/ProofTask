@@ -14,6 +14,7 @@ feature (``feature.evaluation``) but never change feature state.
 
 from __future__ import annotations
 
+import json
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -44,6 +45,28 @@ class EvaluationInputs:
             "# 原始需求 (behavior)",
             self.feature.behavior or "(空)",
             "",
+            "# Task 验收案例 (acceptance cases)",
+        ]
+        cases = self.feature.acceptance_cases or []
+        if cases:
+            for case in cases:
+                if not isinstance(case, dict):
+                    continue
+                lines.append(
+                    "- {id}: Given {given}; When {when}; Then {then}".format(
+                        id=case.get("id", "AC"),
+                        given=case.get("given", ""),
+                        when=case.get("when", ""),
+                        then=case.get("then", ""),
+                    )
+                )
+        else:
+            lines.append("(legacy Task: no explicit acceptance cases)")
+        lines += [
+            "",
+            "# 验证绑定 (VerificationSpec)",
+            json.dumps(self.feature.verification_spec or {}, ensure_ascii=False, sort_keys=True),
+            "",
             "# 声明的验证命令 (verification)",
             self.feature.verification or "(空)",
             "",
@@ -54,8 +77,12 @@ class EvaluationInputs:
                 lines.append(
                     f"- command: {ev.get('command', '')} | "
                     f"exit_code: {ev.get('exit_code')} | "
-                    f"verified_by: {ev.get('verified_by', '')}"
+                    f"verified_by: {ev.get('verified_by', '')} | "
+                    f"collected_count: {ev.get('collected_count', 0)}"
                 )
+                selectors = ev.get("selectors") or []
+                if selectors:
+                    lines.append(f"  selectors: {', '.join(str(item) for item in selectors[:8])}")
                 tail = (ev.get("stdout_tail") or "").strip()
                 if tail:
                     lines.append(f"  stdout_tail: {tail[:500]}")
@@ -141,3 +168,11 @@ def collect_inputs(feature_id: str, workspace: str | Path | None = None) -> Eval
     feature: Feature = get_feature(feature_id, workspace)
     ws = Path(feature.workspace or workspace or ".")
     return EvaluationInputs(feature=feature, diff=_git_diff(ws))
+
+
+def collect_task_inputs(task_id: str, workspace: str | Path) -> EvaluationInputs:
+    """Assemble evaluator inputs from a Task-owned contract and evidence."""
+    from harness.tasks import load_task
+
+    task = load_task(task_id)
+    return EvaluationInputs(feature=task, diff=_git_diff(Path(workspace)))

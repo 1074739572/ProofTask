@@ -1,8 +1,8 @@
-"""Durable task graph with dependencies, ownership, and archive lifecycle.
+"""Durable Task graph and Task-owned verification contracts.
 
-Active board: `.tasks/task_*.json` (pending / in_progress only).
-Completed tasks move to `.tasks/archive/` so list_tasks and teammates
-do not keep steering new work from old goals.
+Tasks are the only execution unit used by Goal mode. A Task may be worked on
+through any number of todos, but only a zero-exit machine verification result
+can make it eligible for completion.
 """
 
 from __future__ import annotations
@@ -15,20 +15,10 @@ from pathlib import Path
 
 from harness.settings import TASKS_DIR
 
-#: Import-time snapshot of TASKS_DIR so tests that patch the module global
-#: (mock.patch.object(tasks_mod, "TASKS_DIR", ...)) keep working while the
-#: default follows the ACTIVE workspace across /open switches.
 _ORIGINAL_TASKS_DIR = TASKS_DIR
 
 
 def _tasks_dir() -> Path:
-    """Active tasks dir — computed at call time.
-
-    Follows ``get_workspace_paths().tasks_dir`` so /open switches never write
-    tasks to the startup workspace. When tests patched the module-level
-    ``TASKS_DIR`` global, that override wins (backward compatible with the
-    F006-style tests).
-    """
     if TASKS_DIR != _ORIGINAL_TASKS_DIR:
         return TASKS_DIR
     from harness.settings import get_workspace_paths
@@ -37,8 +27,6 @@ def _tasks_dir() -> Path:
 
 
 def _archive_dir() -> Path:
-    """Archive directory — computed at call time so tests that patch
-    TASKS_DIR (or a workspace switch) never write to a stale path."""
     return _tasks_dir() / "archive"
 
 
@@ -52,14 +40,27 @@ class Task:
     blockedBy: list[str]
     worktree: str | None = None
     completed_at: float | None = None
-    # L2 extensions — defaulted so legacy JSON files (without these keys)
-    # still load via Task(**data).
-    feature_ids: list[str] = field(default_factory=list)
+    acceptance_cases: list[dict] = field(default_factory=list)
+    verification_spec: dict = field(default_factory=dict)
+    verification_state: str = "not_started"
+    evidence: list[dict] = field(default_factory=list)
+    evaluation: dict | None = None
+    evaluation_required: bool = False
     attempts: int = 0
     last_error: str | None = None
-    # Optional owner for durable workflow projections such as /goal. It lets a
-    # restarted runner reconcile a task created just before goal.json was saved.
     goal_id: str | None = None
+
+    @property
+    def name(self) -> str:
+        return self.subject
+
+    @property
+    def behavior(self) -> str:
+        return self.description
+
+    @property
+    def verification(self) -> str:
+        return str(self.verification_spec.get("command") or "")
 
 
 def _active_path(task_id: str) -> Path:
@@ -75,15 +76,15 @@ def _find_task_path(task_id: str) -> Path | None:
     if active.exists():
         return active
     archived = _archive_path(task_id)
-    if archived.exists():
-        return archived
-    return None
+    return archived if archived.exists() else None
 
 
 def _load_task_from_path(path: Path) -> Task:
     data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
-    if "completed_at" not in data:
-        data["completed_at"] = None
+    allowed = set(Task.__dataclass_fields__)
+    unknown = set(data) - allowed
+    if unknown:
+        raise ValueError(f"unsupported task fields: {sorted(unknown)}")
     return Task(**data)
 
 
@@ -93,15 +94,23 @@ def create_task(
     blockedBy: list[str] | None = None,
     *,
     goal_id: str | None = None,
+    acceptance_cases: list[dict] | None = None,
+    verification_spec: dict | None = None,
+    evaluation_required: bool = False,
 ) -> Task:
+    spec = dict(verification_spec or {})
     task = Task(
         id=f"task_{int(time.time())}_{random.randint(0, 9999):04d}",
         subject=subject,
         description=description,
         status="pending",
         owner=None,
-        blockedBy=blockedBy or [],
+        blockedBy=list(blockedBy or []),
         goal_id=goal_id,
+        acceptance_cases=list(acceptance_cases or []),
+        verification_spec=spec,
+        verification_state=("needs_generation" if spec.get("source") == "needs_generation" else "not_started"),
+        evaluation_required=evaluation_required,
     )
     save_task(task)
     return task
@@ -121,26 +130,16 @@ def load_task(task_id: str) -> Task:
 
 
 def list_tasks(*, include_archived: bool = False) -> list[Task]:
-    """Active board only by default — completed tasks live under archive/."""
-    tasks = [
-        _load_task_from_path(path)
-        for path in sorted(_tasks_dir().glob("task_*.json"))
-    ]
+    tasks = [_load_task_from_path(path) for path in sorted(_tasks_dir().glob("task_*.json"))]
     if include_archived and _archive_dir().exists():
-        tasks.extend(
-            _load_task_from_path(path)
-            for path in sorted(_archive_dir().glob("task_*.json"))
-        )
+        tasks.extend(_load_task_from_path(path) for path in sorted(_archive_dir().glob("task_*.json")))
     return tasks
 
 
 def list_archived_tasks() -> list[Task]:
     if not _archive_dir().exists():
         return []
-    return [
-        _load_task_from_path(path)
-        for path in sorted(_archive_dir().glob("task_*.json"))
-    ]
+    return [_load_task_from_path(path) for path in sorted(_archive_dir().glob("task_*.json"))]
 
 
 def get_task_json(task_id: str) -> str:
@@ -148,63 +147,33 @@ def get_task_json(task_id: str) -> str:
 
 
 def _dependency_satisfied(dep_id: str) -> bool:
-    path = _find_task_path(dep_id)
-    if not path:
+    try:
+        return load_task(dep_id).status == "completed"
+    except FileNotFoundError:
         return False
-    return _load_task_from_path(path).status == "completed"
 
 
 def can_start(task_id: str) -> bool:
-    task = load_task(task_id)
-    return all(_dependency_satisfied(dep_id) for dep_id in task.blockedBy)
+    return all(_dependency_satisfied(dep_id) for dep_id in load_task(task_id).blockedBy)
 
 
 def claim_task(task_id: str, owner: str = "agent") -> str:
     path = _active_path(task_id)
     if not path.exists():
         task = load_task(task_id)
-        if task.status == "completed":
-            return f"Task {task_id} is completed and archived; create a new task instead"
-        return f"Task {task_id} is not on the active board"
+        return f"Task {task_id} is completed and archived; create a new task instead" if task.status == "completed" else f"Task {task_id} is not on the active board"
     task = _load_task_from_path(path)
     if task.status != "pending":
         return f"Task {task_id} is {task.status}, cannot claim"
     if task.owner:
         return f"Task {task_id} already owned by {task.owner}"
     if not can_start(task_id):
-        deps = [
-            dep
-            for dep in task.blockedBy
-            if not _dependency_satisfied(dep)
-        ]
-        missing = [
-            dep for dep in task.blockedBy if _find_task_path(dep) is None
-        ]
-        parts = []
-        if deps:
-            parts.append(f"blocked by: {deps}")
-        if missing:
-            parts.append(f"missing deps: {missing}")
-        return "Cannot start — " + ", ".join(parts)
+        return f"Cannot start task {task_id}: dependencies are incomplete"
     task.owner = owner
     task.status = "in_progress"
     task.attempts += 1
     save_task(task)
-    print(f"  \033[36m[claim] {task.subject} → in_progress\033[0m")
     return f"Claimed {task.id} ({task.subject})"
-
-
-def attach_feature(task_id: str, feature_id: str) -> str:
-    """Link a feature (harness.features) to a task. Idempotent."""
-    path = _active_path(task_id)
-    if not path.exists():
-        raise FileNotFoundError(f"task {task_id} is not on the active board")
-    task = _load_task_from_path(path)
-    if feature_id not in task.feature_ids:
-        task.feature_ids.append(feature_id)
-        save_task(task)
-        return f"Attached {feature_id} to {task_id}"
-    return f"{feature_id} already attached to {task_id}"
 
 
 def _archive_task(task: Task) -> None:
@@ -215,141 +184,109 @@ def _archive_task(task: Task) -> None:
         active.unlink()
 
 
+def set_task_verification_result(
+    task_id: str,
+    *,
+    passed: bool,
+    evidence: dict | None = None,
+    error: str | None = None,
+) -> Task:
+    path = _active_path(task_id)
+    if not path.exists():
+        raise FileNotFoundError(task_id)
+    task = _load_task_from_path(path)
+    if task.status != "in_progress":
+        raise ValueError(f"cannot verify task in state {task.status!r}")
+    if passed:
+        if not evidence or evidence.get("exit_code") != 0:
+            raise ValueError("passing verification requires zero-exit evidence")
+        task.evidence.append(dict(evidence))
+        task.verification_state = "passing"
+        task.last_error = None
+    else:
+        if evidence:
+            task.evidence.append(dict(evidence))
+        task.verification_state = "failing"
+        task.last_error = error or "verification failed"
+    save_task(task)
+    return task
+
+
+def record_task_evaluation(task_id: str, evaluation: dict) -> Task:
+    path = _active_path(task_id)
+    if not path.exists():
+        raise FileNotFoundError(task_id)
+    task = _load_task_from_path(path)
+    task.evaluation = dict(evaluation)
+    save_task(task)
+    return task
+
+
+def bind_task_verification(task_id: str, verification_spec: dict) -> Task:
+    path = _active_path(task_id)
+    if not path.exists():
+        raise FileNotFoundError(task_id)
+    task = _load_task_from_path(path)
+    task.verification_spec = dict(verification_spec)
+    task.verification_state = "not_started"
+    task.last_error = None
+    save_task(task)
+    return task
+
+
 def complete_task(task_id: str) -> str:
     path = _active_path(task_id)
     if not path.exists():
         task = load_task(task_id)
-        if task.status == "completed":
-            return f"Task {task_id} already completed (archived)"
-        return f"Task {task_id} is not on the active board"
+        return f"Task {task_id} already completed (archived)" if task.status == "completed" else f"Task {task_id} is not on the active board"
     task = _load_task_from_path(path)
     if task.status != "in_progress":
         return f"Task {task_id} is {task.status}, cannot complete"
+    if task.verification_spec and task.verification_state != "passing":
+        return f"Cannot complete {task.id}: bound verification has not passed ({task.verification_state})"
 
-    # L4 clean-state gate: report in warn mode; block in enforce mode.
-    # (Delayed import keeps harness.tasks free of a hard dependency on clean.)
     from harness.clean import clean_mode, run_clean_check
     from harness.settings import get_workspace_paths
-    from harness.ui import events
 
-    mode = clean_mode()
-
-    # Check the task's own workspace (its worktree, if bound) — not whatever
-    # workspace the process happens to be in right now.
-    ws_paths = get_workspace_paths()
     check_ws: Path | None = None
     if task.worktree:
-        candidate = ws_paths.worktrees_dir / task.worktree
+        candidate = get_workspace_paths().worktrees_dir / task.worktree
         if candidate.exists():
             check_ws = candidate
-
-    report = run_clean_check(check_ws)
-    if mode == "enforce" and not report.ok:
-        failures = ", ".join(c.id for c in report.hard_failures)
-        if not events.is_enabled():
-            print(f"\n\033[31m[clean:enforce] blocking completion — {failures}\033[0m")
-            print(report.summary())
-        return (
-            f"Cannot complete {task.id} — clean-state check failed ({failures}). "
-            f"Fix the issues and retry. Details:\n{report.summary()}"
-        )
-    if mode == "warn" and not report.ok and not events.is_enabled():
-        print(f"\n\033[33m[clean:warn]\033[0m")
-        print(report.summary())
-
-    # L2 completion gate: every linked feature must be passing and fresh.
-    if task.feature_ids:
-        from harness.features import feature_is_stale, list_features
-
-        features = list_features(workspace=check_ws) if check_ws else list_features()
-        by_id = {f.id: f for f in features}
-        missing = [fid for fid in task.feature_ids if fid not in by_id]
-        not_passing = [
-            f"{fid} ({by_id[fid].name}) [{by_id[fid].state}]"
-            for fid in task.feature_ids
-            if fid in by_id and by_id[fid].state != "passing"
-        ]
-        stale = [
-            f"{fid} ({by_id[fid].name})"
-            for fid in task.feature_ids
-            if fid in by_id and by_id[fid].state == "passing" and feature_is_stale(by_id[fid])
-        ]
-        problems: list[str] = []
-        if missing:
-            problems.append("missing features: " + ", ".join(missing))
-        if not_passing:
-            problems.append("not passing: " + ", ".join(not_passing))
-        if stale:
-            problems.append("stale (code changed after verification): " + ", ".join(stale))
-        if problems:
-            detail = "; ".join(problems)
-            if mode == "enforce":
-                if not events.is_enabled():
-                    print(f"\n\033[31m[clean:enforce] blocking completion — features not done\033[0m")
-                    print(f"  {detail}")
-                return (
-                    f"Cannot complete {task.id} — linked features are not all "
-                    f"passing and fresh. {detail}"
-                )
-            if not events.is_enabled():
-                print(f"\n\033[33m[clean:warn]\033[0m features not all done: {detail}")
+    report = run_clean_check(check_ws, include_feature_consistency=False)
+    if clean_mode() == "enforce" and not report.ok:
+        return f"Cannot complete {task.id}: clean-state check failed. {report.summary()}"
 
     task.status = "completed"
     task.completed_at = time.time()
     _archive_task(task)
-    unblocked = [
-        item.subject
-        for item in list_tasks()
-        if item.status == "pending" and item.blockedBy and can_start(item.id)
-    ]
-    print(f"  \033[32m[complete] {task.subject} archived\033[0m")
-    msg = f"Completed {task.id} ({task.subject}) — removed from active board"
-    if unblocked:
-        msg += f"\nUnblocked: {', '.join(unblocked)}"
-    return msg
+    return f"Completed {task.id} ({task.subject})"
 
 
 def reconcile_task_board() -> int:
-    """Move legacy completed files still on the active board into archive/."""
     moved = 0
     for path in list(_tasks_dir().glob("task_*.json")):
         task = _load_task_from_path(path)
-        if task.status != "completed":
-            continue
-        if task.completed_at is None:
-            task.completed_at = path.stat().st_mtime
-        _archive_task(task)
-        moved += 1
+        if task.status == "completed":
+            task.completed_at = task.completed_at or path.stat().st_mtime
+            _archive_task(task)
+            moved += 1
     return moved
 
 
 def scan_unclaimed_tasks() -> list[dict]:
-    unclaimed = []
-    for path in sorted(_tasks_dir().glob("task_*.json")):
-        task = json.loads(path.read_text(encoding="utf-8"))
-        if (
-            task.get("status") == "pending"
-            and not task.get("owner")
-            and can_start(task["id"])
-        ):
-            unclaimed.append(task)
-    return unclaimed
+    return [asdict(task) for task in list_tasks() if task.status == "pending" and not task.owner and can_start(task.id)]
 
 
 def clear_active_tasks(*, archive: bool = True) -> str:
-    """Remove all tasks from the active board (optional archive before delete)."""
     paths = list(_tasks_dir().glob("task_*.json"))
     if not paths:
         return "Active task board is already empty."
-    if archive:
-        _archive_dir().mkdir(parents=True, exist_ok=True)
-        for path in paths:
-            task = _load_task_from_path(path)
+    for path in paths:
+        task = _load_task_from_path(path)
+        if archive:
             task.status = "cancelled"
             task.completed_at = time.time()
             save_task(task, archived=True)
-            path.unlink()
-        return f"Cleared {len(paths)} active task(s); archived under .tasks/archive/"
-    for path in paths:
         path.unlink()
-    return f"Deleted {len(paths)} active task(s)."
+    return f"Cleared {len(paths)} active task(s)" if archive else f"Deleted {len(paths)} active task(s)"

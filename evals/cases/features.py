@@ -273,8 +273,8 @@ def case_f005_atomic_write_no_corruption() -> None:
 
 # --- F006: task backward compatibility ---------------------------------------
 
-def case_f006_task_extension_backcompat() -> None:
-    """Legacy task JSON (no feature_ids/attempts/last_error) still loads."""
+def case_f006_task_schema_is_strict() -> None:
+    """Old Feature-linked task state is rejected instead of migrated."""
     import harness.tasks as tasks_mod
     from harness.tasks import Task
 
@@ -284,24 +284,15 @@ def case_f006_task_extension_backcompat() -> None:
             tasks_mod.create_task("legacy subject", "desc")
             path = next(Path(tmp.name).glob("task_*.json"))
             data = json.loads(path.read_text(encoding="utf-8"))
-            # Simulate a file written before the L2 extension.
-            for key in ("feature_ids", "attempts", "last_error"):
-                data.pop(key, None)
+            data["feature_ids"] = ["feat_old"]
             path.write_text(json.dumps(data), encoding="utf-8")
-
-            loaded = tasks_mod.load_task(data["id"])
-            assert loaded.feature_ids == []
-            assert loaded.attempts == 0
-            assert loaded.last_error is None
-
-            # attach_feature works on the legacy-loaded task.
-            tasks_mod.attach_feature(data["id"], "feat_abc")
-            loaded = tasks_mod.load_task(data["id"])
-            assert loaded.feature_ids == ["feat_abc"]
-
-            # Task(**data) also works directly with defaulted fields.
+            try:
+                tasks_mod.load_task(data["id"])
+                assert False, "old Feature-linked task must not load"
+            except ValueError:
+                pass
             t = Task(id="t1", subject="s", description="d", status="pending", owner=None, blockedBy=[])
-            assert t.feature_ids == [] and t.attempts == 0 and t.last_error is None
+            assert t.verification_state == "not_started" and t.evidence == []
     finally:
         tmp.cleanup()
 
@@ -453,9 +444,9 @@ CASES = [
     ),
     EvalCase(
         "f006.task_extension_backcompat",
-        "F006: task extension keeps legacy JSON loadable",
+        "F006: Task schema rejects old Feature links",
         "features",
-        case_f006_task_extension_backcompat,
+        case_f006_task_schema_is_strict,
     ),
     EvalCase(
         "f007.workspace_isolation",

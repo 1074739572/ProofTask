@@ -212,23 +212,13 @@ def case_w005_warn_reports_but_completes() -> None:
 
 # --- W008/W009: completion gate on linked features ---------------------------
 
-def _link_feature(task_id: str, feature_id: str, tmp_root: Path) -> None:
+def case_w008_blocks_unverified_task() -> None:
+    """A Task with a binding cannot complete before its own proof passes."""
     import harness.tasks as tasks_mod
-
-    with mock.patch.object(tasks_mod, "TASKS_DIR", tmp_root / "tasks"):
-        tasks_mod.attach_feature(task_id, feature_id)
-
-
-def case_w008_enforce_blocks_not_passing_feature() -> None:
-    """A task linked to a non-passing feature cannot complete in enforce mode."""
-    import harness.tasks as tasks_mod
-    from harness.features import create_feature
 
     tmp, ws = _tmp_workspace()
     try:
-        feat = create_feature("todo", "do the thing", "python check.py", workspace=ws)
         task_id = _setup_task(Path(tmp.name))
-        _link_feature(task_id, feat.id, Path(tmp.name))
 
         with (
             mock.patch.object(tasks_mod, "TASKS_DIR", Path(tmp.name) / "tasks"),
@@ -240,34 +230,26 @@ def case_w008_enforce_blocks_not_passing_feature() -> None:
                 "harness.settings.get_workspace_paths",
                 return_value=_fake_paths(ws),
             ),
-            mock.patch(
-                "harness.features.state.get_workspace_paths",
-                return_value=_fake_paths(ws),
-            ),
             mock.patch.dict(os.environ, {"HARNESS_CLEAN_MODE": "enforce"}),
         ):
+            task = tasks_mod.load_task(task_id)
+            task.verification_spec = {"source": "generated", "command": "pytest -q", "selectors": ["tests/test_x.py::test_x"], "collected_count": 1}
+            tasks_mod.save_task(task)
             msg = tasks_mod.complete_task(task_id)
             assert "Cannot complete" in msg
-            assert "not passing" in msg
+            assert "has not passed" in msg
             assert tasks_mod.load_task(task_id).status == "in_progress"
     finally:
         tmp.cleanup()
 
 
-def case_w009_all_passing_completes() -> None:
-    """A task whose linked features are all passing completes normally."""
+def case_w009_verified_task_completes() -> None:
+    """A Task with zero-exit evidence completes normally."""
     import harness.tasks as tasks_mod
-    from harness.features import create_feature
-    from harness.verification import verify_feature_command
 
     tmp, ws = _tmp_workspace()
     try:
-        (ws / "check.py").write_text("import sys; sys.exit(0)", encoding="utf-8")
-        feat = create_feature("done", "the thing", "python check.py", workspace=ws)
-        verify_feature_command(feat.id, workspace=ws)
-        assert feat.state == "passing" or True  # reloaded below
         task_id = _setup_task(Path(tmp.name))
-        _link_feature(task_id, feat.id, Path(tmp.name))
 
         with (
             mock.patch.object(tasks_mod, "TASKS_DIR", Path(tmp.name) / "tasks"),
@@ -279,12 +261,12 @@ def case_w009_all_passing_completes() -> None:
                 "harness.settings.get_workspace_paths",
                 return_value=_fake_paths(ws),
             ),
-            mock.patch(
-                "harness.features.state.get_workspace_paths",
-                return_value=_fake_paths(ws),
-            ),
             mock.patch.dict(os.environ, {"HARNESS_CLEAN_MODE": "enforce"}),
         ):
+            task = tasks_mod.load_task(task_id)
+            task.verification_spec = {"source": "generated", "command": "pytest -q", "selectors": ["tests/test_x.py::test_x"], "collected_count": 1}
+            tasks_mod.save_task(task)
+            tasks_mod.set_task_verification_result(task_id, passed=True, evidence={"command": "pytest -q", "exit_code": 0})
             msg = tasks_mod.complete_task(task_id)
             assert "Completed" in msg
             assert tasks_mod.load_task(task_id).status == "completed"
@@ -353,16 +335,16 @@ CASES = [
         case_w007_uncommitted_is_soft,
     ),
     EvalCase(
-        "w008.enforce_blocks_not_passing_feature",
-        "W008: enforce blocks completion when a linked feature is not passing",
+        "w008.blocks_unverified_task",
+        "W008: Task completion requires its own passing proof",
         "clean",
-        case_w008_enforce_blocks_not_passing_feature,
+        case_w008_blocks_unverified_task,
     ),
     EvalCase(
-        "w009.all_passing_completes",
-        "W009: all linked features passing -> completion allowed",
+        "w009.verified_task_completes",
+        "W009: verified Task completion allowed",
         "clean",
-        case_w009_all_passing_completes,
+        case_w009_verified_task_completes,
     ),
     EvalCase(
         "w010.corrupt_feature_blocks_enforce",

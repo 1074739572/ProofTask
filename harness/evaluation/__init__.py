@@ -22,17 +22,21 @@ from harness.evaluation.inputs import (
 from harness.evaluation.parser import Findings, parse_findings
 from harness.evaluation.runner import (
     EVALUATOR_AGENT,
+    build_evaluation_prompt,
     requires_evaluation,
     run_evaluation,
+    run_task_evaluation,
 )
 
 __all__ = [
     "RUBRIC",
     "EVALUATOR_AGENT",
+    "build_evaluation_prompt",
     "EvaluationInputs",
     "Findings",
     "collect_inputs",
     "parse_findings",
     "requires_evaluation",
     "run_evaluation",
+    "run_task_evaluation",
 ]

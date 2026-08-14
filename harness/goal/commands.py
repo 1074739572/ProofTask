@@ -165,7 +165,7 @@ def _handle_cancel(runner) -> str:
     return (
         f"Goal stopped [cancelled]\n"
         f"  Reason: {state.stop_reason}\n"
-        f"  Feature: {state.feature_id or '-'}\n"
+        f"  Task: {state.current_task_id or '-'}\n"
         f"  History kept under .project/goal-history/"
     )
 
@@ -173,7 +173,7 @@ def _handle_cancel(runner) -> str:
 def _handle_resume(runner, history: list, context: dict, binding: Any) -> str:
     state = runner.resume_goal(history=history, context=context, binding=binding)
     return (
-        f"Goal resumed: {state.id} [select_feature]\n"
+        f"Goal resumed: {state.id} [select_task]\n"
         f"  Target: {state.target[:80]}\n"
         f"  Attempt: {state.attempts}/{state.max_attempts}"
     )

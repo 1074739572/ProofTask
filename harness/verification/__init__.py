@@ -33,6 +33,12 @@ from harness.features import (
     verify_feature,
 )
 from harness.verification.evidence import evidence_from_result
+from harness.verification.catalog import (
+    TestCatalog,
+    build_pytest_command,
+    collect_pytest_catalog,
+    parse_pytest_collection_output,
+)
 from harness.verification.policy import (
     ALLOWED_PROGRAMS,
     DENY_TOKENS,
@@ -54,11 +60,16 @@ __all__ = [
     "MAX_VERIFICATION_COMMAND_LEN",
     "DEFAULT_VERIFY_TIMEOUT_S",
     "Feature",
+    "TestCatalog",
     "VerificationDecision",
     "VerificationRunResult",
     "check_verification_command",
+    "build_pytest_command",
+    "collect_pytest_catalog",
+    "parse_pytest_collection_output",
     "run_verification",
     "verify_feature_command",
+    "verify_task_command",
 ]
 
 
@@ -102,8 +113,15 @@ def verify_feature_command(
     # executed successfully — record the reason, no fake evidence. Timeouts
     # keep evidence (exit 124 convention).
     executed = result.error is None or result.timed_out
+    spec = feature.verification_spec if isinstance(feature.verification_spec, dict) else {}
+    selectors = spec.get("selectors") or []
     evidence = (
-        evidence_from_result(result, workspace=str(feature.workspace or workspace))
+        evidence_from_result(
+            result,
+            workspace=str(feature.workspace or workspace),
+            selectors=selectors if isinstance(selectors, list) else (),
+            collected_count=spec.get("collected_count") or 0,
+        )
         if executed
         else None
     )
@@ -115,3 +133,40 @@ def verify_feature_command(
         error=error,
         workspace=workspace,
     )
+
+
+def verify_task_command(
+    task_id: str,
+    *,
+    workspace: str | Path | None = None,
+    timeout_s: float | None = None,
+):
+    """Run a Task's bound selector command and persist its machine verdict."""
+    from harness.tasks import load_task, set_task_verification_result
+
+    task = load_task(task_id)
+    spec = task.verification_spec
+    command = str(spec.get("command") or "").strip()
+    selectors = spec.get("selectors") or []
+    collected_count = int(spec.get("collected_count") or 0)
+    if not command or not selectors or collected_count <= 0:
+        return set_task_verification_result(
+            task_id,
+            passed=False,
+            error="task has no collected verification binding; generate and baseline tests first",
+        )
+    root = Path(workspace).expanduser().resolve() if workspace else None
+    result = run_verification(command, workspace=root, timeout_s=timeout_s)
+    error = result.error or (None if result.passed else f"verification failed with exit code {result.exit_code}")
+    executed = result.error is None or result.timed_out
+    evidence = (
+        evidence_from_result(
+            result,
+            workspace=str(root or ""),
+            selectors=selectors,
+            collected_count=collected_count,
+        ).to_dict()
+        if executed
+        else None
+    )
+    return set_task_verification_result(task_id, passed=result.passed, evidence=evidence, error=error)

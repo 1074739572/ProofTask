@@ -59,6 +59,8 @@ class VerificationEvidence:
     duration_ms: float = 0.0
     verified_by: str = "oracle"  # oracle | runner | harness
     code_snapshot: str = ""  # git HEAD:worktree-fingerprint at verification time
+    selectors: tuple[str, ...] = ()
+    collected_count: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -73,6 +75,10 @@ class Feature:
     state: str = "not_started"
     workspace: str = ""
     task_id: str | None = None
+    # Goal Task contract. Feature remains an internal execution projection
+    # during migration, so it persists the Task's acceptance and test binding.
+    acceptance_cases: list[dict[str, Any]] = field(default_factory=list)
+    verification_spec: dict[str, Any] = field(default_factory=dict)
     # L6 v2: dependency edges between goal features (ids of features that must
     # be passing before this one starts).
     depends_on: list[str] = field(default_factory=list)
@@ -98,6 +104,8 @@ class Feature:
         task_id: str | None = None,
         evaluation_required: bool = False,
         depends_on: list[str] | None = None,
+        acceptance_cases: list[dict[str, Any]] | None = None,
+        verification_spec: dict[str, Any] | None = None,
     ) -> "Feature":
         now = time.time()
         return cls(
@@ -107,6 +115,8 @@ class Feature:
             verification=verification,
             workspace=str(workspace or ""),
             task_id=task_id,
+            acceptance_cases=list(acceptance_cases or []),
+            verification_spec=dict(verification_spec or {}),
             evaluation_required=evaluation_required,
             depends_on=depends_on or [],
             created_at=now,
