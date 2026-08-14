@@ -3,7 +3,9 @@
 from harness.goal.commands import parse_goal_command
 from harness.goal.engine import GoalEngine, GoalTransitionError
 from harness.goal.models import GOAL_SCHEMA_VERSION, GoalPhase, GoalState
-from harness.goal.planner import plan_tasks
+import pytest
+
+from harness.goal.planner import GoalPlanningError, plan_tasks
 from harness.goal.store import GoalStoreError, goal_path, load_goal, save_goal
 
 
@@ -13,10 +15,9 @@ def test_parse_limit_flags_map_to_goalrequest_fields():
     assert result["limits"]["max_attempts"] == 2
 
 
-def test_plan_tasks_fallback_requires_test_generation():
-    plans = plan_tasks("fix everything", "pytest -q", planner_runner=lambda **_: "")
-    assert len(plans) == 1
-    assert plans[0].verification_spec.source == "needs_generation"
+def test_plan_tasks_rejects_an_invalid_planner_result():
+    with pytest.raises(GoalPlanningError):
+        plan_tasks("fix everything", "pytest -q", planner_runner=lambda **_: "")
 
 
 def test_engine_rejects_illegal_transition():

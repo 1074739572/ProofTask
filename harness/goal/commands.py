@@ -319,6 +319,17 @@ def _handle_approve(runner, history: list, context: dict, binding: Any) -> str:
         target=draft.target,
         verification=draft.verification,
         task_plan=draft.task_plan,
+        goal_contract={
+            "target": draft.target,
+            "clarifications": [
+                {"question": question, "answer": answer}
+                for question, answer in zip(draft.questions, draft.answers)
+            ],
+            "autonomy": (
+                "After /goal run, resolve ordinary product and technical ambiguity "
+                "from this contract and repository evidence. Do not ask the user."
+            ),
+        },
         await_execution_approval=True,
         **draft.limits,
     )
@@ -346,5 +357,10 @@ def _handle_run(runner, history: list, context: dict, binding: Any) -> str:
     state = load_goal()
     if state is None or state.stop_reason != StopReason.user_approval_required.value:
         return "No Goal is waiting for execution approval. Use /goal resume for an ordinary paused Goal."
-    resumed = runner.resume_goal(history=history, context=context, binding=binding)
+    resumed = runner.resume_goal(
+        history=history,
+        context=context,
+        binding=binding,
+        approve_execution=True,
+    )
     return f"Goal execution approved: {resumed.id} [SELECT_TASK]"

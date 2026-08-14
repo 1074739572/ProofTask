@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 SEVERITIES = ("high", "medium", "low")
+ROUTES = ("pass", "implementation_fix", "test_gap", "replan", "blocked")
 
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL | re.IGNORECASE)
 
@@ -33,6 +34,8 @@ class Findings:
     summary: str = ""
     items: list[dict[str, Any]] = field(default_factory=list)
     error: str | None = None
+    route: str = "blocked"
+    affected_task_ids: list[str] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -44,6 +47,8 @@ class Findings:
             "summary": self.summary,
             "findings": self.items,
             "error": self.error,
+            "route": self.route,
+            "affected_task_ids": list(self.affected_task_ids),
         }
 
 
@@ -118,4 +123,9 @@ def parse_findings(raw: str) -> Findings:
                     "evidence": str(entry.get("evidence") or ""),
                 }
             )
-    return Findings(passed=passed, summary=summary, items=items)
+    route = str(data.get("route") or ("pass" if passed else "implementation_fix"))
+    if route not in ROUTES:
+        route = "blocked"
+    raw_affected = data.get("affected_task_ids")
+    affected = [str(value)[:80] for value in raw_affected if str(value).strip()][:8] if isinstance(raw_affected, list) else []
+    return Findings(passed=passed, summary=summary, items=items, route=route, affected_task_ids=affected)

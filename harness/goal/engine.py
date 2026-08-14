@@ -39,14 +39,28 @@ LEGAL: dict[str, set[str]] = _with_terminal_escapes(
     {
         GoalPhase.INITIALIZE.value: {GoalPhase.SELECT_TASK.value, GoalPhase.PREPARE_TESTS.value},
         GoalPhase.PREPARE_TESTS.value: {GoalPhase.PAUSED.value, GoalPhase.SELECT_TASK.value},
-        GoalPhase.SELECT_TASK.value: {GoalPhase.CLAIM.value, GoalPhase.ACT.value, GoalPhase.CLEAN_CHECK.value, GoalPhase.FULL_VERIFY.value},
+        GoalPhase.SELECT_TASK.value: {GoalPhase.PREPARE_TESTS.value, GoalPhase.CLAIM.value, GoalPhase.ACT.value, GoalPhase.CLEAN_CHECK.value, GoalPhase.FULL_VERIFY.value},
         GoalPhase.CLAIM.value: {GoalPhase.ACT.value},
         GoalPhase.ACT.value: {GoalPhase.VERIFY.value},
         GoalPhase.VERIFY.value: {GoalPhase.ACT.value, GoalPhase.EVALUATE.value, GoalPhase.CLEAN_CHECK.value, GoalPhase.SELECT_TASK.value, GoalPhase.FULL_VERIFY.value},
-        GoalPhase.EVALUATE.value: {GoalPhase.CLEAN_CHECK.value, GoalPhase.SELECT_TASK.value},
-        GoalPhase.CLEAN_CHECK.value: {GoalPhase.DONE.value, GoalPhase.ACT.value, GoalPhase.SELECT_TASK.value},
-        GoalPhase.FULL_VERIFY.value: {GoalPhase.CLEAN_CHECK.value, GoalPhase.DONE.value},
-        GoalPhase.PAUSED.value: {GoalPhase.INITIALIZE.value, GoalPhase.PREPARE_TESTS.value, GoalPhase.SELECT_TASK.value},
+        GoalPhase.EVALUATE.value: {GoalPhase.CLEAN_CHECK.value, GoalPhase.REPAIR_PLAN.value},
+        GoalPhase.REPAIR_PLAN.value: {GoalPhase.ACT.value, GoalPhase.PREPARE_TESTS.value, GoalPhase.SELECT_TASK.value},
+        GoalPhase.CLEAN_CHECK.value: {GoalPhase.DONE.value, GoalPhase.ACT.value, GoalPhase.IMPACT_REVIEW.value},
+        GoalPhase.IMPACT_REVIEW.value: {GoalPhase.SELECT_TASK.value, GoalPhase.PREPARE_TESTS.value},
+        GoalPhase.FULL_VERIFY.value: {GoalPhase.CLEAN_CHECK.value, GoalPhase.DONE.value, GoalPhase.REPAIR_PLAN.value},
+        GoalPhase.PAUSED.value: {
+            GoalPhase.INITIALIZE.value,
+            GoalPhase.PREPARE_TESTS.value,
+            GoalPhase.SELECT_TASK.value,
+            GoalPhase.CLAIM.value,
+            GoalPhase.ACT.value,
+            GoalPhase.VERIFY.value,
+            GoalPhase.EVALUATE.value,
+            GoalPhase.REPAIR_PLAN.value,
+            GoalPhase.IMPACT_REVIEW.value,
+            GoalPhase.CLEAN_CHECK.value,
+            GoalPhase.FULL_VERIFY.value,
+        },
         GoalPhase.DONE.value: set(),
         GoalPhase.CANCELLED.value: set(),
         GoalPhase.FAILED.value: set(),
@@ -61,6 +75,8 @@ _STATUS_FOR_PHASE: dict[str, str] = {
     GoalPhase.ACT.value: GoalStatus.RUNNING.value,
     GoalPhase.VERIFY.value: GoalStatus.RUNNING.value,
     GoalPhase.EVALUATE.value: GoalStatus.RUNNING.value,
+    GoalPhase.REPAIR_PLAN.value: GoalStatus.RUNNING.value,
+    GoalPhase.IMPACT_REVIEW.value: GoalStatus.RUNNING.value,
     GoalPhase.CLEAN_CHECK.value: GoalStatus.RUNNING.value,
     GoalPhase.FULL_VERIFY.value: GoalStatus.RUNNING.value,
     GoalPhase.DONE.value: GoalStatus.DONE.value,
@@ -111,6 +127,9 @@ class GoalEngine:
             state.last_error = error
 
         if target == GoalPhase.PAUSED.value:
+            # Keep the source phase; a restart must never guess that it is safe
+            # to jump straight into implementation.
+            state.resume_phase = current
             state.paused_at = state.paused_at or time.time()
             if stop_reason is not None:
                 state.stop_reason = stop_reason

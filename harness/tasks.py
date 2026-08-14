@@ -8,7 +8,9 @@ can make it eligible for completion.
 from __future__ import annotations
 
 import json
+import os
 import random
+import tempfile
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -45,10 +47,16 @@ class Task:
     verification_state: str = "not_started"
     evidence: list[dict] = field(default_factory=list)
     evaluation: dict | None = None
+    evaluation_history: list[dict] = field(default_factory=list)
+    repair_history: list[dict] = field(default_factory=list)
     evaluation_required: bool = False
     attempts: int = 0
     last_error: str | None = None
     goal_id: str | None = None
+    # Captured when a Goal claims the Task. It scopes evaluator/recovery context
+    # to work performed for this Task instead of the entire repository history.
+    start_snapshot: str | None = None
+    start_diff: str | None = None
     # Feature links are durable Task metadata, used to keep Goal/Feature
     # history attributable after a session is restarted.
     feature_ids: list[str] = field(default_factory=list)
@@ -124,7 +132,17 @@ def create_task(
 def save_task(task: Task, *, archived: bool = False) -> None:
     path = _archive_path(task.id) if archived else _active_path(task.id)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(asdict(task), indent=2), encoding="utf-8")
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{task.id}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(asdict(task), handle, ensure_ascii=False, indent=2)
+        os.replace(tmp_name, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
 
 
 def load_task(task_id: str) -> Task:
@@ -223,6 +241,30 @@ def record_task_evaluation(task_id: str, evaluation: dict) -> Task:
         raise FileNotFoundError(task_id)
     task = _load_task_from_path(path)
     task.evaluation = dict(evaluation)
+    task.evaluation_history.append(dict(evaluation))
+    save_task(task)
+    return task
+
+
+def record_task_repair(task_id: str, repair: dict) -> Task:
+    """Append a machine-visible repair decision without losing prior evidence."""
+    path = _active_path(task_id)
+    if not path.exists():
+        raise FileNotFoundError(task_id)
+    task = _load_task_from_path(path)
+    task.repair_history.append(dict(repair))
+    save_task(task)
+    return task
+
+
+def record_task_start(task_id: str, *, snapshot: str | None, diff: str | None) -> Task:
+    """Persist the Task-local workspace baseline at claim time."""
+    path = _active_path(task_id)
+    if not path.exists():
+        raise FileNotFoundError(task_id)
+    task = _load_task_from_path(path)
+    task.start_snapshot = snapshot
+    task.start_diff = diff
     save_task(task)
     return task
 
@@ -259,6 +301,25 @@ def bind_task_verification(task_id: str, verification_spec: dict) -> Task:
     return task
 
 
+def request_task_test_repair(task_id: str) -> Task:
+    """Request additive coverage without discarding the existing binding."""
+    path = _active_path(task_id)
+    if not path.exists():
+        raise FileNotFoundError(task_id)
+    task = _load_task_from_path(path)
+    spec = dict(task.verification_spec or {})
+    spec["previous_selectors"] = list(spec.get("selectors") or [])
+    spec["previous_test_files"] = list(spec.get("test_files") or [])
+    spec["previous_test_hashes"] = dict(spec.get("test_hashes") or {})
+    spec["source"] = "needs_generation"
+    spec["allow_posthoc_test"] = True
+    task.verification_spec = spec
+    task.verification_state = "needs_generation"
+    task.last_error = "evaluator requested additional focused coverage"
+    save_task(task)
+    return task
+
+
 def complete_task(task_id: str, *, clean_check_mode: str | None = None) -> str:
     path = _active_path(task_id)
     if not path.exists():
@@ -269,6 +330,20 @@ def complete_task(task_id: str, *, clean_check_mode: str | None = None) -> str:
         return f"Task {task_id} is {task.status}, cannot complete"
     if task.verification_spec and task.verification_state != "passing":
         return f"Cannot complete {task.id}: bound verification has not passed ({task.verification_state})"
+    if task.evaluation_required and (task.evaluation or {}).get("passed") is not True:
+        return f"Cannot complete {task.id}: required independent evaluation has not passed"
+    if task.goal_id and task.acceptance_cases:
+        required_cases = {
+            str(case.get("id"))
+            for case in task.acceptance_cases
+            if isinstance(case, dict) and case.get("id")
+        }
+        covered_cases = {
+            str(case_id) for case_id in (task.verification_spec or {}).get("covers", [])
+        }
+        if required_cases and not required_cases.issubset(covered_cases):
+            missing = ", ".join(sorted(required_cases - covered_cases))
+            return f"Cannot complete {task.id}: bound tests do not cover acceptance cases: {missing}"
 
     from harness.clean import clean_mode, run_clean_check
     from harness.settings import get_workspace_paths

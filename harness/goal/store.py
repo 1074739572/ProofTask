@@ -135,6 +135,8 @@ def load_goal(workspace: str | Path | None = None) -> GoalState | None:
     # Process-restart recovery: a running/pausing goal cannot be assumed to
     # still be executing after a restart — require an explicit /goal resume.
     elif state.status in (GoalStatus.RUNNING.value, GoalStatus.PAUSING.value):
+        state.resume_phase = state.phase
+        state.last_phase = state.phase
         state.status = GoalStatus.PAUSED.value
         state.phase = GoalPhase.PAUSED.value
         # The last durable checkpoint is the best available pause boundary.

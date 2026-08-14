@@ -19,6 +19,7 @@ DEFAULT_MAX_ROUNDS_PER_ATTEMPT = 20
 DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_MAX_CONSECUTIVE_FAILURES = 3
 DEFAULT_MAX_DURATION_SECONDS = 1800  # 30 minutes
+DEFAULT_MAX_REPAIR_ATTEMPTS = 2
 MAX_TRANSITION_LOG = 100
 
 
@@ -30,6 +31,8 @@ class GoalPhase(str, Enum):
     ACT = "act"
     VERIFY = "verify"
     EVALUATE = "evaluate"  # conditional; MVP runs at most once
+    REPAIR_PLAN = "repair_plan"
+    IMPACT_REVIEW = "impact_review"
     CLEAN_CHECK = "clean_check"
     FULL_VERIFY = "full_verify"  # L6 v2: whole-goal verification gate
     DONE = "done"
@@ -65,6 +68,9 @@ class StopReason(str, Enum):
     test_generation_required = "test_generation_required"
     user_approval_required = "user_approval_required"
     full_verification_failed = "full_verification_failed"
+    evaluation_unavailable = "evaluation_unavailable"
+    repair_budget_exhausted = "repair_budget_exhausted"
+    autonomy_blocked = "autonomy_blocked"
     internal_error = "internal_error"
 
 
@@ -86,20 +92,30 @@ class GoalState:
     # The plan is persisted before task creation.  Each item maps to exactly
     # one durable Task; there is no Feature projection in Goal mode.
     task_ids: list[str] = field(default_factory=list)
+    # Stable plan-name -> Task id mapping makes INITIALIZE restartable when a
+    # process stops between individual Task creations.
+    task_name_ids: dict[str, str] = field(default_factory=dict)
     current_task_id: str | None = None
     task_plan: list[dict[str, Any]] = field(default_factory=list)
+    # The confirmed product boundary is immutable after `/goal run`; Task plans
+    # may evolve inside it, but execution must not fall back to chat history.
+    goal_contract: dict[str, Any] = field(default_factory=dict)
     initialization_complete: bool = False
+    # The exact durable phase to resume after a pause/restart.
+    resume_phase: str | None = None
 
     max_rounds_per_attempt: int = DEFAULT_MAX_ROUNDS_PER_ATTEMPT
     max_total_rounds: int = DEFAULT_MAX_ROUNDS_PER_ATTEMPT * DEFAULT_MAX_ATTEMPTS
     max_attempts: int = DEFAULT_MAX_ATTEMPTS
     max_consecutive_failures: int = DEFAULT_MAX_CONSECUTIVE_FAILURES
     max_duration_seconds: int = DEFAULT_MAX_DURATION_SECONDS
+    max_repair_attempts: int = DEFAULT_MAX_REPAIR_ATTEMPTS
 
     attempts: int = 0
     consecutive_failures: int = 0
     no_progress_count: int = 0
     total_llm_rounds: int = 0
+    repair_attempts: int = 0
     workspace_generation: int = 0
     started_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)

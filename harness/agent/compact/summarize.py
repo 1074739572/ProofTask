@@ -106,7 +106,22 @@ def is_summary_unusable(summary: str) -> bool:
 
 def summarize_history(messages: list) -> str:
     budget = _safe_input_budget()
-    conversation = json.dumps(messages, default=str)[:budget]
+    # Compaction happens because the current work is too long. The old head is
+    # already represented by earlier summaries, so preserve whole recent
+    # messages instead of slicing the beginning of a JSON document.
+    selected: list = []
+    used = 2  # []
+    for message in reversed(messages):
+        encoded = json.dumps(message, default=str, ensure_ascii=False)
+        addition = len(encoded) + (1 if selected else 0)
+        if selected and used + addition > budget:
+            break
+        if not selected and addition > budget:
+            selected.append({"role": message.get("role", "user"), "content": encoded[-budget:]})
+            break
+        selected.append(message)
+        used += addition
+    conversation = json.dumps(list(reversed(selected)), default=str, ensure_ascii=False)
     prompt = (
         _structured_summary_instruction()
         + f"\n[Conversation trimmed to last {budget} chars for summarization]\n\n"

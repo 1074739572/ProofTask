@@ -63,6 +63,8 @@ def validate_limits(state: GoalState) -> list[str]:
         problems.append("max_consecutive_failures must be positive")
     if state.max_duration_seconds <= 0:
         problems.append("max_duration_seconds must be positive")
+    if state.max_repair_attempts <= 0:
+        problems.append("max_repair_attempts must be positive")
     return problems
 
 

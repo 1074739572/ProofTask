@@ -37,13 +37,14 @@ def build_evaluation_prompt(inputs) -> str:
     """
     return (
         "You are an independent evaluator for one Task. Return ONLY a JSON object "
-        "with keys passed, summary, and findings.\n\n"
+        "with keys passed, route, summary, findings, and affected_task_ids.\n\n"
         "Hard rules:\n"
         "- Judge every acceptance case against the diff and evidence.\n"
         "- A missing binding, zero collected tests, a non-zero verification result, "
         "or a command/evidence mismatch is never passable. Report it as a high finding.\n"
         "- Passing tests are necessary but not sufficient: report unmet behavior, "
         "weak tests, and unrelated scope changes.\n"
+        "- route must be pass, implementation_fix, test_gap, replan, or blocked.\n"
         "- You are advisory. Do not claim to change Task state.\n\n"
         f"{inputs.to_text()}"
     )

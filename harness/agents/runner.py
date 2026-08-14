@@ -117,7 +117,7 @@ class AgentTaskStats:
 
 
 def _tools_for_agent(
-    allowed: list[str], cwd: Path | None = None
+    allowed: list[str], cwd: Path | None = None, write_roots: tuple[str, ...] | None = None,
 ) -> tuple[list[dict], dict]:
     unknown = sorted(set(allowed) - set(_BASE_TOOL_DEFS))
     if unknown:
@@ -131,6 +131,31 @@ def _tools_for_agent(
         "edit_file": partial(run_edit, cwd=bound_cwd),
         "glob": partial(run_glob, cwd=bound_cwd),
     }
+    if write_roots:
+        roots = tuple((bound_cwd / root).resolve() for root in write_roots)
+
+        def guarded_write(*, path: str, content: str) -> str:
+            try:
+                candidate = (bound_cwd / path).resolve()
+            except OSError as exc:
+                return f"Write blocked: invalid path {path!r}: {exc}"
+            if not any(candidate.is_relative_to(root) for root in roots):
+                return "Write blocked: this agent may modify test files only."
+            return run_write(path=path, content=content, cwd=bound_cwd)
+
+        def guarded_edit(*, path: str, old_text: str, new_text: str, occurrence: int = 1) -> str:
+            try:
+                candidate = (bound_cwd / path).resolve()
+            except OSError as exc:
+                return f"Edit blocked: invalid path {path!r}: {exc}"
+            if not any(candidate.is_relative_to(root) for root in roots):
+                return "Edit blocked: this agent may modify test files only."
+            return run_edit(path=path, old_text=old_text, new_text=new_text, occurrence=occurrence, cwd=bound_cwd)
+
+        if "write_file" in handlers:
+            handlers["write_file"] = guarded_write
+        if "edit_file" in handlers:
+            handlers["edit_file"] = guarded_edit
     if "rag_search" in allowed:
         from harness.rag.tools import run_rag_search
 
@@ -153,6 +178,7 @@ def run_agent_task(
     cancel_check: Callable[[], bool] | None = None,
     deadline: float | None = None,
     stats: AgentTaskStats | None = None,
+    write_roots: tuple[str, ...] | None = None,
 ) -> str:
     error = validate_agent_model(agent_type)
     if error:
@@ -166,7 +192,7 @@ def run_agent_task(
     if not agent_cwd.is_relative_to(base_workdir):
         return f"Error: agent working directory escapes workspace: {agent_cwd}"
     try:
-        tools, handlers = _tools_for_agent(profile.tools, agent_cwd)
+        tools, handlers = _tools_for_agent(profile.tools, agent_cwd, write_roots=write_roots)
     except ValueError as exc:
         return f"Error: {exc}"
     workdir = str(agent_cwd)

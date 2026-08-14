@@ -102,7 +102,7 @@ def reactive_compact(messages: list, *, binding=None) -> list:
     return compacted
 
 
-def prepare_context(messages: list) -> list:
+def prepare_context(messages: list, *, binding=None) -> list:
     """
     Keep sent history append-only until a real compaction checkpoint.
 
@@ -112,5 +112,5 @@ def prepare_context(messages: list) -> list:
     """
     # Claude Code–style checkpoint: estimate_tokens ≳ 0.835 × context_window.
     if should_autocompact(messages):
-        messages[:] = compact_history(messages)
+        messages[:] = compact_history(messages, binding=binding)
     return messages

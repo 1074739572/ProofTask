@@ -207,7 +207,7 @@ def agent_loop(
                 {"role": "user", "content": format_todo_reminder()}
             )
 
-        prepare_context(messages)
+        prepare_context(messages, binding=binding)
         repair_tool_pairing(messages)
         context = update_context(context, messages)
         tools, handlers = get_tool_pool(disabled_tools=disabled_tools)
@@ -229,7 +229,7 @@ def agent_loop(
             if is_cancelled():
                 return _finish(True, "cancelled")
             if is_prompt_too_long_error(exc) and not state.has_attempted_reactive_compact:
-                messages[:] = reactive_compact(messages)
+                messages[:] = reactive_compact(messages, binding=binding)
                 state.has_attempted_reactive_compact = True
                 continue
             from harness.providers.errors import format_api_error

@@ -29,6 +29,10 @@ _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL | re.IGNORECASE)
 _AGENT_HEADER = re.compile(r"^\[[^\]]+\] [^\n]*\n*")
 
 
+class GoalPlanningError(ValueError):
+    """Raised when a Goal cannot be decomposed into valid Task contracts."""
+
+
 def _strip_agent_header(text: str) -> str:
     stripped = text.lstrip()
     if _AGENT_HEADER.match(stripped):
@@ -89,6 +93,14 @@ class VerificationSpec:
     collected_count: int = 0
     baseline_result: str = "not_run"
     confidence: str = "low"
+    # Immutable proof metadata captured by the machine when a binding is made.
+    # The model never supplies these fields.
+    baseline_evidence: dict[str, Any] = field(default_factory=dict)
+    test_hashes: dict[str, str] = field(default_factory=dict)
+    covers: tuple[str, ...] = ()
+    # A focused test normally belongs to one Task. Integration coverage is
+    # intentionally shared and must name every owning Task.
+    owners: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -100,11 +112,17 @@ class VerificationSpec:
             "collected_count": self.collected_count,
             "baseline_result": self.baseline_result,
             "confidence": self.confidence,
+            "baseline_evidence": dict(self.baseline_evidence),
+            "test_hashes": dict(self.test_hashes),
+            "covers": list(self.covers),
+            "owners": list(self.owners),
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "VerificationSpec":
-        data = data or {}
+        # Older/manual state may contain malformed optional proof metadata.
+        # Do not make an otherwise recoverable Goal impossible to load.
+        data = data if isinstance(data, dict) else {}
         try:
             collected_count = max(0, int(data.get("collected_count") or 0))
         except (TypeError, ValueError):
@@ -118,6 +136,16 @@ class VerificationSpec:
             collected_count=collected_count,
             baseline_result=str(data.get("baseline_result") or "not_run")[:80],
             confidence=str(data.get("confidence") or "low")[:20],
+            baseline_evidence=(
+                dict(data.get("baseline_evidence"))
+                if isinstance(data.get("baseline_evidence"), dict)
+                else {}
+            ),
+            test_hashes={str(k): str(v) for k, v in (data.get("test_hashes") or {}).items()}
+            if isinstance(data.get("test_hashes"), dict)
+            else {},
+            covers=_normalise_strings(data.get("covers"), limit=MAX_ACCEPTANCE_CASES),
+            owners=_normalise_strings(data.get("owners"), limit=MAX_TASKS),
         )
 
 
@@ -240,7 +268,9 @@ def _extract_json_array(text: str) -> str | None:
     return None
 
 
-def _spec_from_entry(entry: dict[str, Any], catalog: TestCatalog | None) -> VerificationSpec:
+def _spec_from_entry(
+    entry: dict[str, Any], catalog: TestCatalog | None, cases: tuple[AcceptanceCase, ...]
+) -> VerificationSpec:
     spec_data = entry.get("verification_spec") if isinstance(entry.get("verification_spec"), dict) else {}
     requested = _normalise_strings(
         entry.get("test_selectors", spec_data.get("selectors")),
@@ -259,6 +289,7 @@ def _spec_from_entry(entry: dict[str, Any], catalog: TestCatalog | None) -> Veri
             collected_count=len(requested),
             baseline_result="not_run",
             confidence="high",
+            covers=tuple(case.id for case in cases),
         )
     return VerificationSpec(adapter="pytest", source="needs_generation")
 
@@ -291,7 +322,7 @@ def parse_plan(raw: str, *, test_catalog: TestCatalog | None = None) -> list[Tas
         dependencies = _normalise_strings(entry.get("depends_on"), limit=MAX_TASKS)
         if any(dependency not in names for dependency in dependencies):
             return None
-        spec = _spec_from_entry(entry, test_catalog)
+        spec = _spec_from_entry(entry, test_catalog, cases)
         plans.append(
             TaskPlan(
                 name=name,
@@ -338,19 +369,4 @@ def plan_tasks(
     plans = parse_plan(raw, test_catalog=catalog)
     if plans:
         return plans
-    return [
-        TaskPlan(
-            name=(target.strip()[:40] or "goal"),
-            behavior=target,
-            depends_on=(),
-            acceptance_cases=(
-                AcceptanceCase(
-                    id="AC1",
-                    given="the Goal request",
-                    when="the Task is implemented",
-                    then="the requested behavior is available and verified",
-                ),
-            ),
-            verification_spec=VerificationSpec(adapter="pytest", source="needs_generation"),
-        )
-    ]
+    raise GoalPlanningError("Goal planner did not produce a valid Task contract; no execution was started")

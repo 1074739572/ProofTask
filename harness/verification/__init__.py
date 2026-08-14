@@ -23,6 +23,7 @@ Public API::
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 from typing import Any
 
@@ -178,6 +179,15 @@ def _run_task_verification(
     if not command or not selectors or collected_count <= 0:
         return False, None, "task has no collected verification binding; generate and baseline tests first"
     root = Path(workspace).expanduser().resolve() if workspace else None
+    expected_hashes = spec.get("test_hashes") if isinstance(spec.get("test_hashes"), dict) else {}
+    if root is not None and expected_hashes:
+        for rel, expected in expected_hashes.items():
+            try:
+                current = hashlib.sha256((root / str(rel)).read_bytes()).hexdigest()
+            except OSError as exc:
+                return False, None, f"bound test file is unavailable: {rel}: {exc}"
+            if current != str(expected):
+                return False, None, f"bound test file changed after it was approved: {rel}"
     result = run_verification(command, workspace=root, timeout_s=timeout_s)
     error = result.error or (None if result.passed else f"verification failed with exit code {result.exit_code}")
     executed = result.error is None or result.timed_out

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from harness.goal.commands import parse_goal_command
 from harness.goal.draft import answer_draft, approve_draft, create_draft, load_draft
 
@@ -86,13 +88,17 @@ def test_execution_approval_resumes_from_the_test_review_pause(monkeypatch, tmp_
     state.status = GoalStatus.PAUSED.value
     state.stop_reason = "user_approval_required"
     state.execution_approved = False
+    state.initialization_complete = True
     monkeypatch.setattr(runner_mod, "_runner", None)
     monkeypatch.setattr(runner_mod, "load_goal", lambda: state)
     monkeypatch.setattr(runner_mod, "save_goal", lambda state: None)
     monkeypatch.setattr(runner_mod, "_emit_goal", lambda *args: None)
     monkeypatch.setattr(runner_mod.GoalRunner, "start", lambda self: None)
 
-    resumed = runner_mod.resume_goal(history=[], context={}, binding=None)
+    with pytest.raises(runner_mod.GoalNotRunningError):
+        runner_mod.resume_goal(history=[], context={}, binding=None)
+
+    resumed = runner_mod.resume_goal(history=[], context={}, binding=None, approve_execution=True)
 
     assert resumed.phase == GoalPhase.SELECT_TASK.value
     assert resumed.status == GoalStatus.RUNNING.value

@@ -43,8 +43,14 @@ Goal -> Task -> Acceptance Cases -> Test Binding -> Evidence -> Delivery
 Goal 执行顺序：
 
 ```text
-PLAN -> TEST CATALOG -> PREPARE TESTS -> SELECT TASK -> ACT
-     -> VERIFY -> EVALUATE (optional) -> CLEAN CHECK -> COMPLETE
+PLAN -> TEST CATALOG -> PREPARE TESTS -> SELECT TASK -> ACT -> VERIFY
+     -> EVALUATE -> CLEAN CHECK -> IMPACT REVIEW -> next Task
+                     |                |
+                     v                v
+                REPAIR PLAN      cross-Task tests
+                     |
+                     v
+             additive test prep or a fresh ACT worker
      -> FULL VERIFY (all Task bindings + global regression)
 ```
 
@@ -57,13 +63,14 @@ PLAN -> TEST CATALOG -> PREPARE TESTS -> SELECT TASK -> ACT
 1. 验收条件已明确，依赖已满足。
 2. 绑定的 selector 能被真实收集。
 3. 运行结果为 `exit_code = 0`，且已记录命令、输出摘要、收集数量和代码快照。
-4. 严格 clean check 通过；必要时 evaluator 可给出建议，但不能覆盖机器测试结果。
+4. 严格 clean check 通过；启用 evaluator 时必须明确返回 `passed: true`，失败会进入 Repair Plan，不能放行。
 
 一个 Goal 完成，必须同时满足：
 
 1. 所有 Task 均已完成。
 2. 最终阶段重新运行每个 Task 的绑定测试，全部通过。
 3. 配置的全局回归命令通过。
+4. 每次修复、跨 Task 补测和最终回归失败都保留在 Goal 的决策账本与 TestMap 中；恢复或切换内部 worker 后继续加载。
 
 ## Working Model
 

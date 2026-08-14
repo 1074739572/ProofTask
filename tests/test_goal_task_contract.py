@@ -75,15 +75,15 @@ def test_test_generation_uses_writer_and_requires_failing_baseline(tmp_path, mon
         "run_agent_task",
         lambda **kwargs: calls.append(kwargs["agent_type"]) or '{"test_selectors":["tests/test_new.py::test_new"]}',
     )
-    monkeypatch.setattr(
-        runner_mod,
-        "collect_pytest_catalog",
-        lambda workspace: TestCatalog(selectors=("tests/test_new.py::test_new",), test_files=("tests/test_new.py",)),
-    )
+    catalogs = iter((
+        TestCatalog(),
+        TestCatalog(selectors=("tests/test_new.py::test_new",), test_files=("tests/test_new.py",)),
+    ))
+    monkeypatch.setattr(runner_mod, "collect_pytest_catalog", lambda workspace: next(catalogs))
     monkeypatch.setattr(
         runner_mod,
         "run_verification",
-        lambda *args, **kwargs: type("Result", (), {"passed": False, "error": None, "timed_out": False})(),
+        lambda *args, **kwargs: type("Result", (), {"passed": False, "error": None, "timed_out": False, "stdout": "assert missing behavior", "exit_code": 1, "duration_ms": 5, "command": "pytest -q tests/test_new.py::test_new"})(),
     )
 
     GoalRunner(state=state, history=[], context={}, binding=None)._prepare_tests(state)
@@ -102,15 +102,15 @@ def test_test_generation_rejects_a_passing_baseline(tmp_path, monkeypatch):
     task, state = _needs_generation_task(tmp_path, monkeypatch)
     monkeypatch.setattr(runner_mod, "save_goal", lambda state: None)
     monkeypatch.setattr(runner_mod, "run_agent_task", lambda **kwargs: '{"test_selectors":["tests/test_new.py::test_new"]}')
-    monkeypatch.setattr(
-        runner_mod,
-        "collect_pytest_catalog",
-        lambda workspace: TestCatalog(selectors=("tests/test_new.py::test_new",), test_files=("tests/test_new.py",)),
-    )
+    catalogs = iter((
+        TestCatalog(),
+        TestCatalog(selectors=("tests/test_new.py::test_new",), test_files=("tests/test_new.py",)),
+    ))
+    monkeypatch.setattr(runner_mod, "collect_pytest_catalog", lambda workspace: next(catalogs))
     monkeypatch.setattr(
         runner_mod,
         "run_verification",
-        lambda *args, **kwargs: type("Result", (), {"passed": True, "error": None, "timed_out": False})(),
+        lambda *args, **kwargs: type("Result", (), {"passed": True, "error": None, "timed_out": False, "stdout": "1 passed", "exit_code": 0, "duration_ms": 5, "command": "pytest -q tests/test_new.py::test_new"})(),
     )
 
     GoalRunner(state=state, history=[], context={}, binding=None)._prepare_tests(state)
@@ -129,15 +129,15 @@ def test_draft_goal_pauses_after_a_failing_test_baseline_for_user_approval(tmp_p
     monkeypatch.setattr(runner_mod, "save_goal", lambda state: None)
     monkeypatch.setattr(runner_mod, "_emit_goal", lambda *args: None)
     monkeypatch.setattr(runner_mod, "run_agent_task", lambda **kwargs: '{"test_selectors":["tests/test_new.py::test_new"]}')
-    monkeypatch.setattr(
-        runner_mod,
-        "collect_pytest_catalog",
-        lambda workspace: TestCatalog(selectors=("tests/test_new.py::test_new",), test_files=("tests/test_new.py",)),
-    )
+    catalogs = iter((
+        TestCatalog(),
+        TestCatalog(selectors=("tests/test_new.py::test_new",), test_files=("tests/test_new.py",)),
+    ))
+    monkeypatch.setattr(runner_mod, "collect_pytest_catalog", lambda workspace: next(catalogs))
     monkeypatch.setattr(
         runner_mod,
         "run_verification",
-        lambda *args, **kwargs: type("Result", (), {"passed": False, "error": None, "timed_out": False})(),
+        lambda *args, **kwargs: type("Result", (), {"passed": False, "error": None, "timed_out": False, "stdout": "assert missing behavior", "exit_code": 1, "duration_ms": 5, "command": "pytest -q tests/test_new.py::test_new"})(),
     )
 
     GoalRunner(state=state, history=[], context={}, binding=None)._prepare_tests(state)
@@ -216,13 +216,79 @@ def test_goal_persists_global_regression_failure_evidence(monkeypatch):
         "evidence_from_result",
         lambda *args, **kwargs: type("Evidence", (), {"to_dict": lambda self: {"exit_code": 1, "stdout_tail": "1 failed", "duration_ms": 21.0, "code_snapshot": "def"}})(),
     )
+    monkeypatch.setattr(
+        runner,
+        "_queue_goal_repair",
+        lambda current, detail: runner._apply(current, GoalPhase.REPAIR_PLAN, "goal_regression_requires_repair", error=detail),
+    )
 
     runner._full_verify(state)
 
-    assert state.phase == GoalPhase.FAILED.value
+    assert state.phase == GoalPhase.REPAIR_PLAN.value
     assert state.final_verification["status"] == "failed"
     assert state.final_verification["exit_code"] == 1
     assert state.final_verification["stdout_tail"] == "1 failed"
+
+
+def test_replan_returns_current_task_to_additive_test_preparation(tmp_path, monkeypatch):
+    import harness.goal.repair as repair_mod
+    import harness.goal.runner as runner_mod
+    import harness.tasks as tasks
+    from harness.goal.repair import RepairDecision
+
+    monkeypatch.setattr(tasks, "TASKS_DIR", tmp_path / ".tasks")
+    task = tasks.create_task(
+        "repair me",
+        "deliver the requested behavior",
+        goal_id="goal_demo",
+        acceptance_cases=[{"id": "AC1", "given": "x", "when": "y", "then": "z"}],
+        verification_spec={"source": "generated", "selectors": ["tests/test_x.py::test_x"]},
+        evaluation_required=True,
+    )
+    tasks.claim_task(task.id)
+    tasks.record_task_evaluation(task.id, {"passed": False, "route": "replan", "summary": "coverage must be revised"})
+    state = GoalState.new(target="repair", verification="pytest -q", workspace=str(tmp_path))
+    state.id = "goal_demo"
+    state.task_ids = [task.id]
+    state.current_task_id = task.id
+    state.phase = GoalPhase.REPAIR_PLAN.value
+    monkeypatch.setattr(runner_mod, "save_goal", lambda state: None)
+    monkeypatch.setattr(
+        repair_mod,
+        "plan_task_repair",
+        lambda *args, **kwargs: RepairDecision("replan", "add an integration case", summary="replan tests"),
+    )
+
+    GoalRunner(state=state, history=[], context={}, binding=None)._repair_plan(state)
+
+    repaired = tasks.load_task(task.id)
+    assert state.phase == GoalPhase.PREPARE_TESTS.value
+    assert repaired.verification_state == "needs_generation"
+    assert repaired.verification_spec["allow_posthoc_test"] is True
+    assert repaired.repair_history[-1]["action"] == "replan"
+
+
+def test_goal_worker_context_excludes_stale_cli_state():
+    state = GoalState.new(target="x", verification="pytest -q", workspace=".")
+    runner = GoalRunner(
+        state=state,
+        history=[{"role": "user", "content": "old request"}],
+        context={
+            "project_instructions": "follow local rules",
+            "memories": ["known fact"],
+            "connected_mcp": {},
+            "latest_user_query": "unrelated old request",
+            "todos": [{"content": "stale todo"}],
+            "writing_mode": True,
+        },
+        binding=None,
+    )
+
+    assert runner._goal_worker_context() == {
+        "project_instructions": "follow local rules",
+        "memories": ["known fact"],
+        "connected_mcp": {},
+    }
 
 
 def test_goal_event_snapshot_exposes_task_contract_for_terminal_ui(tmp_path, monkeypatch):

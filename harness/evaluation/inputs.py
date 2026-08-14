@@ -90,6 +90,16 @@ class EvaluationInputs:
             lines.append("(无证据 — 该 feature 尚未通过机器验证)")
         lines += ["", "# 实际改动 (git diff)", self.diff or "(无 diff 或非 git 仓库)", ""]
         lines += ["# 评分标准", *[f"- {r}" for r in self.rubric]]
+        start_snapshot = getattr(self.feature, "start_snapshot", None)
+        start_diff = getattr(self.feature, "start_diff", None)
+        if start_snapshot or start_diff:
+            lines.extend(
+                [
+                    "# Task start baseline",
+                    f"snapshot: {start_snapshot or '(not recorded)'}",
+                    (start_diff or "(workspace was clean at Task start)")[:8000],
+                ]
+            )
         return "\n".join(lines)
 
 
