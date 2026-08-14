@@ -49,6 +49,9 @@ class Task:
     attempts: int = 0
     last_error: str | None = None
     goal_id: str | None = None
+    # Feature links are durable Task metadata, used to keep Goal/Feature
+    # history attributable after a session is restarted.
+    feature_ids: list[str] = field(default_factory=list)
 
     @property
     def name(self) -> str:
@@ -94,6 +97,7 @@ def create_task(
     blockedBy: list[str] | None = None,
     *,
     goal_id: str | None = None,
+    feature_ids: list[str] | None = None,
     acceptance_cases: list[dict] | None = None,
     verification_spec: dict | None = None,
     evaluation_required: bool = False,
@@ -107,6 +111,7 @@ def create_task(
         owner=None,
         blockedBy=list(blockedBy or []),
         goal_id=goal_id,
+        feature_ids=list(feature_ids or []),
         acceptance_cases=list(acceptance_cases or []),
         verification_spec=spec,
         verification_state=("needs_generation" if spec.get("source") == "needs_generation" else "not_started"),

@@ -14,3 +14,12 @@ def test_task_cannot_complete_without_passing_bound_verification(tmp_path, monke
     set_task_verification_result(task.id, passed=True, evidence={"command": "pytest -q", "exit_code": 0})
     assert complete_task(task.id).startswith("Completed")
     assert load_task(task.id).status == "completed"
+
+
+def test_task_feature_links_survive_durable_reload(tmp_path, monkeypatch):
+    import harness.tasks as tasks
+
+    monkeypatch.setattr(tasks, "TASKS_DIR", tmp_path / ".tasks")
+    task = create_task("x", "behavior", feature_ids=["feat_rate_limit"])
+
+    assert load_task(task.id).feature_ids == ["feat_rate_limit"]
