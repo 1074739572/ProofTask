@@ -54,6 +54,12 @@ PLAN -> TEST CATALOG -> PREPARE TESTS -> SELECT TASK -> ACT -> VERIFY
      -> FULL VERIFY (all Task bindings + global regression)
 ```
 
+Goal lifetime is unbounded by default. `worker_round_limit` ends only the
+current disposable worker and creates a durable handoff; the next ACT starts
+with a fresh worker. `operation_timeout_seconds` limits one model, test, or
+verification operation. Accumulated elapsed time, worker count, repair cycles,
+and failed attempts are progress data, not failure conditions.
+
 任务依赖未完成时，后续 Task 不会开始。任何失败都回到同一个 Task 继续修复，不会跳到下一项。
 
 ## Definition Of Done

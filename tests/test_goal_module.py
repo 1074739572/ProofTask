@@ -9,10 +9,22 @@ from harness.goal.planner import GoalPlanningError, plan_tasks
 from harness.goal.store import GoalStoreError, goal_path, load_goal, save_goal
 
 
-def test_parse_limit_flags_map_to_goalrequest_fields():
-    result = parse_goal_command('/goal --verify "pytest -q" --max-rounds 5 --max-attempts 2 --max-failures 4 --timeout 600 -- fix bug')
-    assert result["limits"]["max_rounds_per_attempt"] == 5
-    assert result["limits"]["max_attempts"] == 2
+def test_parse_worker_limits_without_a_goal_lifetime_budget():
+    result = parse_goal_command(
+        '/goal --verify "pytest -q" --worker-rounds 5 --operation-timeout 600 -- fix bug'
+    )
+    assert result["limits"] == {
+        "worker_round_limit": 5,
+        "operation_timeout_seconds": 600,
+    }
+
+
+def test_goal_state_has_no_default_lifetime_budget():
+    state = GoalState.new(target="long task", verification="pytest -q", workspace=".")
+    assert state.worker_round_limit == 20
+    assert state.operation_timeout_seconds == 1800
+    assert not hasattr(state, "max_duration_seconds")
+    assert not hasattr(state, "max_total_rounds")
 
 
 def test_plan_tasks_rejects_an_invalid_planner_result():

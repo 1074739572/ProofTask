@@ -291,6 +291,63 @@ def test_goal_worker_context_excludes_stale_cli_state():
     }
 
 
+def test_worker_round_limit_creates_a_durable_rollover(tmp_path, monkeypatch):
+    import harness.goal.runner as runner_mod
+    import harness.tasks as tasks
+
+    monkeypatch.setattr(tasks, "TASKS_DIR", tmp_path / ".tasks")
+    task = tasks.create_task("long task", "keep working", verification_spec={})
+    tasks.claim_task(task.id)
+    state = GoalState.new(target="long task", verification="pytest -q", workspace=str(tmp_path))
+    state.current_task_id = task.id
+    state.task_ids = [task.id]
+    state.phase = GoalPhase.ACT.value
+    state.worker_round_limit = 2
+    monkeypatch.setattr(runner_mod, "save_goal", lambda state: None)
+    monkeypatch.setattr(runner_mod, "_emit_goal", lambda *args: None)
+
+    def capped_worker(*args, stats, **kwargs):
+        stats.llm_rounds = 2
+        stats.stop_reason = "max_rounds"
+        return False
+
+    monkeypatch.setattr(runner_mod, "agent_loop", capped_worker)
+    runner = GoalRunner(state=state, history=[], context={}, binding=None)
+    runner._act(state)
+
+    assert state.phase == GoalPhase.ROLLOVER.value
+    assert state.status == "running"
+    assert state.worker_generation == 1
+    assert state.worker_rollovers == 1
+    runner._rollover(state)
+    assert state.phase == GoalPhase.VERIFY.value
+
+
+def test_no_progress_routes_to_repair_instead_of_failing(tmp_path, monkeypatch):
+    import harness.goal.runner as runner_mod
+    import harness.tasks as tasks
+
+    monkeypatch.setattr(tasks, "TASKS_DIR", tmp_path / ".tasks")
+    task = tasks.create_task("stuck task", "keep working", verification_spec={})
+    tasks.claim_task(task.id)
+    state = GoalState.new(target="stuck task", verification="pytest -q", workspace=str(tmp_path))
+    state.current_task_id = task.id
+    state.task_ids = [task.id]
+    state.phase = GoalPhase.ACT.value
+    state.no_progress_count = 1
+    monkeypatch.setattr(runner_mod, "save_goal", lambda state: None)
+    monkeypatch.setattr(runner_mod, "_emit_goal", lambda *args: None)
+    monkeypatch.setattr(runner_mod, "agent_loop", lambda *args, stats, **kwargs: False)
+    runner = GoalRunner(state=state, history=[], context={}, binding=None)
+    monkeypatch.setattr(runner, "_progress_snapshot", lambda state: ("unchanged",))
+
+    runner._act(state)
+
+    assert state.phase == GoalPhase.REPAIR_PLAN.value
+    assert state.status == "running"
+    assert "no observable progress" in state.last_error
+
+
 def test_goal_event_snapshot_exposes_task_contract_for_terminal_ui(tmp_path, monkeypatch):
     from harness.goal.runner import goal_event_payload
 

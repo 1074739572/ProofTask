@@ -13,13 +13,10 @@ from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Any
 
-GOAL_SCHEMA_VERSION = 2
+GOAL_SCHEMA_VERSION = 3
 
-DEFAULT_MAX_ROUNDS_PER_ATTEMPT = 20
-DEFAULT_MAX_ATTEMPTS = 3
-DEFAULT_MAX_CONSECUTIVE_FAILURES = 3
-DEFAULT_MAX_DURATION_SECONDS = 1800  # 30 minutes
-DEFAULT_MAX_REPAIR_ATTEMPTS = 2
+DEFAULT_WORKER_ROUND_LIMIT = 20
+DEFAULT_OPERATION_TIMEOUT_SECONDS = 1800  # one agent operation, not the Goal
 MAX_TRANSITION_LOG = 100
 
 
@@ -29,6 +26,7 @@ class GoalPhase(str, Enum):
     PREPARE_TESTS = "prepare_tests"
     CLAIM = "claim"
     ACT = "act"
+    ROLLOVER = "rollover"
     VERIFY = "verify"
     EVALUATE = "evaluate"  # conditional; MVP runs at most once
     REPAIR_PLAN = "repair_plan"
@@ -52,12 +50,7 @@ class GoalStatus(str, Enum):
 
 
 class StopReason(str, Enum):
-    max_duration = "max_duration"
-    max_attempts = "max_attempts"
-    max_consecutive_failures = "max_consecutive_failures"
-    max_rounds = "max_rounds"
     permission_wait = "permission_wait"
-    no_progress = "no_progress"
     cancelled_by_user = "cancelled_by_user"
     process_restarted = "process_restarted"
     missing_dependency = "missing_dependency"
@@ -69,7 +62,6 @@ class StopReason(str, Enum):
     user_approval_required = "user_approval_required"
     full_verification_failed = "full_verification_failed"
     evaluation_unavailable = "evaluation_unavailable"
-    repair_budget_exhausted = "repair_budget_exhausted"
     autonomy_blocked = "autonomy_blocked"
     internal_error = "internal_error"
 
@@ -104,18 +96,18 @@ class GoalState:
     # The exact durable phase to resume after a pause/restart.
     resume_phase: str | None = None
 
-    max_rounds_per_attempt: int = DEFAULT_MAX_ROUNDS_PER_ATTEMPT
-    max_total_rounds: int = DEFAULT_MAX_ROUNDS_PER_ATTEMPT * DEFAULT_MAX_ATTEMPTS
-    max_attempts: int = DEFAULT_MAX_ATTEMPTS
-    max_consecutive_failures: int = DEFAULT_MAX_CONSECUTIVE_FAILURES
-    max_duration_seconds: int = DEFAULT_MAX_DURATION_SECONDS
-    max_repair_attempts: int = DEFAULT_MAX_REPAIR_ATTEMPTS
+    # Long Goals are unbounded by default.  Only one disposable worker and one
+    # external operation are bounded; worker rollover preserves durable state.
+    worker_round_limit: int = DEFAULT_WORKER_ROUND_LIMIT
+    operation_timeout_seconds: int = DEFAULT_OPERATION_TIMEOUT_SECONDS
 
     attempts: int = 0
     consecutive_failures: int = 0
     no_progress_count: int = 0
     total_llm_rounds: int = 0
     repair_attempts: int = 0
+    worker_generation: int = 0
+    worker_rollovers: int = 0
     workspace_generation: int = 0
     started_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
@@ -160,13 +152,6 @@ class GoalState:
         for key, value in limits.items():
             if hasattr(state, key):
                 setattr(state, key, value)
-        if "max_total_rounds" in limits:
-            if state.max_total_rounds <= 0:
-                state.max_total_rounds = state.max_rounds_per_attempt * state.max_attempts
-        elif "max_rounds_per_attempt" in limits or "max_attempts" in limits:
-            # The total-round budget must scale with the user's per-attempt
-            # limits, not stay pinned to the 20*3 default.
-            state.max_total_rounds = state.max_rounds_per_attempt * state.max_attempts
         return state
 
     def to_dict(self) -> dict[str, Any]:

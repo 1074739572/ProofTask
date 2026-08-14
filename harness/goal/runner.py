@@ -17,7 +17,7 @@ from harness.evaluation import run_task_evaluation
 from harness.goal.engine import GoalEngine
 from harness.goal.models import GoalPhase, GoalStatus, GoalState, StopReason
 from harness.goal.planner import PLANNER_MAX_ROUNDS, VerificationSpec, plan_tasks
-from harness.goal.policy import check_stop, validate_limits
+from harness.goal.policy import NO_PROGRESS_REPLAN_LIMIT, validate_limits
 from harness.goal.store import GoalStoreError, archive_goal, load_goal, save_goal
 from harness.loop import LoopStats, agent_lock, agent_loop
 from harness.settings import get_workdir, workspace_generation
@@ -44,11 +44,8 @@ class GoalRequest:
     task_plan: list[dict[str, Any]] | None = None
     goal_contract: dict[str, Any] | None = None
     await_execution_approval: bool = False
-    max_rounds_per_attempt: int = 20
-    max_attempts: int = 3
-    max_consecutive_failures: int = 3
-    max_duration_seconds: int = 1800
-    max_repair_attempts: int = 2
+    worker_round_limit: int = 20
+    operation_timeout_seconds: int = 1800
     evaluation_required: bool = True
 
 
@@ -147,10 +144,11 @@ def goal_event_payload(state: GoalState) -> dict[str, Any]:
         "phase": state.phase,
         "status": state.status,
         "current_task_id": state.current_task_id,
-        "attempts": state.attempts,
-        "max_attempts": state.max_attempts,
+        "task_cycles": state.attempts,
         "total_llm_rounds": state.total_llm_rounds,
-        "max_total_rounds": state.max_total_rounds,
+        "worker_generation": state.worker_generation,
+        "worker_rollovers": state.worker_rollovers,
+        "worker_round_limit": state.worker_round_limit,
         "stop_reason": state.stop_reason,
         "final_verification": dict(state.final_verification) if isinstance(state.final_verification, dict) else None,
         "last_error": state.last_error,
@@ -196,8 +194,9 @@ def format_goal_status(state: GoalState) -> str:
     if state.phase == GoalPhase.PREPARE_TESTS.value:
         lines.append("  Waiting for Task test generation and test collection.")
     lines += [
-        f"  Attempt: {state.attempts}/{state.max_attempts}",
-        f"  Elapsed: {int(max(0, time.time() - state.started_at))}s / {state.max_duration_seconds}s",
+        f"  Task cycles: {state.attempts}",
+        f"  Workers: {state.worker_generation} ({state.worker_rollovers} rollover(s), limit {state.worker_round_limit} rounds each)",
+        f"  Goal elapsed: {int(max(0, time.time() - state.started_at))}s (unbounded)",
     ]
     if state.last_error:
         lines.append(f"  Last error: {state.last_error[:200]}")
@@ -248,10 +247,9 @@ def start_goal(request: GoalRequest, *, history: list, context: dict, binding: A
         state = GoalState.new(
             target=request.target, verification=request.verification, workspace=str(get_workdir()),
             workspace_generation=workspace_generation(), evaluation_required=request.evaluation_required,
-            max_rounds_per_attempt=request.max_rounds_per_attempt, max_attempts=request.max_attempts,
-            max_consecutive_failures=request.max_consecutive_failures, max_duration_seconds=request.max_duration_seconds,
+            worker_round_limit=request.worker_round_limit,
+            operation_timeout_seconds=request.operation_timeout_seconds,
         )
-        state.max_repair_attempts = request.max_repair_attempts
         if request.task_plan:
             state.task_plan = [dict(item) for item in request.task_plan]
         state.goal_contract = dict(request.goal_contract or {
@@ -319,7 +317,7 @@ def _resume_target(state: GoalState) -> str:
     allowed = {
         phase.value for phase in (
             GoalPhase.SELECT_TASK, GoalPhase.CLAIM, GoalPhase.ACT,
-            GoalPhase.VERIFY, GoalPhase.EVALUATE, GoalPhase.REPAIR_PLAN,
+            GoalPhase.ROLLOVER, GoalPhase.VERIFY, GoalPhase.EVALUATE, GoalPhase.REPAIR_PLAN,
             GoalPhase.IMPACT_REVIEW, GoalPhase.CLEAN_CHECK, GoalPhase.FULL_VERIFY,
         )
     }
@@ -395,10 +393,6 @@ class GoalRunner(threading.Thread):
             if self._pause_event.is_set() and not self._phase_in_flight:
                 self._pause(state, "user_pause")
                 return
-            decision = check_stop(state, now=time.time())
-            if decision.stop and state.phase not in {GoalPhase.VERIFY.value, GoalPhase.FULL_VERIFY.value}:
-                self._fail(state, decision.reason or StopReason.internal_error, decision.detail)
-                return
             self._step_once(state)
 
     def _step_once(self, state: GoalState) -> None:
@@ -412,6 +406,8 @@ class GoalRunner(threading.Thread):
             self._claim(state)
         elif state.phase == GoalPhase.ACT.value:
             self._act(state)
+        elif state.phase == GoalPhase.ROLLOVER.value:
+            self._rollover(state)
         elif state.phase == GoalPhase.VERIFY.value:
             self._verify(state)
         elif state.phase == GoalPhase.EVALUATE.value:
@@ -571,7 +567,11 @@ class GoalRunner(threading.Thread):
                 save_goal(state)
                 return
             command = build_pytest_command(selectors)
-            baseline = run_verification(command, workspace=root)
+            baseline = run_verification(
+                command,
+                workspace=root,
+                timeout_s=state.operation_timeout_seconds,
+            )
             output = str(getattr(baseline, "stdout", "") or "").lower()
             infrastructure_failure = "error collecting" in output or "importerror" in output or "fixture" in output and "error" in output
             posthoc = bool(task.verification_spec.get("allow_posthoc_test"))
@@ -718,6 +718,8 @@ class GoalRunner(threading.Thread):
         task = load_task(state.current_task_id)
         before = self._progress_snapshot(state)
         stats = LoopStats()
+        state.worker_generation += 1
+        save_goal(state)
         worker_history = [{"role": "user", "content": build_goal_act_prompt(state, task)}]
         worker_context = self._goal_worker_context()
         write_handoff(state, task, phase=GoalPhase.ACT.value)
@@ -727,14 +729,15 @@ class GoalRunner(threading.Thread):
             set_goal_noninteractive(True)
             with agent_lock:
                 clear_cancel()
-                agent_loop(worker_history, worker_context, max_rounds=state.max_rounds_per_attempt, binding=None, disabled_tools=ACT_DISABLED_TOOLS, stats=stats)
+                agent_loop(worker_history, worker_context, max_rounds=state.worker_round_limit, binding=None, disabled_tools=ACT_DISABLED_TOOLS, stats=stats)
         finally:
             set_goal_noninteractive(False)
             self._phase_in_flight = False
         state.total_llm_rounds += stats.llm_rounds
         state.attempts += 1
         state.no_progress_count = state.no_progress_count + 1 if self._progress_snapshot(state) == before else 0
-        write_handoff(state, task, phase=GoalPhase.VERIFY.value, summary=self._worker_summary(worker_history))
+        summary = self._worker_summary(worker_history)
+        write_handoff(state, task, phase=GoalPhase.VERIFY.value, summary=summary)
         if self._cancel_event.is_set():
             self._cancel(state, "user requested cancel")
         elif goal_permission_pending():
@@ -745,8 +748,18 @@ class GoalRunner(threading.Thread):
             )
         elif self._pause_event.is_set():
             self._pause(state, "user_pause")
+        elif stats.stop_reason == "max_rounds":
+            state.worker_rollovers += 1
+            self._apply(state, GoalPhase.ROLLOVER, "worker_round_limit_reached")
+        elif state.no_progress_count >= NO_PROGRESS_REPLAN_LIMIT:
+            state.last_error = f"{state.no_progress_count} workers made no observable progress"
+            self._apply(state, GoalPhase.REPAIR_PLAN, "worker_no_progress", error=state.last_error)
         else:
             self._apply(state, GoalPhase.VERIFY, "agent_loop_finished")
+
+    def _rollover(self, state: GoalState) -> None:
+        """A bounded worker ended; verification decides whether another is needed."""
+        self._apply(state, GoalPhase.VERIFY, "worker_handoff_saved")
 
     def _goal_worker_context(self) -> dict[str, Any]:
         """Keep project rules, never the user's stale chat state or Todo list."""
@@ -765,7 +778,11 @@ class GoalRunner(threading.Thread):
         return ""
 
     def _verify(self, state: GoalState) -> None:
-        task = verify_task_command(state.current_task_id, workspace=state.workspace)
+        task = verify_task_command(
+            state.current_task_id,
+            workspace=state.workspace,
+            timeout_s=state.operation_timeout_seconds,
+        )
         if task.verification_state == "passing":
             state.consecutive_failures = 0
             state.last_error = None
@@ -797,9 +814,6 @@ class GoalRunner(threading.Thread):
         from harness.goal.repair import plan_task_repair
         from harness.tasks import load_task, record_task_repair, request_task_test_repair
 
-        if state.repair_attempts >= state.max_repair_attempts:
-            self._fail(state, StopReason.repair_budget_exhausted, "reached autonomous repair budget")
-            return
         task = load_task(state.current_task_id)
         evaluation = task.evaluation or {"passed": False, "summary": state.last_error or "Goal verification failed", "route": "implementation_fix"}
         if evaluation.get("passed") is None:
@@ -892,7 +906,11 @@ class GoalRunner(threading.Thread):
 
     def _full_verify(self, state: GoalState) -> None:
         for task_id in state.task_ids:
-            task = reverify_task_command(task_id, workspace=state.workspace)
+            task = reverify_task_command(
+                task_id,
+                workspace=state.workspace,
+                timeout_s=state.operation_timeout_seconds,
+            )
             if task.verification_state != "passing":
                 self._record_final_verification(
                     state,
@@ -911,7 +929,11 @@ class GoalRunner(threading.Thread):
         }
         save_goal(state)
         _emit_goal("goal_status", state)
-        result = run_verification(state.verification, workspace=Path(state.workspace))
+        result = run_verification(
+            state.verification,
+            workspace=Path(state.workspace),
+            timeout_s=state.operation_timeout_seconds,
+        )
         self._record_final_verification(state, status="passed" if result.passed else "failed", result=result)
         if result.passed:
             self._apply(state, GoalPhase.DONE, "goal_verification_passed")
@@ -925,9 +947,6 @@ class GoalRunner(threading.Thread):
         """Turn a final regression failure into a durable corrective Task."""
         from harness.tasks import create_task, record_task_evaluation
 
-        if state.repair_attempts >= state.max_repair_attempts:
-            self._fail(state, StopReason.full_verification_failed, detail)
-            return
         name = f"goal regression repair {state.repair_attempts + 1}"
         task = create_task(
             name,
@@ -1018,7 +1037,8 @@ class GoalRunner(threading.Thread):
         return self._cancel_event.is_set() or self._pause_event.is_set()
 
     def _deadline(self, state: GoalState) -> float:
-        return time.monotonic() + max(0, state.max_duration_seconds - (time.time() - state.started_at))
+        """Deadline for one model operation, never the lifetime of a Goal."""
+        return time.monotonic() + state.operation_timeout_seconds
 
     def _apply(self, state: GoalState, target: GoalPhase, reason: str, *, error: str | None = None, stop_reason: str | None = None) -> None:
         self.engine.transition(state, target, reason, error=error, stop_reason=stop_reason)

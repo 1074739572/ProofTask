@@ -26,13 +26,11 @@ GOAL_USAGE = (
     "  /goal cancel     cancel (terminal; history is kept)"
 )
 
-#: CLI limit flag -> GoalRequest field name. Keys must match the GoalRequest
-#: dataclass fields exactly (the old mapping crashed with a TypeError).
+#: These limit one disposable worker or one external operation. They never
+#: impose a lifetime budget on the Goal itself.
 _LIMIT_FLAGS = {
-    "--max-rounds": "max_rounds_per_attempt",
-    "--max-attempts": "max_attempts",
-    "--max-failures": "max_consecutive_failures",
-    "--timeout": "max_duration_seconds",
+    "--worker-rounds": "worker_round_limit",
+    "--operation-timeout": "operation_timeout_seconds",
 }
 
 
@@ -197,9 +195,9 @@ def _handle_cancel(runner) -> str:
 def _handle_resume(runner, history: list, context: dict, binding: Any) -> str:
     state = runner.resume_goal(history=history, context=context, binding=binding)
     return (
-        f"Goal resumed: {state.id} [select_task]\n"
+        f"Goal resumed: {state.id} [{state.phase}]\n"
         f"  Target: {state.target[:80]}\n"
-        f"  Attempt: {state.attempts}/{state.max_attempts}"
+        f"  Task cycles: {state.attempts}; worker generation: {state.worker_generation}"
     )
 
 
@@ -344,9 +342,9 @@ def _handle_approve(runner, history: list, context: dict, binding: Any) -> str:
         f"  Verification: {state.verification}\n"
         "  The Goal will pause after generated tests have a failing baseline.\n"
         "  Review them, then run: /goal run\n"
-        f"  Limits: rounds/attempt={state.max_rounds_per_attempt}, "
-        f"attempts={state.max_attempts}, failures={state.max_consecutive_failures}, "
-        f"timeout={state.max_duration_seconds}s"
+        f"  Worker round limit: {state.worker_round_limit}; "
+        f"operation timeout: {state.operation_timeout_seconds}s\n"
+        "  Goal lifetime: unbounded (workers automatically hand off)."
     )
 
 
