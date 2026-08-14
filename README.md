@@ -1,6 +1,6 @@
 # ProofTask
 
-**可验证的自主编码执行器：让 Agent 从“持续尝试”走到“带着测试证据交付”。**
+**可验证的自主编码执行器：让 AI 不只会反复改代码，而是能用测试结果证明：这次改动真的可以交付。**
 
 [![Python](https://img.shields.io/badge/Python-3.11+-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
 [![Tests](https://img.shields.io/badge/tests-81%20passed-2ea44f?style=flat-square)](https://github.com/1074739572/claude-code_exchange)
