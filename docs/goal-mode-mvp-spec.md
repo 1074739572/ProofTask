@@ -1,3 +1,5 @@
+> 历史设计说明：本文记录早期 `/goal` MVP 的 Feature 方案，保留用于理解项目演进。当前实现已统一为 Goal / Task 模型；请以 [`proof-task-design.md`](./proof-task-design.md) 和 [`goal-task-verification-plan.md`](./goal-task-verification-plan.md) 为准。
+
 # `/goal` 自主执行模式 MVP 技术规格
 
 > 状态：待实现（供下一会话直接执行）  
