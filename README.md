@@ -12,6 +12,12 @@ ProofTask 是一个面向真实代码仓库的 Agent Harness。它把复杂需�
 Goal -> Task -> Acceptance Cases -> Test Binding -> Evidence -> Delivery
 ```
 
+<p align="center">
+  <img src="docs/assets/goal-cli-preview.png" alt="ProofTask Goal CLI: Task graph, test binding, and machine delivery gate" width="100%">
+</p>
+
+<p align="center"><sub>Goal 执行时，模型的工作过程与机器是否允许推进会被明确分开。</sub></p>
+
 ## 为什么需要 ProofTask
 
 普通 Agent 擅长持续修改代码，却容易把“做过很多操作”误认为“需求已经交付”。ProofTask 把完成定义收敛为可审计的事实：绑定测试实际通过，证据已经保存，依赖关系可以继续推进。
