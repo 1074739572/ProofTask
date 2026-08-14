@@ -548,6 +548,11 @@ def run_event_stream() -> None:
     worker_thread.start()
 
     _emit_status(context, binding, history, running=False)
+    # Restore a paused/in-progress Goal after a TUI restart. Terminal Goals stay
+    # out of the startup view, but `/goal status` can still request them.
+    from harness.goal.runner import emit_current_goal_status
+
+    emit_current_goal_status(include_terminal=False)
     _emit_welcome()
     emit("ready")
 
@@ -593,9 +598,13 @@ def run_event_stream() -> None:
                 # agent is busy. They need no LLM round and never flip the UI
                 # into the "running" state.
                 if _is_goal_control_command(text):
-                    from harness.goal.commands import handle_goal_command
+                    from harness.goal.commands import handle_goal_command, parse_goal_subcommand
 
                     note = handle_goal_command(text, history, context, binding)
+                    if parse_goal_subcommand(text) == "status":
+                        from harness.goal.runner import emit_current_goal_status
+
+                        emit_current_goal_status(include_terminal=True)
                     if note:
                         emit("log", level="plain", text=note)
                     continue

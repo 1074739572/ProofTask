@@ -138,6 +138,61 @@ def test_goal_forces_clean_enforcement_and_reverifies_all_tasks(monkeypatch):
     reverified = []
     monkeypatch.setattr(runner_mod, "reverify_task_command", lambda task_id, **kwargs: reverified.append(task_id) or type("Task", (), {"verification_state": "passing", "last_error": None})())
     monkeypatch.setattr(runner_mod, "run_verification", lambda *args, **kwargs: type("Result", (), {"passed": True, "error": None, "exit_code": 0})())
+    monkeypatch.setattr(runner_mod, "evidence_from_result", lambda *args, **kwargs: type("Evidence", (), {"to_dict": lambda self: {"exit_code": 0, "stdout_tail": "3 passed", "duration_ms": 12.5, "code_snapshot": "abc"}})())
     runner._full_verify(state)
     assert reverified == ["task_a", "task_b"]
     assert state.phase == GoalPhase.DONE.value
+    assert state.final_verification["status"] == "passed"
+    assert state.final_verification["exit_code"] == 0
+
+
+def test_goal_persists_global_regression_failure_evidence(monkeypatch):
+    import harness.goal.runner as runner_mod
+
+    state = GoalState.new(target="x", verification="pytest -q", workspace=".")
+    state.task_ids = ["task_a"]
+    state.phase = GoalPhase.FULL_VERIFY.value
+    runner = GoalRunner(state=state, history=[], context={}, binding=None)
+    monkeypatch.setattr(runner_mod, "save_goal", lambda state: None)
+    monkeypatch.setattr(runner_mod, "_emit_goal", lambda event_type, state: None)
+    monkeypatch.setattr(runner_mod, "reverify_task_command", lambda *args, **kwargs: type("Task", (), {"verification_state": "passing", "last_error": None})())
+    monkeypatch.setattr(runner_mod, "run_verification", lambda *args, **kwargs: type("Result", (), {"passed": False, "error": None, "exit_code": 1})())
+    monkeypatch.setattr(runner_mod, "evidence_from_result", lambda *args, **kwargs: type("Evidence", (), {"to_dict": lambda self: {"exit_code": 1, "stdout_tail": "1 failed", "duration_ms": 21.0, "code_snapshot": "def"}})())
+
+    runner._full_verify(state)
+
+    assert state.phase == GoalPhase.FAILED.value
+    assert state.final_verification["status"] == "failed"
+    assert state.final_verification["exit_code"] == 1
+    assert state.final_verification["stdout_tail"] == "1 failed"
+
+
+def test_goal_event_snapshot_exposes_task_contract_for_terminal_ui(tmp_path, monkeypatch):
+    from harness.goal.runner import goal_event_payload
+
+    task, state = _needs_generation_task(tmp_path, monkeypatch)
+    state.phase = GoalPhase.VERIFY.value
+    payload = goal_event_payload(state)
+
+    assert payload["verification"] == "pytest -q"
+    assert payload["final_verification"] is None
+    assert payload["tasks"][0]["id"] == task.id
+    assert payload["tasks"][0]["blocked_by"] == []
+    assert payload["tasks"][0]["latest_evidence"] is None
+
+
+def test_goal_started_snapshot_is_emitted_before_worker_thread_runs(tmp_path, monkeypatch):
+    import harness.goal.runner as runner_mod
+
+    order = []
+    monkeypatch.setattr(runner_mod, "_runner", None)
+    monkeypatch.setattr(runner_mod, "load_goal", lambda: None)
+    monkeypatch.setattr(runner_mod, "save_goal", lambda state: None)
+    monkeypatch.setattr(runner_mod, "get_workdir", lambda: tmp_path)
+    monkeypatch.setattr(runner_mod, "workspace_generation", lambda: 0)
+    monkeypatch.setattr(runner_mod, "_emit_goal", lambda event_type, state: order.append(event_type))
+    monkeypatch.setattr(runner_mod.GoalRunner, "start", lambda self: order.append("worker_started"))
+
+    runner_mod.start_goal(runner_mod.GoalRequest(target="ship behavior", verification="pytest -q"), history=[], context={}, binding=None)
+
+    assert order == ["goal_started", "worker_started"]

@@ -109,6 +109,9 @@ class GoalState:
     last_phase: str | None = None
     last_error: str | None = None
     stop_reason: str | None = None
+    # Durable machine evidence for the Goal-level regression command. Task
+    # evidence proves each unit; this records the final whole-goal gate.
+    final_verification: dict[str, Any] | None = None
     evaluation_required: bool = False
     transition_log: list[dict[str, Any]] = field(default_factory=list)
 

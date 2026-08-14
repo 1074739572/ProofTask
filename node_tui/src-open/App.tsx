@@ -9,6 +9,7 @@ import {buildSections} from './sections.ts';
 import type {ActionRow, Entry, Section, SubagentStatus} from './sections.ts';
 import {C} from './theme.ts';
 import {WelcomeView} from './Welcome.tsx';
+import {GoalView, type GoalSnapshot} from './GoalView.tsx';
 
 export type OverlayOption = {name: string; description: string; value: string};
 export type Overlay = {kind: 'permission' | 'picker'; id: string; title: string; pickerId?: string; options: OverlayOption[]};
@@ -85,6 +86,28 @@ child?.on('error', error => reportDiagnostic(`Backend failed to start: ${error.m
 child?.on('exit', (code, signal) => { if (code !== 0) reportDiagnostic(`Backend exited (${signal ?? code})`); });
 function send(command: Record<string, unknown>) { if (child && !child.stdin.destroyed) child.stdin.write(JSON.stringify(command) + '\n'); }
 function value(event: any, ...keys: string[]) { for (const key of keys) if (event?.[key] !== undefined && event[key] !== null && event[key] !== '') return String(event[key]); return ''; }
+
+function goalSnapshotFromEvent(event: any): GoalSnapshot | null {
+  const id = value(event, 'id');
+  const target = value(event, 'target');
+  if (!id || !target) return null;
+  return {
+    id,
+    target,
+    verification: value(event, 'verification'),
+    phase: value(event, 'phase') || 'initialize',
+    status: value(event, 'status') || 'running',
+    current_task_id: value(event, 'current_task_id') || null,
+    attempts: Number(event.attempts || 0),
+    max_attempts: Number(event.max_attempts || 0),
+    total_llm_rounds: Number(event.total_llm_rounds || 0),
+    max_total_rounds: Number(event.max_total_rounds || 0),
+    stop_reason: value(event, 'stop_reason') || null,
+    final_verification: event.final_verification && typeof event.final_verification === 'object' ? event.final_verification : null,
+    tasks: Array.isArray(event.tasks) ? event.tasks : [],
+    last_error: value(event, 'last_error') || null,
+  };
+}
 
 function formatTokens(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
@@ -548,12 +571,13 @@ function LogView(props: {entries: () => Entry[]; now: () => number; active: () =
 
 type DebugEntries = Entry[] | (() => Entry[]);
 type DebugFlag = boolean | (() => boolean);
+type DebugGoal = GoalSnapshot | null | (() => GoalSnapshot | null);
 
 function resolveDebugValue<T>(value: T | (() => T) | undefined): T | undefined {
   return typeof value === 'function' ? (value as () => T)() : value;
 }
 
-export function App(props?: {debugEntries?: DebugEntries; debugRunning?: DebugFlag; debugStartedAt?: number; debugOverlay?: Overlay; debugUsage?: {input: number; output: number; cacheRead: number; contextUsed?: number; contextWindow?: number}; debugEffort?: {value: string; label: string; options: OverlayOption[]}; debugWelcome?: {quote: string; art: string[]}}) {
+export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal; debugRunning?: DebugFlag; debugStartedAt?: number; debugOverlay?: Overlay; debugUsage?: {input: number; output: number; cacheRead: number; contextUsed?: number; contextWindow?: number}; debugEffort?: {value: string; label: string; options: OverlayOption[]}; debugWelcome?: {quote: string; art: string[]}}) {
   const dims = useTerminalDimensions();
   const initialDebugEntries = resolveDebugValue(props?.debugEntries) ?? [];
   const [entries, setEntries] = createSignal<Entry[]>(initialDebugEntries); const [input, setInput] = createSignal('');
@@ -564,6 +588,7 @@ export function App(props?: {debugEntries?: DebugEntries; debugRunning?: DebugFl
   const [welcomeQuote, setWelcomeQuote] = createSignal(props?.debugWelcome?.quote ?? '');
   const [todayInput, setTodayInput] = createSignal(props?.debugUsage?.input ?? 0); const [todayOutput, setTodayOutput] = createSignal(props?.debugUsage?.output ?? 0); const [todayCacheRead, setTodayCacheRead] = createSignal(props?.debugUsage?.cacheRead ?? 0);
   const [contextUsed, setContextUsed] = createSignal(props?.debugUsage?.contextUsed ?? 0); const [contextWindow, setContextWindow] = createSignal(props?.debugUsage?.contextWindow ?? 0);
+  const [goalSnapshot, setGoalSnapshot] = createSignal<GoalSnapshot | null>(resolveDebugValue(props?.debugGoal) ?? null);
   // Keyboard focus follows only visible collapsible rows.
   // Folded tool entries are intentionally excluded, otherwise Enter would
   // toggle a hidden action and look like the UI is not interactive.
@@ -792,10 +817,30 @@ export function App(props?: {debugEntries?: DebugEntries; debugRunning?: DebugFl
       case 'subagent_round': { const id = value(event, 'id'); const roundText = value(event, 'text'); const label = roundText ? `Round ${Number(event.round || 0)} · "${roundText}"` : `Round ${Number(event.round || 0)}`; update(id, x => x.kind === 'subagent' ? {...x, rounds: [...(x.rounds || []), label]} : x); break; }
       case 'subagent_tool': { const id = value(event, 'id'); const toolId = value(event, 'tool_use_id') || `${value(event, 'name')}-${Date.now()}`; const status = event.ok === null || event.ok === undefined ? 'running' : (event.ok ? 'done' : 'failed'); const name = value(event, 'name') || 'tool'; const summary = value(event, 'summary'); update(id, x => { if (x.kind !== 'subagent') return x; const tools = x.tools || []; const idx = tools.findIndex(tool => tool.id === toolId); const nextTool = {id: toolId, name, summary, status: status as SubagentStatus}; const nextTools = idx >= 0 ? tools.map((tool, i) => i === idx ? {...tool, ...nextTool} : tool) : [...tools, nextTool]; return {...x, tools: nextTools, toolCount: nextTools.length}; }); break; }
       case 'subagent_end': { const id = value(event, 'id'); const ts = Number(event.ts || 0) * 1000 || Date.now(); update(id, x => x.kind === 'subagent' ? {...x, status: event.ok ? 'done' : 'failed', done: true, ok: Boolean(event.ok), end: ts, toolCount: Number(event.tools || x.toolCount || 0), elapsed: Number(event.elapsed || 0), summary: value(event, 'summary')} : x); break; }
-      case 'goal_started': begin('goal planning'); add({id: `goal-${value(event, 'id')}-${Date.now()}`, kind: 'log', text: 'Goal', detail: `${value(event, 'id')} ${value(event, 'phase')}`}); break;
+      case 'goal_started': {
+        const snapshot = goalSnapshotFromEvent(event);
+        if (snapshot) setGoalSnapshot(snapshot);
+        begin(snapshot?.phase || 'goal planning');
+        add({id: `goal-${value(event, 'id')}-${Date.now()}`, kind: 'log', text: 'Goal', detail: `${value(event, 'id')} ${value(event, 'phase')}`});
+        break;
+      }
       case 'goal_status':
-      case 'goal_phase': { const status = value(event, 'status'); const active = status === 'running' || status === 'pausing' || status === 'cancelling'; setRunning(active); setPhase(active ? `goal: ${value(event, 'phase')}` : 'idle'); if (!active) setStartedAt(0); add({id: `goal-${value(event, 'id')}-${Date.now()}`, kind: 'log', text: 'Goal', detail: `${value(event, 'phase')} (${status})`}); break; }
-      case 'goal_stopped': setRunning(false); setPhase(value(event, 'status') === 'cancelled' ? 'interrupted' : 'idle'); setStartedAt(0); add({id: `goal-${value(event, 'id')}-${Date.now()}`, kind: 'log', text: 'Goal', detail: `${value(event, 'status')}${value(event, 'stop_reason') ? `: ${value(event, 'stop_reason')}` : ''}`}); break;
+      case 'goal_phase': {
+        const snapshot = goalSnapshotFromEvent(event);
+        if (snapshot) setGoalSnapshot(snapshot);
+        const status = value(event, 'status'); const active = status === 'running' || status === 'pausing' || status === 'cancelling'; setRunning(active); setPhase(active ? `goal: ${value(event, 'phase')}` : 'idle'); if (!active) setStartedAt(0); add({id: `goal-${value(event, 'id')}-${Date.now()}`, kind: 'log', text: 'Goal', detail: `${value(event, 'phase')} (${status})`}); break;
+      }
+      case 'goal_stopped': {
+        const snapshot = goalSnapshotFromEvent(event);
+        if (snapshot) setGoalSnapshot(snapshot);
+        setRunning(false); setPhase(value(event, 'status') === 'cancelled' ? 'interrupted' : 'idle'); setStartedAt(0); add({id: `goal-${value(event, 'id')}-${Date.now()}`, kind: 'log', text: 'Goal', detail: `${value(event, 'status')}${value(event, 'stop_reason') ? `: ${value(event, 'stop_reason')}` : ''}`}); break;
+      }
+      case 'goal_status_error': {
+        setGoalSnapshot(null);
+        setUserStarted(true);
+        add({id: `goal-error-${Date.now()}`, kind: 'blocked', text: value(event, 'error') || 'Goal state could not be loaded', detail: value(event, 'code') || 'Goal state error'});
+        break;
+      }
       case 'task_update': {
         const tasks = Array.isArray(event.tasks) ? event.tasks : [];
         const existing = entries().find(entry => entry.id === 'tasks:current');
@@ -868,7 +913,7 @@ export function App(props?: {debugEntries?: DebugEntries; debugRunning?: DebugFl
     // Do not consume Ctrl+C: terminals and IDEs use it to copy a mouse selection.
     // Ctrl+Shift+C is handled by OpenTUI as copy-selection; Ctrl+K interrupts a run.
     if (event?.ctrl && name === 'k') { send({type: 'interrupt'}); event.preventDefault?.(); return; }
-    if (event?.ctrl && name === 'l') { setEntries([]); setUserStarted(false); send({type: 'clear'}); }
+    if (event?.ctrl && name === 'l') { setEntries([]); setGoalSnapshot(null); setUserStarted(false); send({type: 'clear'}); }
     // Input history: with an empty composer, ↑ recalls past commands and ↓
     // walks back toward the newest, past the end clears the input. When the
     // composer has text, ↑/↓ move the cursor inside the multiline buffer.
@@ -902,10 +947,12 @@ export function App(props?: {debugEntries?: DebugEntries; debugRunning?: DebugFl
     const text = input().trim();
     if (!text) return;
     const isGoalControl = /^\/goal\s+(?:status|pause|cancel)\s*$/i.test(text);
+    const isGoalCommand = /^\/goal(?:\s|$)/i.test(text);
     if (running() && !isGoalControl) {
       add({id: `log-${Date.now()}`, kind: 'log', text: 'Agent is already running', detail: 'press Ctrl+K to interrupt first'});
       return;
     }
+    if (!isGoalCommand && goalSnapshot()) setGoalSnapshot(null);
     // Slash commands are internal instructions; they must not appear in the
     // transcript. The backend also skips echoing them, so only their effect is
     // visible (toast / log / header state).
@@ -920,10 +967,14 @@ export function App(props?: {debugEntries?: DebugEntries; debugRunning?: DebugFl
     setHistoryIdx(-1);
   };
   return <box width={dims().width} height={dims().height} flexDirection="column">
-    <Show when={showWelcome()} fallback={
-      <LogView entries={displayedEntries} now={now} height={viewportHeight()} active={() => !overlay()} composerEmpty={() => !overlay() && input() === ''} focusId={focusId} onCycleFocus={cycleFocus} onToggleExpand={toggleExpand} onClearFocus={() => setFocusId(null)} />
+    <Show when={goalSnapshot()} fallback={
+      <Show when={showWelcome()} fallback={
+        <LogView entries={displayedEntries} now={now} height={viewportHeight()} active={() => !overlay()} composerEmpty={() => !overlay() && input() === ''} focusId={focusId} onCycleFocus={cycleFocus} onToggleExpand={toggleExpand} onClearFocus={() => setFocusId(null)} />
+      }>
+        <WelcomeView width={dims().width} height={viewportHeight()} quote={welcomeQuote()} />
+      </Show>
     }>
-      <WelcomeView width={dims().width} height={viewportHeight()} quote={welcomeQuote()} />
+      <GoalView goal={goalSnapshot()!} width={dims().width} height={viewportHeight()} />
     </Show>
     <Show when={overlay()}>
       <box border borderStyle="rounded" borderColor={C.accent} title={` ${overlay()?.title} `} height={(overlayWindow()?.rows ?? 0) + 3} paddingX={1} flexDirection="column">

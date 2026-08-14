@@ -21,6 +21,7 @@ from harness.loop import LoopStats, agent_lock, agent_loop
 from harness.project.resume import checkpoint_history
 from harness.settings import get_workdir, workspace_generation
 from harness.verification import build_pytest_command, collect_pytest_catalog, reverify_task_command, run_verification, verify_task_command
+from harness.verification.evidence import evidence_from_result
 
 ACT_DISABLED_TOOLS = frozenset({"complete_task", "clear_tasks"})
 
@@ -73,6 +74,96 @@ def _emit(event_type: str, **payload: Any) -> None:
 
     if events.is_enabled():
         events.emit(event_type, **payload)
+
+
+def goal_event_payload(state: GoalState) -> dict[str, Any]:
+    """Build the TUI snapshot from persisted Goal and Task state."""
+    from harness.tasks import load_task
+
+    tasks: list[dict[str, Any]] = []
+    for task_id in state.task_ids:
+        try:
+            task = load_task(task_id)
+        except (FileNotFoundError, OSError, TypeError, ValueError):
+            tasks.append(
+                {
+                    "id": task_id,
+                    "subject": "Task state unavailable",
+                    "status": "missing",
+                    "verification_state": "unknown",
+                    "blocked_by": [],
+                    "acceptance_cases": [],
+                    "verification_spec": {},
+                    "evidence_count": 0,
+                    "latest_evidence": None,
+                    "last_error": "Task state could not be loaded",
+                }
+            )
+            continue
+        evidence_items = task.evidence if isinstance(task.evidence, list) else []
+        latest_evidence = evidence_items[-1] if evidence_items and isinstance(evidence_items[-1], dict) else None
+        evidence_summary = None
+        if latest_evidence is not None:
+            evidence_selectors = latest_evidence.get("selectors")
+            evidence_summary = {
+                "command": str(latest_evidence.get("command") or ""),
+                "exit_code": latest_evidence.get("exit_code"),
+                "stdout_tail": str(latest_evidence.get("stdout_tail") or "")[-1600:],
+                "duration_ms": latest_evidence.get("duration_ms"),
+                "verified_by": str(latest_evidence.get("verified_by") or ""),
+                "code_snapshot": str(latest_evidence.get("code_snapshot") or ""),
+                "selectors": list(evidence_selectors) if isinstance(evidence_selectors, (list, tuple)) else [],
+                "collected_count": latest_evidence.get("collected_count") or 0,
+            }
+        tasks.append(
+            {
+                "id": task.id,
+                "subject": task.subject,
+                "status": task.status,
+                "verification_state": task.verification_state,
+                "blocked_by": list(task.blockedBy) if isinstance(task.blockedBy, list) else [],
+                "acceptance_cases": task.acceptance_cases if isinstance(task.acceptance_cases, list) else [],
+                "verification_spec": task.verification_spec if isinstance(task.verification_spec, dict) else {},
+                "evidence_count": len(evidence_items),
+                "latest_evidence": evidence_summary,
+                "last_error": task.last_error,
+            }
+        )
+    return {
+        "id": state.id,
+        "target": state.target,
+        "verification": state.verification,
+        "phase": state.phase,
+        "status": state.status,
+        "current_task_id": state.current_task_id,
+        "attempts": state.attempts,
+        "max_attempts": state.max_attempts,
+        "total_llm_rounds": state.total_llm_rounds,
+        "max_total_rounds": state.max_total_rounds,
+        "stop_reason": state.stop_reason,
+        "final_verification": dict(state.final_verification) if isinstance(state.final_verification, dict) else None,
+        "last_error": state.last_error,
+        "tasks": tasks,
+    }
+
+
+def _emit_goal(event_type: str, state: GoalState) -> None:
+    _emit(event_type, **goal_event_payload(state))
+
+
+def emit_current_goal_status(*, include_terminal: bool = True) -> GoalState | None:
+    """Emit the persisted Goal snapshot for TUI hydration and `/goal status`."""
+    try:
+        state = load_goal()
+    except GoalStoreError as exc:
+        _emit("goal_status_error", code=exc.code, error=str(exc))
+        return None
+    if state is None:
+        return None
+    terminal = {GoalStatus.DONE.value, GoalStatus.FAILED.value, GoalStatus.CANCELLED.value}
+    if include_terminal or state.status not in terminal:
+        _emit_goal("goal_status", state)
+    return state
 
 
 def format_goal_status(state: GoalState) -> str:
@@ -154,8 +245,8 @@ def start_goal(request: GoalRequest, *, history: list, context: dict, binding: A
             raise ValueError("invalid goal limits: " + "; ".join(problems))
         save_goal(state)
         _runner = GoalRunner(state=state, history=history, context=context, binding=binding)
+        _emit_goal("goal_started", state)
         _runner.start()
-        _emit("goal_started", id=state.id, phase=state.phase, status=state.status)
         return state
 
 
@@ -178,6 +269,7 @@ def resume_goal(*, history: list, context: dict, binding: Any) -> GoalState:
             GoalEngine().transition(state, GoalPhase.SELECT_TASK, "resume")
         save_goal(state)
         _runner = GoalRunner(state=state, history=history, context=context, binding=binding)
+        _emit_goal("goal_started", state)
         _runner.start()
         return state
 
@@ -214,6 +306,7 @@ class GoalRunner(threading.Thread):
             raise GoalNotRunningError("Goal is not running.")
         self._state.status = GoalStatus.PAUSING.value
         save_goal(self._state)
+        _emit_goal("goal_phase", self._state)
         self._pause_event.set()
         request_cancel()
         return self._state
@@ -225,6 +318,7 @@ class GoalRunner(threading.Thread):
         self._cancel_event.set()
         request_cancel()
         save_goal(self._state)
+        _emit_goal("goal_phase", self._state)
         return self._state
 
     def run(self) -> None:
@@ -235,6 +329,7 @@ class GoalRunner(threading.Thread):
         finally:
             if self._state.status in {GoalStatus.DONE.value, GoalStatus.FAILED.value, GoalStatus.CANCELLED.value}:
                 archive_goal(self._state)
+            _emit_goal("goal_stopped", self._state)
 
     def _drive(self) -> None:
         while self.is_running():
@@ -457,17 +552,50 @@ class GoalRunner(threading.Thread):
         for task_id in state.task_ids:
             task = reverify_task_command(task_id, workspace=state.workspace)
             if task.verification_state != "passing":
+                self._record_final_verification(
+                    state,
+                    status="blocked",
+                    error=f"Task {task_id} final binding failed: {task.last_error}",
+                )
                 self._fail(
                     state,
                     StopReason.full_verification_failed,
                     f"Task {task_id} final binding failed: {task.last_error}",
                 )
                 return
+        state.final_verification = {
+            "status": "running",
+            "command": state.verification,
+            "updated_at": time.time(),
+        }
+        save_goal(state)
+        _emit_goal("goal_status", state)
         result = run_verification(state.verification, workspace=Path(state.workspace))
+        self._record_final_verification(state, status="passed" if result.passed else "failed", result=result)
         if result.passed:
             self._apply(state, GoalPhase.DONE, "goal_verification_passed")
         else:
             self._fail(state, StopReason.full_verification_failed, result.error or f"full verification failed with exit code {result.exit_code}")
+
+    def _record_final_verification(self, state: GoalState, *, status: str, result=None, error: str | None = None) -> None:
+        """Persist the machine result of the whole-goal regression gate."""
+        record: dict[str, Any] = {
+            "status": status,
+            "command": state.verification,
+            "updated_at": time.time(),
+        }
+        if result is not None:
+            evidence = evidence_from_result(
+                result,
+                workspace=state.workspace,
+                verified_by="goal_final",
+            )
+            record.update(evidence.to_dict())
+        if error:
+            record["error"] = error
+        state.final_verification = record
+        save_goal(state)
+        _emit_goal("goal_status", state)
 
     def _progress_snapshot(self, state: GoalState) -> tuple:
         from harness.tasks import load_task
@@ -485,7 +613,7 @@ class GoalRunner(threading.Thread):
     def _apply(self, state: GoalState, target: GoalPhase, reason: str, *, error: str | None = None, stop_reason: str | None = None) -> None:
         self.engine.transition(state, target, reason, error=error, stop_reason=stop_reason)
         save_goal(state)
-        _emit("goal_phase", id=state.id, phase=state.phase, status=state.status, task_id=state.current_task_id, attempt=state.attempts)
+        _emit_goal("goal_phase", state)
 
     def _pause(self, state: GoalState, reason: str, *, stop_reason: str | None = None) -> None:
         self._apply(state, GoalPhase.PAUSED, reason, stop_reason=stop_reason)
