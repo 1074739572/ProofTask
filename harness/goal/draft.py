@@ -223,8 +223,12 @@ def create_draft(
                     max_rounds=12,
                     stats=stats,
                 )
-            except Exception:
-                raw = ""
+            except Exception as exc:
+                raise GoalDraftError(
+                    f"Goal intake request failed: {type(exc).__name__}: {exc}"
+                ) from exc
+            if raw.startswith("[goal_intake] failed:") or raw.startswith("[goal_intake] stopped:"):
+                raise GoalDraftError(f"Goal intake is unavailable: {raw}")
         else:
             raw = runner(target=draft.target, verification=command, catalog=catalog)
         draft.questions = _questions_from_raw(raw)

@@ -364,9 +364,14 @@ def plan_tasks(
             deadline=deadline,
             stats=stats,
         )
-    except Exception:
-        raw = ""
+    except Exception as exc:
+        raise GoalPlanningError(f"Goal planner request failed: {type(exc).__name__}: {exc}") from exc
+    if raw.startswith(f"[{PLANNER_AGENT}] failed:") or raw.startswith(f"[{PLANNER_AGENT}] stopped:"):
+        raise GoalPlanningError(f"Goal planner is unavailable: {raw}")
     plans = parse_plan(raw, test_catalog=catalog)
     if plans:
         return plans
-    raise GoalPlanningError("Goal planner did not produce a valid Task contract; no execution was started")
+    detail = raw.strip().replace("\n", " ")[:500] or "empty response"
+    raise GoalPlanningError(
+        f"Goal planner returned no valid Task contract; no execution was started. Response: {detail}"
+    )

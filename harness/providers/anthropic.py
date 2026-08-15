@@ -39,6 +39,7 @@ def get_anthropic_client(provider: ProviderConfig) -> "Anthropic":
             api_key=api_key,
             base_url=provider.base_url,
             timeout=httpx.Timeout(read, connect=connect, write=write, pool=pool),
+            max_retries=0,
         )
         _clients[provider.id] = client
         return client

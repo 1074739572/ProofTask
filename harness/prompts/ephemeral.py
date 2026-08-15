@@ -44,11 +44,21 @@ def messages_with_ephemeral_context(
     *,
     policy: str | None = None,
 ) -> list:
-    """Shallow copy of messages with session context appended for a single API call."""
+    """Return an API-only copy with session context before conversation history.
+
+    The session block is deliberately present on every stateless request. Putting
+    it before the first user turn keeps the block and the original request in a
+    stable prefix through a tool loop, which lets providers reuse that prefix in
+    their prompt cache without making the model forget runtime constraints.
+    """
     body = build_session_context(context).strip()
     if not body:
         return list(messages)
     ephemeral = build_ephemeral_user_message(context)
     if not ephemeral:
         return list(messages)
-    return [*messages, {"role": "user", "content": ephemeral}]
+    if messages and messages[0].get("role") == "user" and isinstance(messages[0].get("content"), str):
+        first = dict(messages[0])
+        first["content"] = f"{ephemeral}\n\n{first['content']}"
+        return [first, *messages[1:]]
+    return [{"role": "user", "content": ephemeral}, *messages]

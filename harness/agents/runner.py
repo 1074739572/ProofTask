@@ -227,13 +227,20 @@ def run_agent_task(
             renderer.subagent_end(run_id, f"stopped: {reason}", tool_count, time.time() - started, max_len=50)
             return f"[{agent_type}] stopped: {reason}"
         round_num += 1
-        response = create_message(
-            model_id=profile.model_id,
-            system=system,
-            messages=messages,
-            tools=tools,
-            max_tokens=8000,
-        )
+        try:
+            response = create_message(
+                model_id=profile.model_id,
+                system=system,
+                messages=messages,
+                tools=tools,
+                max_tokens=8000,
+            )
+        except Exception as exc:
+            detail = f"{type(exc).__name__}: {exc}"
+            if stats is not None:
+                stats.stop_reason = "provider_error"
+            renderer.subagent_end(run_id, f"failed: {detail}", tool_count, time.time() - started, max_len=120)
+            return f"[{agent_type}] failed: {detail}"
         if stats is not None:
             stats.llm_rounds += 1
 

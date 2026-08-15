@@ -172,7 +172,7 @@ API 请求
 | `slim_context` | 去掉 time/mode/mcp 等 | ~78% | 可选后续 |
 | `time_minute` / `time_none` | 降低时间粒度 | 与 current 接近 | 次要 |
 
-**采纳默认：`HARNESS_EPHEMERAL_POLICY=if_unchanged`**
+**线上默认：`always`。** 真实 API 请求不会保留上一轮 ephemeral 消息；直接跳过未变化的块会使模型丢失 mode、项目规则和 todos。`ephemeral_if_unchanged` 仅保留为离线缓存实验。
 
 ---
 
@@ -203,8 +203,8 @@ API 请求
 
 | 变量 | 默认 | 说明 |
 |------|------|------|
-| `HARNESS_EPHEMERAL_POLICY` | `if_unchanged` | 会话块未变则不发，提高命中率 |
-| 设为 `always` | — | 每轮都发 session 块（调试 / 对比用） |
+| `HARNESS_EPHEMERAL_POLICY` | `always` | 每轮发送当前 session 块，保证无状态 API 请求不会丢失 mode、项目规则和 todos |
+| `ephemeral_if_unchanged` | 仅离线实验 | 会话块未变则跳过，不能直接用于真实 agent loop |
 
 ### 5.4 Phase 2 — append-only 历史
 

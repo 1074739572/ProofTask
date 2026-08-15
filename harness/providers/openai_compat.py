@@ -39,6 +39,9 @@ def get_openai_client(provider: ProviderConfig) -> "OpenAI":
             api_key=api_key,
             base_url=provider.base_url,
             timeout=httpx.Timeout(read, connect=connect, write=write, pool=pool),
+            # A harness turn owns retries and error reporting. SDK retries can
+            # turn one 90s stalled request into several silent minutes.
+            max_retries=0,
         )
         _clients[provider.id] = client
         return client
