@@ -388,6 +388,15 @@ def _resume_target(state: GoalState) -> str:
             return GoalPhase.PREPARE_TESTS.value
         if candidate == GoalPhase.EVALUATE.value and current.verification_state != "passing":
             return GoalPhase.VERIFY.value
+        if candidate == GoalPhase.REPAIR_PLAN.value and current.verification_state == "passing":
+            from harness.verification.snapshot import capture_code_snapshot
+
+            evaluation = current.evaluation if isinstance(current.evaluation, dict) else {}
+            evaluated_snapshot = str(evaluation.get("input_snapshot") or "")
+            # An old or changed evaluation input cannot safely direct a new
+            # implementation attempt. Re-evaluate the current workspace first.
+            if not evaluated_snapshot or evaluated_snapshot != capture_code_snapshot(state.workspace):
+                return GoalPhase.EVALUATE.value
         if candidate in {GoalPhase.VERIFY.value, GoalPhase.CLEAN_CHECK.value} and current.status != "in_progress":
             return GoalPhase.CLAIM.value if current.status == "pending" else GoalPhase.SELECT_TASK.value
         if candidate in {GoalPhase.ACT.value, GoalPhase.ROLLOVER.value, GoalPhase.REPAIR_PLAN.value} and current.status == "pending":
@@ -1072,7 +1081,7 @@ class GoalRunner(threading.Thread):
 
     def _claim(self, state: GoalState) -> None:
         from harness.tasks import claim_task, load_task, record_task_start, save_task
-        from harness.verification.snapshot import capture_code_snapshot
+        from harness.verification.snapshot import capture_code_snapshot, capture_dirty_file_hashes
 
         task = load_task(state.current_task_id)
         spec = task.verification_spec if isinstance(task.verification_spec, dict) else {}
@@ -1087,6 +1096,7 @@ class GoalRunner(threading.Thread):
             state.current_task_id,
             snapshot=capture_code_snapshot(state.workspace),
             diff=self._workspace_diff(state.workspace),
+            dirty_hashes=capture_dirty_file_hashes(state.workspace),
         )
         self._apply(state, GoalPhase.ACT, "task_claimed")
 
@@ -1267,10 +1277,21 @@ class GoalRunner(threading.Thread):
             append_decisions(state, task, list(decision.assumptions), source="repair_planner")
         if decision.unavailable:
             state.last_error = decision.error or "repair planner unavailable"
+            format_error = state.last_error.startswith((
+                "repair planner returned no JSON",
+                "invalid repair JSON:",
+                "repair planner output is not an object",
+                "unsupported repair action:",
+                "repair action needs instructions",
+            ))
             self._pause(
                 state,
-                "repair_planner_unavailable",
-                stop_reason=StopReason.provider_unavailable.value,
+                "repair_planner_format_error" if format_error else "repair_planner_unavailable",
+                stop_reason=(
+                    StopReason.repair_plan_format_error.value
+                    if format_error
+                    else StopReason.provider_unavailable.value
+                ),
             )
             return
         if decision.action == "blocked":

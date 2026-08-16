@@ -68,6 +68,21 @@ def test_store_rejects_prior_goal_schema(tmp_path):
         assert exc.code == "unsupported_schema"
 
 
+def test_load_goal_reclassifies_legacy_repair_json_error(tmp_path):
+    state = GoalState.new(target="repair", verification="pytest -q", workspace=str(tmp_path))
+    state.status = "paused"
+    state.phase = "paused"
+    state.resume_phase = "repair_plan"
+    state.stop_reason = "provider_unavailable"
+    state.last_error = "repair planner returned no JSON"
+    save_goal(state)
+
+    loaded = load_goal(tmp_path)
+
+    assert loaded is not None
+    assert loaded.stop_reason == "repair_plan_format_error"
+
+
 def test_goal_lease_allows_only_one_live_runner_per_workspace(tmp_path):
     state = GoalState.new(target="t", verification="v", workspace=str(tmp_path))
     token = acquire_goal_lease(state)

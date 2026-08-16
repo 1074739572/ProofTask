@@ -110,6 +110,14 @@ class EvaluationInputs:
             lines.append("(无可读取的绑定测试文件)")
         lines += ["", "# 实际改动 (git diff)", self.diff or "(无 diff 或非 git 仓库)", ""]
         lines += ["# 评分标准", *[f"- {r}" for r in self.rubric]]
+        lines += [
+            "",
+            "# Diff interpretation",
+            "This diff contains only currently uncommitted changes attributable to this Task. "
+            "A clean diff can mean the Task work was committed after verification; it is not proof that the implementation is absent. "
+            "Do not fail scope merely because an expected implementation file is absent from an empty diff. "
+            "Judge scope violations only from unrelated files actually present in this Task diff.",
+        ]
         start_snapshot = getattr(self.feature, "start_snapshot", None)
         start_diff = getattr(self.feature, "start_diff", None)
         if start_snapshot or start_diff:
@@ -123,13 +131,18 @@ class EvaluationInputs:
         return "\n".join(lines)
 
 
-def _git_diff(workspace: Path) -> str:
+def _git_diff(workspace: Path, paths: set[str] | None = None) -> str:
     """Diff of tracked changes PLUS the full content of untracked files —
     an evaluator must see new files, not just modifications."""
     parts: list[str] = []
     try:
+        command = ["git", "diff", "HEAD"]
+        if paths is not None:
+            if not paths:
+                return ""
+            command.extend(["--", *sorted(paths)])
         proc = subprocess.run(
-            ["git", "diff", "HEAD"],
+            command,
             cwd=str(workspace),
             capture_output=True,
             text=True,
@@ -144,8 +157,11 @@ def _git_diff(workspace: Path) -> str:
         parts.append(proc.stdout)
     else:
         try:
+            command = ["git", "diff"]
+            if paths is not None:
+                command.extend(["--", *sorted(paths)])
             proc = subprocess.run(
-                ["git", "diff"],
+                command,
                 cwd=str(workspace),
                 capture_output=True,
                 text=True,
@@ -178,7 +194,7 @@ def _git_diff(workspace: Path) -> str:
         for line in status.stdout.splitlines():
             if line.startswith("?? "):
                 rel = line[3:].strip()
-                if rel:
+                if rel and (paths is None or rel.replace("\\", "/") in paths):
                     untracked.append(rel)
         for rel in untracked[:50]:
             path = workspace / rel
@@ -191,6 +207,25 @@ def _git_diff(workspace: Path) -> str:
 
     text = "\n".join(p for p in parts if p)
     return text[:MAX_DIFF_CHARS]
+
+
+def _task_scoped_diff(task, workspace: Path) -> str:
+    """Exclude files that were already dirty and unchanged for this Task."""
+    from harness.verification.snapshot import capture_dirty_file_hashes
+
+    baseline = getattr(task, "start_dirty_hashes", None)
+    if not isinstance(baseline, dict):
+        # Legacy tasks have no usable baseline. Keep their historical behavior.
+        return _git_diff(workspace)
+    current = capture_dirty_file_hashes(workspace)
+    changed = {
+        path for path, digest in current.items()
+        if baseline.get(path) != digest
+    }
+    # A pre-existing dirty file that became clean was touched too, but has no
+    # current patch to render. The machine verification/evidence still records
+    # that outcome; never leak unrelated unchanged baseline files into review.
+    return _git_diff(workspace, changed)
 
 
 def _bound_test_sources(feature: Feature, workspace: Path) -> list[tuple[str, str]]:
@@ -232,6 +267,6 @@ def collect_task_inputs(task_id: str, workspace: str | Path) -> EvaluationInputs
     root = Path(workspace)
     return EvaluationInputs(
         feature=task,
-        diff=_git_diff(root),
+        diff=_task_scoped_diff(task, root),
         bound_test_sources=_bound_test_sources(task, root),
     )

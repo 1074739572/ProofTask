@@ -106,6 +106,28 @@ def test_resume_keeps_evaluator_checkpoint_when_a_future_task_needs_tests(tmp_pa
     assert runner_mod._resume_target(state) == GoalPhase.EVALUATE.value
 
 
+def test_resume_re_evaluates_stale_repair_plan_input(tmp_path, monkeypatch):
+    import harness.goal.runner as runner_mod
+    import harness.tasks as tasks
+
+    monkeypatch.setattr(tasks, "TASKS_DIR", tmp_path / ".tasks")
+    task = tasks.create_task("current", "already implemented", verification_spec={})
+    task.status = "in_progress"
+    task.verification_state = "passing"
+    task.evaluation = {"passed": False, "input_snapshot": "old-snapshot"}
+    tasks.save_task(task)
+    state = GoalState.new(target="resume", verification="python -m pytest -q", workspace=str(tmp_path))
+    state.initialization_complete = True
+    state.task_plan = [{"name": "current"}]
+    state.task_name_ids = {"current": task.id}
+    state.task_ids = [task.id]
+    state.current_task_id = task.id
+    state.resume_phase = GoalPhase.REPAIR_PLAN.value
+    monkeypatch.setattr("harness.verification.snapshot.capture_code_snapshot", lambda _workspace: "new-snapshot")
+
+    assert runner_mod._resume_target(state) == GoalPhase.EVALUATE.value
+
+
 def test_test_generation_expands_a_collected_test_file_to_real_node_ids(tmp_path):
     catalog = TestCatalog(
         selectors=(
@@ -773,6 +795,33 @@ def test_replan_returns_current_task_to_additive_test_preparation(tmp_path, monk
     assert repaired.verification_state == "needs_generation"
     assert repaired.verification_spec["allow_posthoc_test"] is True
     assert repaired.repair_history[-1]["action"] == "replan"
+
+
+def test_repair_plan_json_format_failure_is_not_marked_provider_unavailable(tmp_path, monkeypatch):
+    import harness.goal.repair as repair_mod
+    import harness.goal.runner as runner_mod
+    import harness.tasks as tasks
+    from harness.goal.repair import RepairDecision
+
+    monkeypatch.setattr(tasks, "TASKS_DIR", tmp_path / ".tasks")
+    task = tasks.create_task("repair", "behavior", verification_spec={})
+    tasks.claim_task(task.id)
+    tasks.record_task_evaluation(task.id, {"passed": False, "route": "implementation_fix"})
+    state = GoalState.new(target="repair", verification="pytest -q", workspace=str(tmp_path))
+    state.current_task_id = task.id
+    state.task_ids = [task.id]
+    state.phase = GoalPhase.REPAIR_PLAN.value
+    monkeypatch.setattr(runner_mod, "save_goal", lambda state: None)
+    monkeypatch.setattr(
+        repair_mod,
+        "plan_task_repair",
+        lambda *args, **kwargs: RepairDecision("blocked", "", error="repair planner returned no JSON", unavailable=True),
+    )
+
+    GoalRunner(state=state, history=[], context={}, binding=None)._repair_plan(state)
+
+    assert state.phase == GoalPhase.PAUSED.value
+    assert state.stop_reason == "repair_plan_format_error"
 
 
 def test_goal_worker_context_excludes_stale_cli_state():

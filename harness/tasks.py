@@ -61,6 +61,9 @@ class Task:
     # to work performed for this Task instead of the entire repository history.
     start_snapshot: str | None = None
     start_diff: str | None = None
+    # Hashes of files already dirty when the Task was claimed. They let an
+    # evaluator exclude unrelated workspace changes from this Task's diff.
+    start_dirty_hashes: dict[str, str] = field(default_factory=dict)
     # Feature links are durable Task metadata, used to keep Goal/Feature
     # history attributable after a session is restarted.
     feature_ids: list[str] = field(default_factory=list)
@@ -265,7 +268,13 @@ def record_task_repair(task_id: str, repair: dict) -> Task:
     return task
 
 
-def record_task_start(task_id: str, *, snapshot: str | None, diff: str | None) -> Task:
+def record_task_start(
+    task_id: str,
+    *,
+    snapshot: str | None,
+    diff: str | None,
+    dirty_hashes: dict[str, str] | None = None,
+) -> Task:
     """Persist the Task-local workspace baseline at claim time."""
     path = _active_path(task_id)
     if not path.exists():
@@ -273,6 +282,7 @@ def record_task_start(task_id: str, *, snapshot: str | None, diff: str | None) -
     task = _load_task_from_path(path)
     task.start_snapshot = snapshot
     task.start_diff = diff
+    task.start_dirty_hashes = dict(dirty_hashes or {})
     save_task(task)
     return task
 

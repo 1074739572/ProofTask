@@ -117,6 +117,41 @@ def capture_code_snapshot(workspace: str | Path | None = None) -> str:
     return f"{head.strip()[:12]}:{digest.hexdigest()[:16]}"
 
 
+def capture_dirty_file_hashes(workspace: str | Path | None = None) -> dict[str, str]:
+    """Hash files already changed at Task start for later scope filtering."""
+    ws = Path(workspace).expanduser().resolve() if workspace else None
+    if ws is None:
+        from harness.settings import get_workdir
+
+        ws = get_workdir()
+    changed = _git_bytes("diff", "--name-only", "-z", "HEAD", cwd=ws)
+    untracked = _git_bytes("ls-files", "--others", "--exclude-standard", "-z", cwd=ws)
+    if changed is None or untracked is None:
+        return {}
+    result: dict[str, str] = {}
+    for raw_path in (*changed.split(b"\0"), *untracked.split(b"\0")):
+        if not raw_path:
+            continue
+        relative = Path(raw_path.decode("utf-8", errors="surrogateescape"))
+        if _is_harness_metadata(relative):
+            continue
+        path = ws / relative
+        key = relative.as_posix()
+        if not path.is_file():
+            result[key] = "<missing>"
+            continue
+        digest = hashlib.sha256()
+        try:
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+        except OSError:
+            result[key] = "<unreadable>"
+        else:
+            result[key] = digest.hexdigest()
+    return result
+
+
 def workspace_has_changes_since(workspace: str | Path | None, snapshot: str) -> bool:
     """True when the workspace is a git repo, the snapshot is a git snapshot,
     and the current state differs from it. Non-git -> False (cannot check)."""

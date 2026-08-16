@@ -69,3 +69,39 @@ def test_cross_task_impact_context_is_explicit_in_worker_and_evaluator_prompts(t
     assert "Do not regress the upstream behavior" in worker_prompt
     assert "Cross-Task impact context" in evaluator_prompt
     assert "missing required interaction coverage is never passable" in evaluator_prompt
+
+
+def test_task_scoped_diff_excludes_unchanged_preexisting_dirty_files(monkeypatch, tmp_path):
+    import harness.evaluation.inputs as inputs_mod
+
+    task = SimpleNamespace(start_dirty_hashes={"unrelated.py": "same", "edited.py": "before"})
+    monkeypatch.setattr(
+        "harness.verification.snapshot.capture_dirty_file_hashes",
+        lambda _workspace: {"unrelated.py": "same", "edited.py": "after", "new.py": "new"},
+    )
+    requested = []
+    monkeypatch.setattr(
+        inputs_mod,
+        "_git_diff",
+        lambda _workspace, paths=None: requested.append(paths) or "task diff",
+    )
+
+    assert inputs_mod._task_scoped_diff(task, tmp_path) == "task diff"
+    assert requested == [{"edited.py", "new.py"}]
+
+
+def test_evaluator_input_explains_that_a_clean_diff_is_not_a_scope_failure():
+    feature = SimpleNamespace(
+        behavior="behavior",
+        acceptance_cases=[],
+        verification_spec={},
+        verification="pytest -q",
+        evidence=[],
+        start_snapshot=None,
+        start_diff=None,
+    )
+
+    rendered = EvaluationInputs(feature=feature, diff="").to_text()
+
+    assert "clean diff can mean the Task work was committed" in rendered
+    assert "Do not fail scope merely" in rendered

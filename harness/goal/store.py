@@ -219,6 +219,18 @@ def load_goal(workspace: str | Path | None = None) -> GoalState | None:
     ):
         state.stop_reason = StopReason.impact_review_format_error.value
 
+    if (
+        state.status == GoalStatus.PAUSED.value
+        and state.resume_phase == GoalPhase.REPAIR_PLAN.value
+        and state.stop_reason == StopReason.provider_unavailable.value
+        and state.last_error in {
+            "repair planner returned no JSON",
+            "repair planner output is not an object",
+            "repair action needs instructions",
+        }
+    ):
+        state.stop_reason = StopReason.repair_plan_format_error.value
+
     # A durable cancellation request is final even if the process exited before
     # the worker reached its next checkpoint.
     if state.status == GoalStatus.CANCELLING.value:

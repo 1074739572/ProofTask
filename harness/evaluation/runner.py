@@ -26,6 +26,7 @@ from harness.agents.runner import run_agent_task
 from harness.evaluation.inputs import collect_inputs, collect_task_inputs
 from harness.evaluation.parser import Findings, parse_findings
 from harness.features import Feature, get_feature, record_evaluation
+from harness.verification.snapshot import capture_code_snapshot
 
 EVALUATOR_AGENT = "evaluator"
 MAX_RAW_OUTPUT_TAIL = 2_000
@@ -199,6 +200,7 @@ def run_evaluation(
 
     payload: dict[str, Any] = parsed.to_dict()
     payload.update(diagnostics)
+    payload["input_snapshot"] = capture_code_snapshot(feature.workspace or workspace)
     evidence_error = _contract_evidence_error(feature)
     if evidence_error:
         payload["passed"] = False
@@ -243,6 +245,7 @@ def run_task_evaluation(
     )
     payload = parsed.to_dict()
     payload.update(diagnostics)
+    payload["input_snapshot"] = capture_code_snapshot(workspace)
     evidence_error = _contract_evidence_error(task)
     if evidence_error:
         payload["passed"] = False
