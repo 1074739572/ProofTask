@@ -11,6 +11,7 @@ const height = Number(process.argv[3] || 28);
 const withOverlay = process.argv.includes('overlay');
 const testScroll = process.argv.includes('scroll');
 const emptyMode = process.argv.includes('empty');
+const usageMode = process.argv.includes('usage');
 
 const nowMs = Date.now();
 const fakeEntries: Entry[] = [
@@ -68,7 +69,7 @@ const longOverlay: Overlay = {
   })),
 };
 
-const setup = await testRender(() => <App debugEntries={emptyMode ? [] : fakeEntries} debugOverlay={withOverlay ? (process.argv.includes('long') ? longOverlay : fakeOverlay) : undefined} debugUsage={emptyMode ? {input: 0, output: 0, cacheRead: 0} : {input: 96100, output: 32300, cacheRead: 70153}} />, {width, height});
+const setup = await testRender(() => <App debugEntries={emptyMode ? [] : fakeEntries} debugOverlay={withOverlay ? (process.argv.includes('long') ? longOverlay : fakeOverlay) : undefined} debugUsage={emptyMode ? {input: 0, output: 0, cacheRead: 0} : {input: 96100, output: 32300, cacheRead: 70153}} debugUsageOpen={usageMode} />, {width, height});
 await setup.flush({maxPasses: 5});
 await setup.renderOnce();
 await setup.waitForVisualIdle({quietFrames: 2, maxFrames: 30});

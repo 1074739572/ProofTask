@@ -10,6 +10,7 @@ import type {ActionRow, Entry, Section, SubagentStatus} from './sections.ts';
 import {C} from './theme.ts';
 import {WelcomeView} from './Welcome.tsx';
 import {GoalView, type GoalDecision, type GoalSnapshot} from './GoalView.tsx';
+import {UsageView, type UsageRange} from './UsageView.tsx';
 import {
   applyCompletionResult,
   completionContext,
@@ -620,7 +621,7 @@ function resolveDebugValue<T>(value: T | (() => T) | undefined): T | undefined {
   return typeof value === 'function' ? (value as () => T)() : value;
 }
 
-export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal; debugRunning?: DebugFlag; debugStartedAt?: number; debugOverlay?: Overlay; debugUsage?: {input: number; output: number; cacheRead: number; contextUsed?: number; contextWindow?: number}; debugEffort?: {value: string; label: string; options: OverlayOption[]}; debugWelcome?: {quote: string; art: string[]}}) {
+export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal; debugRunning?: DebugFlag; debugStartedAt?: number; debugOverlay?: Overlay; debugUsage?: {input: number; output: number; cacheRead: number; contextUsed?: number; contextWindow?: number}; debugEffort?: {value: string; label: string; options: OverlayOption[]}; debugWelcome?: {quote: string; art: string[]}; debugUsageOpen?: boolean; debugUsageRange?: UsageRange}) {
   const dims = useTerminalDimensions();
   const initialDebugEntries = resolveDebugValue(props?.debugEntries) ?? [];
   const [entries, setEntries] = createSignal<Entry[]>(initialDebugEntries); const [input, setInput] = createSignal('');
@@ -633,6 +634,9 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
   const [contextUsed, setContextUsed] = createSignal(props?.debugUsage?.contextUsed ?? 0); const [contextWindow, setContextWindow] = createSignal(props?.debugUsage?.contextWindow ?? 0);
   const [goalSnapshot, setGoalSnapshot] = createSignal<GoalSnapshot | null>(resolveDebugValue(props?.debugGoal) ?? null);
   const [goalDecisions, setGoalDecisions] = createSignal<GoalDecision[]>([]);
+  const [usageOpen, setUsageOpen] = createSignal(props?.debugUsageOpen ?? false);
+  const [usageRange, setUsageRange] = createSignal<UsageRange>(props?.debugUsageRange ?? 7);
+  const [usageRevision, setUsageRevision] = createSignal(0);
   let decisionGoalId = goalSnapshot()?.id || '';
   // Keyboard focus follows only visible collapsible rows.
   // Folded tool entries are intentionally excluded, otherwise Enter would
@@ -781,6 +785,15 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
     setToast({text, time: Date.now()});
     if (toastTimer) clearTimeout(toastTimer);
     toastTimer = setTimeout(() => setToast(null), 2500);
+  };
+  const openUsage = (rawArg = '') => {
+    const arg = rawArg.trim().toLowerCase();
+    const range: UsageRange = arg === '30' || arg === '30d' || arg === 'month' || arg === 'm' ? 30
+      : arg === '90' || arg === '90d' || arg === 'year' || arg === 'y' ? 90
+      : 7;
+    setUsageRange(range);
+    setUsageRevision(value => value + 1);
+    setUsageOpen(true);
   };
   const add = (entry: Entry) => setEntries(prev => [...prev, entry].slice(-1000));
   const update = (id: string, fn: (entry: Entry) => Entry) => setEntries(prev => prev.map(x => x.id === id ? fn(x) : x));
@@ -1067,6 +1080,15 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
     const name = String(event?.name || '').toLowerCase();
     if (event?.ctrl && name === 'q') { send({type: 'exit'}); child?.kill?.(); process.exit(0); }
     if (event?.ctrl && name === 'k') { send({type: 'interrupt'}); event.preventDefault?.(); return; }
+    if (usageOpen()) {
+      if (name === 'escape') setUsageOpen(false);
+      else if (name === '1') { setUsageRange(7); setUsageRevision(value => value + 1); }
+      else if (name === '2') { setUsageRange(30); setUsageRevision(value => value + 1); }
+      else if (name === '3') { setUsageRange(90); setUsageRevision(value => value + 1); }
+      else if (name === 'r') setUsageRevision(value => value + 1);
+      event.preventDefault?.();
+      return;
+    }
     const current = overlay();
     if (current) {
       if (name === 'up') { setOverlayIndex(i => Math.max(0, i - 1)); event.preventDefault?.(); }
@@ -1128,6 +1150,16 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
   const submit = () => {
     const text = input().trim();
     if (!text) return;
+    const usageCommand = /^\/usage(?:\s+(.*))?$/i.exec(text);
+    if (usageCommand) {
+      openUsage(usageCommand[1] || '');
+      setInput('');
+      textareaRef?.setText?.('');
+      closeCompletion();
+      setInputHistory(prev => [...prev.slice(-50), text]);
+      setHistoryIdx(-1);
+      return;
+    }
     const isGoalControl = /^\/goal\s+(?:status|pause|stop|cancel)\s*$/i.test(text);
     const isGoalCommand = /^\/goal(?:\s|$)/i.test(text);
     if (running() && !isGoalControl) {
@@ -1150,6 +1182,7 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
     setHistoryIdx(-1);
   };
   return <box width={dims().width} height={dims().height} flexDirection="column">
+    <Show when={usageOpen()} fallback={<>
     <Show when={goalSnapshot()} fallback={
       <Show when={showWelcome()} fallback={
         <LogView entries={displayedEntries} now={now} height={viewportHeight()} active={() => !overlay()} composerEmpty={() => !overlay() && input() === ''} focusId={focusId} onCycleFocus={cycleFocus} onToggleExpand={toggleExpand} onClearFocus={() => setFocusId(null)} />
@@ -1205,5 +1238,8 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
         <text fg={C.textMuted} wrapMode="none" truncate>{footerStatusText(dims().width, model(), effortShortLabel(effortLabel(), effort()), contextUsed(), contextWindow(), todayInput() + todayOutput())}</text>
       </Show>
     </box>
+    </>}>
+      <UsageView width={dims().width} height={dims().height} range={usageRange} revision={usageRevision} />
+    </Show>
   </box>;
 }
