@@ -540,7 +540,6 @@ def run_cli() -> None:
         repair_tool_pairing(history)
         turn_start = len(history)
         history.append({"role": "user", "content": model_query})
-        context["latest_user_query"] = query
         lookup_active = is_lookup_active(query)
         context["writing_mode"] = is_writing_query(query) and not lookup_active
         from harness.prompts.goal_stickiness import augment_if_needed

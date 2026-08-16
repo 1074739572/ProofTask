@@ -35,7 +35,7 @@ from harness.messages.repair import finalize_cancelled_tool_round, repair_tool_p
 from harness.models import get_model
 from harness.modes import mode_auto_route, mode_enables_task, mode_lead_model_hint
 from harness.project.session import serialize_messages
-from harness.prompts import assemble_static_system_prompt, messages_with_ephemeral_context
+from harness.prompts import assemble_system_prompt
 from harness.settings import (
     CONTINUATION_PROMPT,
     DEFAULT_MAX_TOKENS,
@@ -110,8 +110,13 @@ def call_llm(
 ):
     # Optional per-run override (rare). Prefer shared identity + lookup constraints
     # over swapping personas for evals — see harness.prompts.lookup.
-    system = context.get("system_override") or assemble_static_system_prompt()
-    api_messages = messages_with_ephemeral_context(messages, context)
+    system = assemble_system_prompt(
+        context,
+        base_system=context.get("system_override"),
+    )
+    # Session state belongs to the provider system prompt. Do not prefix or
+    # duplicate the user's first message with internal runtime instructions.
+    api_messages = list(messages)
     # Subagent-enabled modes may bind a coordinator model independently from
     # the user's direct model selection. Recovery fallback remains highest priority.
     lead_model = mode_lead_model_hint() if mode_enables_task() else None

@@ -44,8 +44,7 @@ def _call_with_model_selection(*, task_enabled: bool, fallback: str | None = Non
         patch("harness.loop.mode_enables_task", return_value=task_enabled),
         patch("harness.loop.mode_lead_model_hint", return_value="gpt-5.6-sol"),
         patch("harness.loop.get_model", return_value="deepseek-v4-flash"),
-        patch("harness.loop.assemble_static_system_prompt", return_value="system"),
-        patch("harness.loop.messages_with_ephemeral_context", return_value=[]),
+        patch("harness.loop.assemble_system_prompt", return_value="system"),
         patch("harness.loop.create_message", return_value=response) as create,
     ):
         result = call_llm([], {}, [], state, 1000)
@@ -61,6 +60,22 @@ def test_call_llm_uses_mode_bound_lead_model() -> None:
 def test_non_orchestrate_mode_keeps_current_model() -> None:
     _, _, model_id = _call_with_model_selection(task_enabled=False)
     assert model_id == "deepseek-v4-flash"
+
+
+def test_call_llm_keeps_the_literal_user_message_clean() -> None:
+    response = SimpleNamespace(content=[], stop_reason="end_turn")
+    messages = [{"role": "user", "content": "Explain this error in plain Chinese."}]
+    with (
+        patch("harness.loop.mode_enables_task", return_value=False),
+        patch("harness.loop.assemble_system_prompt", return_value="runtime system") as assemble,
+        patch("harness.loop.get_model", return_value="deepseek-v4-flash"),
+        patch("harness.loop.create_message", return_value=response) as create,
+    ):
+        assert call_llm(messages, {}, [], RecoveryState(), 1000) is response
+
+    assert create.call_args.kwargs["system"] == "runtime system"
+    assert create.call_args.kwargs["messages"] == messages
+    assemble.assert_called_once_with({}, base_system=None)
 
 
 def test_recovery_fallback_overrides_mode_bound_lead_model() -> None:

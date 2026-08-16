@@ -1,4 +1,8 @@
-"""Attach per-turn session context to API messages without persisting to session history."""
+"""Legacy user-message context helpers for prompt-cache experiments.
+
+The live agent sends runtime state through the provider system prompt. These
+helpers remain for the cache experiment module and session-history filtering.
+"""
 
 from __future__ import annotations
 
@@ -8,11 +12,10 @@ EPHEMERAL_MARKER = "<session-context>"
 EphemeralPolicy = str  # "always" | "if_unchanged"
 
 def ephemeral_policy() -> str:
-    """Compatibility accessor for callers that inspect the old setting.
+    """Compatibility accessor for cache-experiment callers.
 
-    Dynamic state is part of every stateless API request. Omitting it after a
-    matching previous body made tool-loop and recovery calls forget the mode,
-    project rules, and todos.
+    The experiment still compares an always-present user-message variant. It
+    is not the policy used by the live agent loop.
     """
     return "always"
 

@@ -15,7 +15,7 @@ from harness.modes import (
 )
 from harness.prompts.project_md import format_project_instructions_block
 from harness.providers.config import get_provider
-from harness.settings import WORKDIR, get_workdir
+from harness.settings import WORKDIR
 from harness.todos.format import format_todos_for_prompt
 from harness.todos.state import get_todos
 
@@ -86,7 +86,7 @@ def build_session_context(
     include_project_instructions: bool = True,
     include_platform: bool = True,
 ) -> str:
-    """Dynamic harness state for the model (ephemeral message body, not static system)."""
+    """Dynamic harness state for the per-request system context."""
     sections: list[str] = []
     granularity = time_granularity or default_time_granularity()
 
@@ -154,18 +154,6 @@ def build_session_context(
         todos_block = format_todos_for_prompt(get_todos())
         if todos_block:
             sections.append(todos_block)
-
-    latest = (context.get("latest_user_query") or "").strip()
-    if latest:
-        sections.append(
-            "Latest user request — respond ONLY to this unless they explicitly "
-            f"ask to continue another task:\n{latest}\n"
-            f"Project root: {get_workdir()}\n"
-            "Python package path is `harness/` (there is no `src/harness/`).\n"
-            "If this message answers a choice you offered, continue the pending "
-            "Working goal with that choice. Do not explore `harness/` or "
-            "`main.py` unless the user asked to change this agent runtime."
-        )
 
     turn_constraints = (context.get("turn_constraints") or "").strip()
     if turn_constraints:
