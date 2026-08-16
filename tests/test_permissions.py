@@ -5,8 +5,8 @@ from __future__ import annotations
 from unittest import mock
 
 from harness.hooks import permission_hook
-from harness.permissions.config import _normalize_rules
-from harness.permissions.engine import evaluate_permission
+from harness.permissions.config import SANDBOX_PERMISSIONS, _normalize_rules
+from harness.permissions.engine import evaluate_permission, evaluate_single_permission
 from harness.permissions.state import (
     add_session_rule,
     clear_session_rules,
@@ -47,6 +47,22 @@ def test_windows_file_paths_use_the_same_protected_path_rules():
     assert evaluate_permission(
         "write_file", {"path": ".features\\f001.json"}, rules=rules
     ).effect == "deny"
+
+
+def test_sandbox_protects_absolute_goal_paths_and_keeps_verification_available(tmp_path, monkeypatch):
+    import harness.permissions.engine as engine
+
+    monkeypatch.setattr(engine, "get_workdir", lambda: tmp_path)
+    goal_path = str((tmp_path / ".project" / "goal.json").resolve())
+    assert evaluate_permission(
+        "write_file", {"path": goal_path}, rules=SANDBOX_PERMISSIONS, include_saved=False
+    ).effect == "deny"
+    assert evaluate_permission(
+        "read_file", {"path": ".env"}, rules=SANDBOX_PERMISSIONS, include_saved=False
+    ).effect == "deny"
+    assert evaluate_single_permission(
+        "verify_command", "python -m pytest -q", rules=SANDBOX_PERMISSIONS, include_saved=False
+    ).effect == "allow"
 
 
 def test_file_resource_rules_can_deny_env_but_allow_example():
@@ -163,6 +179,35 @@ def test_permission_hook_remembers_session_approval():
             )
             assert permission_hook(block) is None
         assert any(rule.tool == "bash" and rule.resource == "npm test*" for rule in session_rules())
+    finally:
+        clear_session_rules()
+
+
+def test_goal_permission_uses_the_event_ui_when_available():
+    clear_session_rules()
+    block = {"name": "bash", "input": {"command": "git status"}}
+    try:
+        with mock.patch("harness.hooks.evaluate_permission") as evaluate, mock.patch(
+            "harness.hooks.events.is_enabled", return_value=True
+        ), mock.patch(
+            "harness.ui.permission_events.request_permission", return_value="session"
+        ) as request, mock.patch("harness.hooks.audit_permission"), mock.patch(
+            "harness.goal.runner.is_goal_noninteractive", return_value=True
+        ):
+            evaluate.return_value = mock.Mock(
+                effect="ask",
+                resource="git status",
+                reason="matched bash:*",
+                source="config",
+                save_tool="bash",
+                save_resource="git status",
+                external_resource=None,
+            )
+            assert permission_hook(block) is None
+        request.assert_called_once()
+        assert request.call_args.args == ("bash", "git status", "Allow bash?")
+        assert callable(request.call_args.kwargs["cancel_check"])
+        assert any(rule.tool == "bash" and rule.resource == "git status" for rule in session_rules())
     finally:
         clear_session_rules()
 

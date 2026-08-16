@@ -201,7 +201,14 @@ def check_verification_command(command: str) -> VerificationDecision:
     # `python -c` embeds arbitrary code — reject. python may only run a
     # repository script (runner validates the script path is inside workspace).
     if prog in ("python", "py"):
-        if len(tokens) > 1 and tokens[1] in ("-c", "-m", "-i", "-I"):
+        # The Goal default is ``python -m pytest -q``. Permit that one module
+        # form while keeping arbitrary ``-m`` execution outside the policy.
+        if len(tokens) > 1 and tokens[1] == "-m":
+            if len(tokens) < 3 or tokens[2].lower() != "pytest":
+                return VerificationDecision(
+                    False, "python -m is allowed only for the pytest module"
+                )
+        elif len(tokens) > 1 and tokens[1] in ("-c", "-i", "-I"):
             return VerificationDecision(
                 False, f"python flag {tokens[1]!r} not allowed; run a repository script instead"
             )

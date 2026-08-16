@@ -16,6 +16,7 @@ Design rules (reliability plan §4 L5):
 
 from __future__ import annotations
 
+import hashlib
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -27,6 +28,58 @@ from harness.evaluation.parser import Findings, parse_findings
 from harness.features import Feature, get_feature, record_evaluation
 
 EVALUATOR_AGENT = "evaluator"
+MAX_RAW_OUTPUT_TAIL = 2_000
+
+
+def _run_evaluator(
+    *,
+    description: str,
+    prompt: str,
+    cwd: str | None,
+    cancel_check: Callable[[], bool] | None,
+    deadline: float | None,
+    stats,
+) -> tuple[Findings, dict[str, Any]]:
+    """Run once, then make one JSON-only correction attempt when needed."""
+    raw = run_agent_task(
+        description=description,
+        prompt=prompt,
+        agent_type=EVALUATOR_AGENT,
+        cwd=cwd,
+        cancel_check=cancel_check,
+        deadline=deadline,
+        stats=stats,
+    )
+    parsed = parse_findings(raw)
+    attempts = 1
+    # Provider/cancel/deadline outcomes are not format errors. Retrying them
+    # immediately only hides the real failure and burns another model call.
+    stop_reason = str(getattr(stats, "stop_reason", "") or "")
+    if parsed.passed is None and stop_reason not in {"provider_error", "cancelled", "deadline"}:
+        attempts = 2
+        raw = run_agent_task(
+            description=description + " (JSON correction)",
+            prompt=(
+                prompt
+                + "\n\nYour previous response was not a valid verdict. Reply now with ONLY one valid JSON object, no prose or code fence."
+            ),
+            agent_type=EVALUATOR_AGENT,
+            cwd=cwd,
+            cancel_check=cancel_check,
+            deadline=deadline,
+            stats=stats,
+        )
+        parsed = parse_findings(raw)
+        stop_reason = str(getattr(stats, "stop_reason", "") or "")
+    payload = {
+        "raw_output_tail": str(raw or "")[-MAX_RAW_OUTPUT_TAIL:],
+        "raw_output_sha256": hashlib.sha256(str(raw or "").encode("utf-8", errors="replace")).hexdigest(),
+        "parse_attempts": attempts,
+        "agent_stop_reason": stop_reason or "completed",
+    }
+    if parsed.passed is None and stop_reason == "provider_error":
+        parsed = Findings(passed=None, error="evaluator provider unavailable")
+    return parsed, payload
 
 
 def build_evaluation_prompt(inputs) -> str:
@@ -35,6 +88,15 @@ def build_evaluation_prompt(inputs) -> str:
     The evaluator has useful judgment on coverage and scope, but deterministic
     verification facts are not up for interpretation by the model.
     """
+    from harness.goal.skills import assigned_skill_context
+
+    review_skill = assigned_skill_context(("code-review",))
+    skill_section = (
+        "\n\nReview workflow guidance follows. It is advisory: the required JSON result and hard rules win.\n"
+        f"{review_skill}\n"
+        if review_skill
+        else ""
+    )
     return (
         "You are an independent evaluator for one Task. Return ONLY a JSON object "
         "with keys passed, route, summary, findings, and affected_task_ids.\n\n"
@@ -44,8 +106,11 @@ def build_evaluation_prompt(inputs) -> str:
         "or a command/evidence mismatch is never passable. Report it as a high finding.\n"
         "- Passing tests are necessary but not sufficient: report unmet behavior, "
         "weak tests, and unrelated scope changes.\n"
+        "- When Cross-Task impact context is present, verify the bound tests and diff address it; "
+        "missing required interaction coverage is never passable.\n"
         "- route must be pass, implementation_fix, test_gap, replan, or blocked.\n"
-        "- You are advisory. Do not claim to change Task state.\n\n"
+        "- You are advisory. Do not claim to change Task state."
+        f"{skill_section}\n"
         f"{inputs.to_text()}"
     )
 
@@ -123,18 +188,17 @@ def run_evaluation(
 
     profile = get_agent_profile(EVALUATOR_AGENT)
     prompt = build_evaluation_prompt(inputs)
-    raw = run_agent_task(
+    parsed, diagnostics = _run_evaluator(
         description=f"evaluate feature {feature_id} ({feature.name})",
         prompt=prompt,
-        agent_type=EVALUATOR_AGENT,
         cwd=str(feature.workspace or workspace) if (feature.workspace or workspace) else None,
         cancel_check=cancel_check,
         deadline=deadline,
         stats=stats,
     )
-    parsed: Findings = parse_findings(raw)
 
     payload: dict[str, Any] = parsed.to_dict()
+    payload.update(diagnostics)
     evidence_error = _contract_evidence_error(feature)
     if evidence_error:
         payload["passed"] = False
@@ -169,16 +233,16 @@ def run_task_evaluation(
     if error is not None:
         return record_task_evaluation(task_id, {"passed": None, "summary": "", "findings": [], "evaluated_by": EVALUATOR_AGENT, "evaluated_at": evaluated_at, "error": f"evaluator agent unavailable: {error}"})
     profile = get_agent_profile(EVALUATOR_AGENT)
-    raw = run_agent_task(
+    parsed, diagnostics = _run_evaluator(
         description=f"evaluate task {task_id} ({task.subject})",
         prompt=build_evaluation_prompt(inputs),
-        agent_type=EVALUATOR_AGENT,
         cwd=str(workspace),
         cancel_check=cancel_check,
         deadline=deadline,
         stats=stats,
     )
-    payload = parse_findings(raw).to_dict()
+    payload = parsed.to_dict()
+    payload.update(diagnostics)
     evidence_error = _contract_evidence_error(task)
     if evidence_error:
         payload["passed"] = False

@@ -1,5 +1,7 @@
 # Goal / Task Verification Plan
 
+> 当前 Goal 的完整机制与排查入口见 [`goal-system-guide.md`](./goal-system-guide.md)。本文保留为 Task 验证设计的专题说明。
+
 > 设计主张：模型负责理解、规划和实现；机器负责验证、记录和裁定能否交付。关于长期任务中的上下文腐烂、过度完成和假完成，以及这套分工的原因，见 [`proof-task-design.md`](./proof-task-design.md)。
 
 Last updated: 2026-08-14

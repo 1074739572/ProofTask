@@ -119,3 +119,12 @@ def record_test_binding(state, task, spec: dict[str, Any], *, kind: str = "task"
         }
     )
     _atomic_json(_root(state) / "test-map.json", entries)
+
+
+def remove_test_bindings(state, task_id: str) -> None:
+    """Remove bindings owned only by a discarded synthetic Goal Task."""
+    entries = [
+        entry for entry in load_test_map(state)
+        if task_id not in (entry.get("task_ids") or [])
+    ]
+    _atomic_json(_root(state) / "test-map.json", entries)

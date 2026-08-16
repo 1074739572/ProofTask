@@ -104,7 +104,7 @@ def _help_text() -> str:
     return """Commands:
   /open <directory>        switch workspace in-process (instant, no restart)
   /goal --verify "<cmd>" -- <target>   start an autonomous goal
-  /goal status|pause|resume|cancel     control the running goal
+  /goal status|pause|stop|resume|cancel control the running goal
   /init                    scan repo & create/improve HARNESS.md handbook
   /model                   pick model (↑↓ Enter) or /model <id>
   /mode [id]               pick mode (↑↓ Enter): direct|plan|orchestrate|file|grill
@@ -514,7 +514,7 @@ def run_cli() -> None:
         from harness.goal.runner import is_goal_running as _goal_running
 
         if _goal_running():
-            renderer.warn("Goal is running. Use /goal status|pause|cancel.")
+            renderer.warn("Goal is running. Use /goal status|pause|stop|cancel.")
             print()
             continue
 

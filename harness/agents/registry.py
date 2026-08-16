@@ -17,6 +17,7 @@ AGENTS_CONFIG_PATH = PACKAGE_ROOT / "config" / "agents.json"
 class AgentProfile:
     id: str
     model_id: str
+    reasoning_effort: str | None
     label: str
     tools: list[str]
     system: str
@@ -43,6 +44,7 @@ def get_agent_profile(agent_type: str) -> AgentProfile | None:
     return AgentProfile(
         id=agent_type,
         model_id=entry["model_id"],
+        reasoning_effort=str(entry.get("reasoning_effort") or "").strip().lower() or None,
         label=entry.get("label", agent_type),
         tools=list(entry.get("tools", [])),
         system=entry.get("system", "Complete the task and return a summary."),
@@ -73,6 +75,13 @@ def validate_agent_model(agent_type: str) -> str | None:
             "Add it to config/models.json before using this agent."
         )
     model_profile = get_model_profile(profile.model_id)
+    if profile.reasoning_effort:
+        if profile.reasoning_effort not in model_profile.effort_options:
+            available = ", ".join(model_profile.effort_options) or "none"
+            return (
+                f"Agent '{agent_type}' requests reasoning_effort={profile.reasoning_effort!r} "
+                f"for {profile.model_id}, but supported values are: {available}."
+            )
     try:
         provider = get_provider(model_profile.provider)
     except KeyError:

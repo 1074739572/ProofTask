@@ -8,13 +8,17 @@
 | --- | --- |
 | 项目是什么、如何运行 | [`README.md`](../README.md) |
 | Agent 应该如何读取项目规则 | [`HARNESS.md`](../HARNESS.md) |
+| Goal 的完整机制、排查与已解决问题 | [`goal-system-guide.md`](./goal-system-guide.md) |
 | 为什么要让机器判定交付 | [`proof-task-design.md`](./proof-task-design.md) |
 | Goal / Task / 测试验证如何落地 | [`goal-task-verification-plan.md`](./goal-task-verification-plan.md) |
+| Goal 中模型与 Task 如何传递上下文 | [`goal-context-handoff.md`](./goal-context-handoff.md) |
 
 ## ProofTask 设计
 
+- [`goal-system-guide.md`](./goal-system-guide.md)：Goal 的单一总览入口，覆盖状态机、模型分工、测试与验证、权限、上下文、恢复和问题处理。
 - [`proof-task-design.md`](./proof-task-design.md)：问题、原则、职责边界和当前实现的完整说明。
 - [`goal-task-verification-plan.md`](./goal-task-verification-plan.md)：Goal 状态、Task 契约、测试绑定和完成门槛。
+- [`goal-context-handoff.md`](./goal-context-handoff.md)：模型阶段与跨 Task 的持久化上下文交接。
 - [`goal-mode-mvp-spec.md`](./goal-mode-mvp-spec.md)：早期 MVP 方案，仅用于了解演进过程；当前实现以 Goal / Task 文档为准。
 - [`harness-reliability-plan.md`](./harness-reliability-plan.md)：从评估、状态、验证到自主循环的可靠性建设记录。
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import re
 import subprocess
 import threading
 import time
@@ -18,14 +19,18 @@ from harness.goal.engine import GoalEngine
 from harness.goal.models import GoalPhase, GoalStatus, GoalState, StopReason
 from harness.goal.planner import PLANNER_MAX_ROUNDS, VerificationSpec, plan_tasks
 from harness.goal.policy import NO_PROGRESS_REPLAN_LIMIT, validate_limits
-from harness.goal.store import GoalStoreError, archive_goal, load_goal, save_goal
-from harness.loop import LoopStats, agent_lock, agent_loop
+from harness.goal.store import (
+    GoalLeaseError,
+    GoalStoreError,
+    acquire_goal_lease,
+    archive_goal,
+    load_goal,
+    release_goal_lease,
+    save_goal,
+)
 from harness.settings import get_workdir, workspace_generation
 from harness.verification import build_pytest_command, collect_pytest_catalog, reverify_task_command, run_verification, verify_task_command
 from harness.verification.evidence import evidence_from_result
-
-ACT_DISABLED_TOOLS = frozenset({"complete_task", "clear_tasks"})
-
 
 class GoalNotRunningError(Exception):
     pass
@@ -131,6 +136,7 @@ def goal_event_payload(state: GoalState) -> dict[str, Any]:
                 "verification_state": task.verification_state,
                 "blocked_by": list(task.blockedBy) if isinstance(task.blockedBy, list) else [],
                 "acceptance_cases": task.acceptance_cases if isinstance(task.acceptance_cases, list) else [],
+                "skills": list(task.skill_names) if isinstance(task.skill_names, list) else [],
                 "verification_spec": task.verification_spec if isinstance(task.verification_spec, dict) else {},
                 "evidence_count": len(evidence_items),
                 "latest_evidence": evidence_summary,
@@ -260,42 +266,82 @@ def start_goal(request: GoalRequest, *, history: list, context: dict, binding: A
         problems = validate_limits(state)
         if problems:
             raise ValueError("invalid goal limits: " + "; ".join(problems))
-        save_goal(state)
-        _runner = GoalRunner(state=state, history=history, context=context, binding=binding)
-        _emit_goal("goal_started", state)
-        _runner.start()
-        return state
+        try:
+            lease_token = acquire_goal_lease(state)
+        except GoalLeaseError as exc:
+            raise GoalBusyError(str(exc)) from exc
+        try:
+            save_goal(state)
+            # pause/cancel shares the legacy agent cancellation signal.  A
+            # previous Goal must not leave the next one born cancelled.
+            clear_cancel()
+            _runner = GoalRunner(
+                state=state, history=history, context=context, binding=binding,
+                lease_token=lease_token,
+            )
+            _emit_goal("goal_started", state)
+            _runner.start()
+            return state
+        except BaseException:
+            _runner = None
+            release_goal_lease(state, lease_token)
+            raise
 
 
 def resume_goal(*, history: list, context: dict, binding: Any, approve_execution: bool = False) -> GoalState:
     global _runner
     _reap_runner()
     with _runner_lock:
+        if _runner is not None and _runner.is_alive() and _runner.is_running():
+            raise GoalBusyError("A goal is already running. Use /goal status, pause, or cancel.")
         state = load_goal()
+        if state is not None and state.status in {GoalStatus.RUNNING.value, GoalStatus.PAUSING.value, GoalStatus.CANCELLING.value}:
+            raise GoalBusyError("A Goal runner is already active for this workspace.")
         if state is None or state.status != GoalStatus.PAUSED.value:
             raise GoalNotRunningError("No paused goal to resume.")
-        if state.stop_reason == StopReason.user_approval_required.value:
-            if not approve_execution:
-                raise GoalNotRunningError("Goal is waiting for /goal run. Ordinary /goal resume cannot approve implementation.")
-            state.execution_approved = True
-        elif approve_execution:
-            raise GoalNotRunningError("No Goal is waiting for execution approval.")
+        if Path(state.workspace).expanduser().resolve() != get_workdir().resolve():
+            raise GoalNotRunningError(
+                "Paused Goal belongs to a different workspace. Switch back to its workspace before resuming."
+            )
+        try:
+            lease_token = acquire_goal_lease(state)
+        except GoalLeaseError as exc:
+            raise GoalBusyError(str(exc)) from exc
+        try:
+            # Never write a task or Goal checkpoint before this process owns
+            # the lease.  A second TUI used to cancel a live runner's legacy
+            # repair task before discovering the lease conflict.
+            _discard_legacy_interrupted_final_repair(state)
+            _discard_unbound_goal_regression_repair(state)
+            if state.stop_reason == StopReason.user_approval_required.value:
+                if not approve_execution:
+                    raise GoalNotRunningError("Goal is waiting for /goal run. Ordinary /goal resume cannot approve implementation.")
+                state.execution_approved = True
+            elif approve_execution:
+                raise GoalNotRunningError("No Goal is waiting for execution approval.")
 
-        # Pauses are outside the active execution budget. This also makes a
-        # draft safely resumable the next day after test review.
-        if state.paused_at is not None:
-            state.started_at += max(0.0, time.time() - state.paused_at)
-            state.paused_at = None
+            # Pauses are outside the active execution budget. This also makes
+            # a draft safely resumable the next day after test review.
+            if state.paused_at is not None:
+                state.started_at += max(0.0, time.time() - state.paused_at)
+                state.paused_at = None
 
-        target = _resume_target(state)
-        state.phase = target
-        state.status = GoalStatus.RUNNING.value
-        state.stop_reason = None
-        save_goal(state)
-        _runner = GoalRunner(state=state, history=history, context=context, binding=binding)
-        _emit_goal("goal_started", state)
-        _runner.start()
-        return state
+            target = _resume_target(state)
+            GoalEngine().transition(state, target, "goal_resumed")
+            state.stop_reason = None
+            save_goal(state)
+            clear_cancel()
+            _runner = GoalRunner(
+                state=state, history=history, context=context, binding=binding,
+                lease_token=lease_token,
+            )
+            _emit_goal("goal_started", state)
+            _runner.start()
+            return state
+        except BaseException:
+            _runner = None
+            release_goal_lease(state, lease_token)
+            raise
 
 
 def _resume_target(state: GoalState) -> str:
@@ -304,13 +350,10 @@ def _resume_target(state: GoalState) -> str:
 
     if not state.initialization_complete or len(state.task_name_ids) < len(state.task_plan):
         return GoalPhase.INITIALIZE.value
-    tasks = []
     try:
-        tasks = [load_task(task_id) for task_id in state.task_ids]
+        tasks = {task_id: load_task(task_id) for task_id in state.task_ids}
     except (FileNotFoundError, OSError, TypeError, ValueError):
         return GoalPhase.INITIALIZE.value
-    if any(task.verification_state == "needs_generation" for task in tasks):
-        return GoalPhase.PREPARE_TESTS.value
     if not state.execution_approved:
         return GoalPhase.PREPARE_TESTS.value
     candidate = state.resume_phase or GoalPhase.SELECT_TASK.value
@@ -321,7 +364,155 @@ def _resume_target(state: GoalState) -> str:
             GoalPhase.IMPACT_REVIEW, GoalPhase.CLEAN_CHECK, GoalPhase.FULL_VERIFY,
         )
     }
-    return candidate if candidate in allowed else GoalPhase.SELECT_TASK.value
+    if candidate not in allowed:
+        return GoalPhase.SELECT_TASK.value
+
+    # A paused Task checkpoint wins over unrelated future Tasks that are still
+    # waiting for their dependencies.  Otherwise a review pause on Task A is
+    # incorrectly routed through test generation for Task B and returns to ACT.
+    current = tasks.get(state.current_task_id or "")
+    task_phases = {
+        GoalPhase.CLAIM.value,
+        GoalPhase.ACT.value,
+        GoalPhase.ROLLOVER.value,
+        GoalPhase.VERIFY.value,
+        GoalPhase.EVALUATE.value,
+        GoalPhase.REPAIR_PLAN.value,
+        GoalPhase.CLEAN_CHECK.value,
+        GoalPhase.IMPACT_REVIEW.value,
+    }
+    if candidate in task_phases:
+        if current is None or current.status == "completed":
+            return GoalPhase.SELECT_TASK.value
+        if current.verification_state == "needs_generation":
+            return GoalPhase.PREPARE_TESTS.value
+        if candidate == GoalPhase.EVALUATE.value and current.verification_state != "passing":
+            return GoalPhase.VERIFY.value
+        if candidate in {GoalPhase.VERIFY.value, GoalPhase.CLEAN_CHECK.value} and current.status != "in_progress":
+            return GoalPhase.CLAIM.value if current.status == "pending" else GoalPhase.SELECT_TASK.value
+        if candidate in {GoalPhase.ACT.value, GoalPhase.ROLLOVER.value, GoalPhase.REPAIR_PLAN.value} and current.status == "pending":
+            return GoalPhase.CLAIM.value
+        return candidate
+
+    # SELECT_TASK will find the first runnable test-generation task.  Do not
+    # preempt the saved checkpoint merely because a blocked future Task exists.
+    return candidate
+
+
+def _discard_legacy_interrupted_final_repair(state: GoalState) -> bool:
+    """Remove the old synthetic repair Task created for a cancelled pytest run.
+
+    Older runners treated pytest's exit code 2 (interrupted) as a product
+    regression and queued an untestable ``goal regression repair`` Task.  The
+    Task file remains as an auditable cancelled record; only the Goal queue is
+    repaired so resume can rerun the final verification.
+    """
+    from harness.goal.memory import remove_test_bindings
+    from harness.tasks import load_task, save_task
+
+    final = state.final_verification if isinstance(state.final_verification, dict) else {}
+    output = "\n".join(
+        str(final.get(field) or "")
+        for field in ("stdout_tail", "stderr_tail", "error")
+    ).lower()
+    if final.get("exit_code") != 2 or "keyboardinterrupt" not in output:
+        return False
+    task_id = state.current_task_id
+    if not task_id:
+        return False
+    try:
+        task = load_task(task_id)
+    except (FileNotFoundError, OSError, TypeError, ValueError):
+        return False
+    task_detail = "\n".join(
+        [task.subject, task.description, str((task.evaluation or {}).get("summary") or "")]
+    ).lower()
+    if not task.subject.startswith("goal regression repair ") or "exit code 2" not in task_detail:
+        return False
+
+    # The historical runner did not record provenance.  Only remove a test
+    # file when its current digest still equals the synthetic Task's immutable
+    # binding digest; a user-edited file is deliberately preserved.
+    spec = task.verification_spec if isinstance(task.verification_spec, dict) else {}
+    expected_hashes = spec.get("test_hashes") if isinstance(spec.get("test_hashes"), dict) else {}
+    workspace = Path(state.workspace).resolve()
+    for raw_path, expected_hash in expected_hashes.items():
+        rel = str(raw_path).replace("\\", "/")
+        candidate = (workspace / rel).resolve()
+        if (
+            not candidate.is_relative_to(workspace)
+            or candidate.name.lower() == "conftest.py"
+            or not candidate.name.lower().startswith("test")
+        ):
+            continue
+        try:
+            if hashlib.sha256(candidate.read_bytes()).hexdigest() == str(expected_hash):
+                candidate.unlink()
+        except OSError:
+            continue
+    remove_test_bindings(state, task.id)
+    task.status = "cancelled"
+    task.last_error = "Superseded: full verification was interrupted, not a code regression."
+    save_task(task)
+    state.task_ids = [candidate for candidate in state.task_ids if candidate != task_id]
+    state.task_name_ids = {
+        name: candidate for name, candidate in state.task_name_ids.items() if candidate != task_id
+    }
+    state.task_plan = [
+        plan for plan in state.task_plan
+        if not (str(plan.get("name") or "") == task.subject)
+    ]
+    state.current_task_id = None
+    state.resume_phase = GoalPhase.FULL_VERIFY.value
+    state.final_verification = {
+        **final,
+        "status": "interrupted",
+        "error": "Full verification was interrupted before completion; retrying is required.",
+        "updated_at": time.time(),
+    }
+    state.last_error = "Full verification was interrupted before completion; /goal resume will retry it."
+    state.stop_reason = StopReason.full_verification_interrupted.value
+    return True
+
+
+def _discard_unbound_goal_regression_repair(state: GoalState) -> bool:
+    """Discard an untouched synthetic final-regression Task on resume.
+
+    Whole-suite failures must reopen their owning Task or pause for review.
+    They must never create another numbered ``goal regression repair`` Task,
+    whether an old runner left it unbound or a newer runner bound it directly.
+    """
+    from harness.goal.memory import remove_test_bindings
+    from harness.tasks import load_task, save_task
+
+    task_id = state.current_task_id
+    if not task_id:
+        return False
+    try:
+        task = load_task(task_id)
+    except (FileNotFoundError, OSError, TypeError, ValueError):
+        return False
+    spec = task.verification_spec if isinstance(task.verification_spec, dict) else {}
+    if (
+        not task.subject.startswith("goal regression repair ")
+        or task.status not in {"pending", "in_progress"}
+        or (task.status == "in_progress" and task.owner != f"goal:{state.id}")
+        or spec.get("goal_regression_fingerprint")
+    ):
+        return False
+    task.status = "cancelled"
+    task.last_error = "Superseded: whole-suite failures never create a synthetic Goal Task."
+    save_task(task)
+    remove_test_bindings(state, task.id)
+    state.task_ids = [candidate for candidate in state.task_ids if candidate != task.id]
+    state.task_name_ids = {
+        name: candidate for name, candidate in state.task_name_ids.items() if candidate != task.id
+    }
+    state.task_plan = [plan for plan in state.task_plan if str(plan.get("name") or "") != task.subject]
+    state.current_task_id = None
+    state.resume_phase = GoalPhase.FULL_VERIFY.value
+    state.last_error = "Retrying full verification without creating a synthetic Goal Task."
+    return True
 
 
 def pause_goal() -> GoalState:
@@ -333,19 +524,43 @@ def pause_goal() -> GoalState:
 
 def cancel_goal() -> GoalState:
     with _runner_lock:
-        if _runner is None:
-            raise GoalNotRunningError("Goal is not running.")
-        return _runner.request_cancel()
+        if _runner is not None:
+            return _runner.request_cancel()
+        state = load_goal()
+        if state is None or state.status != GoalStatus.PAUSED.value:
+            raise GoalNotRunningError("Goal is not running or paused.")
+        try:
+            lease_token = acquire_goal_lease(state)
+        except GoalLeaseError as exc:
+            raise GoalBusyError(str(exc)) from exc
+        try:
+            GoalEngine().transition(
+                state,
+                GoalPhase.CANCELLED,
+                StopReason.cancelled_by_user.value,
+                error="user requested cancel",
+                stop_reason=StopReason.cancelled_by_user.value,
+            )
+            save_goal(state)
+            archive_goal(state)
+            _emit_goal("goal_stopped", state)
+            return state
+        finally:
+            release_goal_lease(state, lease_token)
 
 
 class GoalRunner(threading.Thread):
-    def __init__(self, *, state: GoalState, history: list, context: dict, binding: Any):
+    def __init__(
+        self, *, state: GoalState, history: list, context: dict, binding: Any,
+        lease_token: str | None = None,
+    ):
         super().__init__(name=f"goal-{state.id}", daemon=True)
         self._state, self._history, self._context, self._binding = state, history, context, binding
         self._lock = threading.RLock()
         self._pause_event, self._cancel_event = threading.Event(), threading.Event()
         self._phase_in_flight = False
         self._archived = False
+        self._lease_token = lease_token
         self.engine = GoalEngine()
 
     def is_running(self) -> bool:
@@ -377,8 +592,11 @@ class GoalRunner(threading.Thread):
         except Exception as exc:
             self._fail(self._state, StopReason.internal_error, f"{type(exc).__name__}: {exc}")
         finally:
-            if self._state.status in {GoalStatus.DONE.value, GoalStatus.FAILED.value, GoalStatus.CANCELLED.value}:
-                archive_goal(self._state)
+            try:
+                if self._state.status in {GoalStatus.DONE.value, GoalStatus.FAILED.value, GoalStatus.CANCELLED.value}:
+                    archive_goal(self._state)
+            finally:
+                release_goal_lease(self._state, self._lease_token)
             _emit_goal("goal_stopped", self._state)
 
     def _drive(self) -> None:
@@ -436,6 +654,8 @@ class GoalRunner(threading.Thread):
             finally:
                 self._phase_in_flight = False
             state.total_llm_rounds += stats.llm_rounds
+            if self._honor_control_request(state):
+                return
             state.task_plan = [item.to_dict() for item in plans]
             save_goal(state)
         plans = state.task_plan
@@ -457,6 +677,7 @@ class GoalRunner(threading.Thread):
             task = create_task(
                 name, plan["behavior"], deps, goal_id=state.id,
                 acceptance_cases=list(plan.get("acceptance_cases") or []),
+                skill_names=list(plan.get("skills") or []),
                 verification_spec=dict(plan.get("verification_spec") or {}),
                 evaluation_required=state.evaluation_required,
             )
@@ -481,6 +702,8 @@ class GoalRunner(threading.Thread):
                 for case in task.acceptance_cases
                 if isinstance(case, dict) and case.get("id")
             ])
+            if not spec.get("test_hashes"):
+                spec["test_hashes"] = self._test_file_hashes(root, spec.get("test_files") or [])
             task.verification_spec = spec
             save_task(task)
             record_test_binding(state, task, spec)
@@ -522,15 +745,38 @@ class GoalRunner(threading.Thread):
                 continue
             before_catalog = collect_pytest_catalog(root)
             before_hashes = self._test_file_hashes(root, before_catalog.test_files)
+            write_roots = self._test_write_roots(before_catalog)
+            before_tree = self._snapshot_test_tree(root, write_roots)
+            impact_context = task.verification_spec.get("impact_context") or []
+            if not isinstance(impact_context, list):
+                impact_context = []
             prompt = (
                 "Create a NEW focused pytest file for this Task before implementation. You may modify only test files; "
                 "do not edit existing test files or production code. Use existing test conventions. After writing tests, reply ONLY with JSON: "
                 '{"test_selectors":["tests/test_x.py::test_name"]}.\n\n'
                 f"Task: {task.subject}\nBehavior: {task.description}\nAcceptance cases: {json.dumps(task.acceptance_cases)}"
             )
+            from harness.goal.skills import assigned_skill_context, normalize_goal_skills
+
+            test_skills = normalize_goal_skills(task.skill_names)
+            test_skill_context = assigned_skill_context(test_skills)
+            if test_skill_context:
+                prompt += (
+                    f"\n\nAssigned workflow skills: {', '.join(test_skills)}\n"
+                    f"{test_skill_context}\n"
+                    "These skills describe method only; the test-only write boundary and JSON response contract win."
+                )
+            if impact_context:
+                prompt += (
+                    "\n\nCross-Task impact context:\n"
+                    f"{json.dumps(impact_context[-8:], ensure_ascii=False)[:5000]}\n"
+                    "Add focused coverage for these interactions. Do not only repeat task-local tests."
+                )
             stats = AgentTaskStats()
             self._phase_in_flight = True
             try:
+                clear_goal_permission_flags()
+                set_goal_noninteractive(True)
                 raw = run_agent_task(
                     description=f"generate tests for task {task.id}",
                     prompt=prompt,
@@ -540,19 +786,34 @@ class GoalRunner(threading.Thread):
                     cancel_check=self._interrupted,
                     deadline=self._deadline(state),
                     stats=stats,
-                    write_roots=self._test_write_roots(before_catalog),
+                    write_roots=write_roots,
                 )
             finally:
+                set_goal_noninteractive(False)
                 self._phase_in_flight = False
             state.total_llm_rounds += stats.llm_rounds
+            if self._honor_control_request(state):
+                return
+            if goal_permission_pending():
+                self._restore_test_tree(root, before_tree, write_roots)
+                self._pause(
+                    state,
+                    "goal_test_generation_permission_required",
+                    stop_reason=StopReason.permission_wait.value,
+                )
+                state.last_error = "test generation needs permission outside the approved Goal boundary"
+                save_goal(state)
+                return
             after_catalog = collect_pytest_catalog(root)
             selectors = self._selectors_from_generation(raw, root, catalog=after_catalog)
             if not selectors:
+                self._restore_test_tree(root, before_tree, write_roots)
                 self._pause(state, "test_generation_required", stop_reason=StopReason.test_generation_required.value)
                 state.last_error = f"Task {task.id} needs a collected pytest selector before execution."
                 save_goal(state)
                 return
             if any(selector in before_catalog.selectors for selector in selectors):
+                self._restore_test_tree(root, before_tree, write_roots)
                 self._pause(state, "test_generation_reused_existing_selector", stop_reason=StopReason.test_generation_required.value)
                 state.last_error = f"Task {task.id} test writer reused an existing selector; it must add focused coverage."
                 save_goal(state)
@@ -562,6 +823,7 @@ class GoalRunner(threading.Thread):
                 if self._test_file_hashes(root, (path,)).get(path) != digest
             ]
             if changed_existing:
+                self._restore_test_tree(root, before_tree, write_roots)
                 self._pause(state, "test_generation_changed_existing_test", stop_reason=StopReason.test_generation_required.value)
                 state.last_error = f"Task {task.id} test writer modified existing test files: {', '.join(changed_existing)}"
                 save_goal(state)
@@ -571,7 +833,10 @@ class GoalRunner(threading.Thread):
                 command,
                 workspace=root,
                 timeout_s=state.operation_timeout_seconds,
+                cancel_check=self._interrupted,
             )
+            if self._honor_control_request(state):
+                return
             output = str(getattr(baseline, "stdout", "") or "").lower()
             infrastructure_failure = "error collecting" in output or "importerror" in output or "fixture" in output and "error" in output
             posthoc = bool(task.verification_spec.get("allow_posthoc_test"))
@@ -581,6 +846,7 @@ class GoalRunner(threading.Thread):
                     if baseline.passed
                     else "generated test baseline failed outside the requested behavior"
                 )
+                self._restore_test_tree(root, before_tree, write_roots)
                 self._pause(state, "test_generation_baseline_failed", stop_reason=StopReason.test_generation_required.value)
                 state.last_error = f"Task {task.id} test baseline is invalid: {detail}"
                 save_goal(state)
@@ -595,29 +861,39 @@ class GoalRunner(threading.Thread):
                 collected_count=len(selectors),
                 verified_by="goal_test_baseline",
             ).to_dict()
-            bound = bind_task_verification(
-                task.id,
-                VerificationSpec(
-                    adapter="pytest",
-                    command=build_pytest_command(all_selectors),
-                    test_files=files,
-                    selectors=all_selectors,
-                    source="generated",
-                    collected_count=len(selectors),
-                    baseline_result="posthoc_passing" if baseline.passed else "failing",
-                    confidence="high",
-                    baseline_evidence=baseline_evidence,
+            bound_spec = VerificationSpec(
+                adapter="pytest",
+                command=build_pytest_command(all_selectors),
+                test_files=files,
+                selectors=all_selectors,
+                source="generated",
+                collected_count=len(selectors),
+                baseline_result="posthoc_passing" if baseline.passed else "failing",
+                confidence="high",
+                baseline_evidence=baseline_evidence,
                 test_hashes=self._test_file_hashes(root, files),
                 covers=tuple(str(case.get("id")) for case in task.acceptance_cases if isinstance(case, dict) and case.get("id")),
                 owners=tuple(
                     dict.fromkeys(
                         str(owner)
-                        for owner in task.verification_spec.get("owners", [task.id])
+                        for owner in (task.verification_spec.get("owners") or [task.id])
                         if owner
                     )
                 ),
-            ).to_dict(),
-            )
+            ).to_dict()
+            # Binding replaces the verification spec. Preserve the durable
+            # cross-Task reason that caused this additive test generation.
+            if impact_context:
+                bound_spec["impact_context"] = impact_context
+            bound_spec["generated_files"] = [
+                {
+                    "path": path,
+                    "sha256": bound_spec["test_hashes"].get(path),
+                    "created": path not in before_hashes,
+                }
+                for path in files
+            ]
+            bound = bind_task_verification(task.id, bound_spec)
             record_test_binding(
                 state,
                 bound,
@@ -625,6 +901,10 @@ class GoalRunner(threading.Thread):
                 kind="integration" if len(bound.verification_spec.get("owners") or []) > 1 else "task",
             )
         if not state.execution_approved:
+            # A previous test-generation retry may have left a transient
+            # diagnostic behind. Once bindings are ready, status must reflect
+            # the real user-approval pause rather than that stale failure.
+            state.last_error = None
             self._pause(
                 state,
                 "tests_ready_for_user_approval",
@@ -645,7 +925,34 @@ class GoalRunner(threading.Thread):
         except (ValueError, TypeError, json.JSONDecodeError):
             return ()
         catalog = catalog or collect_pytest_catalog(workspace)
-        return requested if requested and all(catalog.contains(item) for item in requested) else ()
+        if not requested:
+            return ()
+        resolved: list[str] = []
+        for item in requested:
+            candidate = item.replace("\\", "/")
+            if catalog.contains(candidate):
+                resolved.append(candidate)
+                continue
+            # Test writers may return a new test file instead of every node.
+            # Expand only nodes pytest actually collected, including params.
+            if candidate in catalog.test_files:
+                resolved.extend(
+                    selector for selector in catalog.selectors
+                    if selector.split("::", 1)[0] == candidate
+                )
+                continue
+            # A writer can name a parameterized test function without its
+            # generated ``[case]`` suffix. Bind every concrete node from the
+            # collection rather than accepting the uncollected shorthand.
+            parameterized = [
+                selector for selector in catalog.selectors
+                if selector.startswith(f"{candidate}[")
+            ]
+            if parameterized:
+                resolved.extend(parameterized)
+                continue
+            return ()
+        return tuple(dict.fromkeys(resolved))
 
     @staticmethod
     def _test_file_hashes(root: Path, paths) -> dict[str, str]:
@@ -659,12 +966,77 @@ class GoalRunner(threading.Thread):
         return hashes
 
     @staticmethod
+    def _snapshot_test_tree(root: Path, roots: tuple[str, ...]) -> dict[str, bytes]:
+        """Capture only the files a test-generation worker may mutate."""
+        snapshot: dict[str, bytes] = {}
+        workspace = root.resolve()
+        for rel_root in roots:
+            try:
+                directory = (workspace / rel_root).resolve()
+            except OSError:
+                continue
+            if not directory.is_relative_to(workspace):
+                continue
+            if not directory.is_dir():
+                continue
+            for path in directory.rglob("*"):
+                if not path.is_file():
+                    continue
+                try:
+                    snapshot[path.relative_to(workspace).as_posix()] = path.read_bytes()
+                except OSError:
+                    continue
+        return snapshot
+
+    @staticmethod
+    def _restore_test_tree(
+        root: Path, snapshot: dict[str, bytes], allowed_roots: tuple[str, ...]
+    ) -> None:
+        """Undo an invalid generation attempt without touching production code."""
+        workspace = root.resolve()
+        roots: list[Path] = []
+        for rel_root in allowed_roots:
+            try:
+                directory = (workspace / rel_root).resolve()
+            except OSError:
+                continue
+            if directory.is_relative_to(workspace):
+                roots.append(directory)
+        for directory in sorted(set(roots), key=lambda item: len(item.parts), reverse=True):
+            if not directory.is_dir():
+                continue
+            for path in sorted(directory.rglob("*"), reverse=True):
+                if not path.is_file():
+                    continue
+                rel = path.relative_to(workspace).as_posix()
+                if rel not in snapshot:
+                    try:
+                        path.unlink()
+                    except OSError:
+                        pass
+        for rel, contents in snapshot.items():
+            try:
+                path = (workspace / rel).resolve()
+            except OSError:
+                continue
+            if not path.is_relative_to(workspace) or not any(path.is_relative_to(item) for item in roots):
+                continue
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                if not path.exists() or path.read_bytes() != contents:
+                    path.write_bytes(contents)
+            except OSError:
+                continue
+
+    @staticmethod
     def _test_write_roots(catalog) -> tuple[str, ...]:
         roots = {"tests", "test", "__tests__"}
         for test_file in getattr(catalog, "test_files", ()):
-            parent = str(Path(test_file).parent).replace("\\", "/")
-            if parent and parent != ".":
-                roots.add(parent)
+            parts = Path(test_file).parts[:-1]
+            for index, part in enumerate(parts):
+                if part.lower() in {"tests", "test", "__tests__"}:
+                    roots.add(Path(*parts[:index + 1]).as_posix())
+                    break
         return tuple(sorted(roots))
 
     def _select_task(self, state: GoalState) -> None:
@@ -699,9 +1071,17 @@ class GoalRunner(threading.Thread):
         self._apply(state, GoalPhase.FULL_VERIFY, "all_tasks_completed")
 
     def _claim(self, state: GoalState) -> None:
-        from harness.tasks import claim_task, record_task_start
+        from harness.tasks import claim_task, load_task, record_task_start, save_task
         from harness.verification.snapshot import capture_code_snapshot
 
+        task = load_task(state.current_task_id)
+        spec = task.verification_spec if isinstance(task.verification_spec, dict) else {}
+        if spec.get("source") == "discovered" and not spec.get("test_hashes"):
+            spec["test_hashes"] = self._test_file_hashes(
+                Path(state.workspace), spec.get("test_files") or []
+            )
+            task.verification_spec = spec
+            save_task(task)
         claim_task(state.current_task_id, owner=f"goal:{state.id}")
         record_task_start(
             state.current_task_id,
@@ -717,37 +1097,72 @@ class GoalRunner(threading.Thread):
 
         task = load_task(state.current_task_id)
         before = self._progress_snapshot(state)
-        stats = LoopStats()
+        stats = AgentTaskStats()
         state.worker_generation += 1
         save_goal(state)
-        worker_history = [{"role": "user", "content": build_goal_act_prompt(state, task)}]
         worker_context = self._goal_worker_context()
+        prompt = build_goal_act_prompt(
+            state,
+            task,
+            project_instructions=str(worker_context.get("project_instructions") or ""),
+            memories=str(worker_context.get("memories") or ""),
+        )
         write_handoff(state, task, phase=GoalPhase.ACT.value)
         self._phase_in_flight = True
         try:
+            from harness.agents.registry import get_agent_profile, validate_agent_model
+
+            goal_worker = get_agent_profile("goal_worker")
+            worker_error = validate_agent_model("goal_worker")
+            if worker_error or goal_worker is None:
+                self._fail(
+                    state,
+                    StopReason.internal_error,
+                    worker_error or "goal_worker agent profile is unavailable",
+                )
+                return
             clear_goal_permission_flags()
             set_goal_noninteractive(True)
-            with agent_lock:
-                clear_cancel()
-                agent_loop(worker_history, worker_context, max_rounds=state.worker_round_limit, binding=None, disabled_tools=ACT_DISABLED_TOOLS, stats=stats)
+            clear_cancel()
+            summary = run_agent_task(
+                description=f"implement Goal task {task.id}",
+                prompt=prompt,
+                agent_type="goal_worker",
+                cwd=state.workspace,
+                max_rounds=state.worker_round_limit,
+                cancel_check=self._interrupted,
+                deadline=self._deadline(state),
+                stats=stats,
+            )
         finally:
             set_goal_noninteractive(False)
             self._phase_in_flight = False
         state.total_llm_rounds += stats.llm_rounds
         state.attempts += 1
         state.no_progress_count = state.no_progress_count + 1 if self._progress_snapshot(state) == before else 0
-        summary = self._worker_summary(worker_history)
         write_handoff(state, task, phase=GoalPhase.VERIFY.value, summary=summary)
         if self._cancel_event.is_set():
             self._cancel(state, "user requested cancel")
         elif goal_permission_pending():
-            self._fail(
+            # A non-interactive Goal must never auto-approve an ``ask`` tool
+            # decision.  This is recoverable after the user adjusts policy or
+            # grants approval, so preserve the Task checkpoint as a pause.
+            self._pause(
                 state,
-                StopReason.autonomy_blocked,
-                "a tool required permission outside the approved Goal boundary",
+                "goal_permission_required",
+                stop_reason=StopReason.permission_wait.value,
             )
+            state.last_error = "a tool required permission outside the approved Goal boundary"
+            save_goal(state)
         elif self._pause_event.is_set():
             self._pause(state, "user_pause")
+        elif stats.stop_reason == "provider_error":
+            state.last_error = summary[:4_000]
+            self._pause(
+                state,
+                "goal_worker_provider_error",
+                stop_reason=StopReason.provider_unavailable.value,
+            )
         elif stats.stop_reason == "max_rounds":
             state.worker_rollovers += 1
             self._apply(state, GoalPhase.ROLLOVER, "worker_round_limit_reached")
@@ -755,7 +1170,7 @@ class GoalRunner(threading.Thread):
             state.last_error = f"{state.no_progress_count} workers made no observable progress"
             self._apply(state, GoalPhase.REPAIR_PLAN, "worker_no_progress", error=state.last_error)
         else:
-            self._apply(state, GoalPhase.VERIFY, "agent_loop_finished")
+            self._apply(state, GoalPhase.VERIFY, "goal_worker_finished")
 
     def _rollover(self, state: GoalState) -> None:
         """A bounded worker ended; verification decides whether another is needed."""
@@ -766,23 +1181,15 @@ class GoalRunner(threading.Thread):
         allowed = {"project_instructions", "memories", "connected_mcp"}
         return {key: value for key, value in self._context.items() if key in allowed}
 
-    @staticmethod
-    def _worker_summary(history: list[dict]) -> str:
-        from harness.tools.dispatch import extract_text
-
-        for message in reversed(history):
-            if message.get("role") == "assistant":
-                text = extract_text(message.get("content"))
-                if text:
-                    return text[:4_000]
-        return ""
-
     def _verify(self, state: GoalState) -> None:
         task = verify_task_command(
             state.current_task_id,
             workspace=state.workspace,
             timeout_s=state.operation_timeout_seconds,
+            cancel_check=self._interrupted,
         )
+        if self._honor_control_request(state):
+            return
         if task.verification_state == "passing":
             state.consecutive_failures = 0
             state.last_error = None
@@ -802,7 +1209,25 @@ class GoalRunner(threading.Thread):
             stats=stats,
         )
         state.total_llm_rounds += stats.llm_rounds
+        if self._honor_control_request(state):
+            return
         evaluation = task.evaluation or {}
+        if evaluation.get("passed") is None:
+            state.last_error = str(
+                evaluation.get("error") or "evaluator did not return a valid verdict"
+            )
+            stop_reason = (
+                StopReason.provider_unavailable.value
+                if evaluation.get("agent_stop_reason") == "provider_error"
+                else StopReason.evaluation_unavailable.value
+            )
+            self._pause(
+                state,
+                "evaluation_unavailable",
+                stop_reason=stop_reason,
+            )
+            save_goal(state)
+            return
         if evaluation.get("passed") is True:
             self._apply(state, GoalPhase.CLEAN_CHECK, "evaluation_passed")
             return
@@ -834,10 +1259,20 @@ class GoalRunner(threading.Thread):
             stats=stats,
         )
         state.total_llm_rounds += stats.llm_rounds
+        if self._honor_control_request(state):
+            return
         record = {"evaluation": evaluation, **decision.to_dict(), "at": time.time()}
         record_task_repair(task.id, record)
         if decision.assumptions:
             append_decisions(state, task, list(decision.assumptions), source="repair_planner")
+        if decision.unavailable:
+            state.last_error = decision.error or "repair planner unavailable"
+            self._pause(
+                state,
+                "repair_planner_unavailable",
+                stop_reason=StopReason.provider_unavailable.value,
+            )
+            return
         if decision.action == "blocked":
             self._fail(state, StopReason.autonomy_blocked, decision.error or decision.summary or "repair planner blocked")
             return
@@ -859,13 +1294,18 @@ class GoalRunner(threading.Thread):
         )
 
     def _clean_check(self, state: GoalState) -> None:
-        from harness.tasks import complete_task
+        from harness.tasks import complete_task, load_task, save_task
 
         result = complete_task(state.current_task_id, clean_check_mode="enforce")
         if result.startswith("Completed") or "already completed" in result:
             self._apply(state, GoalPhase.IMPACT_REVIEW, "task_completed")
             return
         state.consecutive_failures += 1
+        # The next worker is fresh. Persist the clean-gate failure on the
+        # Task so it has the same concrete evidence as a normal test failure.
+        task = load_task(state.current_task_id)
+        task.last_error = result
+        save_task(task)
         self._apply(state, GoalPhase.ACT, "clean_check_failed", error=result)
 
     def _impact_review(self, state: GoalState) -> None:
@@ -892,9 +1332,44 @@ class GoalRunner(threading.Thread):
             stats=stats,
         )
         state.total_llm_rounds += stats.llm_rounds
+        if self._honor_control_request(state):
+            return
+        if decision.unavailable:
+            state.last_error = decision.reason or "test impact reviewer unavailable"
+            self._pause(
+                state,
+                "test_impact_review_unavailable",
+                stop_reason=StopReason.provider_unavailable.value,
+            )
+            return
+        if decision.format_error:
+            state.last_error = decision.reason or "test impact reviewer returned invalid JSON"
+            self._pause(
+                state,
+                "test_impact_review_format_error",
+                stop_reason=StopReason.impact_review_format_error.value,
+            )
+            return
         if decision.action == "add_tests" and decision.task_id:
             target = request_task_test_repair(decision.task_id)
             target.verification_spec["owners"] = list(dict.fromkeys((completed.id, target.id)))
+            existing_context = target.verification_spec.get("impact_context") or []
+            if not isinstance(existing_context, list):
+                existing_context = []
+            context = [entry for entry in existing_context if isinstance(entry, dict)]
+            context = [entry for entry in context if entry.get("source_task_id") != completed.id]
+            context.append(
+                {
+                    "source_task_id": completed.id,
+                    "source_task_subject": str(completed.subject)[:400],
+                    "reason": (decision.reason or f"impact from {completed.id}")[:1200],
+                    "required_coverage": (
+                        "Add focused interaction coverage for this upstream Task and the target Task "
+                        "before implementation; do not only repeat task-local tests."
+                    ),
+                }
+            )
+            target.verification_spec["impact_context"] = context[-8:]
             save_task(target)
             append_decisions(
                 state,
@@ -910,17 +1385,23 @@ class GoalRunner(threading.Thread):
                 task_id,
                 workspace=state.workspace,
                 timeout_s=state.operation_timeout_seconds,
+                cancel_check=self._interrupted,
             )
+            if self._honor_control_request(state):
+                return
             if task.verification_state != "passing":
+                from harness.tasks import reopen_task_for_goal_repair
+
+                detail = f"Task {task_id} final binding failed: {task.last_error}"
                 self._record_final_verification(
                     state,
                     status="blocked",
-                    error=f"Task {task_id} final binding failed: {task.last_error}",
+                    error=detail,
                 )
-                self._queue_goal_repair(
-                    state,
-                    f"Task {task_id} final binding failed: {task.last_error}",
-                )
+                reopen_task_for_goal_repair(task_id, error=detail)
+                state.current_task_id = task_id
+                state.last_error = detail
+                self._apply(state, GoalPhase.REPAIR_PLAN, "final_task_binding_requires_repair", error=detail)
                 return
         state.final_verification = {
             "status": "running",
@@ -933,60 +1414,207 @@ class GoalRunner(threading.Thread):
             state.verification,
             workspace=Path(state.workspace),
             timeout_s=state.operation_timeout_seconds,
+            cancel_check=self._interrupted,
         )
+        if self._honor_control_request(state):
+            return
+        if self._final_verification_was_interrupted(result, state.verification):
+            self._record_final_verification(state, status="interrupted", result=result)
+            detail = "Full verification was interrupted before completion; retry it with /goal resume."
+            state.last_error = detail
+            save_goal(state)
+            self._pause(
+                state,
+                "full_verification_interrupted",
+                stop_reason=StopReason.full_verification_interrupted.value,
+            )
+            return
+
         self._record_final_verification(state, status="passed" if result.passed else "failed", result=result)
         if result.passed:
             self._apply(state, GoalPhase.DONE, "goal_verification_passed")
+        elif getattr(result, "error", None) or getattr(result, "timed_out", False):
+            detail = getattr(result, "error", None) or "full verification timed out"
+            state.last_error = detail
+            self._pause(
+                state,
+                "full_verification_unavailable",
+                stop_reason=StopReason.full_verification_failed.value,
+            )
         else:
             self._queue_goal_repair(
                 state,
                 result.error or f"full verification failed with exit code {result.exit_code}",
             )
 
-    def _queue_goal_repair(self, state: GoalState, detail: str) -> None:
-        """Turn a final regression failure into a durable corrective Task."""
-        from harness.tasks import create_task, record_task_evaluation
+    @staticmethod
+    def _final_verification_was_interrupted(result: Any, command: str = "") -> bool:
+        """Recognize pytest's interrupted result separately from a test failure."""
+        output = "\n".join(
+            str(getattr(result, field, "") or "")
+            for field in ("stdout", "stderr", "error")
+        ).lower()
+        effective_command = str(getattr(result, "command", "") or command).lower()
+        is_pytest = "pytest" in effective_command
+        return is_pytest and (
+            getattr(result, "exit_code", None) == 2 or "keyboardinterrupt" in output
+        )
 
+    def _queue_goal_repair(self, state: GoalState, detail: str) -> None:
+        """Analyze final-test evidence before reopening or adding a Task."""
+        from harness.goal.memory import append_decisions
+        from harness.goal.repair import plan_goal_regression_repair
+        from harness.tasks import (
+            create_task,
+            load_task,
+            record_task_evaluation,
+            record_task_repair,
+            reopen_task_for_goal_repair,
+        )
+
+        try:
+            tasks = [load_task(task_id) for task_id in state.task_ids]
+        except (FileNotFoundError, OSError, TypeError, ValueError) as exc:
+            state.last_error = f"cannot analyze final verification failure: {exc}"
+            self._pause(state, "full_verification_tasks_unavailable", stop_reason=StopReason.full_verification_failed.value)
+            return
+        stats = AgentTaskStats()
+        decision = plan_goal_regression_repair(
+            state,
+            tasks,
+            cwd=state.workspace,
+            cancel_check=self._interrupted,
+            deadline=self._deadline(state),
+            stats=stats,
+        )
+        state.total_llm_rounds += stats.llm_rounds
+        if self._honor_control_request(state):
+            return
+        append_decisions(
+            state,
+            None,
+            [{
+                "decision": f"Full verification analysis: {decision.action}",
+                "basis": decision.summary or decision.instructions or decision.error or detail,
+            }],
+            source="final_verification_analysis",
+        )
+        if decision.unavailable or decision.action == "pause":
+            state.last_error = decision.error or decision.summary or detail
+            self._pause(
+                state,
+                "full_verification_analysis_paused",
+                stop_reason=(
+                    StopReason.provider_unavailable.value
+                    if decision.unavailable
+                    else StopReason.full_verification_failed.value
+                ),
+            )
+            return
+
+        final = state.final_verification if isinstance(state.final_verification, dict) else {}
+        selector = self._failed_pytest_selector(str(final.get("stdout_tail") or ""))
+        if decision.action == "reopen_existing":
+            task = reopen_task_for_goal_repair(
+                str(decision.task_id),
+                error=f"Final verification failed at {selector or 'an unparsed selector'}: {detail}",
+            )
+            record_task_repair(task.id, {
+                "source": "final_verification_analysis",
+                **decision.to_dict(),
+                "final_verification": final,
+                "at": time.time(),
+            })
+            state.current_task_id = task.id
+            state.last_error = detail
+            self._apply(state, GoalPhase.REPAIR_PLAN, "final_regression_reopened_owner_task", error=detail)
+            return
+
+        # A new Task is valid only after the model explicitly chose it and a
+        # concrete failing pytest selector gives it a machine-verifiable gate.
+        if selector is None:
+            state.last_error = f"{detail}. The planner requested a repair Task but no failing pytest selector was recorded."
+            self._pause(state, "full_verification_repair_unbound", stop_reason=StopReason.full_verification_failed.value)
+            return
+        fingerprint = hashlib.sha256(
+            json.dumps(final, ensure_ascii=False, sort_keys=True).encode("utf-8", errors="replace")
+        ).hexdigest()
+        for existing in tasks:
+            spec = existing.verification_spec if isinstance(existing.verification_spec, dict) else {}
+            if spec.get("goal_regression_fingerprint") == fingerprint:
+                state.last_error = "This full verification failure already has a repair Task; refusing to create a duplicate."
+                self._pause(state, "full_verification_repair_duplicate", stop_reason=StopReason.full_verification_failed.value)
+                return
+        root = Path(state.workspace)
+        catalog = collect_pytest_catalog(root)
+        if not catalog.contains(selector):
+            state.last_error = f"Failed selector {selector!r} is no longer collected; repair Task was not created."
+            self._pause(state, "full_verification_repair_selector_unavailable", stop_reason=StopReason.full_verification_failed.value)
+            return
+        test_file = selector.split("::", 1)[0]
         name = f"goal regression repair {state.repair_attempts + 1}"
+        verification_spec = {
+            "adapter": "pytest",
+            "command": build_pytest_command((selector,)),
+            "test_files": [test_file],
+            "selectors": [selector],
+            "source": "discovered",
+            "collected_count": 1,
+            "baseline_result": "failing",
+            "confidence": "high",
+            "test_hashes": self._test_file_hashes(root, (test_file,)),
+            "covers": ["GOAL_REGRESSION"],
+            "owners": [],
+            "goal_regression_fingerprint": fingerprint,
+            "final_verification": final,
+        }
         task = create_task(
             name,
-            f"Repair the Goal-level regression failure: {detail}",
+            f"Repair {selector}: {decision.instructions}",
             goal_id=state.id,
-            acceptance_cases=[
-                {
-                    "id": "GOAL_REGRESSION",
-                    "given": "all previously completed Goal Tasks",
-                    "when": "the configured full verification runs",
-                    "then": "the full verification command exits with code 0",
-                }
-            ],
-            verification_spec={"source": "needs_generation"},
+            acceptance_cases=[{
+                "id": "GOAL_REGRESSION",
+                "given": "the reported full verification failure",
+                "when": selector,
+                "then": "the selector and full verification command exit with code 0",
+            }],
+            skill_names=["systematic-debugging"],
+            verification_spec=verification_spec,
             evaluation_required=True,
         )
-        record_task_evaluation(
-            task.id,
-            {
-                "passed": False,
-                "route": "replan",
-                "summary": detail,
-                "findings": [{"issue": detail, "severity": "high", "evidence": "full verification"}],
-            },
-        )
+        record_task_evaluation(task.id, {
+            "passed": False,
+            "route": "implementation_fix",
+            "summary": decision.summary or detail,
+            "findings": [{"issue": detail, "severity": "high", "evidence": "full verification"}],
+        })
+        record_task_repair(task.id, {
+            "source": "final_verification_analysis",
+            **decision.to_dict(),
+            "final_verification": final,
+            "at": time.time(),
+        })
         state.task_ids.append(task.id)
         state.task_name_ids[name] = task.id
-        state.task_plan.append(
-            {
-                "name": name,
-                "behavior": task.description,
-                "depends_on": [],
-                "acceptance_cases": task.acceptance_cases,
-                "verification_spec": task.verification_spec,
-            }
-        )
+        state.task_plan.append({
+            "name": name,
+            "behavior": task.description,
+            "depends_on": [],
+            "acceptance_cases": task.acceptance_cases,
+            "skills": task.skill_names,
+            "verification_spec": task.verification_spec,
+        })
         state.current_task_id = task.id
         state.last_error = detail
-        save_goal(state)
-        self._apply(state, GoalPhase.REPAIR_PLAN, "goal_regression_requires_repair", error=detail)
+        self._apply(state, GoalPhase.REPAIR_PLAN, "final_regression_analysis_created_repair_task", error=detail)
+
+    @staticmethod
+    def _failed_pytest_selector(output: str) -> str | None:
+        for line in output.splitlines():
+            match = re.match(r"^FAILED\s+([^\s]+\.py::[^\s]+)", line.strip())
+            if match:
+                return match.group(1).replace("\\", "/")
+        return None
 
     def _record_final_verification(self, state: GoalState, *, status: str, result=None, error: str | None = None) -> None:
         """Persist the machine result of the whole-goal regression gate."""
@@ -1035,6 +1663,16 @@ class GoalRunner(threading.Thread):
 
     def _interrupted(self) -> bool:
         return self._cancel_event.is_set() or self._pause_event.is_set()
+
+    def _honor_control_request(self, state: GoalState) -> bool:
+        """Apply durable user controls before interpreting a blocked result."""
+        if self._cancel_event.is_set():
+            self._cancel(state, "user requested cancel")
+            return True
+        if self._pause_event.is_set():
+            self._pause(state, "user_pause")
+            return True
+        return False
 
     def _deadline(self, state: GoalState) -> float:
         """Deadline for one model operation, never the lifetime of a Goal."""

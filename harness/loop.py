@@ -98,7 +98,16 @@ def _local_failure_summary(messages: list, errors: list[str], *, attempted_model
     )
 
 
-def call_llm(messages: list, context: dict, tools: list, state: RecoveryState, max_tokens: int):
+def call_llm(
+    messages: list,
+    context: dict,
+    tools: list,
+    state: RecoveryState,
+    max_tokens: int,
+    *,
+    model_id: str | None = None,
+    reasoning_effort: str | None = None,
+):
     # Optional per-run override (rare). Prefer shared identity + lookup constraints
     # over swapping personas for evals — see harness.prompts.lookup.
     system = context.get("system_override") or assemble_static_system_prompt()
@@ -106,10 +115,14 @@ def call_llm(messages: list, context: dict, tools: list, state: RecoveryState, m
     # Subagent-enabled modes may bind a coordinator model independently from
     # the user's direct model selection. Recovery fallback remains highest priority.
     lead_model = mode_lead_model_hint() if mode_enables_task() else None
-    model_id = state.fallback_model or lead_model or get_model()
+    selected_model = state.fallback_model or lead_model or model_id or get_model()
+    # A recovery model may have a different effort vocabulary. Its configured
+    # default is safer than forwarding an override meant for the primary model.
+    selected_effort = None if state.fallback_model else reasoning_effort
     return with_retry(
         lambda: create_message(
-            model_id=model_id,
+            model_id=selected_model,
+            reasoning_effort=selected_effort,
             system=system,
             messages=api_messages,
             tools=tools,
@@ -128,6 +141,8 @@ def agent_loop(
     binding = None,
     disabled_tools: set[str] | None = None,
     stats: LoopStats | None = None,
+    model_id: str | None = None,
+    reasoning_effort: str | None = None,
 ) -> bool:
     """Run until the agent finishes or cancel is requested. Returns True if interrupted.
 
@@ -165,6 +180,14 @@ def agent_loop(
     grounding_guard = GroundingGuard()
     writing_guard = WritingGuard(active=bool(context.get("writing_mode")))
     mutations = TurnMutationTracker()
+    model_overrides = {
+        key: value
+        for key, value in {
+            "model_id": model_id,
+            "reasoning_effort": reasoning_effort,
+        }.items()
+        if value is not None
+    }
 
     def _finish(interrupted: bool, reason: str = "completed") -> bool:
         if mutations.paths:
@@ -224,7 +247,7 @@ def agent_loop(
 
         try:
             llm_rounds += 1
-            response = call_llm(messages, context, tools, state, max_tokens)
+            response = call_llm(messages, context, tools, state, max_tokens, **model_overrides)
         except Exception as exc:
             if is_cancelled():
                 return _finish(True, "cancelled")
@@ -235,16 +258,18 @@ def agent_loop(
             from harness.providers.errors import format_api_error
 
             formatted = format_api_error(exc)
-            attempted_models = [state.fallback_model or get_model()]
+            lead_model = mode_lead_model_hint() if mode_enables_task() else None
+            active_model = state.fallback_model or lead_model or model_id or get_model()
+            attempted_models = [active_model]
             if is_model_recoverable_error(exc):
-                for candidate in candidate_recovery_models(get_model()):
+                for candidate in candidate_recovery_models(active_model):
                     if candidate in attempted_models:
                         continue
                     renderer.warn(f"模型调用失败，尝试恢复模型：{candidate}")
                     state.fallback_model = candidate
                     attempted_models.append(candidate)
                     try:
-                        response = call_llm(messages, context, tools, state, max_tokens)
+                        response = call_llm(messages, context, tools, state, max_tokens, **model_overrides)
                         break
                     except Exception as retry_exc:
                         formatted = format_api_error(retry_exc)

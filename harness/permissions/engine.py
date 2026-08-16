@@ -55,7 +55,21 @@ def _normalize_resource(tool_name: str, resource: str) -> str:
     backslashes. Matching the raw input let the same protected file have two
     different permission outcomes.
     """
-    if tool_name in ("read_file", "write_file", "edit_file", "glob", "bash"):
+    if tool_name in ("read_file", "write_file", "edit_file"):
+        normalized = resource.replace("\\", "/")
+        # Policies are workspace-relative. Without canonicalizing an absolute
+        # path inside the workspace, `.project/goal.json` can evade a deny rule
+        # simply by spelling the same file as `C:/.../.project/goal.json`.
+        try:
+            base = get_workdir().resolve()
+            candidate = Path(normalized)
+            resolved = (candidate if candidate.is_absolute() else base / candidate).resolve()
+            if resolved.is_relative_to(base):
+                return resolved.relative_to(base).as_posix()
+        except (OSError, ValueError):
+            pass
+        return normalized
+    if tool_name in ("glob", "bash"):
         return resource.replace("\\", "/")
     return resource
 

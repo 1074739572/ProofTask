@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import queue
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -16,6 +18,7 @@ from harness.llm import create_message
 from harness.messages.blocks import block_field, is_tool_use
 from harness.project.session import serialize_messages
 from harness.settings import get_workdir
+from harness.skills_loader import load_skill
 from harness.tools.dispatch import call_tool_handler, extract_text, has_tool_use
 from harness.tools.filesystem import run_bash, run_edit, run_glob, run_read, run_write
 from harness.ui.renderer import renderer
@@ -77,6 +80,15 @@ _BASE_TOOL_DEFS = {
             "required": ["pattern"],
         },
     },
+    "load_skill": {
+        "name": "load_skill",
+        "description": "Load a named workflow skill. This read-only tool does not grant new tools or permissions.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"name": {"type": "string"}},
+            "required": ["name"],
+        },
+    },
     "rag_search": {
         "name": "rag_search",
         "description": "Search the local RAG index.",
@@ -104,6 +116,7 @@ _BASE_HANDLERS = {
     "write_file": run_write,
     "edit_file": run_edit,
     "glob": run_glob,
+    "load_skill": load_skill,
 }
 
 
@@ -130,6 +143,7 @@ def _tools_for_agent(
         "write_file": partial(run_write, cwd=bound_cwd),
         "edit_file": partial(run_edit, cwd=bound_cwd),
         "glob": partial(run_glob, cwd=bound_cwd),
+        "load_skill": load_skill,
     }
     if write_roots:
         roots = tuple((bound_cwd / root).resolve() for root in write_roots)
@@ -227,20 +241,56 @@ def run_agent_task(
             renderer.subagent_end(run_id, f"stopped: {reason}", tool_count, time.time() - started, max_len=50)
             return f"[{agent_type}] stopped: {reason}"
         round_num += 1
-        try:
-            response = create_message(
-                model_id=profile.model_id,
-                system=system,
-                messages=messages,
-                tools=tools,
-                max_tokens=8000,
-            )
-        except Exception as exc:
+        # The provider SDK call is synchronous and may wait on the network for
+        # a long time. Run it in a disposable daemon so Goal pause/cancel and
+        # operation deadlines can take effect while the request is pending.
+        response_queue: queue.Queue[tuple[str, object]] = queue.Queue(maxsize=1)
+
+        def request_model_response() -> None:
+            try:
+                response_queue.put(
+                    (
+                        "response",
+                        create_message(
+                            model_id=profile.model_id,
+                            reasoning_effort=profile.reasoning_effort,
+                            system=system,
+                            messages=messages,
+                            tools=tools,
+                            max_tokens=8000,
+                        ),
+                    )
+                )
+            except Exception as exc:
+                response_queue.put(("error", exc))
+
+        threading.Thread(target=request_model_response, daemon=True).start()
+        while True:
+            try:
+                outcome, value = response_queue.get(timeout=0.1)
+                break
+            except queue.Empty:
+                reason = interrupted()
+                if reason:
+                    if stats is not None:
+                        stats.interrupted = True
+                        stats.stop_reason = reason
+                    renderer.subagent_end(
+                        run_id,
+                        f"stopped while waiting for model: {reason}",
+                        tool_count,
+                        time.time() - started,
+                        max_len=50,
+                    )
+                    return f"[{agent_type}] stopped while waiting for model: {reason}"
+        if outcome == "error":
+            exc = value
             detail = f"{type(exc).__name__}: {exc}"
             if stats is not None:
                 stats.stop_reason = "provider_error"
             renderer.subagent_end(run_id, f"failed: {detail}", tool_count, time.time() - started, max_len=120)
             return f"[{agent_type}] failed: {detail}"
+        response = value
         if stats is not None:
             stats.llm_rounds += 1
 
@@ -273,6 +323,16 @@ def run_agent_task(
             if blocked:
                 output = str(blocked)
             else:
+                # A permission overlay can unblock after the caller has
+                # requested pause/cancel. Re-check before executing the tool
+                # so an old approval never runs after cancellation.
+                reason = interrupted()
+                if reason:
+                    if stats is not None:
+                        stats.interrupted = True
+                        stats.stop_reason = reason
+                    renderer.subagent_end(run_id, f"stopped: {reason}", tool_count, time.time() - started, max_len=50)
+                    return f"[{agent_type}] stopped: {reason}"
                 name = block_field(block, "name", "")
                 tool_input = block_field(block, "input", {}) or {}
                 handler = handlers.get(name)

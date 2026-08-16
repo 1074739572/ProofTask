@@ -31,12 +31,14 @@ RUBRIC: list[str] = [
 ]
 
 MAX_DIFF_CHARS = 30_000
+MAX_BOUND_TEST_CHARS = 12_000
 
 
 @dataclass
 class EvaluationInputs:
     feature: Feature
     diff: str
+    bound_test_sources: list[tuple[str, str]] = field(default_factory=list)
     rubric: list[str] = field(default_factory=lambda: list(RUBRIC))
 
     def to_text(self) -> str:
@@ -72,6 +74,18 @@ class EvaluationInputs:
             "",
             "# 机器验证证据 (evidence)",
         ]
+        spec = self.feature.verification_spec if isinstance(self.feature.verification_spec, dict) else {}
+        impact_context = spec.get("impact_context") or []
+        if isinstance(impact_context, list):
+            impact_context = [entry for entry in impact_context if isinstance(entry, dict)][-8:]
+        else:
+            impact_context = []
+        if impact_context:
+            lines += [
+                "",
+                "# Cross-Task impact context",
+                json.dumps(impact_context, ensure_ascii=False, sort_keys=True)[:5000],
+            ]
         if self.feature.evidence:
             for ev in self.feature.evidence:
                 lines.append(
@@ -88,6 +102,12 @@ class EvaluationInputs:
                     lines.append(f"  stdout_tail: {tail[:500]}")
         else:
             lines.append("(无证据 — 该 feature 尚未通过机器验证)")
+        lines += ["", "# 绑定测试源码 (bound test sources)"]
+        if self.bound_test_sources:
+            for path, source in self.bound_test_sources:
+                lines.extend([f"--- {path} ---", source])
+        else:
+            lines.append("(无可读取的绑定测试文件)")
         lines += ["", "# 实际改动 (git diff)", self.diff or "(无 diff 或非 git 仓库)", ""]
         lines += ["# 评分标准", *[f"- {r}" for r in self.rubric]]
         start_snapshot = getattr(self.feature, "start_snapshot", None)
@@ -173,11 +193,35 @@ def _git_diff(workspace: Path) -> str:
     return text[:MAX_DIFF_CHARS]
 
 
+def _bound_test_sources(feature: Feature, workspace: Path) -> list[tuple[str, str]]:
+    spec = feature.verification_spec if isinstance(feature.verification_spec, dict) else {}
+    sources: list[tuple[str, str]] = []
+    remaining = MAX_BOUND_TEST_CHARS
+    for raw in spec.get("test_files") or []:
+        if remaining <= 0:
+            break
+        rel = str(raw).replace("\\", "/")
+        try:
+            path = (workspace / rel).resolve()
+            if not path.is_relative_to(workspace.resolve()) or not path.is_file():
+                continue
+            source = path.read_text(encoding="utf-8", errors="replace")[:remaining]
+        except OSError:
+            continue
+        sources.append((rel, source))
+        remaining -= len(source)
+    return sources
+
+
 def collect_inputs(feature_id: str, workspace: str | Path | None = None) -> EvaluationInputs:
     """Assemble the inputs for evaluating one feature."""
     feature: Feature = get_feature(feature_id, workspace)
     ws = Path(feature.workspace or workspace or ".")
-    return EvaluationInputs(feature=feature, diff=_git_diff(ws))
+    return EvaluationInputs(
+        feature=feature,
+        diff=_git_diff(ws),
+        bound_test_sources=_bound_test_sources(feature, ws),
+    )
 
 
 def collect_task_inputs(task_id: str, workspace: str | Path) -> EvaluationInputs:
@@ -185,4 +229,9 @@ def collect_task_inputs(task_id: str, workspace: str | Path) -> EvaluationInputs
     from harness.tasks import load_task
 
     task = load_task(task_id)
-    return EvaluationInputs(feature=task, diff=_git_diff(Path(workspace)))
+    root = Path(workspace)
+    return EvaluationInputs(
+        feature=task,
+        diff=_git_diff(root),
+        bound_test_sources=_bound_test_sources(task, root),
+    )

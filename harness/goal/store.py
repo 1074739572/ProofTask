@@ -38,6 +38,7 @@ from harness.settings import get_workspace_paths
 
 GOAL_FILENAME = "goal.json"
 HISTORY_DIRNAME = "goal-history"
+LEASE_FILENAME = "goal.lock"
 
 
 class GoalStoreError(Exception):
@@ -52,6 +53,10 @@ class GoalStoreError(Exception):
         self.code = code
 
 
+class GoalLeaseError(Exception):
+    """Raised when another process owns the workspace Goal runner."""
+
+
 def project_dir(workspace: str | Path | None = None) -> Path:
     if workspace is not None:
         return Path(workspace).expanduser().resolve() / ".project"
@@ -64,6 +69,95 @@ def goal_path(workspace: str | Path | None = None) -> Path:
 
 def history_dir(workspace: str | Path | None = None) -> Path:
     return project_dir(workspace) / HISTORY_DIRNAME
+
+
+def lease_path(workspace: str | Path | None = None) -> Path:
+    return project_dir(workspace) / LEASE_FILENAME
+
+
+def _pid_is_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def acquire_goal_lease(state: GoalState) -> str:
+    """Atomically claim the active Goal slot for one process.
+
+    The JSON Goal state describes durable progress, not process ownership.  A
+    separate lease prevents two TUI processes from both normalizing a running
+    state and resuming it concurrently.
+    """
+    path = lease_path(state.workspace or None)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    token = os.urandom(16).hex()
+    payload = {"pid": os.getpid(), "goal_id": state.id, "token": token, "created_at": time.time()}
+    for _ in range(2):
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            try:
+                current = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+                pid = int(current.get("pid") or 0) if isinstance(current, dict) else 0
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                pid = 0
+            if _pid_is_alive(pid):
+                raise GoalLeaseError("A Goal runner is already active for this workspace.")
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                raise GoalLeaseError(f"Cannot recover stale Goal lease: {exc}") from exc
+            continue
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh)
+            return token
+        except BaseException:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            raise
+    raise GoalLeaseError("Could not acquire the Goal runner lease.")
+
+
+def release_goal_lease(state: GoalState, token: str | None) -> None:
+    if not token:
+        return
+    path = lease_path(state.workspace or None)
+    try:
+        current = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, json.JSONDecodeError):
+        return
+    if isinstance(current, dict) and current.get("token") == token:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
+def _lease_has_live_owner(workspace: str | Path | None = None) -> bool:
+    """Return whether the workspace lease belongs to a live process.
+
+    Loading state must be read-only.  In particular, a second UI process must
+    not reinterpret a still-running Goal as a restart and then mutate it.
+    """
+    try:
+        current = json.loads(lease_path(workspace).read_text(encoding="utf-8", errors="replace"))
+        pid = int(current.get("pid") or 0) if isinstance(current, dict) else 0
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return False
+    return _pid_is_alive(pid)
 
 
 def _atomic_write(path: Path, payload: dict[str, Any]) -> None:
@@ -114,6 +208,17 @@ def load_goal(workspace: str | Path | None = None) -> GoalState | None:
     except (TypeError, ValueError, KeyError) as exc:
         raise GoalStoreError("goal_state_corrupt", f"invalid goal state in {path}: {exc}") from exc
 
+    # Older impact-review code classified a completed model response with no
+    # parseable JSON as a provider outage. The exact diagnostic proves this is
+    # a format failure, so expose the correct recoverable state on load.
+    if (
+        state.status == GoalStatus.PAUSED.value
+        and state.resume_phase == GoalPhase.IMPACT_REVIEW.value
+        and state.stop_reason == StopReason.provider_unavailable.value
+        and state.last_error == "impact reviewer returned no JSON"
+    ):
+        state.stop_reason = StopReason.impact_review_format_error.value
+
     # A durable cancellation request is final even if the process exited before
     # the worker reached its next checkpoint.
     if state.status == GoalStatus.CANCELLING.value:
@@ -134,7 +239,10 @@ def load_goal(workspace: str | Path | None = None) -> GoalState | None:
         )
     # Process-restart recovery: a running/pausing goal cannot be assumed to
     # still be executing after a restart — require an explicit /goal resume.
-    elif state.status in (GoalStatus.RUNNING.value, GoalStatus.PAUSING.value):
+    elif (
+        state.status in (GoalStatus.RUNNING.value, GoalStatus.PAUSING.value)
+        and not _lease_has_live_owner(workspace)
+    ):
         state.resume_phase = state.phase
         state.last_phase = state.phase
         state.status = GoalStatus.PAUSED.value
@@ -164,6 +272,12 @@ def clear_goal_for_test(workspace: str | Path | None = None) -> None:
     if path.exists():
         try:
             path.unlink()
+        except OSError:
+            pass
+    lock = lease_path(workspace)
+    if lock.exists():
+        try:
+            lock.unlink()
         except OSError:
             pass
     hdir = history_dir(workspace)

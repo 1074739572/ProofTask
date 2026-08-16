@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 from typing import Literal, TypeAlias
 
@@ -63,6 +64,95 @@ DEFAULT_PERMISSIONS: dict[str, PermissionRule] = {
     },
 }
 
+# Named permission policy presets.  A config may select one with
+# ``{"permission": "<preset name>"}`` and ``load_permission_rules()`` resolves
+# it to a deep copy of the corresponding rule table.
+SANDBOX_PERMISSIONS: dict[str, PermissionRule] = {
+    "*": "ask",
+    "external_directory": "ask",
+    "read_file": {
+        "*": "allow",
+        "*.env": "deny",
+        "*.env.*": "deny",
+        "*.env.example": "allow",
+    },
+    "glob": "allow",
+    "load_skill": "allow",
+    "rag_search": "allow",
+    "rag_status": "allow",
+    "project_status": "allow",
+    "list_tasks": "allow",
+    "get_task": "allow",
+    "web_search": "allow",
+    "todo_write": "allow",
+    "compact": "allow",
+    "list_features": "allow",
+    "check_inbox": "allow",
+    "list_crons": "allow",
+    # MCP browse tools are read-only with respect to the workspace, matching
+    # DEFAULT_PERMISSIONS; unknown MCP tools still ask.
+    "mcp__fetch__fetch": "allow",
+    "mcp__playwright__browser_navigate": "allow",
+    "mcp__playwright__browser_navigate_back": "allow",
+    "mcp__playwright__browser_snapshot": "allow",
+    "mcp__playwright__browser_take_screenshot": "allow",
+    "mcp__playwright__browser_console_messages": "allow",
+    "mcp__playwright__browser_network_requests": "allow",
+    "mcp__playwright__browser_wait_for": "allow",
+    "mcp__playwright__browser_resize": "allow",
+    "mcp__playwright__browser_tabs": "ask",
+    "mcp__*": "ask",
+    # Verification has its own structural policy and runs without a model
+    # permission prompt. Keep it explicit so the sandbox cannot deadlock Goal.
+    "verify_command": "allow",
+    "write_file": {
+        "*": "ask",
+        ".features": "deny",
+        ".features/*": "deny",
+        "**/.features": "deny",
+        "**/.features/*": "deny",
+        ".project/goal.json": "deny",
+        ".project/goal*": "deny",
+        ".project/goal-history/*": "deny",
+        "**/.project/goal.json": "deny",
+        "**/.project/goal*": "deny",
+        "**/.project/goal-history/*": "deny",
+    },
+    "edit_file": {
+        "*": "ask",
+        ".features": "deny",
+        ".features/*": "deny",
+        "**/.features": "deny",
+        "**/.features/*": "deny",
+        ".project/goal.json": "deny",
+        ".project/goal*": "deny",
+        ".project/goal-history/*": "deny",
+        "**/.project/goal.json": "deny",
+        "**/.project/goal*": "deny",
+        "**/.project/goal-history/*": "deny",
+    },
+    "bash": {
+        "*": "ask",
+        "dir *": "allow",
+        "type *": "allow",
+        "where *": "allow",
+        "git status*": "allow",
+        "git diff*": "allow",
+        "git log*": "allow",
+        "*.features*": "deny",
+        "*.project/goal.json*": "deny",
+        "*.project/goal-history*": "deny",
+        "rm *": "deny",
+        "sudo *": "deny",
+        "shutdown*": "deny",
+        "reboot*": "deny",
+    },
+}
+
+PERMISSION_PRESETS: dict[str, dict[str, PermissionRule]] = {
+    "sandbox": SANDBOX_PERMISSIONS,
+}
+
 
 def _valid_effect(value: object) -> bool:
     return isinstance(value, str) and value in _VALID_EFFECTS
@@ -76,6 +166,10 @@ def _normalize_rules(raw: object) -> dict[str, PermissionRule]:
     section = raw.get("permission", raw)
     if isinstance(section, str) and section in _VALID_EFFECTS:
         return {"*": section}
+    if isinstance(section, str):
+        preset = PERMISSION_PRESETS.get(section.strip().lower())
+        if preset is not None:
+            return copy.deepcopy(preset)
     if not isinstance(section, dict):
         return dict(DEFAULT_PERMISSIONS)
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import threading
 from unittest import mock
 
 import pytest
@@ -39,6 +40,19 @@ def _response(content: list[dict]):
     return mock.Mock(content=content)
 
 
+def test_renderer_downgrades_unicode_for_legacy_console(monkeypatch):
+    import importlib
+
+    renderer_mod = importlib.import_module("harness.ui.renderer")
+
+    class _GbkStdout:
+        encoding = "gbk"
+
+    monkeypatch.setattr(renderer_mod.sys, "stdout", _GbkStdout())
+
+    assert renderer_mod._terminal_safe_text("✓ Finished") == "? Finished"
+
+
 def test_run_agent_task_emits_scoped_events(event_sink):
     """A subagent run emits subagent_start → round → end, and never leaks
     tool_start / log events into the main timeline."""
@@ -73,6 +87,53 @@ def test_run_agent_task_emits_scoped_events(event_sink):
     assert end["summary"]
 
 
+def test_run_agent_task_stops_while_waiting_for_a_model_response():
+    from harness.agents.runner import AgentTaskStats, run_agent_task
+
+    request_started = threading.Event()
+    release_response = threading.Event()
+    response_returned = threading.Event()
+
+    def delayed_response(**kwargs):
+        request_started.set()
+        release_response.wait(timeout=2)
+        try:
+            return _response([{"type": "text", "text": "too late"}])
+        finally:
+            response_returned.set()
+
+    stats = AgentTaskStats()
+    try:
+        with mock.patch("harness.agents.runner.create_message", side_effect=delayed_response):
+            result = run_agent_task(
+                "wait for model",
+                "return a response",
+                "explore",
+                cancel_check=request_started.is_set,
+                stats=stats,
+            )
+    finally:
+        release_response.set()
+        assert response_returned.wait(timeout=1)
+
+    assert "stopped while waiting for model: cancelled" in result
+    assert stats.interrupted is True
+    assert stats.stop_reason == "cancelled"
+
+
+def test_goal_subagent_passes_its_configured_reasoning_effort():
+    from harness.agents.runner import run_agent_task
+
+    with mock.patch(
+        "harness.agents.runner.create_message",
+        return_value=_response([{"type": "text", "text": "{}"}]),
+    ) as create:
+        run_agent_task("plan goal", "return JSON", "goal_planner")
+
+    assert create.call_args.kwargs["model_id"] == "deepseek-v4-pro"
+    assert create.call_args.kwargs["reasoning_effort"] == "max"
+
+
 def test_run_agent_task_emits_nested_tools(event_sink):
     """Tool calls inside a subagent are emitted as scoped subagent_tool events
     (start ok=None, completion ok=True) — not as main-timeline tool events."""
@@ -95,6 +156,8 @@ def test_run_agent_task_emits_nested_tools(event_sink):
     with mock.patch(
         "harness.agents.runner.create_message",
         side_effect=[tool_round, final_round],
+    ), mock.patch("harness.agents.runner.trigger_hooks", return_value=None), mock.patch(
+        "harness.agents.runner.call_tool_handler", return_value="hi"
     ):
         result = run_agent_task("run probe", "run it", "explore")
 

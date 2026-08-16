@@ -27,6 +27,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 from harness.permissions.engine import evaluate_single_permission
 from harness.settings import get_workdir
@@ -87,6 +88,8 @@ def _validate_script_path(tokens: list[str], workspace: Path) -> str | None:
         prog = prog[:-4]
     if prog not in ("python", "py", "node"):
         return None
+    if prog in ("python", "py") and len(tokens) >= 3 and tokens[1] == "-m" and tokens[2].lower() == "pytest":
+        return None
     if len(tokens) < 2:
         return f"{prog} requires a repository script path"
     script = tokens[1]
@@ -108,6 +111,7 @@ def run_verification(
     *,
     workspace: str | Path | None = None,
     timeout_s: float | None = None,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> VerificationRunResult:
     """Validate + run one verification command under controlled execution.
 
@@ -150,6 +154,14 @@ def run_verification(
 
     try:
         # Structured argv, shell=False — no shell interpretation at all.
+        # The Windows console broadcasts Ctrl+C to attached children. Give
+        # pytest its own process group so UI interrupts cannot change a
+        # completed suite into pytest exit code 2.
+        popen_flags = (
+            {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+            if sys.platform == "win32"
+            else {"start_new_session": True}
+        )
         proc = subprocess.Popen(
             argv,
             cwd=str(cwd),
@@ -159,7 +171,7 @@ def run_verification(
             encoding="utf-8",
             errors="replace",
             stdin=subprocess.DEVNULL,  # Windows python-hang bug: never inherit stdin
-            **({"start_new_session": True} if sys.platform != "win32" else {}),
+            **popen_flags,
         )
     except OSError as exc:
         return _reject(f"failed to start: {exc}")
@@ -181,8 +193,8 @@ def run_verification(
     reader_out.start()
     reader_err.start()
 
-    info = _wait_with_escalation(proc, timeout, collected, lock)
-    if info["timed_out"]:
+    info = _wait_with_escalation(proc, timeout, collected, lock, cancel_check=cancel_check)
+    if info["timed_out"] or info.get("cancelled"):
         if job is not None:
             ctypes.windll.kernel32.TerminateJobObject(job, 1)
             ctypes.windll.kernel32.CloseHandle(job)
@@ -201,6 +213,16 @@ def run_verification(
     with lock:
         output = "\n".join(collected).strip()
     output = output[:MAX_VERIFY_OUTPUT_CHARS] if output else "(no output)"
+
+    if info.get("cancelled"):
+        return VerificationRunResult(
+            command=command,
+            exit_code=None,
+            stdout=output,
+            timed_out=False,
+            duration_ms=(time.monotonic() - started) * 1000.0,
+            error="verification cancelled",
+        )
 
     if info["timed_out"]:
         return VerificationRunResult(

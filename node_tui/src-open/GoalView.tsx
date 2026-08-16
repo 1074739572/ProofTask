@@ -54,8 +54,20 @@ export type GoalSnapshot = {
   last_error?: string | null;
 };
 
+export type GoalDecision = {
+  id: string;
+  runId?: string;
+  phase: string;
+  agent: string;
+  model?: string;
+  text: string;
+  status: 'active' | 'done' | 'failed';
+  at: number;
+};
+
 export type GoalTone = 'success' | 'warning' | 'error' | 'info' | 'muted';
 export type GoalPresentation = {tone: GoalTone; icon: string; text: string};
+export type GoalDecisionPresentation = GoalPresentation & {title: string; owner: string; history: GoalDecision[]};
 
 const TERMINAL_STATUSES = new Set(['done', 'failed', 'cancelled']);
 
@@ -107,6 +119,27 @@ export function goalStatusPresentation(status: string): GoalPresentation {
   return {tone: 'info', icon: '●', text: '执行中'};
 }
 
+export function goalDecisionPresentation(goal: GoalSnapshot, decisions: GoalDecision[]): GoalDecisionPresentation {
+  const history = decisions.slice(-4);
+  if (goal.status === 'done') {
+    return {tone: 'success', icon: '✓', title: 'Goal 总结', owner: '已交付', text: `${goal.tasks.filter(task => task.status === 'completed').length}/${goal.tasks.length} Task 完成，最终回归已通过`, history};
+  }
+  if (goal.status === 'failed') {
+    return {tone: 'error', icon: '×', title: 'Goal 总结', owner: '已停止', text: goal.last_error || 'Goal 未能完成', history};
+  }
+  if (goal.status === 'paused') {
+    return {tone: 'warning', icon: 'Ⅱ', title: '模型决策流', owner: '已暂停', text: goal.last_error || '已保存当前进度，等待恢复', history};
+  }
+  const active = [...decisions].reverse().find(decision => decision.status === 'active');
+  if (active) {
+    return {
+      tone: 'info', icon: '●', title: '模型决策流', owner: active.model ? `${active.agent} · ${active.model}` : active.agent,
+      text: active.text, history,
+    };
+  }
+  return {tone: 'warning', icon: '●', title: '模型决策流', owner: phaseLabel(goal.phase), text: '正在准备下一步', history};
+}
+
 export function baselinePresentation(result?: string, source?: string): GoalPresentation {
   if (source === 'needs_generation') return {tone: 'warning', icon: '○', text: '失败基线：等待生成测试'};
   if (result === 'failing') return {tone: 'success', icon: '✓', text: '失败基线：已确认（实现前测试失败）'};
@@ -114,7 +147,8 @@ export function baselinePresentation(result?: string, source?: string): GoalPres
   return {tone: 'warning', icon: '○', text: '失败基线：尚未确认'};
 }
 
-function taskPresentation(task: GoalTaskSnapshot, current: boolean, tasks: GoalTaskSnapshot[]): GoalPresentation {
+function taskPresentation(task: GoalTaskSnapshot, current: boolean, tasks: GoalTaskSnapshot[], goal: GoalSnapshot): GoalPresentation {
+  if (current && goal.status === 'paused' && goal.stop_reason === 'permission_wait') return {tone: 'warning', icon: '!', text: 'Waiting for tool approval'};
   if (task.status === 'missing') return {tone: 'error', icon: '!', text: '状态缺失'};
   if (task.status === 'completed') return {tone: 'success', icon: '✓', text: '已完成'};
   if (current && task.verification_state === 'failing') return {tone: 'error', icon: '×', text: '测试失败，修复中'};
@@ -125,6 +159,8 @@ function taskPresentation(task: GoalTaskSnapshot, current: boolean, tasks: GoalT
 }
 
 export function gatePresentation(goal: GoalSnapshot, task?: GoalTaskSnapshot): GoalPresentation {
+  if (goal.status === 'paused' && goal.stop_reason === 'permission_wait') return {tone: 'warning', icon: '!', text: 'Waiting for tool approval before resuming this Task'};
+  if (goal.status === 'paused' && goal.stop_reason === 'impact_review_format_error') return {tone: 'warning', icon: '!', text: 'Impact review output was invalid after one automatic retry'};
   if (goal.status === 'done') return {tone: 'success', icon: '✓', text: '全部 Task 证据与最终回归均已通过，可以交付'};
   if (goal.status === 'failed') return {tone: 'error', icon: '×', text: '机器门禁未通过，Goal 已停止'};
   if (goal.status === 'cancelled') return {tone: 'muted', icon: '■', text: 'Goal 已取消，现有证据保留'};
@@ -181,7 +217,7 @@ export function goalRegressionPresentation(goal: GoalSnapshot): GoalPresentation
   return {tone: 'muted', icon: '○', text: '状态机结果：等待全部 Task 完成'};
 }
 
-export function GoalView(props: {goal: GoalSnapshot; width: number; height: number}) {
+export function GoalView(props: {goal: GoalSnapshot; decisions?: GoalDecision[]; now?: number; width: number; height: number}) {
   const compact = () => props.width < 76;
   const current = () => props.goal.tasks.find(task => task.id === props.goal.current_task_id);
   const completed = () => props.goal.tasks.filter(task => task.status === 'completed').length;
@@ -192,11 +228,18 @@ export function GoalView(props: {goal: GoalSnapshot; width: number; height: numb
   const regression = () => goalRegressionPresentation(props.goal);
   const finalOutput = () => evidenceLines(props.goal.final_verification?.stdout_tail, compact() ? 2 : 3);
   const terminal = () => TERMINAL_STATUSES.has(props.goal.status);
+  const decisions = () => props.decisions || [];
+  const decision = () => goalDecisionPresentation(props.goal, decisions());
+  const decisionHistory = () => decision().history.filter(item => item.status !== 'active').slice(-3);
+  const decisionPulse = () => ['●', '◌', '○'][Math.floor((props.now || 0) / 520) % 3];
   const gatePanel = () => <box border borderStyle="rounded" borderColor={toneColor(gate().tone)} paddingX={1} flexDirection="column" minWidth={0} flexGrow={compact() ? 0 : 1}>
     <text fg={toneColor(gate().tone)}>机器门禁</text>
     <text fg={C.text} wrapMode="word">{gate().icon} {gate().text}</text>
-    <Show when={props.goal.last_error || current()?.last_error}>
+    <Show when={(props.goal.last_error || current()?.last_error) && props.goal.stop_reason !== 'permission_wait'}>
       <text fg={C.error} wrapMode="word">最近错误：{props.goal.last_error || current()?.last_error}</text>
+    </Show>
+    <Show when={props.goal.stop_reason === 'permission_wait'}>
+      <text fg={C.warning} wrapMode="word">Waiting for tool approval before resuming this Task</text>
     </Show>
     <Show when={props.goal.stop_reason}>
       <text fg={C.textMuted} wrapMode="word">停止原因：{props.goal.stop_reason}</text>
@@ -231,11 +274,27 @@ export function GoalView(props: {goal: GoalSnapshot; width: number; height: numb
       </box>
       <text fg={C.textMuted} wrapMode="none" truncate>{props.goal.id}</text>
 
+      <box border borderStyle="rounded" borderColor={toneColor(decision().tone)} paddingX={1} flexDirection="column" minWidth={0} height={compact() ? 8 : 9} flexShrink={0}>
+        <box flexDirection="row" justifyContent="space-between" minWidth={0}>
+          <text fg={toneColor(decision().tone)}>{decision().title}</text>
+          <text fg={C.textMuted} wrapMode="none" truncate>{decision().owner}</text>
+        </box>
+        <text fg={toneColor(decision().tone)} wrapMode="word">{props.goal.status === 'running' ? decisionPulse() : decision().icon} {decision().text}</text>
+        <Show when={props.goal.status === 'running'}>
+          <text fg={C.textMuted} wrapMode="none">正在接收模型决策，最新内容会自动更新</text>
+        </Show>
+        <Show when={decisionHistory().length} fallback={<text fg={C.textMuted}>等待第一个模型决策</text>}>
+          <For each={decisionHistory()}>{item =>
+            <text fg={item.status === 'failed' ? C.error : C.textMuted} wrapMode="none" truncate>  {item.status === 'done' ? '✓' : '·'} {item.text}</text>
+          }</For>
+        </Show>
+      </box>
+
       <box border borderStyle="rounded" borderColor={C.textMuted} paddingX={1} flexDirection="column" minWidth={0}>
         <text fg={C.secondary}>任务图</text>
         <For each={props.goal.tasks}>{(task, index) => {
           const active = () => task.id === props.goal.current_task_id && !terminal();
-          const presentation = () => taskPresentation(task, active(), props.goal.tasks);
+          const presentation = () => taskPresentation(task, active(), props.goal.tasks, props.goal);
           return <box flexDirection={compact() ? 'column' : 'row'} minWidth={0}>
             <box flexDirection="row" minWidth={0} flexGrow={1}>
               <text fg={toneColor(presentation().tone)} wrapMode="none">{presentation().icon} {String(index() + 1).padStart(2, '0')} </text>

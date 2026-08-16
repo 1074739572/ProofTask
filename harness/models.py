@@ -214,7 +214,16 @@ def get_model() -> str:
         return _current_model
 
 
-def get_model_profile(model_id: str | None = None) -> ModelProfile:
+def get_model_profile(
+    model_id: str | None = None,
+    *,
+    effort_override: str | None = None,
+) -> ModelProfile:
+    """Return a model profile, optionally with a call-scoped effort override.
+
+    A scoped override is used by durable workflows such as Goal mode.  It must
+    not mutate the user's interactive ``/effort`` selection.
+    """
     with _lock:
         if not _catalog:
             initialize_model()
@@ -222,15 +231,16 @@ def get_model_profile(model_id: str | None = None) -> ModelProfile:
         for entry in _catalog:
             if entry["id"] == mid:
                 profile = _profile_from_entry(entry)
-                if _current_effort:
-                    return replace(profile, reasoning_effort=_current_effort)
+                selected_effort = _normalize_effort(effort_override) if effort_override else _current_effort
+                if selected_effort:
+                    return replace(profile, reasoning_effort=selected_effort)
                 return profile
         profile = ModelProfile(
             id=mid,
             label=mid,
             provider="deepseek",
             api_model=mid,
-            reasoning_effort=_current_effort,
+            reasoning_effort=_normalize_effort(effort_override) if effort_override else _current_effort,
             effort_options=(),
             api_effort_values={},
             extra_body={},

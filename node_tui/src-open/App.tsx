@@ -9,7 +9,7 @@ import {buildSections} from './sections.ts';
 import type {ActionRow, Entry, Section, SubagentStatus} from './sections.ts';
 import {C} from './theme.ts';
 import {WelcomeView} from './Welcome.tsx';
-import {GoalView, type GoalSnapshot} from './GoalView.tsx';
+import {GoalView, type GoalDecision, type GoalSnapshot} from './GoalView.tsx';
 import {
   applyCompletionResult,
   completionContext,
@@ -114,6 +114,42 @@ function goalSnapshotFromEvent(event: any): GoalSnapshot | null {
     tasks: Array.isArray(event.tasks) ? event.tasks : [],
     last_error: value(event, 'last_error') || null,
   };
+}
+
+const GOAL_AGENT_LABELS: Record<string, string> = {
+  goal_intake: '规划模型',
+  goal_planner: '规划模型',
+  goal_repair_planner: '规划模型',
+  goal_test_impact: '影响审查模型',
+  goal_test_writer: '执行模型',
+  goal_worker: '执行模型',
+  evaluator: '评估模型',
+};
+
+const GOAL_PHASE_INTENTS: Record<string, string> = {
+  initialize: '正在拆解目标并生成可验证的任务',
+  prepare_tests: '正在准备当前任务的验收测试',
+  select_task: '正在选择下一项可执行任务',
+  claim: '正在接管当前任务并冻结验证边界',
+  act: '正在实现当前任务',
+  verify: '正在运行绑定测试并收集机器证据',
+  evaluate: '正在独立评估验收条件和改动范围',
+  repair_plan: '正在制定下一轮修复方案',
+  impact_review: '正在检查已完成任务对后续测试的影响',
+  clean_check: '正在执行清洁检查',
+  full_verify: '正在运行最终全局回归',
+};
+
+function shortGoalDecision(text: string, fallback: string): string {
+  const normalized = String(text || '').replace(/\s+/g, ' ').replace(/^\[[^\]]+\]\s*/, '').trim();
+  if (!normalized || normalized === '{}' || normalized.startsWith('{') || normalized.startsWith('[')) return fallback;
+  return normalized.length > 110 ? `${normalized.slice(0, 109)}…` : normalized;
+}
+
+function goalPhaseIntent(snapshot: GoalSnapshot): string {
+  const task = snapshot.tasks.find(item => item.id === snapshot.current_task_id);
+  const base = GOAL_PHASE_INTENTS[snapshot.phase] || '正在准备下一步';
+  return task && snapshot.phase === 'act' ? `${base}：${task.subject}` : base;
 }
 
 function formatTokens(n: number): string {
@@ -596,6 +632,8 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
   const [todayInput, setTodayInput] = createSignal(props?.debugUsage?.input ?? 0); const [todayOutput, setTodayOutput] = createSignal(props?.debugUsage?.output ?? 0); const [todayCacheRead, setTodayCacheRead] = createSignal(props?.debugUsage?.cacheRead ?? 0);
   const [contextUsed, setContextUsed] = createSignal(props?.debugUsage?.contextUsed ?? 0); const [contextWindow, setContextWindow] = createSignal(props?.debugUsage?.contextWindow ?? 0);
   const [goalSnapshot, setGoalSnapshot] = createSignal<GoalSnapshot | null>(resolveDebugValue(props?.debugGoal) ?? null);
+  const [goalDecisions, setGoalDecisions] = createSignal<GoalDecision[]>([]);
+  let decisionGoalId = goalSnapshot()?.id || '';
   // Keyboard focus follows only visible collapsible rows.
   // Folded tool entries are intentionally excluded, otherwise Enter would
   // toggle a hidden action and look like the UI is not interactive.
@@ -746,6 +784,63 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
   };
   const add = (entry: Entry) => setEntries(prev => [...prev, entry].slice(-1000));
   const update = (id: string, fn: (entry: Entry) => Entry) => setEntries(prev => prev.map(x => x.id === id ? fn(x) : x));
+  const syncGoalDecisionPhase = (snapshot: GoalSnapshot) => {
+    const isNewGoal = decisionGoalId !== snapshot.id;
+    if (isNewGoal) decisionGoalId = snapshot.id;
+    setGoalDecisions(previous => {
+      const finished = (isNewGoal ? [] : previous).map(item => item.status === 'active' ? {...item, status: 'done' as const} : item);
+      if (snapshot.status !== 'running') return finished.slice(-8);
+      const current = finished[finished.length - 1];
+      if (current?.phase === snapshot.phase && current.agent === '状态机') return finished;
+      return [...finished, {
+        id: `goal-phase-${snapshot.id}-${snapshot.phase}-${Date.now()}`,
+        phase: snapshot.phase,
+        agent: '状态机',
+        text: goalPhaseIntent(snapshot),
+        status: 'active' as const,
+        at: Date.now(),
+      }].slice(-8);
+    });
+  };
+  const recordGoalSubagentStart = (event: any, id: string) => {
+    const agentType = value(event, 'agent_type');
+    const snapshot = goalSnapshot();
+    const label = GOAL_AGENT_LABELS[agentType];
+    if (!snapshot || snapshot.status !== 'running' || !label) return;
+    setGoalDecisions(previous => [
+      ...previous.map(item => item.status === 'active' ? {...item, status: 'done' as const} : item),
+      {
+        id,
+        runId: id,
+        phase: snapshot.phase,
+        agent: label,
+        model: value(event, 'model') || undefined,
+        text: shortGoalDecision(value(event, 'description'), goalPhaseIntent(snapshot)),
+        status: 'active' as const,
+        at: Date.now(),
+      },
+    ].slice(-8));
+  };
+  const recordGoalSubagentRound = (id: string, text: string) => setGoalDecisions(previous => {
+    const active = [...previous].reverse().find(item => item.runId === id && item.status === 'active');
+    if (!active) return previous;
+    const nextText = shortGoalDecision(text, active.text);
+    if (nextText === active.text) return previous;
+    return [
+      ...previous.map(item => item.id === active.id ? {...item, status: 'done' as const} : item),
+      {...active, id: `${id}-round-${Date.now()}`, text: nextText, status: 'active' as const, at: Date.now()},
+    ].slice(-8);
+  });
+  const recordGoalSubagentEnd = (id: string, summary: string) => setGoalDecisions(previous => previous.map(item => {
+    if (item.runId !== id || item.status !== 'active') return item;
+    const failed = /^(failed|stopped):/i.test(summary.trim());
+    return {
+      ...item,
+      text: shortGoalDecision(summary, item.text),
+      status: failed ? 'failed' as const : 'done' as const,
+      at: Date.now(),
+    };
+  }));
   // Bash can emit hundreds of output lines per second. Accumulate them until
   // the next live tick instead of rebuilding the active tool row per line.
   const outputBuffer = new Map<string, string[]>();
@@ -879,13 +974,13 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
       case 'tool_start': { promoteResponseToIntent(); begin('running tool'); turnToolCount += 1; const id = value(event, 'id', 'call_id', 'tool_call_id') || `action-${++actionCounter}`; const ts = Number(event.ts || 0) * 1000 || Date.now(); add({id, kind: 'action', text: value(event, 'name') || 'tool', detail: value(event, 'summary') || 'running…', start: ts, output: []}); break; }
       case 'tool_output': { const id = value(event, 'id', 'call_id', 'tool_call_id'); const line = value(event, 'line'); if (!line) break; queueOutput(id || 'unknown', line); break; }
       case 'tool_end': { const id = value(event, 'id', 'call_id', 'tool_call_id'); const ts = Number(event.ts || 0) * 1000 || Date.now(); flushLiveBuffers(); const target = (id ? entries().find(x => x.id === id) : [...entries()].reverse().find(x => x.kind === 'action' && !x.done)); if (target) update(target.id, x => ({...x, detail: value(event, 'summary') || (event.ok ? 'completed' : 'failed'), done: true, ok: Boolean(event.ok), end: ts})); break; }
-      case 'subagent_start': { promoteResponseToIntent(); begin('subagent'); const id = value(event, 'id') || `subagent-${++actionCounter}`; const ts = Number(event.ts || 0) * 1000 || Date.now(); add({id, kind: 'subagent', text: value(event, 'description') || 'subagent task', agentType: value(event, 'agent_type') || 'agent', model: value(event, 'model') || 'model', status: 'running', rounds: [], tools: [], start: ts, expanded: true}); break; }
-      case 'subagent_round': { const id = value(event, 'id'); const roundText = value(event, 'text'); const label = roundText ? `Round ${Number(event.round || 0)} · "${roundText}"` : `Round ${Number(event.round || 0)}`; update(id, x => x.kind === 'subagent' ? {...x, rounds: [...(x.rounds || []), label]} : x); break; }
+      case 'subagent_start': { promoteResponseToIntent(); begin('subagent'); const id = value(event, 'id') || `subagent-${++actionCounter}`; const ts = Number(event.ts || 0) * 1000 || Date.now(); add({id, kind: 'subagent', text: value(event, 'description') || 'subagent task', agentType: value(event, 'agent_type') || 'agent', model: value(event, 'model') || 'model', status: 'running', rounds: [], tools: [], start: ts, expanded: true}); recordGoalSubagentStart(event, id); break; }
+      case 'subagent_round': { const id = value(event, 'id'); const roundText = value(event, 'text'); const label = roundText ? `Round ${Number(event.round || 0)} · "${roundText}"` : `Round ${Number(event.round || 0)}`; update(id, x => x.kind === 'subagent' ? {...x, rounds: [...(x.rounds || []), label]} : x); recordGoalSubagentRound(id, roundText); break; }
       case 'subagent_tool': { const id = value(event, 'id'); const toolId = value(event, 'tool_use_id') || `${value(event, 'name')}-${Date.now()}`; const status = event.ok === null || event.ok === undefined ? 'running' : (event.ok ? 'done' : 'failed'); const name = value(event, 'name') || 'tool'; const summary = value(event, 'summary'); update(id, x => { if (x.kind !== 'subagent') return x; const tools = x.tools || []; const idx = tools.findIndex(tool => tool.id === toolId); const nextTool = {id: toolId, name, summary, status: status as SubagentStatus}; const nextTools = idx >= 0 ? tools.map((tool, i) => i === idx ? {...tool, ...nextTool} : tool) : [...tools, nextTool]; return {...x, tools: nextTools, toolCount: nextTools.length}; }); break; }
-      case 'subagent_end': { const id = value(event, 'id'); const ts = Number(event.ts || 0) * 1000 || Date.now(); update(id, x => x.kind === 'subagent' ? {...x, status: event.ok ? 'done' : 'failed', done: true, ok: Boolean(event.ok), end: ts, toolCount: Number(event.tools || x.toolCount || 0), elapsed: Number(event.elapsed || 0), summary: value(event, 'summary')} : x); break; }
+      case 'subagent_end': { const id = value(event, 'id'); const ts = Number(event.ts || 0) * 1000 || Date.now(); const summary = value(event, 'summary'); update(id, x => x.kind === 'subagent' ? {...x, status: event.ok ? 'done' : 'failed', done: true, ok: Boolean(event.ok), end: ts, toolCount: Number(event.tools || x.toolCount || 0), elapsed: Number(event.elapsed || 0), summary} : x); recordGoalSubagentEnd(id, summary); break; }
       case 'goal_started': {
         const snapshot = goalSnapshotFromEvent(event);
-        if (snapshot) setGoalSnapshot(snapshot);
+        if (snapshot) { setGoalSnapshot(snapshot); syncGoalDecisionPhase(snapshot); }
         begin(snapshot?.phase || 'goal planning');
         add({id: `goal-${value(event, 'id')}-${Date.now()}`, kind: 'log', text: 'Goal', detail: `${value(event, 'id')} ${value(event, 'phase')}`});
         break;
@@ -893,12 +988,12 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
       case 'goal_status':
       case 'goal_phase': {
         const snapshot = goalSnapshotFromEvent(event);
-        if (snapshot) setGoalSnapshot(snapshot);
+        if (snapshot) { setGoalSnapshot(snapshot); syncGoalDecisionPhase(snapshot); }
         const status = value(event, 'status'); const active = status === 'running' || status === 'pausing' || status === 'cancelling'; setRunning(active); setPhase(active ? `goal: ${value(event, 'phase')}` : 'idle'); if (!active) setStartedAt(0); add({id: `goal-${value(event, 'id')}-${Date.now()}`, kind: 'log', text: 'Goal', detail: `${value(event, 'phase')} (${status})`}); break;
       }
       case 'goal_stopped': {
         const snapshot = goalSnapshotFromEvent(event);
-        if (snapshot) setGoalSnapshot(snapshot);
+        if (snapshot) { setGoalSnapshot(snapshot); syncGoalDecisionPhase(snapshot); }
         setRunning(false); setPhase(value(event, 'status') === 'cancelled' ? 'interrupted' : 'idle'); setStartedAt(0); add({id: `goal-${value(event, 'id')}-${Date.now()}`, kind: 'log', text: 'Goal', detail: `${value(event, 'status')}${value(event, 'stop_reason') ? `: ${value(event, 'stop_reason')}` : ''}`}); break;
       }
       case 'goal_status_error': {
@@ -939,11 +1034,14 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
       case 'completion_result': handleCompletionResult(event); break;
       case 'show_picker': setOverlay({kind: 'picker', id: event.id, pickerId: event.id, title: event.title, options: (event.items || []).map((x: any) => ({name: x.label, description: x.detail || '', value: x.id}))}); setOverlayIndex(0); break;
       case 'permission_request': setOverlay({kind: 'permission', id: event.id, title: event.title || `Allow ${event.tool}?`, options: [{name: 'Allow once', description: event.resource || '', value: 'allow'}, {name: 'Allow session', description: 'Remember until this TUI exits', value: 'session'}, {name: 'Deny', description: 'Block this tool call', value: 'deny'}]}); setOverlayIndex(0); break;
-      case 'permission_auto_approved': {
-        // Backend approved the pending prompt after the auto-approve timeout;
-        // close the matching overlay and tell the user what happened.
+      case 'permission_timed_out': {
         if (overlay()?.kind === 'permission' && overlay()?.id === event.id) { setOverlay(null); setOverlayIndex(0); }
-        showToast(`Auto-approved: ${value(event, 'tool')}`);
+        showToast(`Permission timed out: ${value(event, 'tool')}`);
+        break;
+      }
+      case 'permission_cancelled': {
+        if (overlay()?.kind === 'permission' && overlay()?.id === event.id) { setOverlay(null); setOverlayIndex(0); }
+        showToast(`Permission cancelled: ${value(event, 'tool')}`);
         break;
       }
     }} catch { /* stdout is JSONL; malformed diagnostics are ignored */ } });
@@ -967,12 +1065,17 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
   };
   useKeyboard((event: any) => {
     const name = String(event?.name || '').toLowerCase();
+    if (event?.ctrl && name === 'q') { send({type: 'exit'}); child?.kill?.(); process.exit(0); }
+    if (event?.ctrl && name === 'k') { send({type: 'interrupt'}); event.preventDefault?.(); return; }
     const current = overlay();
     if (current) {
       if (name === 'up') { setOverlayIndex(i => Math.max(0, i - 1)); event.preventDefault?.(); }
       else if (name === 'down') { setOverlayIndex(i => Math.min(current.options.length - 1, i + 1)); event.preventDefault?.(); }
       else if (name === 'return') selectOverlay();
-      else if (name === 'escape') setOverlay(null);
+      else if (name === 'escape') {
+        if (current.kind === 'permission') send({type: 'permission_response', id: current.id, decision: 'deny'});
+        setOverlay(null);
+      }
       return;
     }
     const activeCompletion = completion();
@@ -989,11 +1092,9 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
       event.preventDefault?.();
       return;
     }
-    if (event?.ctrl && name === 'q') { send({type: 'exit'}); child?.kill?.(); process.exit(0); }
     if (event?.ctrl && name === 'e') { openEffortPicker(); event.preventDefault?.(); return; }
     // Do not consume Ctrl+C: terminals and IDEs use it to copy a mouse selection.
     // Ctrl+Shift+C is handled by OpenTUI as copy-selection; Ctrl+K interrupts a run.
-    if (event?.ctrl && name === 'k') { send({type: 'interrupt'}); event.preventDefault?.(); return; }
     if (event?.ctrl && name === 'l') { setEntries([]); setGoalSnapshot(null); setUserStarted(false); send({type: 'clear'}); }
     // Input history: with an empty composer, ↑ recalls past commands and ↓
     // walks back toward the newest, past the end clears the input. When the
@@ -1027,13 +1128,13 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
   const submit = () => {
     const text = input().trim();
     if (!text) return;
-    const isGoalControl = /^\/goal\s+(?:status|pause|cancel)\s*$/i.test(text);
+    const isGoalControl = /^\/goal\s+(?:status|pause|stop|cancel)\s*$/i.test(text);
     const isGoalCommand = /^\/goal(?:\s|$)/i.test(text);
     if (running() && !isGoalControl) {
       add({id: `log-${Date.now()}`, kind: 'log', text: 'Agent is already running', detail: 'press Ctrl+K to interrupt first'});
       return;
     }
-    if (!isGoalCommand && goalSnapshot()) setGoalSnapshot(null);
+    if (!isGoalCommand && goalSnapshot()) { setGoalSnapshot(null); setGoalDecisions([]); decisionGoalId = ''; }
     // Slash commands are internal instructions; they must not appear in the
     // transcript. The backend also skips echoing them, so only their effect is
     // visible (toast / log / header state).
@@ -1056,7 +1157,7 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
         <WelcomeView width={dims().width} height={viewportHeight()} quote={welcomeQuote()} />
       </Show>
     }>
-      <GoalView goal={goalSnapshot()!} width={dims().width} height={viewportHeight()} />
+      <GoalView goal={goalSnapshot()!} decisions={goalDecisions()} now={now()} width={dims().width} height={viewportHeight()} />
     </Show>
     <Show when={overlay()}>
       <box border borderStyle="rounded" borderColor={C.accent} title={` ${overlay()?.title} `} height={(overlayWindow()?.rows ?? 0) + 3} paddingX={1} flexDirection="column">

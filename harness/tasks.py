@@ -18,6 +18,7 @@ from pathlib import Path
 from harness.settings import TASKS_DIR
 
 _ORIGINAL_TASKS_DIR = TASKS_DIR
+MAX_TASK_HISTORY = 20
 
 
 def _tasks_dir() -> Path:
@@ -43,6 +44,9 @@ class Task:
     worktree: str | None = None
     completed_at: float | None = None
     acceptance_cases: list[dict] = field(default_factory=list)
+    # Workflow guidance selected during Goal planning. It is deliberately
+    # separate from VerificationSpec, which remains the evidence contract.
+    skill_names: list[str] = field(default_factory=list)
     verification_spec: dict = field(default_factory=dict)
     verification_state: str = "not_started"
     evidence: list[dict] = field(default_factory=list)
@@ -107,6 +111,7 @@ def create_task(
     goal_id: str | None = None,
     feature_ids: list[str] | None = None,
     acceptance_cases: list[dict] | None = None,
+    skill_names: list[str] | None = None,
     verification_spec: dict | None = None,
     evaluation_required: bool = False,
 ) -> Task:
@@ -121,6 +126,7 @@ def create_task(
         goal_id=goal_id,
         feature_ids=list(feature_ids or []),
         acceptance_cases=list(acceptance_cases or []),
+        skill_names=list(skill_names or []),
         verification_spec=spec,
         verification_state=("needs_generation" if spec.get("source") == "needs_generation" else "not_started"),
         evaluation_required=evaluation_required,
@@ -242,6 +248,7 @@ def record_task_evaluation(task_id: str, evaluation: dict) -> Task:
     task = _load_task_from_path(path)
     task.evaluation = dict(evaluation)
     task.evaluation_history.append(dict(evaluation))
+    del task.evaluation_history[:-MAX_TASK_HISTORY]
     save_task(task)
     return task
 
@@ -253,6 +260,7 @@ def record_task_repair(task_id: str, repair: dict) -> Task:
         raise FileNotFoundError(task_id)
     task = _load_task_from_path(path)
     task.repair_history.append(dict(repair))
+    del task.repair_history[:-MAX_TASK_HISTORY]
     save_task(task)
     return task
 
@@ -286,6 +294,39 @@ def record_task_reverification(
     task.verification_state = "passing" if passed else "failing"
     task.last_error = None if passed else (error or "final task verification failed")
     save_task(task, archived=path.parent == _archive_dir())
+    return task
+
+
+def reopen_task_for_goal_repair(task_id: str, *, error: str) -> Task:
+    """Return one completed Goal Task to the active board for a real regression.
+
+    Final re-verification can invalidate a previously completed Task.  Reopen
+    that Task instead of creating an unbound synthetic task that cannot tell
+    the worker which behavior or test actually failed.
+    """
+    path = _find_task_path(task_id)
+    if path is None:
+        raise FileNotFoundError(task_id)
+    task = _load_task_from_path(path)
+    task.status = "pending"
+    task.owner = None
+    task.completed_at = None
+    task.verification_state = "failing"
+    task.last_error = error
+    task.evaluation = {
+        "passed": False,
+        "route": "implementation_fix",
+        "summary": error,
+        "findings": [{"issue": error, "severity": "high", "evidence": "final task verification"}],
+    }
+    task.evaluation_history.append(dict(task.evaluation))
+    del task.evaluation_history[:-MAX_TASK_HISTORY]
+    save_task(task)
+    if path.parent == _archive_dir():
+        try:
+            path.unlink()
+        except OSError:
+            pass
     return task
 
 

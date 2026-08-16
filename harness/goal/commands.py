@@ -4,7 +4,7 @@ Command surface:
 
     /goal <target>                         create a read-only Goal draft
     /goal preview | answer | approve | revise | discard
-    /goal status | pause | resume | cancel
+    /goal status | pause | stop | resume | cancel
 
 ``--verify`` remains an optional override for the inferred global regression
 command.  Only ``approve`` starts autonomous execution.
@@ -22,6 +22,7 @@ GOAL_USAGE = (
     "  /goal preview | answer <text> | approve | run | revise <target> | discard\n"
     "  /goal status     view the current goal\n"
     "  /goal pause      pause (current round stops at the next checkpoint)\n"
+    "  /goal stop       alias for pause; keeps the checkpoint for resume\n"
     "  /goal resume     continue a paused goal\n"
     "  /goal cancel     cancel (terminal; history is kept)"
 )
@@ -47,8 +48,8 @@ def parse_goal_subcommand(query: str) -> str | None:
         return "usage"
     if not tokens:
         return "usage"
-    if tokens[0] in ("status", "pause", "resume", "cancel", "preview", "approve", "run", "discard", "answer", "revise"):
-        return tokens[0]
+    if tokens[0] in ("status", "pause", "stop", "resume", "cancel", "preview", "approve", "run", "discard", "answer", "revise"):
+        return "pause" if tokens[0] == "stop" else tokens[0]
     return "draft"
 
 
@@ -69,10 +70,10 @@ def parse_goal_command(query: str) -> dict[str, Any]:
         return {"action": "usage", "error": f"unparseable arguments: {exc}"}
     if not tokens:
         return {"action": "usage", "error": GOAL_USAGE}
-    if tokens[0] in ("status", "pause", "resume", "cancel", "preview", "approve", "run", "discard"):
+    if tokens[0] in ("status", "pause", "stop", "resume", "cancel", "preview", "approve", "run", "discard"):
         if len(tokens) > 1:
             return {"action": "usage", "error": f"/goal {tokens[0]} takes no arguments"}
-        return {"action": tokens[0]}
+        return {"action": "pause" if tokens[0] == "stop" else tokens[0]}
     if tokens[0] in ("answer", "revise"):
         value = rest[len(tokens[0]) :].strip()
         if not value:
@@ -169,7 +170,7 @@ def _handle_pause(runner) -> str:
     state = runner.pause_goal()
     return (
         f"Goal pausing [pausing]\n"
-        f"  Phase: {state.phase} (current round stops at the next checkpoint)\n"
+        f"  Phase: {state.phase} (a pending model reply is discarded when it returns)\n"
         f"  Resume: /goal resume"
     )
 

@@ -97,8 +97,20 @@ def parse_pytest_collection_output(output: str, workspace: str | Path) -> tuple[
 
 def build_pytest_command(selectors: tuple[str, ...] | list[str]) -> str:
     """Build the only pytest command used for a bound Task verification."""
-    argv = ["pytest", "-q", *[_normalise_selector(item) for item in selectors]]
-    return subprocess.list2cmdline(argv) if os.name == "nt" else shlex.join(argv)
+    # Running pytest as a module preserves the workspace on ``sys.path``.
+    # The console-script form can otherwise fail to import the harness package
+    # even though the same test succeeds under Goal's inferred global command.
+    normalised = [_normalise_selector(item) for item in selectors]
+    argv = ["python", "-m", "pytest", "-q", *normalised]
+    command = subprocess.list2cmdline(argv) if os.name == "nt" else shlex.join(argv)
+    # Parameterized node ids can exceed the verification policy's command
+    # budget. The file remains a collected, grounded target and exercises the
+    # same generated coverage without a lossy or arbitrary truncation.
+    if len(command) > 900:
+        files = list(dict.fromkeys(item.split("::", 1)[0] for item in normalised))
+        argv = ["python", "-m", "pytest", "-q", *files]
+        command = subprocess.list2cmdline(argv) if os.name == "nt" else shlex.join(argv)
+    return command
 
 
 def collect_pytest_catalog(

@@ -160,6 +160,7 @@ def _wait_with_escalation(
     *,
     max_extensions: int = 2,
     quiet_window: float = 15.0,
+    cancel_check=None,
 ) -> dict:
     """Wait for a process with progress-aware timeout escalation.
 
@@ -188,6 +189,14 @@ def _wait_with_escalation(
                 "elapsed": time.monotonic() - start,
                 "extensions": extensions,
             }
+        if cancel_check is not None and cancel_check():
+            return {
+                "timed_out": False,
+                "cancelled": True,
+                "exit_code": None,
+                "elapsed": time.monotonic() - start,
+                "extensions": extensions,
+            }
         now = time.monotonic()
         with lock:
             cur_len = len(collected)
@@ -208,6 +217,7 @@ def _wait_with_escalation(
                 continue
             return {
                 "timed_out": True,
+                "cancelled": False,
                 "exit_code": None,
                 "elapsed": now - start,
                 "extensions": extensions,

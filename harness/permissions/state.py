@@ -8,11 +8,16 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Literal
 
-from harness.settings import PROJECT_DIR
+from harness.settings import get_workspace_paths
 
 PermissionEffect = Literal["allow", "ask", "deny"]
-SAVED_RULES_PATH = PROJECT_DIR / "permissions.saved.json"
-AUDIT_LOG_PATH = PROJECT_DIR / "permissions.audit.jsonl"
+
+def _saved_rules_path() -> Path:
+    return get_workspace_paths().project_dir / "permissions.saved.json"
+
+
+def _audit_log_path() -> Path:
+    return get_workspace_paths().project_dir / "permissions.audit.jsonl"
 
 
 @dataclass(frozen=True)
@@ -24,7 +29,11 @@ class SavedPermissionRule:
     created_at: int = 0
 
 
-_session_rules: list[SavedPermissionRule] = []
+_session_rules: dict[str, list[SavedPermissionRule]] = {}
+
+
+def _session_key() -> str:
+    return str(get_workspace_paths().root.resolve())
 
 
 def _now() -> int:
@@ -49,11 +58,11 @@ def _normalize_entry(raw: object, *, default_scope: str) -> SavedPermissionRule 
 
 
 def session_rules() -> list[SavedPermissionRule]:
-    return list(_session_rules)
+    return list(_session_rules.get(_session_key(), ()))
 
 
 def clear_session_rules() -> None:
-    _session_rules.clear()
+    _session_rules.pop(_session_key(), None)
 
 
 def add_session_rule(tool: str, resource: str, effect: PermissionEffect = "allow") -> SavedPermissionRule:
@@ -64,15 +73,16 @@ def add_session_rule(tool: str, resource: str, effect: PermissionEffect = "allow
         scope="session",
         created_at=_now(),
     )
-    _session_rules.append(rule)
+    _session_rules.setdefault(_session_key(), []).append(rule)
     return rule
 
 
 def load_persistent_rules() -> list[SavedPermissionRule]:
-    if not SAVED_RULES_PATH.exists():
+    path = _saved_rules_path()
+    if not path.exists():
         return []
     try:
-        data = json.loads(SAVED_RULES_PATH.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return []
     items = data.get("rules") if isinstance(data, dict) else data
@@ -87,11 +97,12 @@ def load_persistent_rules() -> list[SavedPermissionRule]:
 
 
 def save_persistent_rules(rules: list[SavedPermissionRule]) -> None:
-    PROJECT_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = SAVED_RULES_PATH.with_suffix(".tmp")
+    path = _saved_rules_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
     payload = {"rules": [asdict(rule) for rule in rules]}
     tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(SAVED_RULES_PATH)
+    tmp.replace(path)
 
 
 def add_persistent_rule(tool: str, resource: str, effect: PermissionEffect = "allow") -> SavedPermissionRule:
@@ -109,11 +120,12 @@ def add_persistent_rule(tool: str, resource: str, effect: PermissionEffect = "al
 
 
 def audit_permission(event: dict) -> None:
-    PROJECT_DIR.mkdir(parents=True, exist_ok=True)
+    path = _audit_log_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
     payload = dict(event)
     payload.setdefault("ts", _now())
     try:
-        with AUDIT_LOG_PATH.open("a", encoding="utf-8") as fh:
+        with path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
     except OSError:
         pass

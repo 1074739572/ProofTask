@@ -3,6 +3,7 @@ from __future__ import annotations
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from harness.settings import PERMISSION_AUTO_APPROVE_TIMEOUT
 from harness.ui.events import emit
 
@@ -10,7 +11,20 @@ _lock = threading.Condition()
 _pending: dict[str, str | None] = {}
 
 
-def request_permission(tool: str, resource: str, title: str) -> str:
+def request_permission(
+    tool: str,
+    resource: str,
+    title: str,
+    *,
+    cancel_check: Callable[[], bool] | None = None,
+    timeout: float | None = None,
+) -> str:
+    """Wait for an explicit event-UI permission decision.
+
+    An unanswered prompt is never permission.  A configured timeout denies the
+    request, while cancellation lets the calling Goal stop without leaving its
+    worker blocked behind a stale overlay.
+    """
     request_id = uuid.uuid4().hex
     with _lock:
         _pending[request_id] = None
@@ -22,31 +36,24 @@ def request_permission(tool: str, resource: str, title: str) -> str:
         title=title,
         choices=["allow", "session", "deny"],
     )
-    if PERMISSION_AUTO_APPROVE_TIMEOUT > 0:
-        deadline = time.monotonic() + PERMISSION_AUTO_APPROVE_TIMEOUT
-        with _lock:
-            while _pending.get(request_id) is None:
+    wait_timeout = PERMISSION_AUTO_APPROVE_TIMEOUT if timeout is None else max(0.0, timeout)
+    deadline = time.monotonic() + wait_timeout if wait_timeout > 0 else None
+    with _lock:
+        while _pending.get(request_id) is None:
+            if cancel_check is not None and cancel_check():
+                _pending.pop(request_id, None)
+                emit("permission_cancelled", id=request_id, tool=tool, resource=resource)
+                return "cancel"
+            if deadline is not None:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    # Nobody answered in time: approve once (never remembered),
-                    # which is the safe default for the common "yes, just do it"
-                    # case. Users can still deny explicitly before the timeout.
                     _pending.pop(request_id, None)
-                    emit(
-                        "permission_auto_approved",
-                        id=request_id,
-                        tool=tool,
-                        resource=resource,
-                    )
-                    return "allow"
+                    emit("permission_timed_out", id=request_id, tool=tool, resource=resource)
+                    return "deny"
                 _lock.wait(timeout=min(0.25, remaining))
-            decision = _pending.pop(request_id, "deny") or "deny"
-    else:
-        with _lock:
-            while _pending.get(request_id) is None:
+            else:
                 _lock.wait(timeout=0.25)
-            decision = _pending.pop(request_id, "deny") or "deny"
-    return decision
+        return _pending.pop(request_id, "deny") or "deny"
 
 
 def reply_permission(request_id: str, decision: str) -> bool:

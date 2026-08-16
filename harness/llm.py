@@ -52,10 +52,11 @@ def create_message(
     system: str | None = None,
     tools: list | None = None,
     model_id: str | None = None,
+    reasoning_effort: str | None = None,
 ):
     from harness.ui.events import emit as _emit, is_enabled as _is_enabled
 
-    profile = get_model_profile(model_id)
+    profile = get_model_profile(model_id, effort_override=reasoning_effort)
 
     def _delta_callback(text: str, _event_type: str) -> None:
         _emit("assistant_delta", text=text, model=profile.api_model)

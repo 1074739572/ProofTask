@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 import threading
 from contextlib import contextmanager
 
@@ -28,6 +29,23 @@ except ImportError:
 _console = Console(highlight=False, legacy_windows=False) if _RICH else None
 
 
+def _terminal_safe_text(text: str) -> str:
+    """Downgrade characters a legacy terminal cannot encode.
+
+    Rendering is observational. A GBK console must not be able to fail a Goal
+    after its worker has already completed a model call.
+    """
+    value = str(text)
+    encoding = getattr(sys.stdout, "encoding", None)
+    if not encoding:
+        return value
+    try:
+        value.encode(encoding)
+    except UnicodeEncodeError:
+        return value.encode(encoding, errors="replace").decode(encoding)
+    return value
+
+
 class Renderer:
     """Single entry for classic CLI output; keeps loop/llm free of ad-hoc prints."""
 
@@ -37,6 +55,7 @@ class Renderer:
         # producing duplicate Response + classic Assistant panels.
         if events.is_enabled():
             return
+        text = _terminal_safe_text(text)
         if not _RICH or _console is None:
             print(text, end=end, flush=True)
             return

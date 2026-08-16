@@ -124,13 +124,13 @@ def permission_hook(block):
         _hook_print(f"  {decision.resource}")
     if decision.external_resource:
         _hook_print(f"  external: {decision.external_resource}")
-    # /goal ACTs run non-interactively: an `ask` is returned as a rejection
-    # (never blocks on stdin / the TUI permission flow) and the runner pauses
-    # with stop_reason=permission_wait. Thread-local, so normal foreground
-    # turns keep the interactive ask behavior.
+    # A classic /goal ACT has no safe way to block for terminal input, so it
+    # pauses. The event-stream TUI does have a permission overlay; use the
+    # normal request/reply broker there so the user can approve this exact
+    # tool call without broadening config rules.
     from harness.goal.runner import is_goal_noninteractive, mark_goal_permission_pending
 
-    if is_goal_noninteractive():
+    if is_goal_noninteractive() and not events.is_enabled():
         mark_goal_permission_pending()
         audit_permission(
             {
@@ -142,12 +142,18 @@ def permission_hook(block):
         )
         return (
             f"Permission denied: {name} needs human approval, but the goal "
-            "runner is non-interactive. The goal will pause (permission_wait); "
-            "approve it in config and /goal resume."
+            "runner has no interactive permission UI. The goal will pause "
+            "(permission_wait); approve it in config and /goal resume."
         )
     if events.is_enabled():
+        from harness.agent.cancel import is_cancelled
         from harness.ui.permission_events import request_permission
-        choice = request_permission(name, decision.resource or name, f"Allow {name}?")
+        choice = request_permission(
+            name,
+            decision.resource or name,
+            f"Allow {name}?",
+            cancel_check=is_cancelled,
+        )
         response = PermissionResponse("jsonl-permission", choice, decision.resource or name)
     else:
         response = ask_permission(

@@ -61,7 +61,10 @@ class StopReason(str, Enum):
     test_generation_required = "test_generation_required"
     user_approval_required = "user_approval_required"
     full_verification_failed = "full_verification_failed"
+    full_verification_interrupted = "full_verification_interrupted"
     evaluation_unavailable = "evaluation_unavailable"
+    impact_review_format_error = "impact_review_format_error"
+    provider_unavailable = "provider_unavailable"
     autonomy_blocked = "autonomy_blocked"
     internal_error = "internal_error"
 

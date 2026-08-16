@@ -196,16 +196,14 @@ ROUTE_MAX_RUNTIME = _positive_seconds("HARNESS_ROUTE_MAX_RUNTIME", 600)
 
 # Welcome hero variants for /banner demo: classic | emoji | typewriter | shadow3d
 BANNER_STYLE = os.getenv("HARNESS_BANNER", "classic").strip().lower()
-# Auto-approve permission prompts after this many seconds (0 = disabled).
-# A pending "Allow?" prompt that gets no human reply within the timeout is
-# approved once (never remembered). Set HARNESS_PERMISSION_TIMEOUT=0 to keep
-# waiting forever.
+# Permission prompts require an explicit human response. A positive timeout is
+# fail-closed; zero means wait until a reply or cancellation arrives.
 def _permission_timeout() -> float:
-    raw = os.getenv("HARNESS_PERMISSION_TIMEOUT", "15").strip()
+    raw = os.getenv("HARNESS_PERMISSION_TIMEOUT", "0").strip()
     try:
         value = float(raw)
     except ValueError:
-        value = 15.0
+        value = 0.0
     return max(0.0, value)
 PERMISSION_AUTO_APPROVE_TIMEOUT = _permission_timeout()
 

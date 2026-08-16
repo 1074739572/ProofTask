@@ -126,6 +126,13 @@ def parse_findings(raw: str) -> Findings:
     route = str(data.get("route") or ("pass" if passed else "implementation_fix"))
     if route not in ROUTES:
         route = "blocked"
+    if passed and (route != "pass" or any(item["severity"] == "high" for item in items)):
+        return Findings(
+            passed=None,
+            error="inconsistent evaluator verdict: a passing result requires route='pass' and no high findings",
+        )
+    if not passed and route == "pass":
+        return Findings(passed=None, error="inconsistent evaluator verdict: failed result cannot use route='pass'")
     raw_affected = data.get("affected_task_ids")
     affected = [str(value)[:80] for value in raw_affected if str(value).strip()][:8] if isinstance(raw_affected, list) else []
     return Findings(passed=passed, summary=summary, items=items, route=route, affected_task_ids=affected)

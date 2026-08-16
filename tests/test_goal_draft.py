@@ -91,6 +91,7 @@ def test_execution_approval_resumes_from_the_test_review_pause(monkeypatch, tmp_
     state.initialization_complete = True
     monkeypatch.setattr(runner_mod, "_runner", None)
     monkeypatch.setattr(runner_mod, "load_goal", lambda: state)
+    monkeypatch.setattr(runner_mod, "get_workdir", lambda: tmp_path)
     monkeypatch.setattr(runner_mod, "save_goal", lambda state: None)
     monkeypatch.setattr(runner_mod, "_emit_goal", lambda *args: None)
     monkeypatch.setattr(runner_mod.GoalRunner, "start", lambda self: None)

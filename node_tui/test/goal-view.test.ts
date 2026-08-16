@@ -2,9 +2,11 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   baselinePresentation,
+  goalDecisionPresentation,
   gatePresentation,
   goalRegressionPresentation,
   goalStatusPresentation,
+  type GoalDecision,
   type GoalSnapshot,
   type GoalTaskSnapshot,
 } from '../src-open/GoalView.tsx';
@@ -48,6 +50,34 @@ test('machine gate tone follows the persisted verdict', () => {
 test('paused Goal is visually distinct from a running Goal', () => {
   assert.equal(goalStatusPresentation('paused').tone, 'warning');
   assert.equal(goalStatusPresentation('running').tone, 'info');
+});
+
+test('permission wait is presented as a recoverable approval state', () => {
+  const presentation = gatePresentation(goal({status: 'paused', phase: 'paused', stop_reason: 'permission_wait'}), task);
+  assert.equal(presentation.tone, 'warning');
+  assert.match(presentation.text, /approval/);
+});
+
+test('active Goal decision identifies the active model and keeps recent history', () => {
+  const decisions: GoalDecision[] = [
+    {id: 'plan', phase: 'initialize', agent: '规划模型', model: 'deepseek-v4-pro', text: '正在生成任务', status: 'done', at: 1},
+    {id: 'run', phase: 'act', agent: '执行模型', model: 'deepseek-v4-flash', text: '正在实现限流规则', status: 'active', at: 2},
+  ];
+  const presentation = goalDecisionPresentation(goal(), decisions);
+  assert.equal(presentation.tone, 'info');
+  assert.equal(presentation.owner, '执行模型 · deepseek-v4-flash');
+  assert.equal(presentation.text, '正在实现限流规则');
+  assert.equal(presentation.history.length, 2);
+});
+
+test('paused Goal decision shows the persisted error instead of an active model', () => {
+  const presentation = goalDecisionPresentation(
+    goal({status: 'paused', phase: 'paused', last_error: 'impact reviewer returned no JSON'}),
+    [],
+  );
+  assert.equal(presentation.tone, 'warning');
+  assert.equal(presentation.owner, '已暂停');
+  assert.match(presentation.text, /no JSON/);
 });
 
 test('final regression only turns green with durable zero-exit evidence', () => {

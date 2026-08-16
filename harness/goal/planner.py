@@ -24,6 +24,7 @@ MAX_TASKS = 8
 MAX_BEHAVIOR_CHARS = 600
 MAX_ACCEPTANCE_CASES = 8
 MAX_SELECTORS_PER_TASK = 16
+MAX_SKILLS_PER_TASK = 2
 
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL | re.IGNORECASE)
 _AGENT_HEADER = re.compile(r"^\[[^\]]+\] [^\n]*\n*")
@@ -157,6 +158,7 @@ class TaskPlan:
     behavior: str
     depends_on: tuple[str, ...] = ()
     acceptance_cases: tuple[AcceptanceCase, ...] = ()
+    skill_names: tuple[str, ...] = ()
     verification_spec: VerificationSpec = field(default_factory=VerificationSpec)
 
     def to_dict(self) -> dict[str, Any]:
@@ -165,6 +167,7 @@ class TaskPlan:
             "behavior": self.behavior,
             "depends_on": list(self.depends_on),
             "acceptance_cases": [case.to_dict() for case in self.acceptance_cases],
+            "skills": list(self.skill_names),
             "verification_spec": self.verification_spec.to_dict(),
         }
 
@@ -177,6 +180,7 @@ class TaskPlan:
             behavior=str(data["behavior"]),
             depends_on=tuple(str(dep) for dep in (data.get("depends_on") or ())),
             acceptance_cases=cases,
+            skill_names=_normalise_skill_names(data.get("skills")),
             verification_spec=VerificationSpec.from_dict(spec_raw),
         )
 
@@ -197,6 +201,31 @@ def _parse_acceptance_cases(raw: Any) -> tuple[AcceptanceCase, ...]:
         ids.add(case.id)
         cases.append(case)
     return tuple(cases)
+
+
+def _normalise_skill_names(raw: Any) -> tuple[str, ...]:
+    """Keep only installed, bounded skill ids from planner-supplied JSON."""
+    from harness.skills_loader import skill_names
+
+    installed = set(skill_names())
+    return tuple(name for name in _normalise_strings(raw, limit=MAX_SKILLS_PER_TASK) if name in installed)
+
+
+def _recommended_skill_names(name: str, behavior: str, spec: VerificationSpec) -> tuple[str, ...]:
+    """Assign safe defaults when the planner omits clearly relevant guidance."""
+    from harness.skills_loader import skill_names as installed_skill_names
+
+    text = f"{name} {behavior}".lower()
+    installed = set(installed_skill_names())
+    ui_markers = ("frontend", "front-end", " ui", "ux", "react", "vue", "css", "html", "page", "component", "前端", "界面", "页面", "组件", "动画")
+    repair_markers = ("bug", "fix", "repair", "regression", "failure", "error", "debug", "修复", "错误", "回归", "故障")
+    if any(marker in text for marker in ui_markers):
+        return tuple(name for name in ("frontend-design", "webapp-testing") if name in installed)
+    if any(marker in text for marker in repair_markers):
+        return tuple(name for name in ("systematic-debugging",) if name in installed)
+    if spec.source == "needs_generation" and "test-driven-development" in installed:
+        return ("test-driven-development",)
+    return ()
 
 
 def build_plan_prompt(
@@ -224,12 +253,17 @@ def build_plan_prompt(
         "- depends_on lists names of earlier Tasks only.\n"
         "- Preserve separately named deliverables as separate Tasks.\n"
         "- Use one Task only when the Goal cannot be meaningfully split.\n\n"
+        "Optional workflow skills:\n"
+        "- Add skills only when directly relevant, with at most two installed skill names per Task.\n"
+        "- Prefer systematic-debugging for a repair or regression Task, frontend-design for UI work, "
+        "webapp-testing for browser/UI verification, and test-driven-development for a behavior that needs focused tests.\n"
+        "- Do not use code-review here; the independent evaluator handles review.\n\n"
         "Reply with ONLY a JSON array in this schema:\n"
         '[{"name":"paginate list","behavior":"list returns every page",'
         '"acceptance_cases":[{"id":"AC1","given":"more than one page",'
         '"when":"the caller requests pages","then":"no row is skipped"}],'
         '"test_selectors":["tests/test_pagination.py::test_all_pages"],'
-        '"depends_on":[]}]\n'
+        '"depends_on":[],"skills":["test-driven-development"]}]\n'
         "No prose and no code fence."
     )
 
@@ -323,12 +357,16 @@ def parse_plan(raw: str, *, test_catalog: TestCatalog | None = None) -> list[Tas
         if any(dependency not in names for dependency in dependencies):
             return None
         spec = _spec_from_entry(entry, test_catalog, cases)
+        selected_skills = _normalise_skill_names(entry.get("skills"))
+        if not selected_skills:
+            selected_skills = _recommended_skill_names(name, behavior, spec)
         plans.append(
             TaskPlan(
                 name=name,
                 behavior=behavior,
                 depends_on=dependencies,
                 acceptance_cases=cases,
+                skill_names=selected_skills,
                 verification_spec=spec,
             )
         )

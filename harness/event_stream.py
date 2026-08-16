@@ -50,7 +50,7 @@ _INSTANT_SLASH_PREFIXES = ("/model", "/effort", "/mode", "/models", "/usage", "/
 
 
 def _is_goal_control_command(query: str) -> bool:
-    """True for /goal status|pause|cancel — instant while the goal runs.
+    """True for /goal status|pause|stop|cancel — instant while the goal runs.
 
     /goal start/resume require the normal turn queue (no ordinary turn may be
     running), so they are deliberately NOT classified as instant here.
@@ -348,7 +348,7 @@ def _handle_slash_command(query: str, history: list, binding) -> tuple[str | Non
             "  /open <directory>  — switch workspace (instant, no restart)\n"
             "  /goal <target>  — clarify and preview a verified Goal\n"
             "  /goal approve  — write approved tests and start execution\n"
-            "  /goal status|pause|resume|cancel  — control the goal\n"
+            "  /goal status|pause|stop|resume|cancel  — control the goal\n"
             "  /init  — scan repo & create/improve HARNESS.md handbook\n"
             "  @path + Tab        — complete file/dir path\n"
             "  /model <id>  — switch model (use /models to list)\n"
@@ -665,7 +665,7 @@ def run_event_stream() -> None:
                 if not text:
                     continue
                 # Non-interactive control commands (model/mode/effort switches
-                # and /goal status|pause|cancel) run instantly — even while the
+                # and /goal status|pause|stop|cancel) run instantly — even while the
                 # agent is busy. They need no LLM round and never flip the UI
                 # into the "running" state.
                 if _is_goal_control_command(text):
