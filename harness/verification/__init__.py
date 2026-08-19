@@ -53,6 +53,10 @@ from harness.verification.runner import (
     VerificationRunResult,
     run_verification,
 )
+from harness.verification.adapters import VerificationAdapter, VerificationContext
+from harness.verification.node_adapter import NodeTestAdapter, NodeTestCatalog
+from harness.verification.pytest_adapter import PytestAdapter
+from harness.verification.registry import select_adapter
 
 __all__ = [
     "ALLOWED_PROGRAMS",
@@ -72,6 +76,12 @@ __all__ = [
     "verify_feature_command",
     "verify_task_command",
     "reverify_task_command",
+    "VerificationAdapter",
+    "VerificationContext",
+    "PytestAdapter",
+    "NodeTestAdapter",
+    "NodeTestCatalog",
+    "select_adapter",
 ]
 
 

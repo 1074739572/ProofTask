@@ -18,7 +18,11 @@ from harness.settings import get_workdir
 from harness.verification.catalog import TestCatalog, build_pytest_command, collect_pytest_catalog
 
 PLANNER_AGENT = "goal_planner"
-PLANNER_MAX_ROUNDS = 30
+# Planning turns a confirmed requirement plus a machine-collected test catalog
+# into a contract. Deep repository inspection belongs to the test writer and
+# implementation worker; keeping planning tool-free prevents an invisible,
+# unbounded explore loop before a draft can be saved.
+PLANNER_MAX_ROUNDS = 1
 MIN_TASKS = 1
 MAX_TASKS = 8
 MAX_BEHAVIOR_CHARS = 600
@@ -102,6 +106,7 @@ class VerificationSpec:
     # A focused test normally belongs to one Task. Integration coverage is
     # intentionally shared and must name every owning Task.
     owners: tuple[str, ...] = ()
+    case_selectors: dict[str, tuple[str, ...]] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -117,6 +122,7 @@ class VerificationSpec:
             "test_hashes": dict(self.test_hashes),
             "covers": list(self.covers),
             "owners": list(self.owners),
+            "case_selectors": {key: list(value) for key, value in self.case_selectors.items()},
         }
 
     @classmethod
@@ -147,6 +153,11 @@ class VerificationSpec:
             else {},
             covers=_normalise_strings(data.get("covers"), limit=MAX_ACCEPTANCE_CASES),
             owners=_normalise_strings(data.get("owners"), limit=MAX_TASKS),
+            case_selectors={
+                str(case): _normalise_strings(selectors, limit=MAX_SELECTORS_PER_TASK)
+                for case, selectors in (data.get("case_selectors") or {}).items()
+                if isinstance(case, str) and isinstance(selectors, (list, tuple))
+            } if isinstance(data.get("case_selectors"), dict) else {},
         )
 
 
@@ -160,6 +171,10 @@ class TaskPlan:
     acceptance_cases: tuple[AcceptanceCase, ...] = ()
     skill_names: tuple[str, ...] = ()
     verification_spec: VerificationSpec = field(default_factory=VerificationSpec)
+    scope_paths: tuple[str, ...] = ()
+    evidence_refs: tuple[str, ...] = ()
+    test_strategy: str = ""
+    discovery_revision: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -169,6 +184,10 @@ class TaskPlan:
             "acceptance_cases": [case.to_dict() for case in self.acceptance_cases],
             "skills": list(self.skill_names),
             "verification_spec": self.verification_spec.to_dict(),
+            "scope_paths": list(self.scope_paths),
+            "evidence_refs": list(self.evidence_refs),
+            "test_strategy": self.test_strategy,
+            "discovery_revision": self.discovery_revision,
         }
 
     @classmethod
@@ -182,6 +201,10 @@ class TaskPlan:
             acceptance_cases=cases,
             skill_names=_normalise_skill_names(data.get("skills")),
             verification_spec=VerificationSpec.from_dict(spec_raw),
+            scope_paths=_normalise_strings(data.get("scope_paths"), limit=MAX_SELECTORS_PER_TASK),
+            evidence_refs=_normalise_strings(data.get("evidence_refs"), limit=MAX_ACCEPTANCE_CASES),
+            test_strategy=str(data.get("test_strategy") or "")[:1000],
+            discovery_revision=max(0, int(data.get("discovery_revision") or 0)),
         )
 
 
@@ -232,11 +255,17 @@ def build_plan_prompt(
     target: str,
     full_verification: str,
     test_catalog: TestCatalog | None = None,
+    discovery_manifest: dict[str, Any] | None = None,
 ) -> str:
     """Prompt for the read-only planner. Output is a JSON Task array only."""
     catalog_text = (test_catalog or TestCatalog(error="not collected")).prompt_text()
+    manifest_text = "No Discovery Manifest supplied. Use empty evidence_refs and scope_paths."
+    if isinstance(discovery_manifest, dict):
+        manifest_text = "Discovery Manifest (machine-collected; cite evidence IDs exactly):\n" + json.dumps(discovery_manifest, ensure_ascii=False)[:30_000]
     return (
-        "You plan one Goal into independently verifiable Tasks. You are read-only.\n\n"
+        "You plan one Goal into independently verifiable Tasks.\n"
+        "The confirmed Goal and system test catalog below are your complete planning evidence. "
+        "Return the Task contract directly; do not ask questions, inspect files, or call tools.\n\n"
         f"Goal target: {target}\n"
         f"Goal-level full verification command: {full_verification}\n\n"
         "Test binding rules:\n"
@@ -247,10 +276,14 @@ def build_plan_prompt(
         "array. That explicitly requests a later test-generation phase.\n"
         "- Do not invent files, paths, commands, or selectors.\n\n"
         f"{catalog_text}\n\n"
+        f"{manifest_text}\n\n"
         f"Split the Goal into {MIN_TASKS}-{MAX_TASKS} Tasks:\n"
         "- Each Task is independently implementable and machine-verifiable.\n"
         "- Each Task must include 1-8 concrete acceptance_cases using given/when/then.\n"
         "- depends_on lists names of earlier Tasks only.\n"
+        "- scope_paths must be paths from the manifest; evidence_refs must cite evidence IDs.\n"
+        "- test_strategy must explain how each acceptance case will be verified.\n"
+        "- case_selectors maps each acceptance case id to exact catalog selectors; never claim coverage without a mapping.\n"
         "- Preserve separately named deliverables as separate Tasks.\n"
         "- Use one Task only when the Goal cannot be meaningfully split.\n\n"
         "Optional workflow skills:\n"
@@ -263,7 +296,9 @@ def build_plan_prompt(
         '"acceptance_cases":[{"id":"AC1","given":"more than one page",'
         '"when":"the caller requests pages","then":"no row is skipped"}],'
         '"test_selectors":["tests/test_pagination.py::test_all_pages"],'
-        '"depends_on":[],"skills":["test-driven-development"]}]\n'
+        '"depends_on":[],"scope_paths":["src/list.py"],"evidence_refs":["E1"],'
+        '"test_strategy":"one selector per acceptance case", "case_selectors":{"AC1":["tests/test_pagination.py::test_all_pages"]},'
+        '"skills":["test-driven-development"]}]\n'
         "No prose and no code fence."
     )
 
@@ -303,32 +338,43 @@ def _extract_json_array(text: str) -> str | None:
 
 
 def _spec_from_entry(
-    entry: dict[str, Any], catalog: TestCatalog | None, cases: tuple[AcceptanceCase, ...]
+    entry: dict[str, Any], catalog, cases: tuple[AcceptanceCase, ...], verification_adapter=None,
 ) -> VerificationSpec:
     spec_data = entry.get("verification_spec") if isinstance(entry.get("verification_spec"), dict) else {}
     requested = _normalise_strings(
         entry.get("test_selectors", spec_data.get("selectors")),
         limit=MAX_SELECTORS_PER_TASK,
     )
+    raw_mapping = entry.get("case_selectors", spec_data.get("case_selectors"))
+    case_selectors = {
+        str(case): _normalise_strings(values, limit=MAX_SELECTORS_PER_TASK)
+        for case, values in raw_mapping.items()
+        if isinstance(raw_mapping, dict) and isinstance(case, str) and isinstance(values, (list, tuple))
+    } if isinstance(raw_mapping, dict) else {}
 
     # Modern planner output is grounded only against an actual Test Catalog.
     if catalog and catalog.available and requested and all(catalog.contains(item) for item in requested):
         files = tuple(dict.fromkeys(item.split("::", 1)[0] for item in requested))
+        adapter = verification_adapter
+        adapter_id = getattr(adapter, "id", getattr(catalog, "adapter", "pytest"))
+        command = adapter.build_command(requested) if adapter is not None else build_pytest_command(requested)
         return VerificationSpec(
-            adapter="pytest",
-            command=build_pytest_command(requested),
+            adapter=adapter_id,
+            command=command,
             test_files=files,
             selectors=requested,
             source="discovered",
             collected_count=len(requested),
             baseline_result="not_run",
             confidence="high",
-            covers=tuple(case.id for case in cases),
+            covers=tuple(case.id for case in cases if case.id in case_selectors),
+            case_selectors=case_selectors,
         )
-    return VerificationSpec(adapter="pytest", source="needs_generation")
+    adapter_id = getattr(verification_adapter, "id", getattr(catalog, "adapter", "pytest"))
+    return VerificationSpec(adapter=adapter_id, source="needs_generation", case_selectors=case_selectors)
 
 
-def parse_plan(raw: str, *, test_catalog: TestCatalog | None = None) -> list[TaskPlan] | None:
+def parse_plan(raw: str, *, test_catalog=None, discovery_manifest: dict[str, Any] | None = None, verification_adapter=None) -> list[TaskPlan] | None:
     """Parse planner output into validated TaskPlans without raising."""
     block = _extract_json_array(_strip_agent_header(raw or ""))
     if block is None:
@@ -356,7 +402,20 @@ def parse_plan(raw: str, *, test_catalog: TestCatalog | None = None) -> list[Tas
         dependencies = _normalise_strings(entry.get("depends_on"), limit=MAX_TASKS)
         if any(dependency not in names for dependency in dependencies):
             return None
-        spec = _spec_from_entry(entry, test_catalog, cases)
+        spec = _spec_from_entry(entry, test_catalog, cases, verification_adapter)
+        if spec.source == "discovered":
+            if any(case.id not in spec.case_selectors for case in cases):
+                return None
+            if any(selector not in spec.selectors for values in spec.case_selectors.values() for selector in values):
+                return None
+        scopes = _normalise_strings(entry.get("scope_paths"), limit=MAX_SELECTORS_PER_TASK)
+        refs = _normalise_strings(entry.get("evidence_refs"), limit=MAX_ACCEPTANCE_CASES)
+        strategy = str(entry.get("test_strategy") or "")[:1000]
+        if discovery_manifest is not None:
+            evidence_ids = {str(item.get("id")) for item in discovery_manifest.get("evidence", []) if isinstance(item, dict)}
+            file_paths = {str(item) for item in discovery_manifest.get("repo_files", [])}
+            if not scopes or not refs or not strategy or not set(scopes).issubset(file_paths) or not set(refs).issubset(evidence_ids):
+                return None
         selected_skills = _normalise_skill_names(entry.get("skills"))
         if not selected_skills:
             selected_skills = _recommended_skill_names(name, behavior, spec)
@@ -368,6 +427,10 @@ def parse_plan(raw: str, *, test_catalog: TestCatalog | None = None) -> list[Tas
                 acceptance_cases=cases,
                 skill_names=selected_skills,
                 verification_spec=spec,
+                scope_paths=scopes,
+                evidence_refs=refs,
+                test_strategy=strategy,
+                discovery_revision=max(0, int(entry.get("discovery_revision") or 0)),
             )
         )
         names.add(name)
@@ -384,21 +447,28 @@ def plan_tasks(
     deadline: float | None = None,
     stats=None,
     test_catalog: TestCatalog | None = None,
+    discovery_manifest: dict[str, Any] | None = None,
+    verification_adapter=None,
 ) -> list[TaskPlan]:
     """Decompose a Goal and bind only selectors the system collected."""
     from harness.agents.runner import run_agent_task as default_runner
 
     root = (workspace or get_workdir()).resolve()
-    catalog = test_catalog if test_catalog is not None else collect_pytest_catalog(root)
+    if verification_adapter is None:
+        from harness.verification import VerificationContext, select_adapter
+
+        verification_adapter = select_adapter(root, full_verification)
+    catalog = test_catalog if test_catalog is not None else verification_adapter.discover(VerificationContext(root, command=full_verification))
     runner = planner_runner or default_runner
     try:
         raw = runner(
             description="decompose goal into verifiable tasks",
-            prompt=build_plan_prompt(target, full_verification, catalog),
+            prompt=build_plan_prompt(target, full_verification, catalog, discovery_manifest),
             agent_type=PLANNER_AGENT,
             cwd=str(root),
-            max_rounds=PLANNER_MAX_ROUNDS,
-            cancel_check=cancel_check,
+        max_rounds=PLANNER_MAX_ROUNDS,
+        tools_override=(),
+        cancel_check=cancel_check,
             deadline=deadline,
             stats=stats,
         )
@@ -406,7 +476,7 @@ def plan_tasks(
         raise GoalPlanningError(f"Goal planner request failed: {type(exc).__name__}: {exc}") from exc
     if raw.startswith(f"[{PLANNER_AGENT}] failed:") or raw.startswith(f"[{PLANNER_AGENT}] stopped:"):
         raise GoalPlanningError(f"Goal planner is unavailable: {raw}")
-    plans = parse_plan(raw, test_catalog=catalog)
+    plans = parse_plan(raw, test_catalog=catalog, discovery_manifest=discovery_manifest, verification_adapter=verification_adapter)
     if plans:
         return plans
     detail = raw.strip().replace("\n", " ")[:500] or "empty response"

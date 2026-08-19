@@ -2,8 +2,8 @@
   "opencode": {
     "label": "OpenCode Go (DeepSeek)",
     "type": "openai",
-    "base_url": "https://opencode.ai/zen/go/v1",
-    "api_key_env": "OPENCODE_GO_API_KEY"
+    "base_url": "https://api.deepseek.com",
+    "api_key_env": "DEEPSEEK_API_KEY"
   },
   "xiaomi-mimo": {
     "label": "Xiaomi MiMo",

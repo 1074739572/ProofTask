@@ -29,7 +29,10 @@ from harness.goal.store import (
     save_goal,
 )
 from harness.settings import get_workdir, workspace_generation
-from harness.verification import build_pytest_command, collect_pytest_catalog, reverify_task_command, run_verification, verify_task_command
+from harness.verification import (
+    VerificationContext, build_pytest_command, collect_pytest_catalog,
+    reverify_task_command, run_verification, select_adapter, verify_task_command,
+)
 from harness.verification.evidence import evidence_from_result
 
 class GoalNotRunningError(Exception):
@@ -228,6 +231,18 @@ def is_goal_running() -> bool:
 
 
 def get_goal_status() -> str:
+    # Drafts are the active user workflow. A stale terminal Goal must never
+    # hide an in-progress clarification/discovery/planning draft.
+    try:
+        from harness.goal.draft import format_draft, load_draft
+
+        draft = load_draft()
+        if draft is not None and draft.status != "consumed":
+            return format_draft(draft)
+    except Exception:
+        # Goal status should still be useful when a draft file is corrupt; the
+        # caller will get the normal Goal state error below.
+        pass
     with _runner_lock:
         runner = _runner
         if runner is not None and runner.is_alive() and runner.is_running():
@@ -689,6 +704,9 @@ class GoalRunner(threading.Thread):
                 skill_names=list(plan.get("skills") or []),
                 verification_spec=dict(plan.get("verification_spec") or {}),
                 evaluation_required=state.evaluation_required,
+                scope_paths=list(plan.get("scope_paths") or []),
+                evidence_refs=list(plan.get("evidence_refs") or []),
+                discovery_revision=int(plan.get("discovery_revision") or 0),
             )
             names[name] = task.id
             state.task_name_ids = dict(names)
@@ -706,11 +724,9 @@ class GoalRunner(threading.Thread):
             if spec.get("source") != "discovered" or task_id in known_bindings:
                 continue
             spec["owners"] = [task_id]
-            spec["covers"] = list(spec.get("covers") or [
-                str(case.get("id"))
-                for case in task.acceptance_cases
-                if isinstance(case, dict) and case.get("id")
-            ])
+            # Completion depends on explicit case->selector evidence. Never
+            # manufacture coverage merely because a selector exists.
+            spec["covers"] = list(spec.get("case_selectors") or [])
             if not spec.get("test_hashes"):
                 spec["test_hashes"] = self._test_file_hashes(root, spec.get("test_files") or [])
             task.verification_spec = spec
@@ -752,7 +768,13 @@ class GoalRunner(threading.Thread):
             if any(load_task(dep).status != "completed" for dep in task.blockedBy):
                 deferred = True
                 continue
-            before_catalog = collect_pytest_catalog(root)
+            adapter = select_adapter(root, task.verification_spec.get("adapter") or state.verification)
+            verification_context = VerificationContext(root, command=state.verification)
+            before_catalog = (
+                collect_pytest_catalog(root)
+                if adapter.id == "pytest"
+                else adapter.discover(verification_context)
+            )
             before_hashes = self._test_file_hashes(root, before_catalog.test_files)
             write_roots = self._test_write_roots(before_catalog)
             before_tree = self._snapshot_test_tree(root, write_roots)
@@ -760,9 +782,9 @@ class GoalRunner(threading.Thread):
             if not isinstance(impact_context, list):
                 impact_context = []
             prompt = (
-                "Create a NEW focused pytest file for this Task before implementation. You may modify only test files; "
+                f"Create a NEW focused {adapter.id} test file for this Task before implementation. You may modify only test files; "
                 "do not edit existing test files or production code. Use existing test conventions. After writing tests, reply ONLY with JSON: "
-                '{"test_selectors":["tests/test_x.py::test_name"]}.\n\n'
+                '{"test_selectors":["tests/test_x.py::test_name"],"case_selectors":{"AC1":["tests/test_x.py::test_name"]}}.\n\n'
                 f"Task: {task.subject}\nBehavior: {task.description}\nAcceptance cases: {json.dumps(task.acceptance_cases)}"
             )
             from harness.goal.skills import assigned_skill_context, normalize_goal_skills
@@ -813,12 +835,27 @@ class GoalRunner(threading.Thread):
                 state.last_error = "test generation needs permission outside the approved Goal boundary"
                 save_goal(state)
                 return
-            after_catalog = collect_pytest_catalog(root)
+            after_catalog = (
+                collect_pytest_catalog(root)
+                if adapter.id == "pytest"
+                else adapter.discover(verification_context)
+            )
             selectors = self._selectors_from_generation(raw, root, catalog=after_catalog)
+            case_selectors = self._case_selectors_from_generation(raw, selectors, task.acceptance_cases)
             if not selectors:
                 self._restore_test_tree(root, before_tree, write_roots)
                 self._pause(state, "test_generation_required", stop_reason=StopReason.test_generation_required.value)
                 state.last_error = f"Task {task.id} needs a collected pytest selector before execution."
+                save_goal(state)
+                return
+            required_cases = {
+                str(case.get("id")) for case in task.acceptance_cases
+                if isinstance(case, dict) and case.get("id")
+            }
+            if not required_cases.issubset(case_selectors):
+                self._restore_test_tree(root, before_tree, write_roots)
+                self._pause(state, "test_generation_case_mapping_required", stop_reason=StopReason.test_generation_required.value)
+                state.last_error = f"Task {task.id} test writer must map every acceptance case to collected selectors."
                 save_goal(state)
                 return
             if any(selector in before_catalog.selectors for selector in selectors):
@@ -837,7 +874,7 @@ class GoalRunner(threading.Thread):
                 state.last_error = f"Task {task.id} test writer modified existing test files: {', '.join(changed_existing)}"
                 save_goal(state)
                 return
-            command = build_pytest_command(selectors)
+            command = adapter.build_command(selectors)
             baseline = run_verification(
                 command,
                 workspace=root,
@@ -871,8 +908,8 @@ class GoalRunner(threading.Thread):
                 verified_by="goal_test_baseline",
             ).to_dict()
             bound_spec = VerificationSpec(
-                adapter="pytest",
-                command=build_pytest_command(all_selectors),
+                adapter=adapter.id,
+                command=adapter.build_command(all_selectors),
                 test_files=files,
                 selectors=all_selectors,
                 source="generated",
@@ -881,7 +918,8 @@ class GoalRunner(threading.Thread):
                 confidence="high",
                 baseline_evidence=baseline_evidence,
                 test_hashes=self._test_file_hashes(root, files),
-                covers=tuple(str(case.get("id")) for case in task.acceptance_cases if isinstance(case, dict) and case.get("id")),
+                covers=tuple(case_id for case_id in case_selectors),
+                case_selectors=case_selectors,
                 owners=tuple(
                     dict.fromkeys(
                         str(owner)
@@ -962,6 +1000,27 @@ class GoalRunner(threading.Thread):
                 continue
             return ()
         return tuple(dict.fromkeys(resolved))
+
+    @staticmethod
+    def _case_selectors_from_generation(raw: str, selectors: tuple[str, ...], cases) -> dict[str, list[str]]:
+        """Accept only explicit case->selector claims from a test writer."""
+        try:
+            data = json.loads(raw[raw.find("{") : raw.rfind("}") + 1])
+        except (ValueError, TypeError, json.JSONDecodeError):
+            return {}
+        mapping = data.get("case_selectors") if isinstance(data, dict) else None
+        if not isinstance(mapping, dict):
+            return {}
+        valid = set(selectors)
+        case_ids = {str(item.get("id")) for item in cases if isinstance(item, dict) and item.get("id")}
+        result: dict[str, list[str]] = {}
+        for case_id, values in mapping.items():
+            if str(case_id) not in case_ids or not isinstance(values, list):
+                continue
+            chosen = [str(value) for value in values if str(value) in valid]
+            if chosen:
+                result[str(case_id)] = list(dict.fromkeys(chosen))
+        return result
 
     @staticmethod
     def _test_file_hashes(root: Path, paths) -> dict[str, str]:
@@ -1150,6 +1209,12 @@ class GoalRunner(threading.Thread):
         state.total_llm_rounds += stats.llm_rounds
         state.attempts += 1
         state.no_progress_count = state.no_progress_count + 1 if self._progress_snapshot(state) == before else 0
+        scope_error = self._validate_task_scope(state, task)
+        if scope_error:
+            self._pause(state, "task_scope_violation", stop_reason=StopReason.autonomy_blocked.value)
+            state.last_error = scope_error
+            save_goal(state)
+            return
         write_handoff(state, task, phase=GoalPhase.VERIFY.value, summary=summary)
         if self._cancel_event.is_set():
             self._cancel(state, "user requested cancel")
@@ -1681,6 +1746,26 @@ class GoalRunner(threading.Thread):
 
         task = load_task(state.current_task_id)
         return (task.evidence, task.last_error, capture_code_snapshot(state.workspace))
+
+    @staticmethod
+    def _validate_task_scope(state: GoalState, task) -> str | None:
+        """Reject production changes outside the planner's declared scope.
+
+        Files already dirty when the Task was claimed are exempt; they belong
+        to the user's pre-existing work and are recorded in the Task baseline.
+        """
+        from harness.verification.snapshot import capture_dirty_file_hashes
+
+        scope = {str(path).replace("\\", "/").lstrip("./") for path in (task.scope_paths or []) if path}
+        if not scope:
+            return None
+        current = capture_dirty_file_hashes(state.workspace)
+        baseline = set(task.start_dirty_hashes or {})
+        changed = {path for path in current if path not in baseline}
+        outside = sorted(path for path in changed if path not in scope and not any(path.startswith(item.rstrip("/") + "/") for item in scope))
+        if outside:
+            return "worker changed files outside Task scope: " + ", ".join(outside[:12])
+        return None
 
     def _interrupted(self) -> bool:
         return self._cancel_event.is_set() or self._pause_event.is_set()

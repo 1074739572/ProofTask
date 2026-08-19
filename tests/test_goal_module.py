@@ -45,6 +45,25 @@ def test_plan_tasks_rejects_an_invalid_planner_result():
         plan_tasks("fix everything", "pytest -q", planner_runner=lambda **_: "")
 
 
+def test_planner_is_a_single_tool_free_contract_call():
+    seen = {}
+
+    def planner(**kwargs):
+        seen.update(kwargs)
+        return (
+            '[{"name":"limit requests","behavior":"each user is limited",'
+            '"acceptance_cases":[{"id":"AC1","given":"a user exceeds the limit",'
+            '"when":"a request arrives","then":"the request is rejected"}],'
+            '"test_selectors":[],"depends_on":[]}]'
+        )
+
+    plans = plan_tasks("limit requests", "pytest -q", planner_runner=planner)
+
+    assert len(plans) == 1
+    assert seen["max_rounds"] == 1
+    assert seen["tools_override"] == ()
+
+
 def test_engine_rejects_illegal_transition():
     state = GoalState.new(target="t", verification="v", workspace="w")
     try:

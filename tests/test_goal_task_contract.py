@@ -19,13 +19,42 @@ def test_plan_binds_only_catalog_selectors():
     plans = parse_plan(
         '[{"name":"pages","behavior":"all pages return",'
         '"acceptance_cases":[{"id":"AC1","given":"pages","when":"listed","then":"none skipped"}],'
-        '"test_selectors":["tests/test_api.py::test_lists_all_pages"],"depends_on":[]}]',
+            '"test_selectors":["tests/test_api.py::test_lists_all_pages"],"depends_on":[],'
+            '"case_selectors":{"AC1":["tests/test_api.py::test_lists_all_pages"]}}]',
         test_catalog=_catalog(),
     )
     assert plans is not None
     assert isinstance(plans[0], TaskPlan)
     assert plans[0].verification_spec.source == "discovered"
     assert plans[0].verification_spec.selectors == ("tests/test_api.py::test_lists_all_pages",)
+
+
+def test_plan_requires_explicit_case_mapping_when_mapping_is_present():
+    raw = ('[{"name":"pages","behavior":"all pages return",'
+           '"acceptance_cases":[{"id":"AC1","given":"pages","when":"listed","then":"none skipped"}],'
+           '"test_selectors":["tests/test_api.py::test_lists_all_pages"],"depends_on":[],'
+           '"case_selectors":{"AC2":["tests/test_api.py::test_lists_all_pages"]}}]')
+    assert parse_plan(raw, test_catalog=_catalog()) is None
+
+
+def test_worker_scope_gate_ignores_preexisting_files_and_rejects_new_outside_scope(monkeypatch, tmp_path):
+    from harness.goal import runner as runner_mod
+    from harness.tasks import Task
+
+    state = GoalState.new(target="x", verification="pytest -q", workspace=str(tmp_path))
+    task = Task(
+        id="task_scope", subject="x", description="x", status="in_progress", owner="goal:x",
+        blockedBy=[], scope_paths=["src"], start_dirty_hashes={"README.md": "old"},
+    )
+    monkeypatch.setattr("harness.verification.snapshot.capture_dirty_file_hashes", lambda _workspace: {
+        "README.md": "changed", "src/app.py": "new", "docs/extra.md": "new",
+    })
+
+    error = runner_mod.GoalRunner._validate_task_scope(state, task)
+
+    assert error is not None
+    assert "docs/extra.md" in error
+    assert "README.md" not in error
 
 
 def test_unknown_selector_requires_test_generation():
@@ -197,7 +226,7 @@ def test_test_generation_uses_writer_and_requires_failing_baseline(tmp_path, mon
     monkeypatch.setattr(
         runner_mod,
         "run_agent_task",
-        lambda **kwargs: calls.append(kwargs["agent_type"]) or '{"test_selectors":["tests/test_new.py::test_new"]}',
+        lambda **kwargs: calls.append(kwargs["agent_type"]) or '{"test_selectors":["tests/test_new.py::test_new"],"case_selectors":{"AC1":["tests/test_new.py::test_new"]}}',
     )
     catalogs = iter((
         TestCatalog(),
@@ -236,7 +265,7 @@ def test_test_generation_receives_and_preserves_cross_task_impact_context(tmp_pa
     monkeypatch.setattr(
         runner_mod,
         "run_agent_task",
-        lambda **kwargs: prompts.append(kwargs["prompt"]) or '{"test_selectors":["tests/test_new.py::test_new"]}',
+        lambda **kwargs: prompts.append(kwargs["prompt"]) or '{"test_selectors":["tests/test_new.py::test_new"],"case_selectors":{"AC1":["tests/test_new.py::test_new"]}}',
     )
     catalogs = iter((
         TestCatalog(),
@@ -263,7 +292,7 @@ def test_test_generation_rejects_a_passing_baseline(tmp_path, monkeypatch):
 
     task, state = _needs_generation_task(tmp_path, monkeypatch)
     monkeypatch.setattr(runner_mod, "save_goal", lambda state: None)
-    monkeypatch.setattr(runner_mod, "run_agent_task", lambda **kwargs: '{"test_selectors":["tests/test_new.py::test_new"]}')
+    monkeypatch.setattr(runner_mod, "run_agent_task", lambda **kwargs: '{"test_selectors":["tests/test_new.py::test_new"],"case_selectors":{"AC1":["tests/test_new.py::test_new"]}}')
     catalogs = iter((
         TestCatalog(),
         TestCatalog(selectors=("tests/test_new.py::test_new",), test_files=("tests/test_new.py",)),
@@ -293,7 +322,7 @@ def test_test_generation_rolls_back_files_when_baseline_is_invalid(tmp_path, mon
 
     def writer(**kwargs):
         (tests_dir / "test_new.py").write_text("def test_new(): pass\n", encoding="utf-8")
-        return '{"test_selectors":["tests/test_new.py::test_new"]}'
+        return '{"test_selectors":["tests/test_new.py::test_new"],"case_selectors":{"AC1":["tests/test_new.py::test_new"]}}'
 
     monkeypatch.setattr(runner_mod, "save_goal", lambda state: None)
     monkeypatch.setattr(runner_mod, "run_agent_task", writer)
@@ -355,7 +384,7 @@ def test_draft_goal_pauses_after_a_failing_test_baseline_for_user_approval(tmp_p
     state.last_error = "old test generation failure"
     monkeypatch.setattr(runner_mod, "save_goal", lambda state: None)
     monkeypatch.setattr(runner_mod, "_emit_goal", lambda *args: None)
-    monkeypatch.setattr(runner_mod, "run_agent_task", lambda **kwargs: '{"test_selectors":["tests/test_new.py::test_new"]}')
+    monkeypatch.setattr(runner_mod, "run_agent_task", lambda **kwargs: '{"test_selectors":["tests/test_new.py::test_new"],"case_selectors":{"AC1":["tests/test_new.py::test_new"]}}')
     catalogs = iter((
         TestCatalog(),
         TestCatalog(selectors=("tests/test_new.py::test_new",), test_files=("tests/test_new.py",)),

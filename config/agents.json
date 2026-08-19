@@ -26,6 +26,41 @@
       "tools": ["read_file", "glob", "load_skill"],
       "system": "You clarify a coding Goal before any code or test file is written. Ask only for product decisions that cannot be learned from the repository. Never implement, edit files, invent test selectors, or start execution. Return only the requested JSON."
     },
+    "goal_discovery_requirement": {
+      "model_id": "mimo-v2.5-pro",
+      "reasoning_effort": "max",
+      "label": "Goal discovery: requirement evidence",
+      "tools": ["read_file"],
+      "system": "You are a read-only Goal discovery worker. Inspect only assigned files and return ONLY the requested JSON evidence report. Never modify files, run commands, request extra paths, or spawn subagents. Every claim must cite an assigned path and line range."
+    },
+    "goal_discovery_architecture": {
+      "model_id": "mimo-v2.5-pro",
+      "reasoning_effort": "max",
+      "label": "Goal discovery: architecture evidence",
+      "tools": ["read_file"],
+      "system": "You are a read-only Goal discovery worker. Inspect only assigned files and return ONLY the requested JSON evidence report. Never modify files, run commands, request extra paths, or spawn subagents. Every claim must cite an assigned path and line range."
+    },
+    "goal_discovery_implementation": {
+      "model_id": "mimo-v2.5-pro",
+      "reasoning_effort": "max",
+      "label": "Goal discovery: implementation evidence",
+      "tools": ["read_file"],
+      "system": "You are a read-only Goal discovery worker. Inspect only assigned files and return ONLY the requested JSON evidence report. Never modify files, run commands, request extra paths, or spawn subagents. Every claim must cite an assigned path and line range."
+    },
+    "goal_discovery_tests": {
+      "model_id": "mimo-v2.5-pro",
+      "reasoning_effort": "max",
+      "label": "Goal discovery: test evidence",
+      "tools": ["read_file"],
+      "system": "You are a read-only Goal discovery worker. Inspect only assigned files and return ONLY the requested JSON evidence report. Never modify files, run commands, request extra paths, or spawn subagents. Every claim must cite an assigned path and line range."
+    },
+    "goal_discovery_history": {
+      "model_id": "mimo-v2.5-pro",
+      "reasoning_effort": "max",
+      "label": "Goal discovery: history evidence",
+      "tools": ["read_file"],
+      "system": "You are a read-only Goal discovery worker. Inspect only assigned files and return ONLY the requested JSON evidence report. Never modify files, run commands, request extra paths, or spawn subagents. Every claim must cite an assigned path and line range."
+    },
     "goal_planner": {
       "model_id": "deepseek-v4-pro",
       "reasoning_effort": "max",
@@ -34,7 +69,7 @@
       "system": "You plan a Goal into independently verifiable Tasks. Inspect only with the provided read-only tools. Every Task needs concrete acceptance cases. You may bind only test selectors supplied by the system Test Catalog; never invent a path or command. If no listed selector proves the Task, request test generation in the requested structured plan. Never modify files or spawn subagents."
     },
     "goal_test_writer": {
-      "model_id": "deepseek-v4-flash",
+      "model_id": "mimo-v2.5-pro",
       "reasoning_effort": "max",
       "label": "Goal test writer (DeepSeek V4 Flash, max)",
       "tools": ["read_file", "write_file", "edit_file", "glob", "load_skill"],
@@ -61,7 +96,7 @@
       "system": "You inspect one completed Goal Task and its pending dependents for missing cross-Task coverage. Return only the requested JSON. Select add_tests only when a pending Task needs new integration or interface coverage; otherwise none. Do not modify files or ask the user."
     },
     "goal_worker": {
-      "model_id": "deepseek-v4-flash",
+      "model_id": "mimo-v2.5-pro",
       "reasoning_effort": "max",
       "label": "Goal implementation worker (DeepSeek V4 Flash, max)",
       "tools": ["bash", "read_file", "write_file", "edit_file", "glob", "load_skill"],

@@ -67,6 +67,11 @@ class Task:
     # Feature links are durable Task metadata, used to keep Goal/Feature
     # history attributable after a session is restarted.
     feature_ids: list[str] = field(default_factory=list)
+    # Planner-declared production scope. Machine gates compare worker diffs
+    # against this list before any verification result can advance the Task.
+    scope_paths: list[str] = field(default_factory=list)
+    evidence_refs: list[str] = field(default_factory=list)
+    discovery_revision: int = 0
 
     @property
     def name(self) -> str:
@@ -117,6 +122,9 @@ def create_task(
     skill_names: list[str] | None = None,
     verification_spec: dict | None = None,
     evaluation_required: bool = False,
+    scope_paths: list[str] | None = None,
+    evidence_refs: list[str] | None = None,
+    discovery_revision: int = 0,
 ) -> Task:
     spec = dict(verification_spec or {})
     task = Task(
@@ -133,6 +141,9 @@ def create_task(
         verification_spec=spec,
         verification_state=("needs_generation" if spec.get("source") == "needs_generation" else "not_started"),
         evaluation_required=evaluation_required,
+        scope_paths=list(scope_paths or []),
+        evidence_refs=list(evidence_refs or []),
+        discovery_revision=max(0, int(discovery_revision or 0)),
     )
     save_task(task)
     return task

@@ -135,6 +135,12 @@ def handle_goal_command(query: str, history: list, context: dict, binding: Any) 
         return cmd.get("error") or GOAL_USAGE
     try:
         if action == "status":
+            # A fresh Draft is the most actionable state. Do not let an old
+            # terminal goal hide a draft that is still discovering/planning.
+            from harness.goal.draft import format_draft, load_draft
+            draft = load_draft()
+            if draft is not None and draft.status not in {"consumed"}:
+                return format_draft(draft)
             status = runner.get_goal_status()
             return _handle_preview() if status == "No goal in this workspace." else status
         if action == "pause":
@@ -142,6 +148,13 @@ def handle_goal_command(query: str, history: list, context: dict, binding: Any) 
         if action == "cancel":
             return _handle_cancel(runner)
         if action == "resume":
+            from harness.goal.draft import GoalDraftError, format_draft, load_draft, resume_draft
+            draft = load_draft()
+            if draft is not None and draft.status == "paused":
+                try:
+                    return format_draft(resume_draft())
+                except GoalDraftError as exc:
+                    return str(exc)
             return _handle_resume(runner, history, context, binding)
         if action == "preview":
             return _handle_preview()
@@ -308,10 +321,10 @@ def handle_goal_draft_answer(text: str) -> str | None:
 def _handle_approve(runner, history: list, context: dict, binding: Any) -> str:
     from harness.goal.models import GoalState
     from harness.goal.runner import GoalRequest
-    from harness.goal.draft import GoalDraftError, approve_draft
+    from harness.goal.draft import GoalDraftError, validate_ready_draft, mark_draft_consumed, mark_draft_start_failed
 
     try:
-        draft = approve_draft()
+        draft = validate_ready_draft()
     except GoalDraftError as exc:
         return str(exc)
     request = GoalRequest(
@@ -334,8 +347,14 @@ def _handle_approve(runner, history: list, context: dict, binding: Any) -> str:
     )
     note = _start_precondition_note(request)
     if note is not None:
+        mark_draft_start_failed(note)
         return note
-    state = runner.start_goal(request, history=history, context=context, binding=binding)
+    try:
+        state = runner.start_goal(request, history=history, context=context, binding=binding)
+    except BaseException as exc:
+        mark_draft_start_failed(f"Goal start failed: {type(exc).__name__}: {exc}")
+        raise
+    mark_draft_consumed()
     assert isinstance(state, GoalState)
     return (
         f"Goal test preparation started: {state.id} [INITIALIZE]\n"

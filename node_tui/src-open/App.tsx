@@ -44,6 +44,20 @@ function terminalColumns(text: string): number {
   return width;
 }
 
+function truncateTerminalText(text: string, maxColumns: number): string {
+  if (terminalColumns(text) <= maxColumns) return text;
+  const limit = Math.max(1, maxColumns - 3);
+  let used = 0;
+  let result = '';
+  for (const ch of Array.from(text)) {
+    const width = (ch.codePointAt(0) || 0) >= 0x1100 ? 2 : 1;
+    if (used + width > limit) break;
+    result += ch;
+    used += width;
+  }
+  return `${result}...`;
+}
+
 function composerVisualLines(text: string, width: number): number {
   const columns = Math.max(20, width);
   return text.split('\n').reduce((sum, line) => sum + Math.max(1, Math.ceil(terminalColumns(line) / columns)), 0);
@@ -759,7 +773,9 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
     if (overlay()) {
       const o = overlay()!;
       const rows = Math.min(o.options.length, 8);
-      used += rows + 3; // overlay border(2) + content + hint
+      // Permission requests reserve one bounded command preview above their
+      // options. Long commands are truncated rather than wrapping into them.
+      used += rows + 3 + (o.kind === 'permission' ? 1 : 0);
     }
     return Math.max(3, h - used);
   };
@@ -778,6 +794,9 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
     const start = Math.max(0, Math.min(overlayIndex() - Math.floor(rows / 2), Math.max(0, total - rows)));
     return {options: o.options.slice(start, start + rows), start, rows, total};
   });
+  const permissionResource = () => overlay()?.kind === 'permission' ? overlay()?.options[0]?.description || '' : '';
+  const permissionPreview = () => truncateTerminalText(permissionResource(), Math.max(12, dims().width - 13));
+  const overlayHeight = () => (overlayWindow()?.rows ?? 0) + 3 + (overlay()?.kind === 'permission' ? 1 : 0);
   // Auto-dismiss toast after 2.5s via an independent timer. The clock-based
   // effect below would never fire while idle (now() only ticks when running).
   let toastTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1193,13 +1212,16 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
       <GoalView goal={goalSnapshot()!} decisions={goalDecisions()} now={now()} width={dims().width} height={viewportHeight()} />
     </Show>
     <Show when={overlay()}>
-      <box border borderStyle="rounded" borderColor={C.accent} title={` ${overlay()?.title} `} height={(overlayWindow()?.rows ?? 0) + 3} paddingX={1} flexDirection="column">
+      <box border borderStyle="rounded" borderColor={C.accent} title={` ${overlay()?.title} `} height={overlayHeight()} paddingX={1} flexDirection="column">
+        <Show when={overlay()?.kind === 'permission'}>
+          <text flexShrink={0} fg={C.text} wrapMode="none">Command: {permissionPreview()}</text>
+        </Show>
         <For each={overlayWindow()?.options ?? []}>{(option, i) => {
           const absoluteIndex = () => (overlayWindow()?.start ?? 0) + i();
           const active = () => absoluteIndex() === overlayIndex();
           return <box flexDirection="row" onMouseUp={(event: any) => { if (event?.button === 0) { setOverlayIndex(absoluteIndex()); selectOverlay(absoluteIndex()); } }}>
-            <text fg={active() ? C.primary : C.textMuted}>{active() ? '▶ ' : '  '}{option.name}</text>
-            {option.description ? <text fg={C.textMuted}>  {option.description}</text> : null}
+            <text fg={active() ? C.primary : C.textMuted} width={Math.min(22, Math.max(18, Math.floor(dims().width * 0.24)))} wrapMode="none" truncate>{active() ? '▶ ' : '  '}{option.name}</text>
+            {option.description && overlay()?.kind !== 'permission' ? <text flexGrow={1} minWidth={0} fg={C.textMuted} wrapMode="none" truncate>  {option.description}</text> : null}
           </box>;
         }}</For>
         <text fg={C.textMuted}>{overlayWindow()! && overlayWindow()!.total > overlayWindow()!.rows ? `${overlayIndex() + 1}/${overlayWindow()!.total} · ` : ''}↑↓ select · Enter confirm · Esc cancel</text>

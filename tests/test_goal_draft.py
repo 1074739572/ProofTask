@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from harness.goal.commands import parse_goal_command
-from harness.goal.draft import answer_draft, approve_draft, create_draft, load_draft
+from harness.goal.draft import answer_draft, approve_draft, create_draft, load_draft, resume_draft
 
 
 def _plan_json() -> str:
@@ -43,6 +43,105 @@ def test_draft_waits_for_clarification_before_planning(tmp_path):
     assert ready.task_plan[0]["verification_spec"]["source"] == "needs_generation"
 
 
+def test_draft_recognizes_questions_wrapped_by_agent_runner(tmp_path):
+    planner_called = False
+
+    def planner(**_):
+        nonlocal planner_called
+        planner_called = True
+        return _plan_json()
+
+    draft = create_draft(
+        "add rate limits",
+        workspace=tmp_path,
+        verification="python -m pytest -q",
+        intake_runner=lambda **_: (
+            "[goal_intake / deepseek-v4-pro] clarify verified coding goal (0 tools, 1.0s)\n\n"
+            '{"questions":["Should limits be per user or per API key?"]}'
+        ),
+        planner_runner=planner,
+    )
+
+    assert draft.status == "clarifying"
+    assert draft.questions == ["Should limits be per user or per API key?"]
+    assert not planner_called
+
+
+def test_draft_is_persisted_before_slow_intake(tmp_path):
+    observed = {}
+
+    def intake(**_):
+        persisted = load_draft(tmp_path)
+        observed["draft"] = persisted
+        return '{"questions":[]}'
+
+    draft = create_draft("add rate limits", workspace=tmp_path, verification="python -m pytest -q", intake_runner=intake, planner_runner=lambda **_: _plan_json())
+
+    assert observed["draft"] is not None
+    assert observed["draft"].stage in {"discovering", "intake"}
+    assert observed["draft"].input_hash
+    assert observed["draft"].last_heartbeat > 0
+    assert draft.stage == "planning" or draft.stage == "ready"
+
+
+def test_invalid_intake_json_pauses_draft_instead_of_planning(tmp_path):
+    with pytest.raises(ValueError, match="invalid JSON"):
+        create_draft(
+            "add rate limits",
+            workspace=tmp_path,
+            verification="python -m pytest -q",
+            intake_runner=lambda **_: "not json",
+            planner_runner=lambda **_: pytest.fail("planner must not run"),
+        )
+
+    draft = load_draft(tmp_path)
+    assert draft is not None
+    assert draft.status == "paused"
+    assert draft.stage == "paused"
+    assert "invalid JSON" in (draft.last_error or "")
+
+
+def test_answer_replans_through_discovery_and_resume_retries_paused_draft(tmp_path):
+    discovery_calls = []
+
+    def discovery(**kwargs):
+        discovery_calls.append(kwargs["draft"].target)
+        return {
+            "repo_files": ["src/rate.py"],
+            "evidence": [{"id": "E1", "path": "src/rate.py"}],
+            "jobs": [], "revision": 2,
+        }
+
+    def planner(**_):
+        return ('[{"name":"limit requests","behavior":"each user is limited",'
+                '"acceptance_cases":[{"id":"AC1","given":"a user exceeds the limit",'
+                '"when":"a request arrives","then":"the request is rejected"}],'
+                '"test_selectors":[],"depends_on":[],"scope_paths":["src/rate.py"],'
+                '"evidence_refs":["E1"],"test_strategy":"generated focused test"}]')
+
+    draft = create_draft(
+        "add rate limits", workspace=tmp_path, verification="python -m pytest -q",
+        intake_runner=lambda **_: '{"questions":["scope?"]}',
+    )
+    ready = answer_draft(
+        "per user", workspace=tmp_path, planner_runner=planner,
+        discovery_runner=discovery,
+    )
+
+    assert ready.status == "ready"
+    assert discovery_calls == ["add rate limits"]
+
+    ready.status = "paused"
+    from harness.goal.draft import save_draft
+    save_draft(ready, tmp_path)
+    resumed = resume_draft(
+        workspace=tmp_path, planner_runner=planner,
+        discovery_runner=discovery,
+    )
+    assert resumed.status == "ready"
+    assert len(discovery_calls) == 2
+
+
 def test_approval_requires_a_ready_plan_and_preserves_it(tmp_path):
     draft = create_draft(
         "add rate limits",
@@ -57,6 +156,33 @@ def test_approval_requires_a_ready_plan_and_preserves_it(tmp_path):
     assert draft.status == "ready"
     assert approved.status == "approved"
     assert approved.task_plan == draft.task_plan
+
+
+def test_start_failure_restores_ready_draft(monkeypatch, tmp_path):
+    import harness.goal.commands as commands
+    import harness.goal.draft as draft_module
+
+    create_draft(
+        "add rate limits",
+        workspace=tmp_path,
+        verification="python -m pytest -q",
+        intake_runner=lambda **_: '{"questions":[]}',
+        planner_runner=lambda **_: _plan_json(),
+    )
+    approve_draft(workspace=tmp_path)
+    monkeypatch.setattr(commands, "_start_precondition_note", lambda _request: "startup unavailable")
+    monkeypatch.setattr(draft_module, "get_workdir", lambda: tmp_path)
+
+    class Runner:
+        pass
+
+    result = commands._handle_approve(Runner(), [], {}, None)
+
+    assert result == "startup unavailable"
+    draft = load_draft(tmp_path)
+    assert draft.status == "ready"
+    assert draft.stage == "ready"
+    assert draft.last_error == "startup unavailable"
 
 
 def test_approved_draft_plan_seeds_the_runner(monkeypatch, tmp_path):

@@ -92,6 +92,35 @@ def _validate_script_path(tokens: list[str], workspace: Path) -> str | None:
         return None
     if len(tokens) < 2:
         return f"{prog} requires a repository script path"
+    if prog == "node":
+        # Node test commands commonly begin with loader/test flags. Validate
+        # every repository test path while ignoring flag values such as `tsx`.
+        candidates: list[str] = []
+        skip_next = False
+        for token in tokens[1:]:
+            if skip_next:
+                skip_next = False
+                continue
+            if token in {"--import", "--require", "--loader", "--test-name-pattern"}:
+                skip_next = True
+                continue
+            if token.startswith("-"):
+                continue
+            if token == "tsx":
+                continue
+            candidates.append(token)
+        if not candidates:
+            return "node test command requires a repository test path"
+        for script in candidates:
+            if script.startswith(("/", "\\")) or ":" in script[:2]:
+                return f"node script must be a relative repository path, got {script!r}"
+            try:
+                resolved = (workspace / script).resolve()
+            except OSError as exc:
+                return f"invalid script path {script!r}: {exc}"
+            if not resolved.is_relative_to(workspace.resolve()) or not resolved.is_file():
+                return f"node script {script!r} does not exist in the workspace"
+        return None
     script = tokens[1]
     if script.startswith(("-", "/", "\\")) or ":" in script[:2]:
         return f"{prog} script must be a relative repository path, got {script!r}"

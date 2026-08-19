@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Callable
 
 from harness.agent.cancel import is_cancelled
+from harness.agent.recovery import RecoveryState, with_retry
 from harness.agents.registry import get_agent_profile, validate_agent_model
 from harness.hooks import trigger_hooks
 from harness.llm import create_message
@@ -131,6 +132,7 @@ class AgentTaskStats:
 
 def _tools_for_agent(
     allowed: list[str], cwd: Path | None = None, write_roots: tuple[str, ...] | None = None,
+    read_roots: tuple[str, ...] | None = None, read_paths: tuple[str, ...] | None = None,
 ) -> tuple[list[dict], dict]:
     unknown = sorted(set(allowed) - set(_BASE_TOOL_DEFS))
     if unknown:
@@ -170,6 +172,22 @@ def _tools_for_agent(
             handlers["write_file"] = guarded_write
         if "edit_file" in handlers:
             handlers["edit_file"] = guarded_edit
+    if read_roots is not None or read_paths is not None:
+        roots = tuple((bound_cwd / root).resolve() for root in (read_roots or ()))
+        paths = tuple((bound_cwd / path).resolve() for path in (read_paths or ()))
+
+        def guarded_read(*, path: str, limit: int | None = None, offset: int | None = None) -> str:
+            try:
+                candidate = (bound_cwd / path).resolve()
+            except OSError as exc:
+                return f"Read blocked: invalid path {path!r}: {exc}"
+            allowed_path = candidate in paths or any(candidate.is_relative_to(root) for root in roots)
+            if not allowed_path:
+                return "Read blocked: this agent may only read its assigned discovery paths."
+            return run_read(path=path, limit=limit, offset=offset, cwd=bound_cwd)
+
+        if "read_file" in handlers:
+            handlers["read_file"] = guarded_read
     if "rag_search" in allowed:
         from harness.rag.tools import run_rag_search
 
@@ -193,6 +211,9 @@ def run_agent_task(
     deadline: float | None = None,
     stats: AgentTaskStats | None = None,
     write_roots: tuple[str, ...] | None = None,
+    tools_override: tuple[str, ...] | None = None,
+    read_roots: tuple[str, ...] | None = None,
+    read_paths: tuple[str, ...] | None = None,
 ) -> str:
     error = validate_agent_model(agent_type)
     if error:
@@ -206,7 +227,11 @@ def run_agent_task(
     if not agent_cwd.is_relative_to(base_workdir):
         return f"Error: agent working directory escapes workspace: {agent_cwd}"
     try:
-        tools, handlers = _tools_for_agent(profile.tools, agent_cwd, write_roots=write_roots)
+        allowed_tools = profile.tools if tools_override is None else tools_override
+        tools, handlers = _tools_for_agent(
+            allowed_tools, agent_cwd, write_roots=write_roots,
+            read_roots=read_roots, read_paths=read_paths,
+        )
     except ValueError as exc:
         return f"Error: {exc}"
     workdir = str(agent_cwd)
@@ -248,16 +273,20 @@ def run_agent_task(
 
         def request_model_response() -> None:
             try:
+                recovery = RecoveryState()
                 response_queue.put(
                     (
                         "response",
-                        create_message(
-                            model_id=profile.model_id,
-                            reasoning_effort=profile.reasoning_effort,
-                            system=system,
-                            messages=messages,
-                            tools=tools,
-                            max_tokens=8000,
+                        with_retry(
+                            lambda: create_message(
+                                model_id=profile.model_id,
+                                reasoning_effort=profile.reasoning_effort,
+                                system=system,
+                                messages=messages,
+                                tools=tools,
+                                max_tokens=8000,
+                            ),
+                            recovery,
                         ),
                     )
                 )

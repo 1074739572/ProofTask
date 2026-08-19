@@ -69,7 +69,17 @@ const longOverlay: Overlay = {
   })),
 };
 
-const setup = await testRender(() => <App debugEntries={emptyMode ? [] : fakeEntries} debugOverlay={withOverlay ? (process.argv.includes('long') ? longOverlay : fakeOverlay) : undefined} debugUsage={emptyMode ? {input: 0, output: 0, cacheRead: 0} : {input: 96100, output: 32300, cacheRead: 70153}} debugUsageOpen={usageMode} />, {width, height});
+const longPermissionOverlay: Overlay = {
+  kind: 'permission', id: 'perm-long', title: 'Allow bash?',
+  options: [
+    {name: 'Allow once', description: 'npm run test -- --test-concurrency=1 --reporter=spec --project integration --grep "usage dashboard preserves all permission options when the command is substantially longer than the terminal width"', value: 'allow'},
+    {name: 'Allow session', description: 'Remember until this TUI exits', value: 'session'},
+    {name: 'Deny', description: 'Block this tool call', value: 'deny'},
+  ],
+};
+
+const debugOverlay = !withOverlay ? undefined : process.argv.includes('permission-long') ? longPermissionOverlay : process.argv.includes('long') ? longOverlay : fakeOverlay;
+const setup = await testRender(() => <App debugEntries={emptyMode ? [] : fakeEntries} debugOverlay={debugOverlay} debugUsage={emptyMode ? {input: 0, output: 0, cacheRead: 0} : {input: 96100, output: 32300, cacheRead: 70153}} debugUsageOpen={usageMode} />, {width, height});
 await setup.flush({maxPasses: 5});
 await setup.renderOnce();
 await setup.waitForVisualIdle({quietFrames: 2, maxFrames: 30});
