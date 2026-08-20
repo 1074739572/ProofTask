@@ -171,12 +171,12 @@ def goal_event_payload(state: GoalState) -> dict[str, Any]:
     }
 
 
-def _emit_goal(event_type: str, state: GoalState) -> None:
-    _emit(event_type, **goal_event_payload(state))
+def _emit_goal(event_type: str, state: GoalState, **metadata: Any) -> None:
+    _emit(event_type, **goal_event_payload(state), **metadata)
 
 
-def emit_current_goal_status(*, include_terminal: bool = True) -> GoalState | None:
-    """Emit the persisted Goal snapshot for TUI hydration and `/goal status`."""
+def emit_current_goal_status(*, include_terminal: bool = True, hydrated: bool = False) -> GoalState | None:
+    """Emit the persisted Goal snapshot for startup hydration or `/goal status`."""
     try:
         state = load_goal()
     except GoalStoreError as exc:
@@ -186,7 +186,10 @@ def emit_current_goal_status(*, include_terminal: bool = True) -> GoalState | No
         return None
     terminal = {GoalStatus.DONE.value, GoalStatus.FAILED.value, GoalStatus.CANCELLED.value}
     if include_terminal or state.status not in terminal:
-        _emit_goal("goal_status", state)
+        if hydrated:
+            _emit_goal("goal_status", state, hydrated=True)
+        else:
+            _emit_goal("goal_status", state)
     return state
 
 

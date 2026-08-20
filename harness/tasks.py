@@ -9,9 +9,9 @@ from __future__ import annotations
 
 import json
 import os
-import random
 import tempfile
 import time
+import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -128,7 +128,7 @@ def create_task(
 ) -> Task:
     spec = dict(verification_spec or {})
     task = Task(
-        id=f"task_{int(time.time())}_{random.randint(0, 9999):04d}",
+        id=f"task_{int(time.time())}_{uuid.uuid4().hex[:12]}",
         subject=subject,
         description=description,
         status="pending",

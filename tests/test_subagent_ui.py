@@ -36,8 +36,8 @@ def _captured(sink: io.StringIO) -> list[dict]:
     return out
 
 
-def _response(content: list[dict]):
-    return mock.Mock(content=content)
+def _response(content: list[dict], *, stop_reason: str = "end_turn"):
+    return mock.Mock(content=content, stop_reason=stop_reason)
 
 
 def test_renderer_downgrades_unicode_for_legacy_console(monkeypatch):
@@ -143,6 +143,29 @@ def test_goal_subagent_passes_its_configured_reasoning_effort():
 
     assert create.call_args.kwargs["model_id"] == "deepseek-v4-pro"
     assert create.call_args.kwargs["reasoning_effort"] == "max"
+
+
+def test_subagent_uses_a_call_specific_output_budget_and_records_exhaustion():
+    from harness.agents.runner import AgentTaskStats, run_agent_task
+
+    stats = AgentTaskStats()
+    with mock.patch(
+        "harness.agents.runner.create_message",
+        return_value=_response(
+            [{"type": "text", "text": "incomplete"}],
+            stop_reason="max_tokens",
+        ),
+    ) as create:
+        run_agent_task(
+            "large plan",
+            "return JSON",
+            "goal_planner",
+            max_tokens=32_000,
+            stats=stats,
+        )
+
+    assert create.call_args.kwargs["max_tokens"] == 32_000
+    assert stats.stop_reason == "max_tokens"
 
 
 def test_run_agent_task_emits_nested_tools(event_sink):

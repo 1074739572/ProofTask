@@ -122,6 +122,54 @@ def test_discovery_and_planning_statuses_match_the_active_stage(tmp_path, monkey
     assert observed == [("discovering", "discovering")]
 
 
+def test_draft_event_includes_every_planned_task():
+    from harness.goal.draft import GoalDraft, _draft_event_payload
+
+    draft = GoalDraft(
+        id="large-draft",
+        target="large goal",
+        verification="python -m pytest -q",
+        verification_source="test",
+        status="ready",
+        stage="ready",
+        task_plan=[
+            {"name": f"task {index}", "behavior": f"behavior {index}"}
+            for index in range(20)
+        ],
+    )
+
+    payload = _draft_event_payload(draft, event="completed")
+
+    assert payload["task_count"] == 20
+    assert len(payload["tasks"]) == 20
+    assert payload["tasks"][-1]["name"] == "task 19"
+
+
+def test_current_draft_status_distinguishes_hydration_from_explicit_status(monkeypatch):
+    from harness.goal import draft as draft_mod
+
+    current = draft_mod.GoalDraft(
+        id="draft-status",
+        target="keep normal chat available",
+        verification="python -m pytest -q",
+        verification_source="test",
+        status="ready",
+        stage="ready",
+    )
+    emitted = []
+    monkeypatch.setattr(draft_mod, "load_draft", lambda *_args, **_kwargs: current)
+    monkeypatch.setattr(
+        draft_mod,
+        "_emit_draft_event",
+        lambda value, *, event="updated", message=None: emitted.append(event),
+    )
+
+    draft_mod.emit_current_draft_status()
+    draft_mod.emit_current_draft_status(event="status")
+
+    assert emitted == ["hydrated", "status"]
+
+
 def test_invalid_intake_json_pauses_draft_instead_of_planning(tmp_path):
     with pytest.raises(ValueError, match="invalid JSON"):
         create_draft(

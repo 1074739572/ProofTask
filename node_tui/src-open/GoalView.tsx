@@ -2,7 +2,10 @@ import {For, Show} from 'solid-js';
 import {C} from './theme.ts';
 export {
   goalDraftHasQuestion,
+  goalDraftEventShouldFocus,
   goalDraftIsBusy,
+  goalBlocksChat,
+  goalEventShouldFocus,
   goalIsActive,
   goalSnapshotFromEvent,
   goalDraftSnapshotFromEvent,

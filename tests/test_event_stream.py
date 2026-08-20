@@ -185,7 +185,11 @@ def test_completion_request_empty_text_no_crash(fake_workdir):
 
 
 def test_draft_answer_requires_an_actual_unanswered_question(tmp_path, monkeypatch):
-    from harness.event_stream import _active_goal_draft_stage, _is_goal_draft_answer
+    from harness.event_stream import (
+        _active_goal_draft_stage,
+        _is_goal_background_command,
+        _is_goal_draft_answer,
+    )
     from harness.goal.draft import GoalDraft
 
     draft = GoalDraft(
@@ -198,8 +202,50 @@ def test_draft_answer_requires_an_actual_unanswered_question(tmp_path, monkeypat
     assert _active_goal_draft_stage() == "intake"
 
     draft.questions = ["Which scope?"]
-    assert _is_goal_draft_answer("per user")
+    assert not _is_goal_draft_answer("per user")
+    assert not _is_goal_draft_answer("per user", goal_context=False)
+    assert _is_goal_draft_answer("per user", goal_context=True)
+    assert _is_goal_background_command("per user", goal_context=True)
+    assert _is_goal_background_command("/goal answer per user")
     draft.status = "discovering"
     draft.stage = "discovering"
-    assert not _is_goal_draft_answer("per user")
+    assert not _is_goal_draft_answer("per user", goal_context=True)
     assert _active_goal_draft_stage() == "discovering"
+
+
+def test_user_turn_only_consumes_draft_answer_with_goal_context(monkeypatch):
+    from harness.event_stream import _run_user_turn
+    from harness.goal.draft import GoalDraft
+
+    draft = GoalDraft(
+        id="draft-context",
+        target="improve input",
+        verification="pytest -q",
+        verification_source="test",
+        status="clarifying",
+        stage="intake",
+        questions=["Which scope?"],
+    )
+    emitted = []
+    answers = []
+    monkeypatch.setattr("harness.goal.draft.load_draft", lambda *_args, **_kwargs: draft)
+    monkeypatch.setattr("harness.goal.runner.is_goal_running", lambda: False)
+    monkeypatch.setattr("harness.rag.file_mode.is_file_mode", lambda: True)
+    monkeypatch.setattr("harness.rag.file_mode.handle_file_mode_turn", lambda text: f"chat:{text}")
+    monkeypatch.setattr(
+        "harness.goal.commands.handle_goal_draft_answer",
+        lambda text: answers.append(text) or f"draft:{text}",
+    )
+    monkeypatch.setattr(
+        "harness.event_stream.emit",
+        lambda event_type, **payload: emitted.append((event_type, payload)),
+    )
+
+    _run_user_turn("ordinary chat", [], {}, None, goal_context=False)
+    assert answers == []
+    assert ("assistant_message", {"text": "chat:ordinary chat"}) in emitted
+
+    emitted.clear()
+    _run_user_turn("only src", [], {}, None, goal_context=True)
+    assert answers == ["only src"]
+    assert ("assistant_message", {"text": "draft:only src"}) in emitted

@@ -159,6 +159,26 @@ export function goalIsActive(goal: GoalSnapshot | null | undefined): boolean {
   return Boolean(goal && ACTIVE_GOAL_STATUSES.has(goal.status));
 }
 
+export function goalBlocksChat(goal: GoalSnapshot | null | undefined, running: boolean): boolean {
+  return running && goalIsActive(goal);
+}
+
+export function goalEventShouldFocus(event: any, goal: GoalSnapshot | null | undefined): boolean {
+  const type = stringValue(event?.type);
+  if (type === 'goal_status') return event?.hydrated !== true || goalIsActive(goal);
+  return type === 'goal_started' || type === 'goal_phase' || type === 'goal_stopped';
+}
+
+export function goalDraftEventShouldFocus(
+  event: any,
+  draft: GoalDraftSnapshot | null | undefined,
+  goal: GoalSnapshot | null | undefined,
+): boolean {
+  if (!draft || goalIsActive(goal)) return false;
+  if (draft.status === 'consumed' || draft.event === 'discarded') return false;
+  return stringValue(event?.event) !== 'hydrated';
+}
+
 export function goalDraftHasQuestion(draft: GoalDraftSnapshot | null | undefined): boolean {
   return Boolean(draft?.status === 'clarifying' && draft.question?.trim());
 }

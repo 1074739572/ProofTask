@@ -224,6 +224,43 @@ def test_initialize_recovers_orphan_task_written_before_goal_checkpoint(tmp_path
     assert len(tasks.list_tasks(include_archived=True)) == 1
 
 
+def test_initialize_persists_every_task_in_a_large_plan(tmp_path, monkeypatch):
+    import harness.goal.runner as runner_mod
+    import harness.tasks as tasks
+
+    monkeypatch.setattr(tasks, "TASKS_DIR", tmp_path / ".tasks")
+    state = GoalState.new(target="large goal", verification="python -m pytest -q", workspace=str(tmp_path))
+    state.execution_approved = False
+    state.task_plan = [
+        {
+            "name": f"task {index + 1}",
+            "behavior": f"deliver behavior {index + 1}",
+            "depends_on": [f"task {index}"] if index else [],
+            "acceptance_cases": [{
+                "id": "AC1",
+                "given": "the preceding task is complete",
+                "when": f"behavior {index + 1} is used",
+                "then": f"deliverable {index + 1} is observable",
+            }],
+            "verification_spec": {"source": "generated"},
+        }
+        for index in range(20)
+    ]
+    monkeypatch.setattr(runner_mod, "save_goal", lambda state: None)
+    monkeypatch.setattr(runner_mod, "_emit_goal", lambda *args: None)
+
+    GoalRunner(state=state, history=[], context={}, binding=None)._initialize(state)
+
+    persisted = tasks.list_tasks()
+    assert len(state.task_ids) == 20
+    assert len(state.task_name_ids) == 20
+    assert len(persisted) == 20
+    assert len({task.id for task in persisted}) == 20
+    assert all(len(task.id.rsplit("_", 1)[-1]) == 12 for task in persisted)
+    final_task = tasks.load_task(state.task_name_ids["task 20"])
+    assert final_task.blockedBy == [state.task_name_ids["task 19"]]
+
+
 def test_repair_planning_pauses_after_repeated_task_repairs(tmp_path, monkeypatch):
     import harness.goal.runner as runner_mod
     import harness.tasks as tasks
@@ -1267,17 +1304,25 @@ def test_goal_status_hydration_skips_old_terminal_goal(monkeypatch):
     state = GoalState.new(target="ship behavior", verification="pytest -q", workspace=".")
     emitted = []
     monkeypatch.setattr(runner_mod, "load_goal", lambda: state)
-    monkeypatch.setattr(runner_mod, "_emit_goal", lambda event_type, current: emitted.append((event_type, current.status)))
+    monkeypatch.setattr(
+        runner_mod,
+        "_emit_goal",
+        lambda event_type, current, **metadata: emitted.append((event_type, current.status, metadata)),
+    )
 
     runner_mod.emit_current_goal_status(include_terminal=False)
-    assert emitted == [("goal_status", "running")]
+    assert emitted == [("goal_status", "running", {})]
+
+    emitted.clear()
+    runner_mod.emit_current_goal_status(include_terminal=False, hydrated=True)
+    assert emitted == [("goal_status", "running", {"hydrated": True})]
 
     state.status = "done"
     runner_mod.emit_current_goal_status(include_terminal=False)
-    assert emitted == [("goal_status", "running")]
+    assert emitted == [("goal_status", "running", {"hydrated": True})]
 
     runner_mod.emit_current_goal_status(include_terminal=True)
-    assert emitted[-1] == ("goal_status", "done")
+    assert emitted[-1] == ("goal_status", "done", {})
 
 
 def test_goal_snapshot_degrades_missing_task_state_without_breaking_runner(monkeypatch):

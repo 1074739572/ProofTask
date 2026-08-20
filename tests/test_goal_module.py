@@ -1,11 +1,13 @@
 """Core tests for strict Goal task persistence and planning."""
 
+import json
+
 from harness.goal.commands import parse_goal_command, parse_goal_subcommand
 from harness.goal.engine import GoalEngine, GoalTransitionError
 from harness.goal.models import GOAL_SCHEMA_VERSION, GoalPhase, GoalState
 import pytest
 
-from harness.goal.planner import GoalPlanningError, build_plan_prompt, plan_tasks
+from harness.goal.planner import GoalPlanningError, build_plan_prompt, parse_plan, plan_tasks
 from harness.verification.catalog import TestCatalog
 from harness.goal.store import (
     GoalLeaseError,
@@ -62,7 +64,40 @@ def test_planner_is_a_single_tool_free_contract_call():
 
     assert len(plans) == 1
     assert seen["max_rounds"] == 1
+    assert seen["max_tokens"] == 32_000
     assert seen["tools_override"] == ()
+
+
+def test_planner_does_not_cap_a_large_goal_at_eight_tasks():
+    entries = []
+    for index in range(20):
+        entries.append({
+            "name": f"task {index + 1}",
+            "behavior": f"deliver behavior {index + 1}",
+            "acceptance_cases": [{
+                "id": "AC1",
+                "given": "the preceding work is available",
+                "when": f"behavior {index + 1} is used",
+                "then": f"deliverable {index + 1} is observable",
+            }],
+            "test_selectors": [],
+            "depends_on": [f"task {index}"] if index else [],
+        })
+
+    plans = parse_plan(json.dumps(entries))
+
+    assert plans is not None
+    assert len(plans) == 20
+    assert plans[-1].depends_on == ("task 19",)
+
+
+def test_planner_reports_output_token_exhaustion_precisely():
+    def exhausted(**kwargs):
+        kwargs["stats"].stop_reason = "max_tokens"
+        return "I need to continue reasoning about the plan"
+
+    with pytest.raises(GoalPlanningError, match="exhausted its 32000-token output budget"):
+        plan_tasks("large goal", "pytest -q", planner_runner=exhausted)
 
 
 def test_planner_prompt_keeps_evidence_visible_when_manifest_has_a_large_repo_map():
@@ -78,7 +113,13 @@ def test_planner_prompt_keeps_evidence_visible_when_manifest_has_a_large_repo_ma
             "symbol": "P0-01",
             "lines": [53, 112],
             "source_job": "requirement-1",
-        }],
+        }, *[{
+            "id": f"E{index}",
+            "path": f"node_tui/src/feature_{index}.ts",
+            "claim": f"Independent deliverable {index} must be implemented.",
+            "lines": [index, index],
+            "source_job": "requirement-1",
+        } for index in range(2, 61)]],
         "jobs": [{"id": "requirement-1", "role": "requirement", "status": "done"}],
     }
 
@@ -91,9 +132,12 @@ def test_planner_prompt_keeps_evidence_visible_when_manifest_has_a_large_repo_ma
 
     assert '"id": "E1"' in prompt
     assert "Queued messages must be submitted" in prompt
+    assert '"id": "E60"' in prompt
     assert "node_tui/docs/requirements.md" in prompt
+    assert "scope_candidates or evidence.path" in prompt
     assert "generated/file_49999.ts" not in prompt
-    assert len(prompt) < 30_000
+    assert "There is no target Task count" in prompt
+    assert len(prompt) < 100_000
 
 
 def test_engine_rejects_illegal_transition():

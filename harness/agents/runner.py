@@ -138,7 +138,7 @@ class AgentTaskStats:
 
     llm_rounds: int = 0
     interrupted: bool = False
-    stop_reason: str = "completed"  # completed | cancelled | deadline | max_rounds
+    stop_reason: str = "completed"  # completed | cancelled | deadline | max_rounds | max_tokens
 
 
 def _tools_for_agent(
@@ -226,6 +226,7 @@ def run_agent_task(
     read_roots: tuple[str, ...] | None = None,
     read_paths: tuple[str, ...] | None = None,
     reasoning_effort_override: str | None = None,
+    max_tokens: int = 8_000,
 ) -> str:
     error = validate_agent_model(agent_type, reasoning_effort=reasoning_effort_override)
     if error:
@@ -304,7 +305,7 @@ def run_agent_task(
                                 system=system,
                                 messages=messages,
                                 tools=tools,
-                                max_tokens=8000,
+                                max_tokens=max(1, int(max_tokens)),
                             ),
                             recovery,
                         ),
@@ -342,6 +343,8 @@ def run_agent_task(
         response = value
         if stats is not None:
             stats.llm_rounds += 1
+            if getattr(response, "stop_reason", None) == "max_tokens":
+                stats.stop_reason = "max_tokens"
 
         # Extract thinking text for this round (truncated to 50 chars)
         thinking_text = extract_text(response.content) or ""

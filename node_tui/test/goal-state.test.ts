@@ -1,9 +1,12 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  goalBlocksChat,
+  goalDraftEventShouldFocus,
   goalDraftHasQuestion,
   goalDraftIsBusy,
   goalDraftSnapshotFromEvent,
+  goalEventShouldFocus,
   goalNextActionPresentation,
   goalSnapshotFromEvent,
   mergeGoalDiscoveryEvent,
@@ -37,6 +40,28 @@ test('a real clarification checkpoint accepts an answer and is not busy', () => 
   const snapshot = draft({question: '按用户还是按 API key 限流？', question_count: 1});
   assert.equal(goalDraftHasQuestion(snapshot), true);
   assert.equal(goalDraftIsBusy(snapshot), false);
+});
+
+test('startup hydration keeps inactive Goal and Draft snapshots out of normal chat', () => {
+  const pausedGoal = goal({status: 'paused', phase: 'paused'});
+  const waitingDraft = draft({status: 'clarifying', question: 'Which scope?', question_count: 1});
+  const staleBusyDraft = draft({status: 'discovering', stage: 'discovering'});
+
+  assert.equal(goalEventShouldFocus({type: 'goal_status', hydrated: true}, pausedGoal), false);
+  assert.equal(goalDraftEventShouldFocus({type: 'goal_draft_status', event: 'hydrated'}, waitingDraft, pausedGoal), false);
+  assert.equal(goalDraftEventShouldFocus({type: 'goal_draft_status', event: 'hydrated'}, staleBusyDraft, null), false);
+  assert.equal(goalBlocksChat(pausedGoal, true), false);
+});
+
+test('active and explicitly requested Goal events focus their workflow pages', () => {
+  const activeGoal = goal();
+  const pausedGoal = goal({status: 'paused', phase: 'paused'});
+  const waitingDraft = draft({status: 'ready', stage: 'ready'});
+
+  assert.equal(goalEventShouldFocus({type: 'goal_status', hydrated: true}, activeGoal), true);
+  assert.equal(goalEventShouldFocus({type: 'goal_status'}, pausedGoal), true);
+  assert.equal(goalDraftEventShouldFocus({type: 'goal_draft_status', event: 'status'}, waitingDraft, pausedGoal), true);
+  assert.equal(goalBlocksChat(activeGoal, true), true);
 });
 
 test('discovery events update one visible job instead of duplicating it', () => {

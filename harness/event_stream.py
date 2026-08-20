@@ -1,7 +1,8 @@
 """JSONL event-stream entrypoint for the TypeScript Ink TUI.
 
 Protocol:
-- stdin: one JSON command per line, e.g. {"type":"user_message","text":"..."}
+- stdin: one JSON command per line, e.g.
+  {"type":"user_message","text":"...","goal_context":false}
 - stdout: one JSON event per line, emitted via harness.ui.events
 - stderr: diagnostics / legacy prints when unavoidable
 """
@@ -64,9 +65,9 @@ def _is_goal_control_command(query: str) -> bool:
     return parse_goal_subcommand(query) in ("status", "pause", "cancel")
 
 
-def _is_goal_background_command(query: str) -> bool:
+def _is_goal_background_command(query: str, *, goal_context: bool = False) -> bool:
     """Commands whose Draft/Goal setup may perform slow external work."""
-    if _is_goal_draft_answer(query):
+    if _is_goal_draft_answer(query, goal_context=goal_context):
         return True
     try:
         from harness.goal.commands import parse_goal_subcommand
@@ -76,9 +77,9 @@ def _is_goal_background_command(query: str) -> bool:
         return False
 
 
-def _is_goal_draft_answer(query: str) -> bool:
-    """A normal composer message answers the active clarification question."""
-    if not query.strip() or query.lstrip().startswith("/"):
+def _is_goal_draft_answer(query: str, *, goal_context: bool = False) -> bool:
+    """Whether a message explicitly submitted from the Draft view is an answer."""
+    if not goal_context or not query.strip() or query.lstrip().startswith("/"):
         return False
     try:
         from harness.goal.draft import load_draft
@@ -90,7 +91,7 @@ def _is_goal_draft_answer(query: str) -> bool:
 
 
 def _active_goal_draft_stage() -> str | None:
-    """Return the durable stage that currently owns Draft input, if any."""
+    """Return the durable Draft stage for progress diagnostics, if any."""
     try:
         from harness.goal.draft import load_draft
 
@@ -409,14 +410,22 @@ def _run_instant_slash_command(text: str, context: dict, history: list, binding,
     _emit_status(context, binding, history, running=running)
 
 
-def _run_user_turn(query: str, history: list, context: dict, binding, *, echo_user: bool = True) -> tuple[dict, bool, object]:
+def _run_user_turn(
+    query: str,
+    history: list,
+    context: dict,
+    binding,
+    *,
+    echo_user: bool = True,
+    goal_context: bool = False,
+) -> tuple[dict, bool, object]:
     """Run one user turn. Returns (possibly updated context, interrupted, binding)."""
     # Slash commands are internal instructions: never echo them as transcript
     # messages, regardless of echo_user. Feedback is delivered via log events.
     if echo_user and not query.strip().startswith("/"):
         emit("user_message", text=query, silent=False)
 
-    if _is_goal_draft_answer(query):
+    if _is_goal_draft_answer(query, goal_context=goal_context):
         from harness.goal.commands import handle_goal_draft_answer
 
         note = handle_goal_draft_answer(query)
@@ -609,7 +618,7 @@ def run_event_stream() -> None:
         cli_active=False,
     )
     state_lock = threading.Lock()
-    turn_queue: "queue.Queue[tuple[str, bool] | None]" = queue.Queue(maxsize=MAX_PENDING_TURNS)
+    turn_queue: "queue.Queue[tuple[str, bool, bool] | None]" = queue.Queue(maxsize=MAX_PENDING_TURNS)
     running = threading.Event()
     goal_turn_active = threading.Event()
     shutdown = threading.Event()
@@ -624,12 +633,12 @@ def run_event_stream() -> None:
             if item is None:
                 turn_queue.task_done()
                 break
-            query, echo_user = item
+            query, echo_user, goal_context = item
             # Most slash commands are instant, but Draft/Goal setup can spend
             # minutes in catalog/discovery/planning. Treat those as a real
             # turn so the TUI gets an active phase and heartbeat events.
-            is_background = _is_goal_background_command(query)
-            is_slash = query.strip().startswith("/") or _is_goal_draft_answer(query)
+            is_background = _is_goal_background_command(query, goal_context=goal_context)
+            is_slash = query.strip().startswith("/") or _is_goal_draft_answer(query, goal_context=goal_context)
             if not is_slash or is_background:
                 running.set()
                 emit("agent_start", phase="goal_draft" if is_background else "preparing")
@@ -637,7 +646,14 @@ def run_event_stream() -> None:
             _interrupted = False
             try:
                 with state_lock:
-                    context, _interrupted, binding = _run_user_turn(query, history, context, binding, echo_user=echo_user)
+                    context, _interrupted, binding = _run_user_turn(
+                        query,
+                        history,
+                        context,
+                        binding,
+                        echo_user=echo_user,
+                        goal_context=goal_context,
+                    )
                     _emit_status(context, binding, history, running=False)
             except Exception as exc:
                 emit("error", text=f"Turn failed: {exc}")
@@ -659,7 +675,7 @@ def run_event_stream() -> None:
     # out of the startup view, but `/goal status` can still request them.
     from harness.goal.runner import emit_current_goal_status
 
-    emit_current_goal_status(include_terminal=False)
+    emit_current_goal_status(include_terminal=False, hydrated=True)
     try:
         from harness.goal.draft import emit_current_draft_status
 
@@ -718,7 +734,7 @@ def run_event_stream() -> None:
                     if parse_goal_subcommand(text) == "status":
                         from harness.goal.draft import emit_current_draft_status
 
-                        draft = emit_current_draft_status()
+                        draft = emit_current_draft_status(event="status")
                         if draft is None or draft.status == "consumed":
                             from harness.goal.runner import emit_current_goal_status
 
@@ -738,9 +754,8 @@ def run_event_stream() -> None:
                 # discovery/model calls can be slow. Never queue another turn
                 # behind it: by the time that message ran, its context and the
                 # user's intended meaning could have changed completely.
-                active_draft_stage = _active_goal_draft_stage()
-                if goal_turn_active.is_set() or active_draft_stage:
-                    stage = active_draft_stage or "starting"
+                if goal_turn_active.is_set():
+                    stage = _active_goal_draft_stage() or "starting"
                     emit(
                         "log",
                         level="warn",
@@ -763,15 +778,22 @@ def run_event_stream() -> None:
                 except Exception:
                     pass
                 silent = bool(command.get("silent"))
+                goal_context = command.get("goal_context") is True
+                is_goal_background = _is_goal_background_command(text, goal_context=goal_context)
+                if is_goal_background:
+                    # Set ownership before publishing to the worker. A fast
+                    # failure could otherwise clear the flag before this
+                    # thread set it, leaving Draft input locked forever.
+                    goal_turn_active.set()
                 try:
-                    turn_queue.put_nowait((text, not silent))
-                    if _is_goal_background_command(text):
-                        goal_turn_active.set()
+                    turn_queue.put_nowait((text, not silent, goal_context))
                     pending = turn_queue.qsize()
                     if running.is_set() or pending > 1:
                         emit("message_queued", text=text, position=pending, pending=pending)
                     emit_queue_status()
                 except queue.Full:
+                    if is_goal_background:
+                        goal_turn_active.clear()
                     emit("log", level="warn", text=f"Message queue is full ({MAX_PENDING_TURNS}). Wait for the current turn to finish.")
                 continue
             emit("error", text=f"Unknown command type: {ctype}")

@@ -23,16 +23,11 @@ PLANNER_AGENT = "goal_planner"
 # implementation worker; keeping planning tool-free prevents an invisible,
 # unbounded explore loop before a draft can be saved.
 PLANNER_MAX_ROUNDS = 1
-MIN_TASKS = 1
-MAX_TASKS = 8
+PLANNER_MAX_OUTPUT_TOKENS = 32_000
 MAX_BEHAVIOR_CHARS = 600
 MAX_ACCEPTANCE_CASES = 8
-MAX_SELECTORS_PER_TASK = 16
 MAX_SKILLS_PER_TASK = 2
 PLANNER_CATALOG_LIMIT = 80
-PLANNER_EVIDENCE_LIMIT = 48
-PLANNER_GAP_LIMIT = 20
-PLANNER_SCOPE_LIMIT = 80
 
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL | re.IGNORECASE)
 _AGENT_HEADER = re.compile(r"^\[[^\]]+\] [^\n]*\n*")
@@ -49,7 +44,7 @@ def _strip_agent_header(text: str) -> str:
     return stripped.strip()
 
 
-def _normalise_strings(raw: Any, *, limit: int) -> tuple[str, ...]:
+def _normalise_strings(raw: Any, *, limit: int | None = None) -> tuple[str, ...]:
     if not isinstance(raw, (list, tuple)):
         return ()
     values: list[str] = []
@@ -62,7 +57,7 @@ def _normalise_strings(raw: Any, *, limit: int) -> tuple[str, ...]:
             continue
         seen.add(text)
         values.append(text[:500])
-        if len(values) >= limit:
+        if limit is not None and len(values) >= limit:
             break
     return tuple(values)
 
@@ -147,8 +142,8 @@ class VerificationSpec:
         return cls(
             adapter=str(data.get("adapter") or "command")[:40],
             command=str(data.get("command") or "").strip()[:1000],
-            test_files=_normalise_strings(data.get("test_files"), limit=MAX_SELECTORS_PER_TASK),
-            selectors=_normalise_strings(data.get("selectors"), limit=MAX_SELECTORS_PER_TASK),
+            test_files=_normalise_strings(data.get("test_files")),
+            selectors=_normalise_strings(data.get("selectors")),
             source=str(data.get("source") or "needs_generation")[:40],
             collected_count=collected_count,
             baseline_result=str(data.get("baseline_result") or "not_run")[:80],
@@ -161,10 +156,10 @@ class VerificationSpec:
             test_hashes={str(k): str(v) for k, v in (data.get("test_hashes") or {}).items()}
             if isinstance(data.get("test_hashes"), dict)
             else {},
-            covers=_normalise_strings(data.get("covers"), limit=MAX_ACCEPTANCE_CASES),
-            owners=_normalise_strings(data.get("owners"), limit=MAX_TASKS),
+            covers=_normalise_strings(data.get("covers")),
+            owners=_normalise_strings(data.get("owners")),
             case_selectors={
-                str(case): _normalise_strings(selectors, limit=MAX_SELECTORS_PER_TASK)
+                str(case): _normalise_strings(selectors)
                 for case, selectors in (data.get("case_selectors") or {}).items()
                 if isinstance(case, str) and isinstance(selectors, (list, tuple))
             } if isinstance(data.get("case_selectors"), dict) else {},
@@ -211,8 +206,8 @@ class TaskPlan:
             acceptance_cases=cases,
             skill_names=_normalise_skill_names(data.get("skills")),
             verification_spec=VerificationSpec.from_dict(spec_raw),
-            scope_paths=_normalise_strings(data.get("scope_paths"), limit=MAX_SELECTORS_PER_TASK),
-            evidence_refs=_normalise_strings(data.get("evidence_refs"), limit=MAX_ACCEPTANCE_CASES),
+            scope_paths=_normalise_strings(data.get("scope_paths")),
+            evidence_refs=_normalise_strings(data.get("evidence_refs")),
             test_strategy=str(data.get("test_strategy") or "")[:1000],
             discovery_revision=max(0, int(data.get("discovery_revision") or 0)),
         )
@@ -221,11 +216,11 @@ class TaskPlan:
 def _parse_acceptance_cases(raw: Any) -> tuple[AcceptanceCase, ...]:
     if raw is None:
         return ()
-    if not isinstance(raw, list) or not raw:
+    if not isinstance(raw, list) or not raw or len(raw) > MAX_ACCEPTANCE_CASES:
         return ()
     cases: list[AcceptanceCase] = []
     ids: set[str] = set()
-    for index, item in enumerate(raw[:MAX_ACCEPTANCE_CASES], start=1):
+    for index, item in enumerate(raw, start=1):
         if not isinstance(item, dict):
             return ()
         case = AcceptanceCase.from_dict(item, index=index)
@@ -275,13 +270,13 @@ def _planner_manifest_view(discovery_manifest: dict[str, Any]) -> dict[str, Any]
 
     def add_scope(path: Any) -> None:
         normalized = str(path or "").strip().replace("\\", "/").strip("/")
-        if not normalized or normalized in seen_scopes or len(scope_candidates) >= PLANNER_SCOPE_LIMIT:
+        if not normalized or normalized in seen_scopes:
             return
         seen_scopes.add(normalized)
         scope_candidates.append(normalized)
 
     for raw in discovery_manifest.get("evidence", []) if isinstance(discovery_manifest.get("evidence"), list) else []:
-        if not isinstance(raw, dict) or len(evidence) >= PLANNER_EVIDENCE_LIMIT:
+        if not isinstance(raw, dict):
             continue
         evidence_id = str(raw.get("id") or "").strip()
         path = str(raw.get("path") or "").strip().replace("\\", "/")
@@ -306,7 +301,7 @@ def _planner_manifest_view(discovery_manifest: dict[str, Any]) -> dict[str, Any]
 
     jobs: list[dict[str, str]] = []
     for raw in discovery_manifest.get("jobs", []) if isinstance(discovery_manifest.get("jobs"), list) else []:
-        if not isinstance(raw, dict) or len(jobs) >= 16:
+        if not isinstance(raw, dict):
             continue
         jobs.append({
             "id": str(raw.get("id") or "")[:80],
@@ -320,8 +315,8 @@ def _planner_manifest_view(discovery_manifest: dict[str, Any]) -> dict[str, Any]
         "revision": discovery_manifest.get("revision", 0),
         "evidence": evidence,
         "scope_candidates": scope_candidates,
-        "gaps": [str(item)[:500] for item in discovery_manifest.get("gaps", [])[:PLANNER_GAP_LIMIT] if str(item).strip()],
-        "conflicts": [str(item)[:500] for item in discovery_manifest.get("conflicts", [])[:PLANNER_GAP_LIMIT] if str(item).strip()],
+        "gaps": [str(item)[:500] for item in discovery_manifest.get("gaps", []) if str(item).strip()],
+        "conflicts": [str(item)[:500] for item in discovery_manifest.get("conflicts", []) if str(item).strip()],
         "jobs": jobs,
     }
 
@@ -356,14 +351,15 @@ def build_plan_prompt(
         "- Do not invent files, paths, commands, or selectors.\n\n"
         f"{catalog_text}\n\n"
         f"{manifest_text}\n\n"
-        f"Split the Goal into {MIN_TASKS}-{MAX_TASKS} Tasks:\n"
+        "Split the Goal into as many Tasks as its independently verifiable deliverables require:\n"
+        "- There is no target Task count. Cover every distinct deliverable; never merge work merely to reduce the count.\n"
         "- Each Task is independently implementable and machine-verifiable.\n"
-        "- Each Task must include 1-8 concrete acceptance_cases using given/when/then.\n"
+        "- Each Task must include 1-8 concrete acceptance_cases using given/when/then; split a Task that needs more.\n"
         "- depends_on lists names of earlier Tasks only.\n"
-        "- scope_paths must be paths from the manifest; evidence_refs must cite evidence IDs.\n"
+        "- scope_paths must be selected from scope_candidates or evidence.path; evidence_refs must cite evidence IDs.\n"
         "- test_strategy must explain how each acceptance case will be verified.\n"
         "- case_selectors maps each acceptance case id to exact catalog selectors; never claim coverage without a mapping.\n"
-        "- Preserve separately named deliverables as separate Tasks.\n"
+        "- Keep related implementation details together, but preserve independently testable deliverables as separate Tasks.\n"
         "- Use one Task only when the Goal cannot be meaningfully split.\n\n"
         "Optional workflow skills:\n"
         "- Add skills only when directly relevant, with at most two installed skill names per Task.\n"
@@ -422,11 +418,10 @@ def _spec_from_entry(
     spec_data = entry.get("verification_spec") if isinstance(entry.get("verification_spec"), dict) else {}
     requested = _normalise_strings(
         entry.get("test_selectors", spec_data.get("selectors")),
-        limit=MAX_SELECTORS_PER_TASK,
     )
     raw_mapping = entry.get("case_selectors", spec_data.get("case_selectors"))
     case_selectors = {
-        str(case): _normalise_strings(values, limit=MAX_SELECTORS_PER_TASK)
+        str(case): _normalise_strings(values)
         for case, values in raw_mapping.items()
         if isinstance(raw_mapping, dict) and isinstance(case, str) and isinstance(values, (list, tuple))
     } if isinstance(raw_mapping, dict) else {}
@@ -464,8 +459,6 @@ def parse_plan(raw: str, *, test_catalog=None, discovery_manifest: dict[str, Any
         return None
     if not isinstance(data, list) or not data:
         return None
-    data = data[:MAX_TASKS]
-
     plans: list[TaskPlan] = []
     names: set[str] = set()
     for entry in data:
@@ -478,7 +471,7 @@ def parse_plan(raw: str, *, test_catalog=None, discovery_manifest: dict[str, Any
         cases = _parse_acceptance_cases(entry.get("acceptance_cases"))
         if not cases:
             return None
-        dependencies = _normalise_strings(entry.get("depends_on"), limit=MAX_TASKS)
+        dependencies = _normalise_strings(entry.get("depends_on"))
         if any(dependency not in names for dependency in dependencies):
             return None
         spec = _spec_from_entry(entry, test_catalog, cases, verification_adapter)
@@ -487,8 +480,8 @@ def parse_plan(raw: str, *, test_catalog=None, discovery_manifest: dict[str, Any
                 return None
             if any(selector not in spec.selectors for values in spec.case_selectors.values() for selector in values):
                 return None
-        scopes = _normalise_strings(entry.get("scope_paths"), limit=MAX_SELECTORS_PER_TASK)
-        refs = _normalise_strings(entry.get("evidence_refs"), limit=MAX_ACCEPTANCE_CASES)
+        scopes = _normalise_strings(entry.get("scope_paths"))
+        refs = _normalise_strings(entry.get("evidence_refs"))
         strategy = str(entry.get("test_strategy") or "")[:1000]
         if discovery_manifest is not None:
             evidence_ids = {str(item.get("id")) for item in discovery_manifest.get("evidence", []) if isinstance(item, dict)}
@@ -537,7 +530,7 @@ def plan_tasks(
     verification_adapter=None,
 ) -> list[TaskPlan]:
     """Decompose a Goal and bind only selectors the system collected."""
-    from harness.agents.runner import run_agent_task as default_runner
+    from harness.agents.runner import AgentTaskStats, run_agent_task as default_runner
 
     root = (workspace or get_workdir()).resolve()
     if verification_adapter is None:
@@ -546,16 +539,18 @@ def plan_tasks(
         verification_adapter = select_adapter(root, full_verification)
     catalog = test_catalog if test_catalog is not None else verification_adapter.discover(VerificationContext(root, command=full_verification))
     runner = planner_runner or default_runner
+    planner_stats = stats if stats is not None else AgentTaskStats()
     planner_call = {
         "description": "decompose goal into verifiable tasks",
         "prompt": build_plan_prompt(target, full_verification, catalog, discovery_manifest),
         "agent_type": PLANNER_AGENT,
         "cwd": str(root),
         "max_rounds": PLANNER_MAX_ROUNDS,
+        "max_tokens": PLANNER_MAX_OUTPUT_TOKENS,
         "tools_override": (),
         "cancel_check": cancel_check,
         "deadline": deadline,
-        "stats": stats,
+        "stats": planner_stats,
     }
     try:
         raw = runner(**planner_call)
@@ -566,6 +561,11 @@ def plan_tasks(
     plans = parse_plan(raw, test_catalog=catalog, discovery_manifest=discovery_manifest, verification_adapter=verification_adapter)
     if plans:
         return plans
+    if planner_stats.stop_reason == "max_tokens":
+        raise GoalPlanningError(
+            f"Goal planner exhausted its {PLANNER_MAX_OUTPUT_TOKENS}-token output budget before returning "
+            "a complete Task contract; no execution was started."
+        )
     detail = raw.strip().replace("\n", " ")[:500] or "empty response"
     raise GoalPlanningError(
         f"Goal planner returned no valid Task contract; no execution was started. Response: {detail}"

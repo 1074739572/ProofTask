@@ -11,8 +11,11 @@ import {WelcomeView} from './Welcome.tsx';
 import {
   GoalDraftView,
   GoalView,
+  goalBlocksChat,
+  goalDraftEventShouldFocus,
   goalDraftIsBusy,
   goalDraftSnapshotFromEvent,
+  goalEventShouldFocus,
   goalIsActive,
   goalSnapshotFromEvent,
   mergeGoalDiscoveryEvent,
@@ -624,6 +627,7 @@ function LogView(props: {entries: () => Entry[]; now: () => number; active: () =
 type DebugEntries = Entry[] | (() => Entry[]);
 type DebugFlag = boolean | (() => boolean);
 type DebugGoal = GoalSnapshot | null | (() => GoalSnapshot | null);
+type OfflineMessage = {text: string; goalContext: boolean};
 
 function resolveDebugValue<T>(value: T | (() => T) | undefined): T | undefined {
   return typeof value === 'function' ? (value as () => T)() : value;
@@ -693,7 +697,7 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
   const [backendState, setBackendState] = createSignal<BackendConnectionState>(props?.debugEntries != null ? 'connected' : 'disconnected');
   const [backendExitCode, setBackendExitCode] = createSignal<number | null>(null);
   const [queuedMessages, setQueuedMessages] = createSignal(0);
-  const [offlineMessages, setOfflineMessages] = createSignal<string[]>([]);
+  const [offlineMessages, setOfflineMessages] = createSignal<OfflineMessage[]>([]);
   const [currentTool, setCurrentTool] = createSignal<string | null>(null);
   const [toolDone, setToolDone] = createSignal(0);
   const [toolTotal, setToolTotal] = createSignal(0);
@@ -1066,27 +1070,33 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
         break;
       case 'goal_draft_status': {
         const draftId = value(event, 'id');
-        if (closedDraftIds.has(draftId) && value(event, 'event') !== 'started') break;
+        const draftEvent = value(event, 'event');
+        if (closedDraftIds.has(draftId) && draftEvent !== 'started') break;
         const snapshot = goalDraftSnapshotFromEvent(event, draftStatus());
         const stage = value(event, 'stage');
         if (snapshot && snapshot.status !== 'consumed' && snapshot.event !== 'discarded') {
           setDraftStatus(snapshot);
-          if (!goalIsActive(goalSnapshot())) setLifecycleView('draft');
+          if (goalDraftEventShouldFocus(event, snapshot, goalSnapshot())) setLifecycleView('draft');
         } else if (draftStatus()?.id === draftId) {
           setDraftStatus(null);
           closedDraftIds.add(draftId);
-          if (goalSnapshot()) setLifecycleView('goal');
+          setLifecycleView(goalIsActive(goalSnapshot()) ? 'goal' : 'chat');
         }
-        if (stage) setPhase(`goal draft: ${stage}`);
-        const draftBusy = goalDraftIsBusy(snapshot);
-        if (draftBusy && !goalIsActive(goalSnapshot())) begin(`goal draft: ${stage || 'working'}`);
-        if (!draftBusy && !goalIsActive(goalSnapshot())) {
-          setRunning(false);
-          if (snapshot?.status === 'clarifying') setPhase('goal draft: clarifying');
-          if (snapshot?.status === 'ready') setPhase('goal draft: ready');
+        const passiveSnapshot = draftEvent === 'hydrated' || draftEvent === 'status';
+        if (!passiveSnapshot) {
+          if (stage) setPhase(`goal draft: ${stage}`);
+          const draftBusy = goalDraftIsBusy(snapshot);
+          if (draftBusy && !goalIsActive(goalSnapshot())) begin(`goal draft: ${stage || 'working'}`);
+          if (!draftBusy && !goalIsActive(goalSnapshot())) {
+            setRunning(false);
+            if (snapshot?.status === 'clarifying') setPhase('goal draft: clarifying');
+            if (snapshot?.status === 'ready') setPhase('goal draft: ready');
+          }
         }
         const draftError = value(event, 'last_error');
-        if (draftError && draftError !== lastDraftError) {
+        if (draftEvent === 'hydrated') {
+          lastDraftError = draftError;
+        } else if (draftError && draftError !== lastDraftError) {
           lastDraftError = draftError;
           add({id: `draft-error-${Date.now()}`, kind: 'blocked', text: draftError, detail: `${stage || 'draft'} failed`});
         } else if (!draftError) {
@@ -1095,10 +1105,9 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
         // Persisted Draft events are the only visibility into read-only intake
         // and planning. Do not log heartbeats, but make every stage decision
         // visible so an empty questions list never looks like a stalled UI.
-        const draftEvent = value(event, 'event');
         const message = value(event, 'message');
         const question = value(event, 'question');
-        if (draftEvent !== 'heartbeat' && (message || question)) {
+        if (draftEvent !== 'hydrated' && draftEvent !== 'heartbeat' && (message || question)) {
           add({
             id: `draft-${draftId}-${draftEvent || stage}-${Date.now()}`,
             kind: 'log',
@@ -1178,13 +1187,17 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
       case 'goal_phase': {
         const snapshot = goalSnapshotFromEvent(event, goalSnapshot());
         if (snapshot) { setGoalSnapshot(snapshot); syncGoalDecisionPhase(snapshot); }
-        setLifecycleView('goal');
         const status = snapshot?.status || value(event, 'status');
         const active = status === 'running' || status === 'pausing' || status === 'cancelling';
-        setRunning(active || Boolean(draftStatus() && ['preflight', 'catalog', 'intake', 'discovering', 'planning'].includes(draftStatus()!.stage)));
-        setPhase(active ? `goal: ${snapshot?.phase || value(event, 'phase')}` : (status === 'paused' ? 'goal: paused' : 'idle'));
-        if (!active && !draftStatus()) setStartedAt(0);
-        add({id: `goal-${value(event, 'id')}-${Date.now()}`, kind: 'log', text: 'Goal', detail: `${value(event, 'phase')} (${status})`}); break;
+        const passiveHydration = event.type === 'goal_status' && event.hydrated === true && !active;
+        if (goalEventShouldFocus(event, snapshot)) setLifecycleView('goal');
+        if (!passiveHydration) {
+          setRunning(active || goalDraftIsBusy(draftStatus()));
+          setPhase(active ? `goal: ${snapshot?.phase || value(event, 'phase')}` : (status === 'paused' ? 'goal: paused' : 'idle'));
+          if (!active && !draftStatus()) setStartedAt(0);
+          add({id: `goal-${value(event, 'id')}-${Date.now()}`, kind: 'log', text: 'Goal', detail: `${value(event, 'phase')} (${status})`});
+        }
+        break;
       }
       case 'goal_stopped': {
         const snapshot = goalSnapshotFromEvent(event, goalSnapshot());
@@ -1224,10 +1237,9 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
         }
         }
         const durableGoalActive = goalIsActive(goalSnapshot());
-        const durableDraftActive = goalDraftIsBusy(draftStatus());
-        if (durableGoalActive || durableDraftActive) {
+        if (durableGoalActive) {
           setRunning(true);
-          setPhase(durableGoalActive ? `goal: ${goalSnapshot()?.phase || 'working'}` : `goal draft: ${draftStatus()?.stage || 'working'}`);
+          setPhase(`goal: ${goalSnapshot()?.phase || 'working'}`);
           if (!startedAt()) setStartedAt(Date.now());
         } else {
           setRunning(false); setPhase(interrupted ? 'interrupted' : 'idle'); setStartedAt(0);
@@ -1280,8 +1292,10 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
           setBackendExitCode(null);
           const pending = offlineMessages();
           if (pending.length) {
-            const remaining: string[] = [];
-            for (const text of pending) if (!send({type: 'user_message', text})) remaining.push(text);
+            const remaining: OfflineMessage[] = [];
+            for (const message of pending) {
+              if (!send({type: 'user_message', text: message.text, goal_context: message.goalContext})) remaining.push(message);
+            }
             setOfflineMessages(remaining);
           }
         } else if (state === 'disconnected') {
@@ -1403,8 +1417,11 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
     const paste = pastedContent();
     const text = (paste && !paste.expanded ? paste.text : input()).trim();
     if (!text) return;
+    const isCommand = text.startsWith('/');
+    const draftAnswerCheckpoint = draftStatus()?.status === 'clarifying' && Boolean(draftStatus()?.question);
+    const goalContext = !isCommand && lifecycleView() === 'draft' && draftAnswerCheckpoint;
     if (backendState() === 'disconnected') {
-      setOfflineMessages(previous => [...previous, text].slice(-32));
+      setOfflineMessages(previous => [...previous, {text, goalContext}].slice(-32));
       recordHistory(text);
       setComposerText('');
       setPastedContent(null);
@@ -1424,13 +1441,12 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
     }
     const isGoalControl = /^\/goal\s+(?:status|pause|stop|cancel)\s*$/i.test(text);
     const isGoalCommand = /^\/goal(?:\s|$)/i.test(text);
-    const isCommand = text.startsWith('/');
-    const draftAnswerCheckpoint = draftStatus()?.status === 'clarifying' && Boolean(draftStatus()?.question);
-    if (!isGoalControl && !isGoalCommand && goalDraftIsBusy(draftStatus()) && !draftAnswerCheckpoint) {
+    const liveDraftBusy = lifecycleView() === 'draft' && running() && goalDraftIsBusy(draftStatus());
+    if (!isGoalControl && !isGoalCommand && liveDraftBusy && !draftAnswerCheckpoint) {
       add({id: `draft-busy-${Date.now()}`, kind: 'log', text: 'Goal 草案正在处理', detail: `当前阶段：${draftStatus()?.stage || 'working'}。可用 /goal status、/goal pause 或 /goal cancel。`});
       return;
     }
-    if (goalSnapshot() && running() && !isGoalControl) {
+    if (goalBlocksChat(goalSnapshot(), running()) && !isGoalControl) {
       add({id: `log-${Date.now()}`, kind: 'log', text: 'Goal is running', detail: 'use /goal status, pause, or cancel'});
       return;
     }
@@ -1444,10 +1460,10 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
     if (!isCommand) add({id: `prompt-${Date.now()}`, kind: 'prompt', text});
     if (!isCommand) pendingPrompts.push(text);
     setUserStarted(true);
-    const sent = send({type: 'user_message', text});
+    const sent = send({type: 'user_message', text, goal_context: goalContext});
     if (!sent) {
       if (!isCommand) pendingPrompts = pendingPrompts.filter(item => item !== text);
-      setOfflineMessages(previous => [...previous, text].slice(-32));
+      setOfflineMessages(previous => [...previous, {text, goalContext}].slice(-32));
       showToast('Backend unavailable; message saved for reconnect');
     } else if (running() && !isGoalControl) {
       showToast(`Message queued (${queuedMessages() + 1} pending)`);

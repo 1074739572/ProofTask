@@ -119,7 +119,7 @@ def _draft_event_payload(draft: GoalDraft, *, event: str, message: str | None = 
     values and raw model output never belong in the event stream.
     """
     task_summaries: list[dict[str, Any]] = []
-    for plan in draft.task_plan[:8]:
+    for plan in draft.task_plan:
         if not isinstance(plan, dict):
             continue
         spec = plan.get("verification_spec") if isinstance(plan.get("verification_spec"), dict) else {}
@@ -130,7 +130,7 @@ def _draft_event_payload(draft: GoalDraft, *, event: str, message: str | None = 
             {
                 "name": str(plan.get("name") or "Unnamed Task")[:300],
                 "behavior": str(plan.get("behavior") or "")[:600],
-                "depends_on": [str(item)[:200] for item in dependencies[:8]],
+                "depends_on": [str(item)[:200] for item in dependencies],
                 "acceptance_count": len(cases),
                 "verification_source": str(spec.get("source") or "needs_generation")[:80],
                 "selectors": [str(item)[:500] for item in selectors[:8]],
@@ -195,11 +195,11 @@ def load_draft(workspace: Path | None = None) -> GoalDraft | None:
         return GoalDraft.from_dict(data)
 
 
-def emit_current_draft_status(*, workspace: Path | None = None) -> GoalDraft | None:
-    """Hydrate an event-stream TUI from an existing Draft after restart."""
+def emit_current_draft_status(*, workspace: Path | None = None, event: str = "hydrated") -> GoalDraft | None:
+    """Emit an existing Draft as startup hydration or an explicit status response."""
     draft = load_draft(workspace)
     if draft is not None and draft.status != "consumed":
-        _emit_draft_event(draft, event="hydrated")
+        _emit_draft_event(draft, event=event)
     return draft
 
 
