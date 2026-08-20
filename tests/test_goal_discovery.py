@@ -1,3 +1,5 @@
+import subprocess
+
 from harness.goal.discovery import (
     DISCOVERY_MAX_ROUNDS,
     DiscoverySupervisor,
@@ -24,6 +26,43 @@ def test_repo_map_excludes_secrets_builds_and_binary_files(tmp_path):
     assert shards[0].symbols == ("run",)
     assert shards[0].imports == ("os",)
     assert len(shards[0].sha256) == 64
+
+
+def test_repo_map_respects_gitignore_but_allows_explicit_ignored_source_path(tmp_path):
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    (tmp_path / ".gitignore").write_text("generated/\n*.cache\n", encoding="utf-8")
+    (tmp_path / "src").mkdir()
+    (tmp_path / "generated").mkdir()
+    (tmp_path / "src" / "app.py").write_text("def run(): pass\n", encoding="utf-8")
+    (tmp_path / "generated" / "snapshot.py").write_text("def generated(): pass\n", encoding="utf-8")
+    (tmp_path / "notes.cache").write_text("local output", encoding="utf-8")
+    (tmp_path / ".env").write_text("TOKEN=secret", encoding="utf-8")
+
+    automatic = iter_readable_files(tmp_path)
+    explicit = iter_readable_files(tmp_path, paths=("generated/snapshot.py", ".env"))
+
+    assert [path.relative_to(tmp_path).as_posix() for path in automatic] == ["src/app.py"]
+    assert [path.relative_to(tmp_path).as_posix() for path in explicit] == ["generated/snapshot.py"]
+    assert [shard.path for shard in build_repo_map(tmp_path)] == ["src/app.py"]
+
+    calls = []
+
+    def fake_runner(**kwargs):
+        calls.append(kwargs)
+        path = kwargs["read_paths"][0]
+        return (
+            '{"evidence":[{"path":"%s","lines":[1,1],'
+            '"excerpt":"def generated(): pass","claim":"generated source exists"}],"gaps":[]}'
+        ) % path
+
+    DiscoverySupervisor(runner=fake_runner).run(
+        goal_id="goal-ignored-file",
+        target="fix generated/snapshot.py",
+        workspace=tmp_path,
+        roles=("implementation",),
+    )
+
+    assert calls[0]["read_paths"] == ("generated/snapshot.py",)
 
 
 def test_discovery_store_writes_jobs_and_manifest_atomically(tmp_path):

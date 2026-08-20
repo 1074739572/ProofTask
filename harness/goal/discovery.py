@@ -34,6 +34,9 @@ DISCOVERY_ROLES = (
 DISCOVERY_MAX_ROUNDS = 16
 DISCOVERY_FILE_LIMIT = 16
 DEFAULT_DISCOVERY_CONCURRENCY = 1
+_TARGET_PATH_RE = re.compile(
+    r"(?<![A-Za-z0-9_.-])(?:(?:\.\.?)[/\\]|[A-Za-z0-9_@.+-]+[/\\])(?:[A-Za-z0-9_@.+-]+[/\\])*[A-Za-z0-9_@.+-]+"
+)
 
 
 @dataclass(frozen=True)
@@ -59,15 +62,54 @@ def _safe_path(root: Path, path: Path) -> bool:
         return False
 
 
-def iter_readable_files(root: str | Path, paths: Iterable[str] | None = None) -> tuple[Path, ...]:
+def _git_visible_files(root: Path) -> tuple[Path, ...] | None:
+    """Return Git-visible files, respecting every applicable ignore rule.
+
+    ``git ls-files --exclude-standard`` applies the workspace's nested
+    ``.gitignore`` files, ``.git/info/exclude``, and the user's global Git
+    excludes. It also avoids recursively walking large ignored directories.
+    ``None`` means this is not a usable Git worktree and callers should use
+    the conservative filesystem fallback.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
+            cwd=str(root),
+            capture_output=True,
+            stdin=subprocess.DEVNULL,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    return tuple(
+        (root / Path(raw.decode("utf-8", errors="surrogateescape"))).resolve()
+        for raw in proc.stdout.split(b"\0")
+        if raw
+    )
+
+
+def iter_readable_files(root: str | Path, paths: Iterable[str | Path] | None = None) -> tuple[Path, ...]:
+    """Return bounded text files for Discovery.
+
+    Automatic repository mapping follows Git's standard ignore rules. Passing
+    explicit ``paths`` is an intentional escape hatch for a specifically
+    requested ignored source file; secrets remain excluded in every mode.
+    """
     base = Path(root).expanduser().resolve()
-    candidates = ((base / item).resolve() for item in paths) if paths else base.rglob("*")
+    explicit_paths = paths is not None
+    if explicit_paths:
+        candidates = ((base / item).resolve() for item in paths or ())
+    else:
+        git_files = _git_visible_files(base)
+        candidates = git_files if git_files is not None else base.rglob("*")
     found: list[Path] = []
     for path in candidates:
         if not _safe_path(base, path) or not path.is_file():
             continue
         relative = path.relative_to(base)
-        if any(part in EXCLUDED_DIRS for part in relative.parts):
+        if not explicit_paths and any(part in EXCLUDED_DIRS for part in relative.parts):
             continue
         if path.name in EXCLUDED_NAMES or path.name.startswith(".env"):
             continue
@@ -94,10 +136,19 @@ def _python_outline(text: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
     return tuple(dict.fromkeys(symbols)), tuple(dict.fromkeys(imports))
 
 
-def build_repo_map(root: str | Path, paths: Iterable[str] | None = None) -> tuple[FileShard, ...]:
+def build_repo_map(
+    root: str | Path,
+    paths: Iterable[str | Path] | None = None,
+    *,
+    include_paths: Iterable[str | Path] = (),
+) -> tuple[FileShard, ...]:
+    """Build a map from automatic files plus intentionally requested paths."""
     base = Path(root).expanduser().resolve()
+    readable = set(iter_readable_files(base, paths))
+    if include_paths:
+        readable.update(iter_readable_files(base, include_paths))
     shards: list[FileShard] = []
-    for path in iter_readable_files(base, paths):
+    for path in sorted(readable, key=lambda item: item.relative_to(base).as_posix()):
         try:
             raw = path.read_bytes()
             text = raw.decode("utf-8")
@@ -154,6 +205,19 @@ def _target_scope(target: str, names: list[str]) -> tuple[str, ...]:
         if candidate in names:
             roots.append(candidate.split("/")[0])
     return tuple(dict.fromkeys(root for root in roots if root))
+
+
+def _explicit_target_paths(root: Path, target: str) -> tuple[str, ...]:
+    """Find user-named workspace files, including normally ignored files."""
+    paths: list[str] = []
+    for match in _TARGET_PATH_RE.finditer(target):
+        try:
+            candidate = (root / match.group(0)).resolve()
+        except OSError:
+            continue
+        if _safe_path(root, candidate) and candidate.is_file():
+            paths.append(candidate.relative_to(root).as_posix())
+    return tuple(dict.fromkeys(paths))
 
 
 def _assigned_paths(
@@ -219,7 +283,10 @@ class DiscoverySupervisor:
         roles: tuple[str, ...] = DISCOVERY_ROLES,
     ) -> DiscoveryManifest:
         root = Path(workspace).expanduser().resolve()
-        shards = build_repo_map(root)
+        # Git-ignored files never enter automatic discovery. A file path named
+        # directly in the user's Goal is deliberate scope, so include that one
+        # bounded file without reopening an ignored directory tree.
+        shards = build_repo_map(root, include_paths=_explicit_target_paths(root, target))
         revision = git_revision(root)
         jobs = [DiscoveryJob(id=f"{role}-1", role=role, read_paths=_assigned_paths(role, shards, target=target)) for role in roles]
         for job in jobs:
