@@ -63,6 +63,12 @@ def _normalise_strings(raw: Any, *, limit: int) -> tuple[str, ...]:
     return tuple(values)
 
 
+def _valid_scope_path(path: str) -> bool:
+    """Keep planner scope declarations relative to the workspace."""
+    candidate = Path(path)
+    return not candidate.is_absolute() and ".." not in candidate.parts
+
+
 @dataclass(frozen=True)
 class AcceptanceCase:
     """One observable behavior required for a Task to be accepted."""
@@ -367,7 +373,7 @@ def _spec_from_entry(
             collected_count=len(requested),
             baseline_result="not_run",
             confidence="high",
-            covers=tuple(case.id for case in cases if case.id in case_selectors),
+            covers=tuple(case.id for case in cases if case_selectors.get(case.id)),
             case_selectors=case_selectors,
         )
     adapter_id = getattr(verification_adapter, "id", getattr(catalog, "adapter", "pytest"))
@@ -404,7 +410,7 @@ def parse_plan(raw: str, *, test_catalog=None, discovery_manifest: dict[str, Any
             return None
         spec = _spec_from_entry(entry, test_catalog, cases, verification_adapter)
         if spec.source == "discovered":
-            if any(case.id not in spec.case_selectors for case in cases):
+            if any(not spec.case_selectors.get(case.id) for case in cases):
                 return None
             if any(selector not in spec.selectors for values in spec.case_selectors.values() for selector in values):
                 return None
@@ -414,7 +420,14 @@ def parse_plan(raw: str, *, test_catalog=None, discovery_manifest: dict[str, Any
         if discovery_manifest is not None:
             evidence_ids = {str(item.get("id")) for item in discovery_manifest.get("evidence", []) if isinstance(item, dict)}
             file_paths = {str(item) for item in discovery_manifest.get("repo_files", [])}
-            if not scopes or not refs or not strategy or not set(scopes).issubset(file_paths) or not set(refs).issubset(evidence_ids):
+            # A scope may be an existing file or a directory that contains a
+            # discovered file. The latter is required for planned new files.
+            scopes_valid = all(
+                _valid_scope_path(scope)
+                and any(path == scope or path.startswith(scope.rstrip("/") + "/") for path in file_paths)
+                for scope in scopes
+            )
+            if not scopes or not refs or not strategy or not scopes_valid or not set(refs).issubset(evidence_ids):
                 return None
         selected_skills = _normalise_skill_names(entry.get("skills"))
         if not selected_skills:
@@ -460,18 +473,19 @@ def plan_tasks(
         verification_adapter = select_adapter(root, full_verification)
     catalog = test_catalog if test_catalog is not None else verification_adapter.discover(VerificationContext(root, command=full_verification))
     runner = planner_runner or default_runner
+    planner_call = {
+        "description": "decompose goal into verifiable tasks",
+        "prompt": build_plan_prompt(target, full_verification, catalog, discovery_manifest),
+        "agent_type": PLANNER_AGENT,
+        "cwd": str(root),
+        "max_rounds": PLANNER_MAX_ROUNDS,
+        "tools_override": (),
+        "cancel_check": cancel_check,
+        "deadline": deadline,
+        "stats": stats,
+    }
     try:
-        raw = runner(
-            description="decompose goal into verifiable tasks",
-            prompt=build_plan_prompt(target, full_verification, catalog, discovery_manifest),
-            agent_type=PLANNER_AGENT,
-            cwd=str(root),
-        max_rounds=PLANNER_MAX_ROUNDS,
-        tools_override=(),
-        cancel_check=cancel_check,
-            deadline=deadline,
-            stats=stats,
-        )
+        raw = runner(**planner_call)
     except Exception as exc:
         raise GoalPlanningError(f"Goal planner request failed: {type(exc).__name__}: {exc}") from exc
     if raw.startswith(f"[{PLANNER_AGENT}] failed:") or raw.startswith(f"[{PLANNER_AGENT}] stopped:"):

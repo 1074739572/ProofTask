@@ -31,8 +31,10 @@ def test_orchestrate_role_bindings_and_permissions() -> None:
     assert models["mimo-v2.5-pro"]["provider"] == "xiaomi-mimo"
     assert providers["xiaomi-mimo"]["type"] == "openai"
 
-    assert agents["code"]["model_id"] == "deepseek-v4-pro"
+    assert agents["code"]["model_id"] == "deepseek-v4-flash"
+    assert agents["code"]["reasoning_effort"] == "max"
     assert {"write_file", "edit_file"} <= set(agents["code"]["tools"])
+    assert models["deepseek-v4-flash"]["provider"] == "opencode"
     assert models["deepseek-v4-pro"]["provider"] == "deepseek"
 
 
@@ -83,6 +85,30 @@ def test_recovery_fallback_overrides_mode_bound_lead_model() -> None:
         task_enabled=True, fallback="deepseek-v4-flash"
     )
     assert model_id == "deepseek-v4-flash"
+
+
+def test_explicit_agent_model_does_not_inherit_interactive_effort() -> None:
+    from harness.models import get_model_profile, initialize_model, set_reasoning_effort
+
+    initialize_model("deepseek-v4-flash")
+    set_reasoning_effort("max")
+    try:
+        mimo = get_model_profile("mimo-v2.5-pro")
+        assert mimo.reasoning_effort is None
+    finally:
+        set_reasoning_effort(None)
+
+
+def test_goal_calls_disable_interactive_effort_inheritance() -> None:
+    from harness.models import get_model_profile, initialize_model, set_reasoning_effort
+
+    initialize_model("mimo-v2.5-pro")
+    set_reasoning_effort("max")
+    try:
+        mimo = get_model_profile("mimo-v2.5-pro", inherit_interactive_effort=False)
+        assert mimo.reasoning_effort is None
+    finally:
+        set_reasoning_effort(None)
 
 
 def _route_messages() -> list[dict]:

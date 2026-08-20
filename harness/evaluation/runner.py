@@ -56,7 +56,7 @@ def _run_evaluator(
     # Provider/cancel/deadline outcomes are not format errors. Retrying them
     # immediately only hides the real failure and burns another model call.
     stop_reason = str(getattr(stats, "stop_reason", "") or "")
-    if parsed.passed is None and stop_reason not in {"provider_error", "cancelled", "deadline"}:
+    if parsed.passed is None and stop_reason not in {"provider_error", "configuration_error", "cancelled", "deadline"}:
         attempts = 2
         raw = run_agent_task(
             description=description + " (JSON correction)",
@@ -78,7 +78,7 @@ def _run_evaluator(
         "parse_attempts": attempts,
         "agent_stop_reason": stop_reason or "completed",
     }
-    if parsed.passed is None and stop_reason == "provider_error":
+    if parsed.passed is None and stop_reason in {"provider_error", "configuration_error"}:
         parsed = Findings(passed=None, error="evaluator provider unavailable")
     return parsed, payload
 

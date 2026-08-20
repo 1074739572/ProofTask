@@ -47,6 +47,8 @@ def _json_dumps(payload: Any) -> str:
 #: must be executable while the agent is running — never flip the UI into the
 #: "running" state, never print "Agent is already running".
 _INSTANT_SLASH_PREFIXES = ("/model", "/effort", "/mode", "/models", "/usage", "/help")
+MAX_PENDING_TURNS = 32
+_ACTIVE_GOAL_DRAFT_STAGES = frozenset({"preflight", "catalog", "intake", "discovering", "planning"})
 
 
 def _is_goal_control_command(query: str) -> bool:
@@ -62,6 +64,18 @@ def _is_goal_control_command(query: str) -> bool:
     return parse_goal_subcommand(query) in ("status", "pause", "cancel")
 
 
+def _is_goal_background_command(query: str) -> bool:
+    """Commands whose Draft/Goal setup may perform slow external work."""
+    if _is_goal_draft_answer(query):
+        return True
+    try:
+        from harness.goal.commands import parse_goal_subcommand
+
+        return parse_goal_subcommand(query) in {"draft", "answer", "approve", "run", "resume", "revise"}
+    except ImportError:
+        return False
+
+
 def _is_goal_draft_answer(query: str) -> bool:
     """A normal composer message answers the active clarification question."""
     if not query.strip() or query.lstrip().startswith("/"):
@@ -70,9 +84,22 @@ def _is_goal_draft_answer(query: str) -> bool:
         from harness.goal.draft import load_draft
 
         draft = load_draft()
-        return bool(draft and draft.status == "clarifying")
+        return bool(draft and draft.status == "clarifying" and draft.unanswered_question)
     except ValueError:
         return False
+
+
+def _active_goal_draft_stage() -> str | None:
+    """Return the durable stage that currently owns Draft input, if any."""
+    try:
+        from harness.goal.draft import load_draft
+
+        draft = load_draft()
+    except (OSError, ValueError):
+        return None
+    if draft is None or draft.status in {"paused", "cancelled", "ready", "approved", "failed", "consumed"}:
+        return None
+    return draft.stage if draft.stage in _ACTIVE_GOAL_DRAFT_STAGES else None
 
 
 def _is_instant_slash_command(query: str) -> bool:
@@ -582,9 +609,13 @@ def run_event_stream() -> None:
         cli_active=False,
     )
     state_lock = threading.Lock()
-    turn_queue: "queue.Queue[tuple[str, bool] | None]" = queue.Queue(maxsize=1)
+    turn_queue: "queue.Queue[tuple[str, bool] | None]" = queue.Queue(maxsize=MAX_PENDING_TURNS)
     running = threading.Event()
+    goal_turn_active = threading.Event()
     shutdown = threading.Event()
+
+    def emit_queue_status() -> None:
+        emit("queue_status", pending=turn_queue.qsize(), running=running.is_set(), capacity=MAX_PENDING_TURNS)
 
     def worker() -> None:
         nonlocal context, binding
@@ -594,12 +625,15 @@ def run_event_stream() -> None:
                 turn_queue.task_done()
                 break
             query, echo_user = item
-            # Slash commands (handled inside _run_user_turn, no LLM round) must
-            # NOT flip the UI into "running": no agent_start, no running flag.
+            # Most slash commands are instant, but Draft/Goal setup can spend
+            # minutes in catalog/discovery/planning. Treat those as a real
+            # turn so the TUI gets an active phase and heartbeat events.
+            is_background = _is_goal_background_command(query)
             is_slash = query.strip().startswith("/") or _is_goal_draft_answer(query)
-            if not is_slash:
+            if not is_slash or is_background:
                 running.set()
-                emit("agent_start", phase="preparing")
+                emit("agent_start", phase="goal_draft" if is_background else "preparing")
+            emit_queue_status()
             _interrupted = False
             try:
                 with state_lock:
@@ -609,9 +643,12 @@ def run_event_stream() -> None:
                 emit("error", text=f"Turn failed: {exc}")
             finally:
                 clear_cancel()
-                if not is_slash:
+                if not is_slash or is_background:
                     running.clear()
                     emit("agent_end", status="interrupted" if _interrupted else "done")
+                if is_background:
+                    goal_turn_active.clear()
+                emit_queue_status()
                 turn_queue.task_done()
 
     worker_thread = threading.Thread(target=worker, name="harness-event-stream-worker", daemon=True)
@@ -623,8 +660,15 @@ def run_event_stream() -> None:
     from harness.goal.runner import emit_current_goal_status
 
     emit_current_goal_status(include_terminal=False)
+    try:
+        from harness.goal.draft import emit_current_draft_status
+
+        emit_current_draft_status()
+    except Exception:
+        pass
     _emit_welcome()
     emit("ready")
+    emit_queue_status()
 
     try:
         for raw in sys.stdin:
@@ -672,9 +716,13 @@ def run_event_stream() -> None:
 
                     note = handle_goal_command(text, history, context, binding)
                     if parse_goal_subcommand(text) == "status":
-                        from harness.goal.runner import emit_current_goal_status
+                        from harness.goal.draft import emit_current_draft_status
 
-                        emit_current_goal_status(include_terminal=True)
+                        draft = emit_current_draft_status()
+                        if draft is None or draft.status == "consumed":
+                            from harness.goal.runner import emit_current_goal_status
+
+                            emit_current_goal_status(include_terminal=True)
                     if note:
                         emit("log", level="plain", text=note)
                     continue
@@ -686,14 +734,45 @@ def run_event_stream() -> None:
                     # doesn't look idle.
                     _run_instant_slash_command(text, context, history, binding, running=running.is_set())
                     continue
-                if running.is_set() or not turn_queue.empty():
-                    emit("log", level="warn", text="Agent is already running. Press Ctrl+C to interrupt before sending another message.")
+                # Draft setup is a foreground transaction even though its
+                # discovery/model calls can be slow. Never queue another turn
+                # behind it: by the time that message ran, its context and the
+                # user's intended meaning could have changed completely.
+                active_draft_stage = _active_goal_draft_stage()
+                if goal_turn_active.is_set() or active_draft_stage:
+                    stage = active_draft_stage or "starting"
+                    emit(
+                        "log",
+                        level="warn",
+                        text=(
+                            f"Goal draft is {stage}; new messages are not queued. "
+                            "Use /goal status, /goal pause, or /goal cancel."
+                        ),
+                    )
                     continue
+                # An autonomous Goal owns the workspace and its context. Do
+                # not enqueue ordinary chat into a queue that would later run
+                # against a different contract; the user can use Goal
+                # controls instantly and resume normal chat after it pauses.
+                try:
+                    from harness.goal.runner import is_goal_running
+
+                    if is_goal_running():
+                        emit("log", level="warn", text="Goal is running; use /goal status, /goal pause, or /goal cancel.")
+                        continue
+                except Exception:
+                    pass
                 silent = bool(command.get("silent"))
                 try:
                     turn_queue.put_nowait((text, not silent))
+                    if _is_goal_background_command(text):
+                        goal_turn_active.set()
+                    pending = turn_queue.qsize()
+                    if running.is_set() or pending > 1:
+                        emit("message_queued", text=text, position=pending, pending=pending)
+                    emit_queue_status()
                 except queue.Full:
-                    emit("log", level="warn", text="Agent is already running. Message not queued.")
+                    emit("log", level="warn", text=f"Message queue is full ({MAX_PENDING_TURNS}). Wait for the current turn to finish.")
                 continue
             emit("error", text=f"Unknown command type: {ctype}")
     finally:

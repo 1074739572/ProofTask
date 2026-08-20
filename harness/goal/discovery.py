@@ -10,6 +10,7 @@ import os
 import subprocess
 import time
 import threading
+import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable
@@ -21,7 +22,8 @@ from harness.goal.discovery_store import save_job_state, save_manifest, save_rep
 
 EXCLUDED_DIRS = frozenset({
     ".git", ".project", ".venv", "venv", "node_modules", "dist", "build",
-    "coverage", "__pycache__", ".mypy_cache", ".pytest_cache",
+    "coverage", "__pycache__", ".mypy_cache", ".pytest_cache", ".worktrees",
+    ".task_outputs", ".local", ".goal-smoke", ".playwright-mcp", ".rag",
 })
 EXCLUDED_NAMES = frozenset({".env", ".env.local", ".env.production", "id_rsa"})
 TEXT_SUFFIXES = frozenset({".py", ".js", ".jsx", ".ts", ".tsx", ".json", ".md", ".txt", ".toml", ".yaml", ".yml", ".css", ".html"})
@@ -29,7 +31,8 @@ MAX_FILE_BYTES = 512_000
 DISCOVERY_ROLES = (
     "requirement", "architecture", "implementation", "tests", "history",
 )
-DISCOVERY_MAX_ROUNDS = 8
+DISCOVERY_MAX_ROUNDS = 16
+DISCOVERY_FILE_LIMIT = 16
 DEFAULT_DISCOVERY_CONCURRENCY = 1
 
 
@@ -122,30 +125,62 @@ def git_revision(root: str | Path) -> str:
 
 
 def _parse_report(raw: str) -> dict:
-    start, end = raw.find("{"), raw.rfind("}")
-    if start < 0 or end <= start:
-        return {}
-    try:
-        data = json.loads(raw[start : end + 1])
-    except json.JSONDecodeError:
-        return {}
-    return data if isinstance(data, dict) else {}
+    """Extract one complete evidence report from a model wrapper or code fence."""
+    decoder = json.JSONDecoder()
+    for index, char in enumerate(raw):
+        if char != "{":
+            continue
+        try:
+            data, _ = decoder.raw_decode(raw[index:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(data, dict) and any(key in data for key in ("evidence", "candidate_scope", "related_tests", "gaps")):
+            return data
+    return {}
 
 
-def _assigned_paths(role: str, shards: tuple[FileShard, ...], *, limit: int = 40) -> tuple[str, ...]:
-    # Deterministic, conservative assignment. Every worker sees project entry
-    # material plus its specialty; a later targeted wave can add paths without
-    # opening the whole repository to one model.
+def _target_scope(target: str, names: list[str]) -> tuple[str, ...]:
+    """Find repository roots named by a Goal target without trusting arbitrary paths."""
+    normalized = target.replace("\\", "/")
+    exact = [path for path in names if path in normalized]
+    roots: list[str] = []
+    for path in exact:
+        parts = path.split("/")
+        if len(parts) > 1:
+            roots.append(parts[0])
+    # Targets often contain a relative path without an exact absolute match.
+    for candidate in re.findall(r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+", normalized):
+        candidate = candidate.lstrip("./")
+        if candidate in names:
+            roots.append(candidate.split("/")[0])
+    return tuple(dict.fromkeys(root for root in roots if root))
+
+
+def _assigned_paths(
+    role: str,
+    shards: tuple[FileShard, ...],
+    *,
+    target: str = "",
+    limit: int = DISCOVERY_FILE_LIMIT,
+) -> tuple[str, ...]:
+    """Assign a small, target-local evidence set to each discovery role."""
     names = [item.path for item in shards]
+    roots = _target_scope(target, names)
+    scoped = [path for path in names if not roots or any(path == root or path.startswith(f"{root}/") for root in roots)]
+    target_files = [path for path in names if path in target.replace("\\", "/")]
+    is_test = lambda path: "/test" in path.lower() or path.startswith("test")
+
     if role == "tests":
-        selected = [path for path in names if "/test" in path.lower() or path.startswith("test")]
+        selected = [*target_files, *(path for path in scoped if is_test(path))]
     elif role == "history":
-        selected = [path for path in names if path.startswith("docs/") or "/goal" in path]
+        selected = [*target_files, *(path for path in scoped if path.startswith("docs/") or "/docs/" in path or "/goal" in path)]
     elif role == "requirement":
-        selected = [path for path in names if path.lower().endswith((".md", ".txt"))]
+        selected = [*target_files, *(path for path in scoped if path.lower().endswith((".md", ".txt")))]
     else:
-        selected = [path for path in names if not ("/test" in path.lower() or path.startswith("test"))]
-    return tuple((selected or names)[:limit])
+        selected = [*target_files, *(path for path in scoped if not is_test(path))]
+    if not selected:
+        selected = scoped or names
+    return tuple(dict.fromkeys(selected))[:limit]
 
 
 def _prompt(target: str, role: str, base_revision: str, shards: tuple[FileShard, ...], paths: tuple[str, ...]) -> str:
@@ -155,6 +190,7 @@ def _prompt(target: str, role: str, base_revision: str, shards: tuple[FileShard,
         "Collect repository evidence for a verified coding Goal.\n"
         f"Goal: {target}\nRole: {role}\nBase revision: {base_revision}\n"
         f"Assigned files: {json.dumps(outline, ensure_ascii=False)}\n\n"
+        f"Read only the files needed for the role (at most {len(paths)}); reserve your final response for the report.\n"
         "Return ONLY JSON: {\"evidence\":[{\"path\":\"assigned file\",\"symbol\":\"optional\","
         "\"lines\":[1,2],\"excerpt\":\"exact text from those lines\",\"claim\":\"fact grounded in that file\"}],"
         "\"candidate_scope\":[\"assigned file\"],\"related_tests\":[\"assigned test file\"],"
@@ -185,15 +221,17 @@ class DiscoverySupervisor:
         root = Path(workspace).expanduser().resolve()
         shards = build_repo_map(root)
         revision = git_revision(root)
-        jobs = [DiscoveryJob(id=f"{role}-1", role=role, read_paths=_assigned_paths(role, shards)) for role in roles]
+        jobs = [DiscoveryJob(id=f"{role}-1", role=role, read_paths=_assigned_paths(role, shards, target=target)) for role in roles]
         for job in jobs:
             save_job_state(root, goal_id, job.to_dict())
+            _emit_discovery_job(goal_id, job, event="queued")
 
         completed: list[tuple[DiscoveryJob, dict]] = []
         def execute(job: DiscoveryJob) -> tuple[DiscoveryJob, dict]:
             started = time.time()
             running = DiscoveryJob(**{**job.to_dict(), "status": "running", "started_at": started})
             save_job_state(root, goal_id, running.to_dict())
+            _emit_discovery_job(goal_id, running, event="started")
             if cancel_check is not None and cancel_check():
                 return running, {"error": "cancelled"}
             stats = AgentTaskStats()
@@ -213,10 +251,16 @@ class DiscoverySupervisor:
                     read_paths=job.read_paths, deadline=deadline, cancel_check=cancel_check, stats=stats,
                 )
             except Exception as exc:
-                return running, {"error": f"{type(exc).__name__}: {exc}"}
+                return running, {"error": f"{type(exc).__name__}: {exc}", "failure_kind": "exception"}
             report = _parse_report(raw)
             if not report:
-                report = {"error": raw[-800:] or "discovery returned no JSON"}
+                report = {
+                    "error": "discovery response did not contain a valid JSON evidence report",
+                    "failure_kind": "invalid_report",
+                    "response_tail": raw[-800:],
+                }
+            if stats.stop_reason in {"configuration_error", "provider_error", "empty_response", "deadline", "cancelled"}:
+                report.setdefault("failure_kind", stats.stop_reason)
             error_text = str(report.get("error") or raw).lower()
             if "429" in error_text or "ratelimit" in error_text or "too many requests" in error_text or "max retries" in error_text:
                 report["error"] = "provider rate limited discovery job"
@@ -243,12 +287,15 @@ class DiscoverySupervisor:
                 report_path = save_report(root, goal_id, finished.id, report)
                 finished = DiscoveryJob(**{**finished.to_dict(), "report_path": str(report_path.relative_to(root)).replace("\\", "/")})
                 save_job_state(root, goal_id, finished.to_dict())
+                _emit_discovery_job(goal_id, finished, event="failed" if error else "completed", failure_kind=report.get("failure_kind"))
                 completed.append((finished, report))
 
         by_path = {item.path: item for item in shards}
         evidence: list[Evidence] = []
         gaps: list[str] = []
         for job, report in sorted(completed, key=lambda item: item[0].id):
+            if job.error:
+                gaps.append(f"{job.role} discovery unavailable: {job.error[:300]}")
             gaps.extend(str(item)[:500] for item in report.get("gaps", []) if str(item).strip())
             for item in report.get("evidence", []) if isinstance(report.get("evidence"), list) else []:
                 if not isinstance(item, dict):
@@ -285,4 +332,33 @@ class DiscoverySupervisor:
             jobs=tuple(job for job, _ in sorted(completed, key=lambda item: item[0].id)), gaps=tuple(dict.fromkeys(gaps)),
         )
         save_manifest(root, goal_id, manifest.to_dict())
+        _emit_discovery_job(goal_id, None, event="wave_completed", completed=len(completed), total=len(jobs))
         return manifest
+
+
+def _emit_discovery_job(goal_id: str, job: DiscoveryJob | None, *, event: str, **extra: object) -> None:
+    """Emit bounded discovery progress without coupling classic CLI output."""
+    try:
+        from harness.ui.events import emit, is_enabled
+
+        if not is_enabled():
+            return
+        payload: dict[str, object] = {"goal_id": goal_id, "event": event}
+        if job is not None:
+            payload.update({
+                "job_id": job.id,
+                "role": job.role,
+                "status": job.status,
+                "read_path_count": len(job.read_paths),
+                # Discovery is deliberately read-only. Surface the bounded
+                # assignment so the UI can explain what it is inspecting.
+                "read_paths": list(job.read_paths[:12]),
+                "tools": ["read_file"],
+                "error": (job.error or "")[:1_000],
+                "retryable": job.retryable,
+                "report_path": job.report_path,
+            })
+        payload.update(extra)
+        emit("goal_discovery_job", **payload)
+    except Exception:
+        return

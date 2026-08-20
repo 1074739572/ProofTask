@@ -65,6 +65,7 @@ class StopReason(str, Enum):
     evaluation_unavailable = "evaluation_unavailable"
     impact_review_format_error = "impact_review_format_error"
     repair_plan_format_error = "repair_plan_format_error"
+    repair_limit_reached = "repair_limit_reached"
     provider_unavailable = "provider_unavailable"
     autonomy_blocked = "autonomy_blocked"
     internal_error = "internal_error"
@@ -96,6 +97,8 @@ class GoalState:
     # The confirmed product boundary is immutable after `/goal run`; Task plans
     # may evolve inside it, but execution must not fall back to chat history.
     goal_contract: dict[str, Any] = field(default_factory=dict)
+    # Origin Draft id links the two durable files for crash reconciliation.
+    draft_id: str = ""
     initialization_complete: bool = False
     # The exact durable phase to resume after a pause/restart.
     resume_phase: str | None = None

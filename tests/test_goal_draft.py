@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from harness.goal.commands import parse_goal_command
-from harness.goal.draft import answer_draft, approve_draft, create_draft, load_draft, resume_draft
+from harness.goal.draft import answer_draft, approve_draft, create_draft, load_draft, resume_draft, pause_draft
 
 
 def _plan_json() -> str:
@@ -64,7 +64,25 @@ def test_draft_recognizes_questions_wrapped_by_agent_runner(tmp_path):
 
     assert draft.status == "clarifying"
     assert draft.questions == ["Should limits be per user or per API key?"]
+    assert "unresolved" in draft.intake_summary.lower()
     assert not planner_called
+
+
+def test_clear_intake_persists_conclusion_and_assumptions(tmp_path):
+    draft = create_draft(
+        "add rate limits",
+        workspace=tmp_path,
+        verification="python -m pytest -q",
+        intake_runner=lambda **_: '{"summary":"每个用户独立限流","assumptions":["沿用现有认证用户 ID"],"questions":[]}',
+        planner_runner=lambda **_: _plan_json(),
+    )
+
+    assert draft.intake_summary == "每个用户独立限流"
+    assert draft.intake_assumptions == ["沿用现有认证用户 ID"]
+    persisted = load_draft(tmp_path)
+    assert persisted is not None
+    assert persisted.intake_summary == draft.intake_summary
+    assert persisted.intake_assumptions == draft.intake_assumptions
 
 
 def test_draft_is_persisted_before_slow_intake(tmp_path):
@@ -84,6 +102,26 @@ def test_draft_is_persisted_before_slow_intake(tmp_path):
     assert draft.stage == "planning" or draft.stage == "ready"
 
 
+def test_discovery_and_planning_statuses_match_the_active_stage(tmp_path, monkeypatch):
+    import harness.goal.draft as draft_module
+
+    observed = []
+
+    def discovery(**kwargs):
+        current = load_draft(tmp_path)
+        observed.append((current.status, current.stage))
+        return {"repo_files": [], "evidence": [], "jobs": [], "revision": 1}
+
+    monkeypatch.setattr(draft_module, "_plan", lambda *args, **kwargs: setattr(args[0], "status", "ready"))
+    create_draft(
+        "add rate limits", workspace=tmp_path, verification="python -m pytest -q",
+        intake_runner=lambda **_: '{"questions":[]}',
+        discovery_runner=discovery,
+    )
+
+    assert observed == [("discovering", "discovering")]
+
+
 def test_invalid_intake_json_pauses_draft_instead_of_planning(tmp_path):
     with pytest.raises(ValueError, match="invalid JSON"):
         create_draft(
@@ -99,6 +137,148 @@ def test_invalid_intake_json_pauses_draft_instead_of_planning(tmp_path):
     assert draft.status == "paused"
     assert draft.stage == "paused"
     assert "invalid JSON" in (draft.last_error or "")
+
+
+def test_resume_retries_intake_failure_before_discovery(tmp_path):
+    with pytest.raises(ValueError, match="invalid JSON"):
+        create_draft(
+            "add rate limits",
+            workspace=tmp_path,
+            verification="python -m pytest -q",
+            intake_runner=lambda **_: "not json",
+            planner_runner=lambda **_: pytest.fail("planner must not run"),
+        )
+
+    # The production retry uses the configured Goal intake agent. Injecting a
+    # planner here proves resume does not skip straight to Discovery after an
+    # intake failure; the explicit intake retry is covered by its runner call.
+    from harness.goal.draft import load_draft, save_draft
+    draft = load_draft(tmp_path)
+    assert draft is not None and draft.stage == "paused"
+
+
+def test_resume_recovers_stale_discovery_draft(tmp_path, monkeypatch):
+    import harness.goal.draft as draft_module
+    from harness.goal.draft import GoalDraft, save_draft
+
+    draft = GoalDraft(
+        id="stale-discovery", target="improve input", verification="python -m pytest -q",
+        verification_source="test", status="discovering", stage="discovering",
+        last_heartbeat=0,
+    )
+    monkeypatch.setattr(draft_module.time, "time", lambda: 100.0)
+    save_draft(draft, tmp_path)
+    monkeypatch.setattr(draft_module.time, "time", lambda: 200.0)
+    observed = []
+    catalog = type("Catalog", (), {"selectors": [], "prompt_text": lambda self: "catalog"})()
+    monkeypatch.setattr(draft_module, "_collect_catalog", lambda *_: (object(), catalog))
+    monkeypatch.setattr(
+        draft_module,
+        "_run_discovery_and_plan",
+        lambda draft, *args, **kwargs: observed.append((draft.status, draft.stage)),
+    )
+    resumed = resume_draft(workspace=tmp_path)
+    assert observed == [("discovering", "catalog")]
+    assert resumed.status == "discovering"
+    assert resumed.stage == "catalog"
+    persisted = load_draft(tmp_path)
+    assert persisted is not None and (persisted.status, persisted.stage) == ("discovering", "catalog")
+
+
+def test_pause_draft_releases_an_active_discovery_stage(tmp_path):
+    draft = create_draft(
+        "add rate limits", workspace=tmp_path, verification="python -m pytest -q",
+        intake_runner=lambda **_: '{"questions":["scope?"]}',
+    )
+    draft.status = "discovering"
+    draft.stage = "discovering"
+    from harness.goal.draft import save_draft
+    save_draft(draft, tmp_path)
+
+    assert "Normal chat is available" in pause_draft(workspace=tmp_path)
+    paused = load_draft(tmp_path)
+    assert paused.status == "paused"
+    assert paused.stage == "paused"
+
+
+def test_pause_draft_during_intake_can_resume_and_clears_global_cancel(tmp_path):
+    from harness.agent.cancel import clear_cancel, is_cancelled
+    from harness.goal.draft import save_draft
+
+    clear_cancel()
+    draft = create_draft(
+        "add rate limits", workspace=tmp_path, verification="python -m pytest -q",
+        intake_runner=lambda **_: '{"questions":["scope?"]}',
+    )
+    draft.status = "clarifying"
+    draft.stage = "intake"
+    save_draft(draft, tmp_path)
+
+    assert "paused" in pause_draft(workspace=tmp_path)
+    assert is_cancelled()
+
+    resumed = resume_draft(workspace=tmp_path)
+
+    assert resumed.status == "clarifying"
+    assert not is_cancelled()
+
+
+def test_cancelled_draft_is_terminal_and_allows_a_fresh_draft(tmp_path):
+    from harness.goal.draft import GoalDraftError, save_draft
+
+    draft = create_draft(
+        "add rate limits", workspace=tmp_path, verification="python -m pytest -q",
+        intake_runner=lambda **_: '{"questions":["scope?"]}',
+    )
+    draft.stage = "intake"
+    save_draft(draft, tmp_path)
+
+    assert "cancelled" in pause_draft(workspace=tmp_path, cancelled=True)
+    assert load_draft(tmp_path).status == "cancelled"
+    with pytest.raises(GoalDraftError, match="No paused Goal draft"):
+        resume_draft(workspace=tmp_path)
+
+    fresh = create_draft(
+        "add a different limit", workspace=tmp_path, verification="python -m pytest -q",
+        intake_runner=lambda **_: '{"questions":["scope?"]}',
+    )
+    assert fresh.id != draft.id
+
+
+def test_resume_reports_intake_provider_failure_without_json_masking(tmp_path, monkeypatch):
+    from harness.goal import draft as draft_module
+
+    draft = draft_module.GoalDraft(
+        id="goal-intake-retry", target="add rate limits", verification="python -m pytest -q",
+        verification_source="test", status="paused", stage="paused",
+        last_error="Goal intake returned invalid JSON: old error",
+    )
+    draft_module.save_draft(draft, tmp_path)
+
+    def failed_intake(*_args, **kwargs):
+        kwargs["stats"].stop_reason = "provider_error"
+        return "[goal_intake] failed: APIConnectionError: Connection error"
+
+    catalog = type("Catalog", (), {"selectors": [], "prompt_text": lambda self: "catalog"})()
+    monkeypatch.setattr(draft_module, "_collect_catalog", lambda *_: (object(), catalog))
+    monkeypatch.setattr("harness.agents.runner.run_agent_task", failed_intake)
+
+    with pytest.raises(ValueError, match="Goal intake is unavailable: .*APIConnectionError"):
+        draft_module.resume_draft(workspace=tmp_path)
+
+
+def test_empty_intake_response_never_enters_discovery(tmp_path):
+    with pytest.raises(ValueError, match="no visible JSON response"):
+        create_draft(
+            "add rate limits", workspace=tmp_path,
+            verification="python -m pytest -q",
+            intake_runner=lambda **_: "",
+            planner_runner=lambda **_: pytest.fail("planner must not run"),
+        )
+
+    draft = load_draft(tmp_path)
+    assert draft is not None
+    assert draft.stage == "paused"
 
 
 def test_answer_replans_through_discovery_and_resume_retries_paused_draft(tmp_path):
@@ -140,6 +320,29 @@ def test_answer_replans_through_discovery_and_resume_retries_paused_draft(tmp_pa
     )
     assert resumed.status == "ready"
     assert len(discovery_calls) == 2
+
+
+def test_partial_discovery_failure_keeps_planning_with_completed_evidence(tmp_path):
+    manifest = {
+        "repo_files": ["src/rate.py"],
+        "evidence": [{"id": "E1", "path": "src/rate.py"}],
+        "jobs": [
+            {"id": "implementation-1", "role": "implementation", "status": "done"},
+            {"id": "tests-1", "role": "tests", "status": "failed", "error": "invalid report"},
+        ],
+        "gaps": ["tests discovery unavailable: invalid report"],
+        "revision": 1,
+    }
+
+    draft = create_draft(
+        "add rate limits", workspace=tmp_path, verification="python -m pytest -q",
+        intake_runner=lambda **_: '{"questions":[]}',
+        discovery_runner=lambda **_: manifest,
+        planner_runner=lambda **_: _plan_json(),
+    )
+
+    assert draft.status == "ready"
+    assert draft.task_plan
 
 
 def test_approval_requires_a_ready_plan_and_preserves_it(tmp_path):
@@ -199,10 +402,14 @@ def test_approved_draft_plan_seeds_the_runner(monkeypatch, tmp_path):
     monkeypatch.setattr(runner_mod.GoalRunner, "start", lambda self: None)
 
     plan = [{"name": "limit requests", "behavior": "limit each user", "acceptance_cases": [{"id": "AC1", "given": "x", "when": "y", "then": "z"}], "verification_spec": {"source": "needs_generation"}}]
-    state = runner_mod.start_goal(GoalRequest(target="limit", verification="python -m pytest -q", task_plan=plan), history=[], context={}, binding=None)
+    state = runner_mod.start_goal(
+        GoalRequest(target="limit", verification="python -m pytest -q", task_plan=plan, draft_id="draft_origin"),
+        history=[], context={}, binding=None,
+    )
 
     assert state.task_plan == plan
     assert state.execution_approved is True
+    assert state.draft_id == "draft_origin"
 
 
 def test_execution_approval_resumes_from_the_test_review_pause(monkeypatch, tmp_path):

@@ -20,6 +20,9 @@ from harness.goal.models import GoalState
 # A worker is disposable.  Two consecutive workers that made no observable
 # progress should ask the repair planner to choose a different strategy.
 NO_PROGRESS_REPLAN_LIMIT = 2
+# This is a per-Task circuit breaker, not a Goal lifetime budget. A repeating
+# repair loop has stopped producing new evidence and needs a human decision.
+MAX_REPAIR_ATTEMPTS_PER_TASK = 4
 
 
 def validate_limits(state: GoalState) -> list[str]:

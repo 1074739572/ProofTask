@@ -97,7 +97,7 @@ def review_test_impact(
         )
     except Exception as exc:
         return ImpactDecision(reason=f"impact reviewer unavailable: {type(exc).__name__}", unavailable=True)
-    if _agent_stop_reason(stats) == "provider_error":
+    if _agent_stop_reason(stats) in {"provider_error", "configuration_error"}:
         return ImpactDecision(reason="impact reviewer provider unavailable", unavailable=True)
 
     decision = _parse_impact_decision(raw, pending_tasks)
@@ -124,7 +124,7 @@ def review_test_impact(
         )
     except Exception as exc:
         return ImpactDecision(reason=f"impact reviewer unavailable: {type(exc).__name__}", unavailable=True)
-    if _agent_stop_reason(stats) == "provider_error":
+    if _agent_stop_reason(stats) in {"provider_error", "configuration_error"}:
         return ImpactDecision(reason="impact reviewer provider unavailable", unavailable=True)
 
     corrected_decision = _parse_impact_decision(corrected, pending_tasks)

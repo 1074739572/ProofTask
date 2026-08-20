@@ -120,10 +120,15 @@ def test_goal_agents_use_the_configured_plan_run_eval_profiles():
 
     expected = {
         "goal_intake": ("deepseek-v4-pro", "max"),
+        "goal_discovery_requirement": ("mimo-v2.5-pro", None),
+        "goal_discovery_architecture": ("mimo-v2.5-pro", None),
+        "goal_discovery_implementation": ("mimo-v2.5-pro", None),
+        "goal_discovery_tests": ("mimo-v2.5-pro", None),
+        "goal_discovery_history": ("mimo-v2.5-pro", None),
         "goal_planner": ("deepseek-v4-pro", "max"),
         "goal_repair_planner": ("deepseek-v4-pro", "max"),
-        "goal_test_impact": ("deepseek-v4-pro", "max"),
-        "goal_test_writer": ("deepseek-v4-flash", "max"),
+        "goal_test_impact": ("mimo-v2.5-pro", None),
+        "goal_test_writer": ("deepseek-v4-pro", "max"),
         "goal_worker": ("deepseek-v4-flash", "max"),
         "evaluator": ("mimo-v2.5-pro", None),
     }

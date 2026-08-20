@@ -48,7 +48,17 @@ def _report_retry(kind: str, attempt: int, delay: float) -> None:
 
 def _is_transient(exc: Exception) -> bool:
     name = type(exc).__name__.lower()
-    msg = str(exc).lower()
+    parts = [str(exc)]
+    cause = exc
+    while getattr(cause, "__cause__", None) is not None:
+        cause = cause.__cause__
+        parts.append(str(cause))
+    msg = " ".join(parts).lower()
+    # Windows socket permission failures are deterministic. Retrying them
+    # only obscures the real problem and makes every configured model appear
+    # unavailable.
+    if "10013" in msg or "access is denied" in msg or "permission denied" in msg:
+        return False
     return any(
         token in name or token in msg
         for token in ("timeout", "connection", "temporarily unavailable", "502", "503", "529")
@@ -56,12 +66,14 @@ def _is_transient(exc: Exception) -> bool:
 
 
 def with_retry(fn, state: RecoveryState):
+    last_error: Exception | None = None
     for attempt in range(MAX_RETRIES):
         try:
             result = fn()
             state.consecutive_529 = 0
             return result
         except Exception as exc:
+            last_error = exc
             name = type(exc).__name__.lower()
             msg = str(exc).lower()
             if "ratelimit" in name or "429" in msg:
@@ -88,7 +100,8 @@ def with_retry(fn, state: RecoveryState):
                     raise RuntimeError("cancelled during retry")
                 continue
             raise
-    raise RuntimeError(f"Max retries ({MAX_RETRIES}) exceeded")
+    detail = f"{type(last_error).__name__}: {last_error}" if last_error is not None else "unknown error"
+    raise RuntimeError(f"Max retries ({MAX_RETRIES}) exceeded; last error: {detail}") from last_error
 
 
 def is_model_recoverable_error(exc: Exception) -> bool:

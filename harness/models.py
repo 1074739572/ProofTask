@@ -218,6 +218,7 @@ def get_model_profile(
     model_id: str | None = None,
     *,
     effort_override: str | None = None,
+    inherit_interactive_effort: bool = True,
 ) -> ModelProfile:
     """Return a model profile, optionally with a call-scoped effort override.
 
@@ -231,7 +232,11 @@ def get_model_profile(
         for entry in _catalog:
             if entry["id"] == mid:
                 profile = _profile_from_entry(entry)
-                selected_effort = _normalize_effort(effort_override) if effort_override else _current_effort
+                selected_effort = _normalize_effort(effort_override) if effort_override else (
+                    _current_effort
+                    if inherit_interactive_effort and (model_id is None or model_id == _current_model)
+                    else None
+                )
                 if selected_effort:
                     return replace(profile, reasoning_effort=selected_effort)
                 return profile
@@ -240,7 +245,11 @@ def get_model_profile(
             label=mid,
             provider="deepseek",
             api_model=mid,
-            reasoning_effort=_normalize_effort(effort_override) if effort_override else _current_effort,
+            reasoning_effort=(
+                _normalize_effort(effort_override)
+                if effort_override
+                else (_current_effort if inherit_interactive_effort else None)
+            ),
             effort_options=(),
             api_effort_values={},
             extra_body={},

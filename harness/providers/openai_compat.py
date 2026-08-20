@@ -174,6 +174,21 @@ def openai_response_to_anthropic(completion) -> MessageResponse:
     if message.content:
         blocks.append(TextBlock(text=message.content))
 
+    # DeepSeek reasoning models can return their entire final answer in the
+    # OpenAI-compatible ``reasoning_content`` field while ``content`` is
+    # empty. Dropping it turns a successful structured Goal reply into an
+    # empty response and a misleading "invalid JSON" failure. Only use this
+    # fallback when there is no ordinary answer or tool call to preserve the
+    # normal visible-response contract.
+    reasoning_fallback = None
+    if not message.content and not (message.tool_calls or []):
+        reasoning_fallback = (
+            getattr(message, "reasoning_content", None)
+            or getattr(message, "reasoning", None)
+        )
+        if reasoning_fallback:
+            blocks.append(TextBlock(text=str(reasoning_fallback)))
+
     for tool_call in message.tool_calls or []:
         raw_args = tool_call.function.arguments or "{}"
         try:
@@ -277,6 +292,7 @@ def _stream_openai(client: OpenAI, kwargs: dict, on_delta: callable) -> MessageR
 
     stream = client.chat.completions.create(**kwargs)
     text_parts: list[str] = []
+    reasoning_parts: list[str] = []
     tool_call_buf: dict[str, dict] = {}  # index -> {id, name, args}
     finish_reason: str | None = None
     model: str | None = None
@@ -302,6 +318,20 @@ def _stream_openai(client: OpenAI, kwargs: dict, on_delta: callable) -> MessageR
             if is_enabled():
                 on_delta(delta.content, "text_delta")
 
+        # DeepSeek reasoning models may put the complete structured answer in
+        # the OpenAI-compatible reasoning_content stream field while leaving
+        # content empty. Preserve it so Goal intake does not see a false empty
+        # response. Prefer ordinary content when both are present.
+        reasoning_delta = (
+            getattr(delta, "reasoning_content", None)
+            or getattr(delta, "reasoning", None)
+        )
+        if reasoning_delta:
+            reasoning_parts.append(str(reasoning_delta))
+            # reasoning_content is provider-internal chain-of-thought. Keep it
+            # for structured-response fallback below, but never stream it to
+            # the user-facing TUI as assistant text.
+
         # Tool call delta
         for tc in delta.tool_calls or []:
             idx = tc.index
@@ -317,6 +347,8 @@ def _stream_openai(client: OpenAI, kwargs: dict, on_delta: callable) -> MessageR
     blocks: list = []
     if text_parts:
         blocks.append(TextBlock(text="".join(text_parts)))
+    elif reasoning_parts and not tool_call_buf:
+        blocks.append(TextBlock(text="".join(reasoning_parts)))
 
     has_tool_calls = bool(tool_call_buf)
     for buf in sorted(tool_call_buf.values(), key=lambda b: list(tool_call_buf.keys())[list(tool_call_buf.values()).index(b)]):

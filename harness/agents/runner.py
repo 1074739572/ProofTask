@@ -111,6 +111,17 @@ _BASE_TOOL_DEFS = {
     },
 }
 
+
+def _provider_error_detail(exc: Exception) -> str:
+    """Preserve the transport cause hidden by SDK wrapper exceptions."""
+
+    detail = f"{type(exc).__name__}: {exc}"
+    cause = exc.__cause__ or exc.__context__
+    if cause is None:
+        return detail
+    cause_detail = f"{type(cause).__name__}: {cause}"
+    return detail if cause_detail == detail else f"{detail} (cause: {cause_detail})"
+
 _BASE_HANDLERS = {
     "bash": run_bash,
     "read_file": run_read,
@@ -214,17 +225,23 @@ def run_agent_task(
     tools_override: tuple[str, ...] | None = None,
     read_roots: tuple[str, ...] | None = None,
     read_paths: tuple[str, ...] | None = None,
+    reasoning_effort_override: str | None = None,
 ) -> str:
-    error = validate_agent_model(agent_type)
+    error = validate_agent_model(agent_type, reasoning_effort=reasoning_effort_override)
     if error:
+        if stats is not None:
+            stats.stop_reason = "configuration_error"
         return f"Error: {error}"
 
     profile = get_agent_profile(agent_type)
     assert profile is not None
+    selected_effort = reasoning_effort_override if reasoning_effort_override is not None else profile.reasoning_effort
 
     base_workdir = get_workdir().resolve()
     agent_cwd = Path(cwd).resolve() if cwd else base_workdir
     if not agent_cwd.is_relative_to(base_workdir):
+        if stats is not None:
+            stats.stop_reason = "configuration_error"
         return f"Error: agent working directory escapes workspace: {agent_cwd}"
     try:
         allowed_tools = profile.tools if tools_override is None else tools_override
@@ -233,6 +250,8 @@ def run_agent_task(
             read_roots=read_roots, read_paths=read_paths,
         )
     except ValueError as exc:
+        if stats is not None:
+            stats.stop_reason = "configuration_error"
         return f"Error: {exc}"
     workdir = str(agent_cwd)
     system = f"{profile.system}\n\nWorking directory: {workdir}"
@@ -280,7 +299,8 @@ def run_agent_task(
                         with_retry(
                             lambda: create_message(
                                 model_id=profile.model_id,
-                                reasoning_effort=profile.reasoning_effort,
+                                reasoning_effort=selected_effort,
+                                inherit_interactive_effort=False,
                                 system=system,
                                 messages=messages,
                                 tools=tools,
@@ -314,7 +334,7 @@ def run_agent_task(
                     return f"[{agent_type}] stopped while waiting for model: {reason}"
         if outcome == "error":
             exc = value
-            detail = f"{type(exc).__name__}: {exc}"
+            detail = _provider_error_detail(exc)
             if stats is not None:
                 stats.stop_reason = "provider_error"
             renderer.subagent_end(run_id, f"failed: {detail}", tool_count, time.time() - started, max_len=120)
@@ -382,7 +402,10 @@ def run_agent_task(
     elapsed = time.time() - started
 
     if stats is not None and final_text is None:
-        stats.stop_reason = "max_rounds"
+        # An assistant turn with neither visible text nor tool calls is not a
+        # successful completion.  Returning a generic "finished" marker lets
+        # structured Goal stages accidentally continue after an empty reply.
+        stats.stop_reason = "empty_response"
 
     # If we didn't capture a final_text (loop ran 30 rounds), extract it now
     if final_text is None:
@@ -399,8 +422,10 @@ def run_agent_task(
             f"[{agent_type} / {profile.model_id}] {description} "
             f"({tool_count} tools, {elapsed:.1f}s)\n\n{final_text}"
         )
-    renderer.subagent_end(run_id, "finished without summary", tool_count, elapsed, max_len=50)
-    return f"[{agent_type}] finished without summary ({tool_count} tools, {elapsed:.1f}s)"
+    if stats is not None:
+        stats.stop_reason = "empty_response"
+    renderer.subagent_end(run_id, "failed: empty response", tool_count, elapsed, max_len=50)
+    return f"[{agent_type}] failed: empty response ({tool_count} tools, {elapsed:.1f}s)"
 
 
 def spawn_subagent(description: str) -> str:

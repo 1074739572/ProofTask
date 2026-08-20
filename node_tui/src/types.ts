@@ -23,6 +23,9 @@ export type UiEvent =
   | { type: 'ui_clear'; seq?: number; ts?: number }
   | { type: 'welcome'; seq?: number; ts?: number; art?: string[]; quote?: string; date?: string }
   | { type: 'session_status'; seq?: number; ts?: number; model?: string; mode?: string; cwd?: string; session_id?: string; running?: boolean; session_source?: string }
+  | { type: 'queue_status'; seq?: number; ts?: number; pending: number; running: boolean; capacity?: number }
+  | { type: 'message_queued'; seq?: number; ts?: number; text: string; position: number; pending: number }
+  | { type: 'backend_state'; seq?: number; ts?: number; state: 'connected' | 'disconnected' | 'reconnecting'; code?: number | null; signal?: string | null; error?: string }
   | { type: 'user_message'; seq?: number; ts?: number; text: string }
   | { type: 'local_user_message'; seq?: number; ts?: number; text: string }
   | { type: 'thinking_start'; seq?: number; ts?: number; phase?: RunPhase; model?: string }
@@ -50,10 +53,12 @@ export type UiEvent =
   | { type: 'subagent_round'; seq?: number; ts?: number; id: string; round: number; text: string }
   | { type: 'subagent_tool'; seq?: number; ts?: number; id: string; tool_use_id?: string; name: string; summary: string; ok?: boolean | null }
   | { type: 'subagent_end'; seq?: number; ts?: number; id: string; ok: boolean; tools: number; elapsed: number; summary: string }
-  | { type: 'goal_started'; seq?: number; ts?: number; id: string; phase: string; status: string }
-  | { type: 'goal_status'; seq?: number; ts?: number; id: string; phase: string; status: string }
-  | { type: 'goal_phase'; seq?: number; ts?: number; id: string; phase: string; status: string; feature_id?: string; attempt?: number }
-  | { type: 'goal_stopped'; seq?: number; ts?: number; id: string; status: string; stop_reason?: string };
+  | { type: 'goal_started'; seq?: number; ts?: number; id: string; draft_id?: string; phase: string; status: string; resume_phase?: string | null; execution_approved?: boolean; task_cycles?: number; updated_at?: number }
+  | { type: 'goal_status'; seq?: number; ts?: number; id: string; draft_id?: string; phase: string; status: string; resume_phase?: string | null; execution_approved?: boolean; task_cycles?: number; updated_at?: number }
+  | { type: 'goal_phase'; seq?: number; ts?: number; id: string; draft_id?: string; phase: string; status: string; feature_id?: string; attempt?: number; resume_phase?: string | null; execution_approved?: boolean; task_cycles?: number; updated_at?: number }
+  | { type: 'goal_stopped'; seq?: number; ts?: number; id: string; draft_id?: string; status: string; stop_reason?: string; resume_phase?: string | null; execution_approved?: boolean; task_cycles?: number; updated_at?: number }
+  | { type: 'goal_draft_status'; seq?: number; ts?: number; id: string; target?: string; verification?: string; verification_source?: string; verification_adapter?: string; status: string; stage: string; event?: string; updated_at?: number; stage_started_at?: number; last_heartbeat?: number; stage_deadline?: number; test_catalog_count?: number; discovery_path?: string; intake_summary?: string; intake_assumptions?: string[]; clarifications?: Array<{question: string; answer: string}>; tasks?: Array<{name: string; behavior?: string; depends_on?: string[]; acceptance_count?: number; verification_source?: string; selectors?: string[]}>; last_error?: string; question?: string; question_index?: number; question_count?: number; task_count?: number; message?: string }
+  | { type: 'goal_discovery_job'; seq?: number; ts?: number; goal_id: string; event: string; job_id?: string; role?: string; status?: string; read_path_count?: number; read_paths?: string[]; tools?: string[]; error?: string; retryable?: boolean; report_path?: string; completed?: number; total?: number };
 
 export type ToolRecord = {
   key: string;

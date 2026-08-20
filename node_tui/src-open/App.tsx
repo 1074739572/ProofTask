@@ -2,14 +2,24 @@ import {BoxRenderable, ScrollBoxRenderable, SyntaxStyle} from '@opentui/core';
 import {batch, createSignal, createEffect, createMemo, For, Show, onCleanup} from 'solid-js';
 import {createStore, reconcile} from 'solid-js/store';
 import {useTerminalDimensions, useKeyboard} from '@opentui/solid';
-import {spawn} from 'node:child_process';
-import readline from 'node:readline';
+import {startBackend, type Backend} from '../src/backend.ts';
 import {alwaysSeparate, setPreLayoutSiblingMargin} from './layout.ts';
 import {buildSections} from './sections.ts';
 import type {ActionRow, Entry, Section, SubagentStatus} from './sections.ts';
 import {C} from './theme.ts';
 import {WelcomeView} from './Welcome.tsx';
-import {GoalView, type GoalDecision, type GoalSnapshot} from './GoalView.tsx';
+import {
+  GoalDraftView,
+  GoalView,
+  goalDraftIsBusy,
+  goalDraftSnapshotFromEvent,
+  goalIsActive,
+  goalSnapshotFromEvent,
+  mergeGoalDiscoveryEvent,
+  type GoalDecision,
+  type GoalDraftSnapshot,
+  type GoalSnapshot,
+} from './GoalView.tsx';
 import {UsageView, type UsageRange} from './UsageView.tsx';
 import {
   applyCompletionResult,
@@ -18,6 +28,18 @@ import {
   shouldHandleAutocompleteKey,
   type CompletionMenuState,
 } from '../src/autocomplete.ts';
+import {
+  appendHistory,
+  foldedPasteLabel,
+  footerHint,
+  likelyPaste,
+  loadHistory,
+  makePasteSnapshot,
+  persistHistory,
+  searchHistory,
+  type BackendConnectionState,
+  type PasteSnapshot,
+} from './interaction.ts';
 
 export type OverlayOption = {name: string; description: string; value: string};
 export type Overlay = {kind: 'permission' | 'picker'; id: string; title: string; pickerId?: string; options: OverlayOption[]};
@@ -98,38 +120,10 @@ function readDefaultMode(): string {
   return 'mode';
 }
 
-const child = process.env.DEBUG_SKIP_BACKEND === '1' ? null : spawn(process.env.PYTHON || 'python', ['main.py', '--event-stream'], {cwd: repoRoot, stdio: ['pipe', 'pipe', 'pipe'], env: {...process.env, PYTHONIOENCODING: 'utf-8'}});
 let reportDiagnostic: (text: string) => void = (text: string) => { process.stderr.write(`${text}\n`); };
-if (child?.stderr) {
-  const stderr = readline.createInterface({input: child.stderr});
-  stderr.on('line', line => { const text = line.trim(); if (text) reportDiagnostic(text); });
-}
-child?.on('error', error => reportDiagnostic(`Backend failed to start: ${error.message}`));
-child?.on('exit', (code, signal) => { if (code !== 0) reportDiagnostic(`Backend exited (${signal ?? code})`); });
-function send(command: Record<string, unknown>) { if (child && !child.stdin.destroyed) child.stdin.write(JSON.stringify(command) + '\n'); }
+let backendClient: Backend | null = null;
+function send(command: Record<string, unknown>): boolean { return backendClient?.send(command) ?? false; }
 function value(event: any, ...keys: string[]) { for (const key of keys) if (event?.[key] !== undefined && event[key] !== null && event[key] !== '') return String(event[key]); return ''; }
-
-function goalSnapshotFromEvent(event: any): GoalSnapshot | null {
-  const id = value(event, 'id');
-  const target = value(event, 'target');
-  if (!id || !target) return null;
-  return {
-    id,
-    target,
-    verification: value(event, 'verification'),
-    phase: value(event, 'phase') || 'initialize',
-    status: value(event, 'status') || 'running',
-    current_task_id: value(event, 'current_task_id') || null,
-    attempts: Number(event.attempts || 0),
-    max_attempts: Number(event.max_attempts || 0),
-    total_llm_rounds: Number(event.total_llm_rounds || 0),
-    max_total_rounds: Number(event.max_total_rounds || 0),
-    stop_reason: value(event, 'stop_reason') || null,
-    final_verification: event.final_verification && typeof event.final_verification === 'object' ? event.final_verification : null,
-    tasks: Array.isArray(event.tasks) ? event.tasks : [],
-    last_error: value(event, 'last_error') || null,
-  };
-}
 
 const GOAL_AGENT_LABELS: Record<string, string> = {
   goal_intake: '规划模型',
@@ -647,6 +641,11 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
   const [todayInput, setTodayInput] = createSignal(props?.debugUsage?.input ?? 0); const [todayOutput, setTodayOutput] = createSignal(props?.debugUsage?.output ?? 0); const [todayCacheRead, setTodayCacheRead] = createSignal(props?.debugUsage?.cacheRead ?? 0);
   const [contextUsed, setContextUsed] = createSignal(props?.debugUsage?.contextUsed ?? 0); const [contextWindow, setContextWindow] = createSignal(props?.debugUsage?.contextWindow ?? 0);
   const [goalSnapshot, setGoalSnapshot] = createSignal<GoalSnapshot | null>(resolveDebugValue(props?.debugGoal) ?? null);
+  const [lifecycleView, setLifecycleView] = createSignal<'goal' | 'draft' | 'chat'>(goalSnapshot() ? 'goal' : 'chat');
+  // A consumed/discarded draft may still have late heartbeat events from the
+  // foreground operation. Ignore those events until a genuinely new draft id
+  // arrives, otherwise the old Draft page can resurrect after Goal start.
+  const closedDraftIds = new Set<string>();
   const [goalDecisions, setGoalDecisions] = createSignal<GoalDecision[]>([]);
   const [usageOpen, setUsageOpen] = createSignal(props?.debugUsageOpen ?? false);
   const [usageRange, setUsageRange] = createSignal<UsageRange>(props?.debugUsageRange ?? 7);
@@ -672,9 +671,13 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
   const toggleExpand = (id: string) => update(id, x => ({...x, expanded: !x.expanded}));
   const [phase, setPhase] = createSignal('idle'); const [running, setRunning] = createSignal(false); const [startedAt, setStartedAt] = createSignal(0); const [now, setNow] = createSignal(Date.now()); const [overlay, setOverlay] = createSignal<Overlay | null>(props?.debugOverlay ?? null);
   const [overlayIndex, setOverlayIndex] = createSignal(0);
-  // Input history
-  const [inputHistory, setInputHistory] = createSignal<string[]>([]);
+  // Input history is durable per workspace and de-duplicates consecutive turns.
+  const [inputHistory, setInputHistory] = createSignal<string[]>(loadHistory(repoRoot));
   const [historyIdx, setHistoryIdx] = createSignal(-1);
+  const [historyDraft, setHistoryDraft] = createSignal('');
+  const [historySearchOpen, setHistorySearchOpen] = createSignal(false);
+  const [historySearchIndex, setHistorySearchIndex] = createSignal(0);
+  let historyWriteChain: Promise<void> = Promise.resolve();
   // Toast for picker feedback
   const [toast, setToast] = createSignal<{text: string; time: number} | null>(null);
   // Tracks whether the user has started a conversation. The welcome panel stays
@@ -687,8 +690,21 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
   // the real daily quote. Nothing blocks on startup. Debug renders inject
   // entries directly and have no real backend, so they start ready.
   const [backendReady, setBackendReady] = createSignal(props?.debugEntries != null);
+  const [backendState, setBackendState] = createSignal<BackendConnectionState>(props?.debugEntries != null ? 'connected' : 'disconnected');
+  const [backendExitCode, setBackendExitCode] = createSignal<number | null>(null);
+  const [queuedMessages, setQueuedMessages] = createSignal(0);
+  const [offlineMessages, setOfflineMessages] = createSignal<string[]>([]);
+  const [currentTool, setCurrentTool] = createSignal<string | null>(null);
+  const [toolDone, setToolDone] = createSignal(0);
+  const [toolTotal, setToolTotal] = createSignal(0);
+  const [draftStatus, setDraftStatus] = createSignal<GoalDraftSnapshot | null>(null);
+  const [pastedContent, setPastedContent] = createSignal<PasteSnapshot | null>(null);
+  let lastBufferValue = '';
+  let lastBufferChangedAt = 0;
+  let suppressContentChange = false;
   let turnStart = 0; let turnToolCount = 0; let turnFiles: string[] = []; let turnTokens = {inp: 0, out: 0, cache: 0};
-  let responseId = ''; let pendingPrompt = ''; let actionCounter = 0; let firstEvent = true; let lastIntentText = '';
+  let responseId = ''; let pendingPrompts: string[] = []; let actionCounter = 0; let firstEvent = true; let lastIntentText = '';
+  let lastDraftError = '';
   // Reference to the multiline composer so programmatic edits (history recall,
   // clearing after submit) can update its buffer directly.
   let textareaRef: any = null;
@@ -804,6 +820,54 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
     setToast({text, time: Date.now()});
     if (toastTimer) clearTimeout(toastTimer);
     toastTimer = setTimeout(() => setToast(null), 2500);
+  };
+  const setComposerText = (text: string) => {
+    suppressContentChange = true;
+    lastBufferValue = text;
+    lastBufferChangedAt = Date.now();
+    setInput(text);
+    textareaRef?.setText?.(text);
+    queueMicrotask(() => { suppressContentChange = false; });
+  };
+  const recordHistory = (text: string) => {
+    const next = appendHistory(inputHistory(), text);
+    setInputHistory(next);
+    historyWriteChain = historyWriteChain.then(() => persistHistory(cwd() || repoRoot, next));
+  };
+  const closeHistorySearch = (restore = false) => {
+    if (restore) setComposerText(historyDraft());
+    setHistorySearchOpen(false);
+    setHistorySearchIndex(0);
+  };
+  const historyMatches = () => searchHistory(inputHistory(), input());
+  const chooseHistoryMatch = () => {
+    const matches = historyMatches();
+    if (!matches.length) return false;
+    setComposerText(matches[Math.min(historySearchIndex(), matches.length - 1)]);
+    closeHistorySearch();
+    return true;
+  };
+  const recallHistory = (direction: 1 | -1) => {
+    const history = inputHistory();
+    if (!history.length) return;
+    if (historyIdx() === -1) {
+      setHistoryDraft(input());
+      setHistoryIdx(direction < 0 ? history.length - 1 : 0);
+    } else {
+      const next = historyIdx() + direction;
+      if (next < 0) return;
+      if (next >= history.length) {
+        setHistoryIdx(-1);
+        setComposerText(historyDraft());
+        return;
+      }
+      setHistoryIdx(next);
+    }
+    const idx = historyIdx();
+    if (idx >= 0) setComposerText(history[idx]);
+  };
+  let reconnectBackend: () => void = () => {
+    showToast('Backend unavailable');
   };
   const openUsage = (rawArg = '') => {
     const arg = rawArg.trim().toLowerCase();
@@ -969,11 +1033,10 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
   const elapsed = () => startedAt() ? `${Math.floor((now() - startedAt()) / 1000)}s` : '0s';
   const spinner = () => ['|', '/', '-', '\\'][Math.floor(now() / 180) % 4];
   reportDiagnostic = (text: string) => add({id: `log-${Date.now()}`, kind: 'log', text: 'Backend', detail: text});
-  if (child?.stdout) {
-    const rl = readline.createInterface({input: child.stdout});
-    rl.on('line', raw => { try {
+  const handleBackendEvent = (event: any) => {
+    try {
       if (firstEvent) { firstEvent = false; setBackendReady(true); }
-      const event = JSON.parse(raw); switch (event.type) {
+      switch (event.type) {
       case 'session_status': {
         setModel(value(event, 'model') || 'model'); setMode(value(event, 'mode') || 'mode'); setCwd(value(event, 'cwd', 'working_dir')); setSession(value(event, 'session', 'session_id'));
         setEffort(value(event, 'reasoning_effort') || 'off'); setEffortLabel(value(event, 'reasoning_effort_label') || 'Model default');
@@ -987,6 +1050,94 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
         setWelcomeQuote(value(event, 'quote') || '');
         break;
       }
+      case 'backend_state': {
+        const state = value(event, 'state') as BackendConnectionState;
+        if (state === 'connected' || state === 'disconnected' || state === 'reconnecting') setBackendState(state);
+        if (state === 'connected') { setBackendReady(true); setBackendExitCode(null); }
+        if (state === 'disconnected') { setBackendReady(false); setBackendExitCode(event.code == null ? null : Number(event.code)); }
+        break;
+      }
+      case 'queue_status':
+        setQueuedMessages(Math.max(0, Number(event.pending || 0)));
+        break;
+      case 'message_queued':
+        setQueuedMessages(Math.max(0, Number(event.pending || 0)));
+        showToast(`Message queued (${Number(event.position || event.pending || 1)} pending)`);
+        break;
+      case 'goal_draft_status': {
+        const draftId = value(event, 'id');
+        if (closedDraftIds.has(draftId) && value(event, 'event') !== 'started') break;
+        const snapshot = goalDraftSnapshotFromEvent(event, draftStatus());
+        const stage = value(event, 'stage');
+        if (snapshot && snapshot.status !== 'consumed' && snapshot.event !== 'discarded') {
+          setDraftStatus(snapshot);
+          if (!goalIsActive(goalSnapshot())) setLifecycleView('draft');
+        } else if (draftStatus()?.id === draftId) {
+          setDraftStatus(null);
+          closedDraftIds.add(draftId);
+          if (goalSnapshot()) setLifecycleView('goal');
+        }
+        if (stage) setPhase(`goal draft: ${stage}`);
+        const draftBusy = goalDraftIsBusy(snapshot);
+        if (draftBusy && !goalIsActive(goalSnapshot())) begin(`goal draft: ${stage || 'working'}`);
+        if (!draftBusy && !goalIsActive(goalSnapshot())) {
+          setRunning(false);
+          if (snapshot?.status === 'clarifying') setPhase('goal draft: clarifying');
+          if (snapshot?.status === 'ready') setPhase('goal draft: ready');
+        }
+        const draftError = value(event, 'last_error');
+        if (draftError && draftError !== lastDraftError) {
+          lastDraftError = draftError;
+          add({id: `draft-error-${Date.now()}`, kind: 'blocked', text: draftError, detail: `${stage || 'draft'} failed`});
+        } else if (!draftError) {
+          lastDraftError = '';
+        }
+        // Persisted Draft events are the only visibility into read-only intake
+        // and planning. Do not log heartbeats, but make every stage decision
+        // visible so an empty questions list never looks like a stalled UI.
+        const draftEvent = value(event, 'event');
+        const message = value(event, 'message');
+        const question = value(event, 'question');
+        if (draftEvent !== 'heartbeat' && (message || question)) {
+          add({
+            id: `draft-${draftId}-${draftEvent || stage}-${Date.now()}`,
+            kind: 'log',
+            text: question ? 'Goal 需要澄清' : 'Goal 草案',
+            detail: question || message || `${stage || 'working'} (${value(event, 'status')})`,
+          });
+        }
+        break;
+      }
+      case 'goal_discovery_job': {
+        const currentDraft = draftStatus();
+        if (currentDraft) {
+          setDraftStatus(mergeGoalDiscoveryEvent(currentDraft, event));
+          if (!goalIsActive(goalSnapshot())) setLifecycleView('draft');
+        }
+        const role = value(event, 'role') || 'discovery';
+        const status = value(event, 'event') || value(event, 'status');
+        if (status === 'started') {
+          setPhase(`discovering: ${role}`);
+          const paths = Array.isArray(event.read_paths) ? event.read_paths.filter(Boolean) : [];
+          const tools = Array.isArray(event.tools) ? event.tools.filter(Boolean) : ['read_file'];
+          const count = Number(event.read_path_count || paths.length || 0);
+          const inspected = paths.length ? ` 文件：${paths.join(', ')}。` : '';
+          add({
+            id: `discovery-${value(event, 'job_id') || role}-started`,
+            kind: 'log',
+            text: `Goal 发现：${role}`,
+            detail: `只读。工具：${tools.join(', ')}。正在检查 ${count} 个文件。${inspected}`,
+          });
+        }
+        if (status === 'completed') {
+          add({id: `discovery-${value(event, 'job_id') || role}-completed`, kind: 'log', text: `Goal 发现：${role}`, detail: '证据报告已完成。'});
+        }
+        if (status === 'wave_completed') {
+          add({id: `discovery-wave-${Date.now()}`, kind: 'log', text: 'Goal 发现', detail: `已完成 ${Number(event.completed || 0)}/${Number(event.total || 0)} 个证据任务，正在生成 Task 草案。`});
+        }
+        if (status === 'failed') add({id: `discovery-${value(event, 'job_id')}-${Date.now()}`, kind: 'blocked', text: value(event, 'error') || `${role} discovery failed`, detail: 'Goal discovery'});
+        break;
+      }
       case 'usage_update': {
         setTodayInput(total => total + Number(event.input_tokens || 0));
         setTodayOutput(total => total + Number(event.output_tokens || 0));
@@ -996,40 +1147,53 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
         turnTokens.cache += Number(event.cache_read_tokens || 0);
         break;
       }
-      case 'user_message': if (!event.silent) { const prompt = value(event, 'text'); responseId = ''; if (pendingPrompt === prompt) pendingPrompt = ''; else add({id: `prompt-${Date.now()}`, kind: 'prompt', text: prompt}); } break;
-      case 'agent_start': begin(value(event, 'phase') || 'thinking'); turnStart = Date.now(); turnToolCount = 0; turnFiles = []; turnTokens = {inp: 0, out: 0, cache: 0}; lastIntentText = ''; break;
+      case 'user_message': if (!event.silent) { const prompt = value(event, 'text'); responseId = ''; const pendingIndex = pendingPrompts.indexOf(prompt); if (pendingIndex >= 0) pendingPrompts = pendingPrompts.filter((_, i) => i !== pendingIndex); else add({id: `prompt-${Date.now()}`, kind: 'prompt', text: prompt}); } break;
+      case 'agent_start': begin(value(event, 'phase') || 'thinking'); setCurrentTool(null); setToolDone(0); setToolTotal(0); turnStart = Date.now(); turnToolCount = 0; turnFiles = []; turnTokens = {inp: 0, out: 0, cache: 0}; lastIntentText = ''; break;
       case 'assistant_intent': { const text = value(event, 'text'); if (text) promoteResponseToIntent(text); break; }
       case 'thinking_start': if (!responseId) begin(value(event, 'phase') || 'thinking'); else setPhase(value(event, 'phase') || 'thinking'); break;
       case 'thinking_end': if (running()) setPhase('working'); break;
       case 'assistant_delta': { const delta = value(event, 'text'); if (!delta) break; if (!responseId) { begin('responding'); responseId = `response-${Date.now()}`; add({id: responseId, kind: 'response', text: delta, streaming: true}); } else { setPhase('responding'); queueDelta(delta); } break; }
       case 'assistant_message': clearDeltas(); begin('responding'); if (!responseId) { responseId = `response-${Date.now()}`; add({id: responseId, kind: 'response', text: value(event, 'text'), streaming: false}); } else update(responseId, x => ({...x, text: value(event, 'text'), streaming: false})); break;
-      case 'tool_start': { promoteResponseToIntent(); begin('running tool'); turnToolCount += 1; const id = value(event, 'id', 'call_id', 'tool_call_id') || `action-${++actionCounter}`; const ts = Number(event.ts || 0) * 1000 || Date.now(); add({id, kind: 'action', text: value(event, 'name') || 'tool', detail: value(event, 'summary') || 'running…', start: ts, output: []}); break; }
+      case 'tool_start': { promoteResponseToIntent(); begin('running tool'); setCurrentTool(value(event, 'name') || 'tool'); setToolTotal(total => total + 1); turnToolCount += 1; const id = value(event, 'id', 'call_id', 'tool_call_id') || `action-${++actionCounter}`; const ts = Number(event.ts || 0) * 1000 || Date.now(); add({id, kind: 'action', text: value(event, 'name') || 'tool', detail: value(event, 'summary') || 'running…', start: ts, output: []}); break; }
       case 'tool_output': { const id = value(event, 'id', 'call_id', 'tool_call_id'); const line = value(event, 'line'); if (!line) break; queueOutput(id || 'unknown', line); break; }
-      case 'tool_end': { const id = value(event, 'id', 'call_id', 'tool_call_id'); const ts = Number(event.ts || 0) * 1000 || Date.now(); flushLiveBuffers(); const target = (id ? entries().find(x => x.id === id) : [...entries()].reverse().find(x => x.kind === 'action' && !x.done)); if (target) update(target.id, x => ({...x, detail: value(event, 'summary') || (event.ok ? 'completed' : 'failed'), done: true, ok: Boolean(event.ok), end: ts})); break; }
+      case 'tool_end': { const id = value(event, 'id', 'call_id', 'tool_call_id'); const ts = Number(event.ts || 0) * 1000 || Date.now(); flushLiveBuffers(); setCurrentTool(null); setToolDone(done => done + 1); const target = (id ? entries().find(x => x.id === id) : [...entries()].reverse().find(x => x.kind === 'action' && !x.done)); if (target) update(target.id, x => ({...x, detail: value(event, 'summary') || (event.ok ? 'completed' : 'failed'), done: true, ok: Boolean(event.ok), end: ts})); break; }
       case 'subagent_start': { promoteResponseToIntent(); begin('subagent'); const id = value(event, 'id') || `subagent-${++actionCounter}`; const ts = Number(event.ts || 0) * 1000 || Date.now(); add({id, kind: 'subagent', text: value(event, 'description') || 'subagent task', agentType: value(event, 'agent_type') || 'agent', model: value(event, 'model') || 'model', status: 'running', rounds: [], tools: [], start: ts, expanded: true}); recordGoalSubagentStart(event, id); break; }
       case 'subagent_round': { const id = value(event, 'id'); const roundText = value(event, 'text'); const label = roundText ? `Round ${Number(event.round || 0)} · "${roundText}"` : `Round ${Number(event.round || 0)}`; update(id, x => x.kind === 'subagent' ? {...x, rounds: [...(x.rounds || []), label]} : x); recordGoalSubagentRound(id, roundText); break; }
       case 'subagent_tool': { const id = value(event, 'id'); const toolId = value(event, 'tool_use_id') || `${value(event, 'name')}-${Date.now()}`; const status = event.ok === null || event.ok === undefined ? 'running' : (event.ok ? 'done' : 'failed'); const name = value(event, 'name') || 'tool'; const summary = value(event, 'summary'); update(id, x => { if (x.kind !== 'subagent') return x; const tools = x.tools || []; const idx = tools.findIndex(tool => tool.id === toolId); const nextTool = {id: toolId, name, summary, status: status as SubagentStatus}; const nextTools = idx >= 0 ? tools.map((tool, i) => i === idx ? {...tool, ...nextTool} : tool) : [...tools, nextTool]; return {...x, tools: nextTools, toolCount: nextTools.length}; }); break; }
       case 'subagent_end': { const id = value(event, 'id'); const ts = Number(event.ts || 0) * 1000 || Date.now(); const summary = value(event, 'summary'); update(id, x => x.kind === 'subagent' ? {...x, status: event.ok ? 'done' : 'failed', done: true, ok: Boolean(event.ok), end: ts, toolCount: Number(event.tools || x.toolCount || 0), elapsed: Number(event.elapsed || 0), summary} : x); recordGoalSubagentEnd(id, summary); break; }
       case 'goal_started': {
-        const snapshot = goalSnapshotFromEvent(event);
+        const snapshot = goalSnapshotFromEvent(event, goalSnapshot());
         if (snapshot) { setGoalSnapshot(snapshot); syncGoalDecisionPhase(snapshot); }
+        const startedDraftId = value(event, 'draft_id');
+        if (!startedDraftId || draftStatus()?.id === startedDraftId) {
+          if (startedDraftId) closedDraftIds.add(startedDraftId);
+          setDraftStatus(null);
+        }
+        setLifecycleView('goal');
         begin(snapshot?.phase || 'goal planning');
         add({id: `goal-${value(event, 'id')}-${Date.now()}`, kind: 'log', text: 'Goal', detail: `${value(event, 'id')} ${value(event, 'phase')}`});
         break;
       }
       case 'goal_status':
       case 'goal_phase': {
-        const snapshot = goalSnapshotFromEvent(event);
+        const snapshot = goalSnapshotFromEvent(event, goalSnapshot());
         if (snapshot) { setGoalSnapshot(snapshot); syncGoalDecisionPhase(snapshot); }
-        const status = value(event, 'status'); const active = status === 'running' || status === 'pausing' || status === 'cancelling'; setRunning(active); setPhase(active ? `goal: ${value(event, 'phase')}` : 'idle'); if (!active) setStartedAt(0); add({id: `goal-${value(event, 'id')}-${Date.now()}`, kind: 'log', text: 'Goal', detail: `${value(event, 'phase')} (${status})`}); break;
+        setLifecycleView('goal');
+        const status = snapshot?.status || value(event, 'status');
+        const active = status === 'running' || status === 'pausing' || status === 'cancelling';
+        setRunning(active || Boolean(draftStatus() && ['preflight', 'catalog', 'intake', 'discovering', 'planning'].includes(draftStatus()!.stage)));
+        setPhase(active ? `goal: ${snapshot?.phase || value(event, 'phase')}` : (status === 'paused' ? 'goal: paused' : 'idle'));
+        if (!active && !draftStatus()) setStartedAt(0);
+        add({id: `goal-${value(event, 'id')}-${Date.now()}`, kind: 'log', text: 'Goal', detail: `${value(event, 'phase')} (${status})`}); break;
       }
       case 'goal_stopped': {
-        const snapshot = goalSnapshotFromEvent(event);
+        const snapshot = goalSnapshotFromEvent(event, goalSnapshot());
         if (snapshot) { setGoalSnapshot(snapshot); syncGoalDecisionPhase(snapshot); }
-        setRunning(false); setPhase(value(event, 'status') === 'cancelled' ? 'interrupted' : 'idle'); setStartedAt(0); add({id: `goal-${value(event, 'id')}-${Date.now()}`, kind: 'log', text: 'Goal', detail: `${value(event, 'status')}${value(event, 'stop_reason') ? `: ${value(event, 'stop_reason')}` : ''}`}); break;
+        setLifecycleView('goal');
+        const terminalStatus = snapshot?.status || value(event, 'status');
+        setRunning(false); setPhase(terminalStatus === 'cancelled' ? 'interrupted' : 'idle'); setStartedAt(0); add({id: `goal-${value(event, 'id')}-${Date.now()}`, kind: 'log', text: 'Goal', detail: `${terminalStatus}${value(event, 'stop_reason') ? `: ${value(event, 'stop_reason')}` : ''}`}); break;
       }
       case 'goal_status_error': {
-        setGoalSnapshot(null);
         setUserStarted(true);
         add({id: `goal-error-${Date.now()}`, kind: 'blocked', text: value(event, 'error') || 'Goal state could not be loaded', detail: value(event, 'code') || 'Goal state error'});
         break;
@@ -1059,7 +1223,16 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
           add({id: `summary-${Date.now()}`, kind: 'summary', text: `已完成 ${turnToolCount} 项操作`, start, end, toolCount: turnToolCount, paths: turnFiles, tokens: {...turnTokens}, expanded: false});
         }
         }
-        setRunning(false); setPhase(interrupted ? 'interrupted' : 'idle'); setStartedAt(0); responseId = ''; pendingPrompt = '';
+        const durableGoalActive = goalIsActive(goalSnapshot());
+        const durableDraftActive = goalDraftIsBusy(draftStatus());
+        if (durableGoalActive || durableDraftActive) {
+          setRunning(true);
+          setPhase(durableGoalActive ? `goal: ${goalSnapshot()?.phase || 'working'}` : `goal draft: ${draftStatus()?.stage || 'working'}`);
+          if (!startedAt()) setStartedAt(Date.now());
+        } else {
+          setRunning(false); setPhase(interrupted ? 'interrupted' : 'idle'); setStartedAt(0);
+        }
+        responseId = ''; pendingPrompts = [];
          break;
       }
       case 'log': if (event.level === 'warn' || event.level === 'plain') add({id: `log-${Date.now()}`, kind: 'log', text: value(event, 'text')}); break;
@@ -1071,13 +1244,65 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
         showToast(`Permission timed out: ${value(event, 'tool')}`);
         break;
       }
+      case 'workspace_switched': {
+        const nextCwd = value(event, 'cwd');
+        if (nextCwd) {
+          setCwd(nextCwd);
+          const nextHistory = loadHistory(nextCwd);
+          setInputHistory(nextHistory);
+          setHistoryIdx(-1);
+          setHistoryDraft('');
+        }
+        setGoalSnapshot(null);
+        setDraftStatus(null);
+        closedDraftIds.clear();
+        setLifecycleView('chat');
+        setDraftStatus(null);
+        setGoalDecisions([]);
+        break;
+      }
       case 'permission_cancelled': {
         if (overlay()?.kind === 'permission' && overlay()?.id === event.id) { setOverlay(null); setOverlayIndex(0); }
         showToast(`Permission cancelled: ${value(event, 'tool')}`);
         break;
       }
-    }} catch { /* stdout is JSONL; malformed diagnostics are ignored */ } });
-  }
+    } } catch { /* stdout is JSONL; malformed diagnostics are ignored */ }
+  };
+  const startBackendClient = () => {
+    if (process.env.DEBUG_SKIP_BACKEND === '1') return;
+    setBackendState('reconnecting');
+    backendClient = startBackend(handleBackendEvent, reportDiagnostic, {
+      cwd: cwd() || undefined,
+      onState: (state, detail) => {
+        setBackendState(state);
+        if (state === 'connected') {
+          setBackendReady(true);
+          setBackendExitCode(null);
+          const pending = offlineMessages();
+          if (pending.length) {
+            const remaining: string[] = [];
+            for (const text of pending) if (!send({type: 'user_message', text})) remaining.push(text);
+            setOfflineMessages(remaining);
+          }
+        } else if (state === 'disconnected') {
+          setBackendReady(false);
+          setBackendExitCode(detail?.code == null ? null : Number(detail.code));
+        }
+      },
+    });
+  };
+  reconnectBackend = () => {
+    if (backendClient) {
+      try { backendClient.stop(); } catch { /* already gone */ }
+      backendClient = null;
+    }
+    startBackendClient();
+  };
+  if (process.env.DEBUG_SKIP_BACKEND !== '1' && !props?.debugEntries) startBackendClient();
+  onCleanup(() => {
+    try { backendClient?.stop(); } catch { /* best effort */ }
+    backendClient = null;
+  });
   const selectOverlay = (index?: number) => {
     const current = overlay();
     if (!current) return;
@@ -1097,8 +1322,22 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
   };
   useKeyboard((event: any) => {
     const name = String(event?.name || '').toLowerCase();
-    if (event?.ctrl && name === 'q') { send({type: 'exit'}); child?.kill?.(); process.exit(0); }
+    if (event?.ctrl && name === 'q') { send({type: 'exit'}); try { backendClient?.stop(); } catch { /* best effort */ } process.exit(0); }
     if (event?.ctrl && name === 'k') { send({type: 'interrupt'}); event.preventDefault?.(); return; }
+    if (event?.ctrl && name === 'r') {
+      if (backendState() === 'disconnected') reconnectBackend();
+      else { setHistoryDraft(input()); setHistorySearchOpen(true); setHistorySearchIndex(0); showToast('History search: type a query, Enter selects, Esc cancels'); }
+      event.preventDefault?.();
+      return;
+    }
+    if (event?.ctrl && name === 'p') { recallHistory(-1); event.preventDefault?.(); return; }
+    if (event?.ctrl && name === 'n') { recallHistory(1); event.preventDefault?.(); return; }
+    if (event?.ctrl && name === 'o') {
+      const paste = pastedContent();
+      if (paste) { const next = {...paste, expanded: !paste.expanded}; setPastedContent(next); setComposerText(next.expanded ? next.text : foldedPasteLabel(next)); }
+      event.preventDefault?.();
+      return;
+    }
     if (usageOpen()) {
       if (name === 'escape') setUsageOpen(false);
       else if (name === '1') { setUsageRange(7); setUsageRevision(value => value + 1); }
@@ -1116,6 +1355,21 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
       else if (name === 'escape') {
         if (current.kind === 'permission') send({type: 'permission_response', id: current.id, decision: 'deny'});
         setOverlay(null);
+      }
+      return;
+    }
+    if (historySearchOpen()) {
+      const matches = historyMatches();
+      if (name === 'up' || name === 'down') {
+        const delta = name === 'up' ? -1 : 1;
+        setHistorySearchIndex(index => Math.max(0, Math.min(Math.max(0, matches.length - 1), index + delta)));
+        event.preventDefault?.();
+      } else if (name === 'return') {
+        chooseHistoryMatch();
+        event.preventDefault?.();
+      } else if (name === 'escape') {
+        closeHistorySearch(true);
+        event.preventDefault?.();
       }
       return;
     }
@@ -1140,73 +1394,99 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
     // Input history: with an empty composer, ↑ recalls past commands and ↓
     // walks back toward the newest, past the end clears the input. When the
     // composer has text, ↑/↓ move the cursor inside the multiline buffer.
-    if (name === 'up' && input() === '') {
-      const hist = inputHistory();
-      if (hist.length > 0) {
-        const idx = historyIdx() === -1 ? hist.length - 1 : Math.max(0, historyIdx() - 1);
-        setHistoryIdx(idx);
-        const val = hist[idx];
-        setInput(val);
-        textareaRef?.setText?.(val);
-      }
-      event.preventDefault?.();
-    }
-    if (name === 'down' && input() === '' && historyIdx() >= 0) {
-      const idx = historyIdx() + 1;
-      if (idx >= inputHistory().length) {
-        setHistoryIdx(-1);
-        setInput('');
-        textareaRef?.setText?.('');
-      } else {
-        setHistoryIdx(idx);
-        const val = inputHistory()[idx];
-        setInput(val);
-        textareaRef?.setText?.(val);
-      }
-      event.preventDefault?.();
-    }
+    if (name === 'up' && (input() === '' || historyIdx() >= 0)) { recallHistory(-1); event.preventDefault?.(); }
+    if (name === 'down' && historyIdx() >= 0) { recallHistory(1); event.preventDefault?.(); }
+    if (name === 'left' || name === 'right') setTimeout(() => refreshCompletion(), 0);
   });
   const submit = () => {
-    const text = input().trim();
+    if (historySearchOpen()) { chooseHistoryMatch(); return; }
+    const paste = pastedContent();
+    const text = (paste && !paste.expanded ? paste.text : input()).trim();
     if (!text) return;
+    if (backendState() === 'disconnected') {
+      setOfflineMessages(previous => [...previous, text].slice(-32));
+      recordHistory(text);
+      setComposerText('');
+      setPastedContent(null);
+      closeCompletion();
+      showToast('Backend unavailable; message saved and will retry on reconnect');
+      reconnectBackend();
+      return;
+    }
     const usageCommand = /^\/usage(?:\s+(.*))?$/i.exec(text);
     if (usageCommand) {
       openUsage(usageCommand[1] || '');
-      setInput('');
-      textareaRef?.setText?.('');
+      setComposerText('');
       closeCompletion();
-      setInputHistory(prev => [...prev.slice(-50), text]);
+      recordHistory(text);
       setHistoryIdx(-1);
       return;
     }
     const isGoalControl = /^\/goal\s+(?:status|pause|stop|cancel)\s*$/i.test(text);
     const isGoalCommand = /^\/goal(?:\s|$)/i.test(text);
-    if (running() && !isGoalControl) {
-      add({id: `log-${Date.now()}`, kind: 'log', text: 'Agent is already running', detail: 'press Ctrl+K to interrupt first'});
+    const isCommand = text.startsWith('/');
+    const draftAnswerCheckpoint = draftStatus()?.status === 'clarifying' && Boolean(draftStatus()?.question);
+    if (!isGoalControl && !isGoalCommand && goalDraftIsBusy(draftStatus()) && !draftAnswerCheckpoint) {
+      add({id: `draft-busy-${Date.now()}`, kind: 'log', text: 'Goal 草案正在处理', detail: `当前阶段：${draftStatus()?.stage || 'working'}。可用 /goal status、/goal pause 或 /goal cancel。`});
       return;
     }
-    if (!isGoalCommand && goalSnapshot()) { setGoalSnapshot(null); setGoalDecisions([]); decisionGoalId = ''; }
+    if (goalSnapshot() && running() && !isGoalControl) {
+      add({id: `log-${Date.now()}`, kind: 'log', text: 'Goal is running', detail: 'use /goal status, pause, or cancel'});
+      return;
+    }
+    // Keep the durable Goal snapshot for recovery, but let ordinary chat use
+    // the transcript after a paused/terminal Goal. `/goal status` returns to
+    // the Goal page; starting a new Goal replaces the snapshot.
+    if (!isCommand && !draftAnswerCheckpoint && !goalIsActive(goalSnapshot())) setLifecycleView('chat');
     // Slash commands are internal instructions; they must not appear in the
     // transcript. The backend also skips echoing them, so only their effect is
     // visible (toast / log / header state).
-    const isCommand = text.startsWith('/');
     if (!isCommand) add({id: `prompt-${Date.now()}`, kind: 'prompt', text});
-    pendingPrompt = text;
+    if (!isCommand) pendingPrompts.push(text);
     setUserStarted(true);
-    send({type: 'user_message', text});
-    setInput('');
-    textareaRef?.setText?.('');
+    const sent = send({type: 'user_message', text});
+    if (!sent) {
+      if (!isCommand) pendingPrompts = pendingPrompts.filter(item => item !== text);
+      setOfflineMessages(previous => [...previous, text].slice(-32));
+      showToast('Backend unavailable; message saved for reconnect');
+    } else if (running() && !isGoalControl) {
+      showToast(`Message queued (${queuedMessages() + 1} pending)`);
+    }
+    setComposerText('');
+    setPastedContent(null);
     closeCompletion();
-    setInputHistory(prev => [...prev.slice(-50), text]);
+    recordHistory(text);
     setHistoryIdx(-1);
+    setHistoryDraft('');
   };
+  const footerText = () => footerHint({
+    width: dims().width,
+    running: running(),
+    phase: phase(),
+    elapsed: elapsed(),
+    pending: queuedMessages(),
+    currentTool: currentTool() || undefined,
+    toolsDone: toolDone(),
+    toolsTotal: toolTotal(),
+    backend: backendState(),
+    composerLines: composerLines(),
+    paste: pastedContent(),
+    toast: toast()?.text || null,
+    historySearch: {open: historySearchOpen(), matches: historyMatches().length},
+  });
+  const showGoalPage = () => Boolean(goalSnapshot() && (lifecycleView() === 'goal' || goalIsActive(goalSnapshot())));
+  const showDraftPage = () => Boolean(draftStatus() && lifecycleView() === 'draft' && !showGoalPage());
   return <box width={dims().width} height={dims().height} flexDirection="column">
     <Show when={usageOpen()} fallback={<>
-    <Show when={goalSnapshot()} fallback={
-      <Show when={showWelcome()} fallback={
-        <LogView entries={displayedEntries} now={now} height={viewportHeight()} active={() => !overlay()} composerEmpty={() => !overlay() && input() === ''} focusId={focusId} onCycleFocus={cycleFocus} onToggleExpand={toggleExpand} onClearFocus={() => setFocusId(null)} />
+    <Show when={showGoalPage()} fallback={
+      <Show when={showDraftPage()} fallback={
+        <Show when={showWelcome()} fallback={
+          <LogView entries={displayedEntries} now={now} height={viewportHeight()} active={() => !overlay()} composerEmpty={() => !overlay() && input() === ''} focusId={focusId} onCycleFocus={cycleFocus} onToggleExpand={toggleExpand} onClearFocus={() => setFocusId(null)} />
+        }>
+          <WelcomeView width={dims().width} height={viewportHeight()} quote={welcomeQuote()} />
+        </Show>
       }>
-        <WelcomeView width={dims().width} height={viewportHeight()} quote={welcomeQuote()} />
+        <GoalDraftView draft={draftStatus()!} width={dims().width} height={viewportHeight()} />
       </Show>
     }>
       <GoalView goal={goalSnapshot()!} decisions={goalDecisions()} now={now()} width={dims().width} height={viewportHeight()} />
@@ -1245,19 +1525,22 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
         <text fg={C.textMuted} wrapMode="none"> · </text>
         <text fg={C.info} wrapMode="none" truncate selectable={false} onMouseUp={(event: any) => { if (event?.button === 0) openEffortPicker(); }}>{effortShortLabel(effortLabel(), effort())} ▾</text>
         <text fg={C.primary}> › </text>
-        <textarea flexGrow={1} focused height={composerLines()} placeholder={running() ? 'working…' : 'Ask anything…'} initialValue={input()} keyBindings={textareaBindings as any} onContentChange={() => { const v = textareaRef?.plainText ?? ''; if (v !== input()) { setInput(v); refreshCompletion(v); } }} onSubmit={submit as any} ref={el => { textareaRef = el as any; }} />
+        <textarea flexGrow={1} focused height={composerLines()} placeholder={running() ? 'working…' : 'Ask anything…'} initialValue={input()} keyBindings={textareaBindings as any} onContentChange={() => { const v = textareaRef?.plainText ?? ''; const nowValue = Date.now(); const elapsedMs = lastBufferChangedAt ? nowValue - lastBufferChangedAt : 0; if (suppressContentChange) { lastBufferValue = v; lastBufferChangedAt = nowValue; return; } if (v !== input() && likelyPaste(lastBufferValue, v, elapsedMs)) { const paste = makePasteSnapshot(v); setPastedContent(paste); const folded = foldedPasteLabel(paste); setInput(folded); textareaRef?.setText?.(folded); showToast(`Pasted ${paste.lines} lines · ${paste.bytes} bytes · Ctrl+O expand`); lastBufferValue = folded; lastBufferChangedAt = nowValue; return; } if (v !== input()) { setInput(v); refreshCompletion(v); } lastBufferValue = v; lastBufferChangedAt = nowValue; }} onSubmit={submit as any} ref={el => { textareaRef = el as any; }} />
       </box>
-      <Show when={running()}>
+      <Show when={false && running()}>
         <text fg={C.warning} wrapMode="none" truncate>• {phase()} · {spinner()} {elapsed()} · Ctrl+K 中断</text>
       </Show>
       <Show when={!running() && toast()}>
         <text fg={C.success} wrapMode="none" truncate>{toast()?.text}</text>
       </Show>
-      <Show when={!running() && !toast() && !overlay() && !backendReady()}>
+      <Show when={false && !running() && !toast() && !overlay() && !backendReady()}>
         <text fg={C.warning} wrapMode="none" truncate>• 正在连接后端…</text>
       </Show>
-      <Show when={!running() && !toast() && !overlay() && backendReady()}>
+      <Show when={false && !running() && !toast() && !overlay() && backendReady()}>
         <text fg={C.textMuted} wrapMode="none" truncate>{footerStatusText(dims().width, model(), effortShortLabel(effortLabel(), effort()), contextUsed(), contextWindow(), todayInput() + todayOutput())}</text>
+      </Show>
+      <Show when={!overlay()}>
+        <text fg={backendState() === 'disconnected' ? C.warning : running() ? C.warning : C.textMuted} wrapMode="none" truncate>{footerText()}</text>
       </Show>
     </box>
     </>}>

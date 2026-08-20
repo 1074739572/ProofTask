@@ -174,6 +174,11 @@ def print_turn_assistants(messages: list, turn_start: int | None) -> None:
 def cron_autorun_loop(history: list, context: dict, *, binding: SessionBinding) -> None:
     while True:
         time.sleep(1)
+        # Goal owns the workspace while it is mutating/verifying. Dropping a
+        # scheduled chat turn is unsafe; leave it queued until Goal finishes.
+        from harness.goal.runner import is_goal_running
+        if is_goal_running():
+            continue
         fired = consume_cron_queue()
         if not fired:
             continue

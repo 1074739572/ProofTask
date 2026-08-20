@@ -39,9 +39,10 @@ def test_goal_task_requires_passing_eval_and_coverage_for_completion(tmp_path, m
             "command": "pytest -q",
             "selectors": ["tests/test_x.py::test_x"],
             "collected_count": 1,
-            "source": "generated",
-            "covers": ["AC1"],
-        },
+                "source": "generated",
+                "covers": ["AC1"],
+                "case_selectors": {"AC1": ["tests/test_x.py::test_x"]},
+            },
         evaluation_required=True,
     )
     claim_task(task.id)

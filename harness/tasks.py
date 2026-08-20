@@ -400,10 +400,22 @@ def complete_task(task_id: str, *, clean_check_mode: str | None = None) -> str:
             for case in task.acceptance_cases
             if isinstance(case, dict) and case.get("id")
         }
-        covered_cases = {
-            str(case_id) for case_id in (task.verification_spec or {}).get("covers", [])
+        spec = task.verification_spec or {}
+        selectors = {str(selector) for selector in spec.get("selectors", []) if selector}
+        raw_mapping = spec.get("case_selectors")
+        mappings = raw_mapping if isinstance(raw_mapping, dict) else {}
+        invalid_cases = {
+            case_id
+            for case_id in required_cases
+            if not isinstance(mappings.get(case_id), list)
+            or not mappings.get(case_id)
+            or any(str(selector) not in selectors for selector in mappings[case_id])
         }
-        if required_cases and not required_cases.issubset(covered_cases):
+        if invalid_cases:
+            missing = ", ".join(sorted(invalid_cases))
+            return f"Cannot complete {task.id}: bound tests do not map acceptance cases to collected selectors: {missing}"
+        covered_cases = {str(case_id) for case_id in spec.get("covers", [])}
+        if not required_cases.issubset(covered_cases):
             missing = ", ".join(sorted(required_cases - covered_cases))
             return f"Cannot complete {task.id}: bound tests do not cover acceptance cases: {missing}"
 

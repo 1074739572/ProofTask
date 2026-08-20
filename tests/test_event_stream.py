@@ -182,3 +182,24 @@ def test_instant_model_switch_preserves_running_flag(monkeypatch):
 def test_completion_request_empty_text_no_crash(fake_workdir):
     payload = _handle_completion_request({"text": "", "request_id": "r5"})
     assert payload["candidates"] == []
+
+
+def test_draft_answer_requires_an_actual_unanswered_question(tmp_path, monkeypatch):
+    from harness.event_stream import _active_goal_draft_stage, _is_goal_draft_answer
+    from harness.goal.draft import GoalDraft
+
+    draft = GoalDraft(
+        id="draft-1", target="improve input", verification="pytest -q",
+        verification_source="test", status="clarifying", stage="intake",
+    )
+    monkeypatch.setattr("harness.goal.draft.load_draft", lambda *_args, **_kwargs: draft)
+
+    assert not _is_goal_draft_answer("ordinary chat")
+    assert _active_goal_draft_stage() == "intake"
+
+    draft.questions = ["Which scope?"]
+    assert _is_goal_draft_answer("per user")
+    draft.status = "discovering"
+    draft.stage = "discovering"
+    assert not _is_goal_draft_answer("per user")
+    assert _active_goal_draft_stage() == "discovering"

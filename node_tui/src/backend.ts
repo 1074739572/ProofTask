@@ -9,12 +9,13 @@ const repoRoot = path.resolve(__dirname, '..', '..');
 
 export type BackendOptions = {
   cwd?: string;
+  onState?: (state: 'connected' | 'disconnected' | 'reconnecting', detail?: {code?: number | null; signal?: string | null; error?: string}) => void;
 };
 
 export type Backend = {
   process: ChildProcessWithoutNullStreams;
   cwd?: string;
-  send: (command: Record<string, unknown>) => void;
+  send: (command: Record<string, unknown>) => boolean;
   stop: () => void;
 };
 
@@ -45,6 +46,7 @@ export function startBackend(
     stdio: ['pipe', 'pipe', 'pipe'],
     env: {...process.env, PYTHONIOENCODING: 'utf-8'},
   });
+  options.onState?.('connected');
 
   const rl = readline.createInterface({input: child.stdout});
   rl.on('line', line => {
@@ -72,7 +74,11 @@ export function startBackend(
     onDiagnostic(trimmed);
   });
 
+  child.on('error', error => {
+    options.onState?.('disconnected', {error: error.message});
+  });
   child.on('exit', (code, signal) => {
+    options.onState?.('disconnected', {code, signal});
     onEvent({type: 'log', level: code === 0 ? 'muted' : 'warn', text: `backend exited (${signal ?? code})`});
   });
 
@@ -80,8 +86,13 @@ export function startBackend(
     process: child,
     cwd: options.cwd,
     send(command) {
-      if (child.killed || !child.stdin.writable) return;
-      child.stdin.write(JSON.stringify(command) + '\n');
+      if (child.killed || child.exitCode !== null || !child.stdin.writable) return false;
+      try {
+        child.stdin.write(JSON.stringify(command) + '\n');
+        return true;
+      } catch {
+        return false;
+      }
     },
     stop() {
       if (!child.killed) {

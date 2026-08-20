@@ -37,7 +37,7 @@ def test_plan_requires_explicit_case_mapping_when_mapping_is_present():
     assert parse_plan(raw, test_catalog=_catalog()) is None
 
 
-def test_worker_scope_gate_ignores_preexisting_files_and_rejects_new_outside_scope(monkeypatch, tmp_path):
+def test_worker_scope_gate_rejects_changed_dirty_files_and_new_outside_scope(monkeypatch, tmp_path):
     from harness.goal import runner as runner_mod
     from harness.tasks import Task
 
@@ -54,7 +54,33 @@ def test_worker_scope_gate_ignores_preexisting_files_and_rejects_new_outside_sco
 
     assert error is not None
     assert "docs/extra.md" in error
-    assert "README.md" not in error
+    assert "README.md" in error
+
+
+def test_plan_allows_a_discovered_directory_scope_for_new_files():
+    manifest = {
+        "repo_files": ["src/existing.py"],
+        "evidence": [{"id": "E1", "path": "src/existing.py"}],
+    }
+    plans = parse_plan(
+        '[{"name":"new module","behavior":"adds a module",'
+        '"acceptance_cases":[{"id":"AC1","given":"input","when":"called","then":"result"}],'
+        '"depends_on":[],"scope_paths":["src"],"evidence_refs":["E1"],'
+        '"test_strategy":"new focused test"}]',
+        test_catalog=_catalog(), discovery_manifest=manifest,
+    )
+
+    assert plans is not None
+    assert plans[0].scope_paths == ("src",)
+
+
+def test_plan_rejects_empty_acceptance_case_selector_mapping():
+    raw = ('[{"name":"pages","behavior":"all pages return",'
+           '"acceptance_cases":[{"id":"AC1","given":"pages","when":"listed","then":"none skipped"}],'
+           '"test_selectors":["tests/test_api.py::test_lists_all_pages"],"depends_on":[],'
+           '"case_selectors":{"AC1":[]}}]')
+
+    assert parse_plan(raw, test_catalog=_catalog()) is None
 
 
 def test_unknown_selector_requires_test_generation():
@@ -155,6 +181,69 @@ def test_resume_re_evaluates_stale_repair_plan_input(tmp_path, monkeypatch):
     monkeypatch.setattr("harness.verification.snapshot.capture_code_snapshot", lambda _workspace: "new-snapshot")
 
     assert runner_mod._resume_target(state) == GoalPhase.EVALUATE.value
+
+
+def test_resume_routes_completed_clean_checkpoint_through_impact_review(tmp_path, monkeypatch):
+    import harness.goal.runner as runner_mod
+    import harness.tasks as tasks
+
+    monkeypatch.setattr(tasks, "TASKS_DIR", tmp_path / ".tasks")
+    task = tasks.create_task("current", "implemented", verification_spec={})
+    task.status = "completed"
+    tasks.save_task(task, archived=True)
+    (tmp_path / ".tasks" / f"{task.id}.json").unlink()
+    state = GoalState.new(target="resume", verification="python -m pytest -q", workspace=str(tmp_path))
+    state.initialization_complete = True
+    state.task_plan = [{"name": "current"}]
+    state.task_name_ids = {"current": task.id}
+    state.task_ids = [task.id]
+    state.current_task_id = task.id
+    state.resume_phase = GoalPhase.CLEAN_CHECK.value
+
+    assert runner_mod._resume_target(state) == GoalPhase.IMPACT_REVIEW.value
+
+
+def test_initialize_recovers_orphan_task_written_before_goal_checkpoint(tmp_path, monkeypatch):
+    import harness.goal.runner as runner_mod
+    import harness.tasks as tasks
+
+    monkeypatch.setattr(tasks, "TASKS_DIR", tmp_path / ".tasks")
+    state = GoalState.new(target="recover", verification="python -m pytest -q", workspace=str(tmp_path))
+    state.execution_approved = False
+    state.task_plan = [{
+        "name": "orphan", "behavior": "already persisted",
+        "acceptance_cases": [], "verification_spec": {"source": "generated"},
+    }]
+    orphan = tasks.create_task("orphan", "already persisted", goal_id=state.id, verification_spec={"source": "generated"})
+    monkeypatch.setattr(runner_mod, "save_goal", lambda state: None)
+    monkeypatch.setattr(runner_mod, "_emit_goal", lambda *args: None)
+
+    GoalRunner(state=state, history=[], context={}, binding=None)._initialize(state)
+
+    assert state.task_ids == [orphan.id]
+    assert len(tasks.list_tasks(include_archived=True)) == 1
+
+
+def test_repair_planning_pauses_after_repeated_task_repairs(tmp_path, monkeypatch):
+    import harness.goal.runner as runner_mod
+    import harness.tasks as tasks
+    from harness.goal.policy import MAX_REPAIR_ATTEMPTS_PER_TASK
+
+    monkeypatch.setattr(tasks, "TASKS_DIR", tmp_path / ".tasks")
+    task = tasks.create_task("current", "still failing", verification_spec={})
+    task.status = "in_progress"
+    task.repair_history = [{"attempt": index} for index in range(MAX_REPAIR_ATTEMPTS_PER_TASK)]
+    tasks.save_task(task)
+    state = GoalState.new(target="repair", verification="python -m pytest -q", workspace=str(tmp_path))
+    state.phase = GoalPhase.REPAIR_PLAN.value
+    state.current_task_id = task.id
+    monkeypatch.setattr(runner_mod, "save_goal", lambda state: None)
+    monkeypatch.setattr(runner_mod, "_emit_goal", lambda *args: None)
+
+    GoalRunner(state=state, history=[], context={}, binding=None)._repair_plan(state)
+
+    assert state.phase == GoalPhase.PAUSED.value
+    assert state.stop_reason == "repair_limit_reached"
 
 
 def test_test_generation_expands_a_collected_test_file_to_real_node_ids(tmp_path):
@@ -344,6 +433,38 @@ def test_test_generation_rolls_back_files_when_baseline_is_invalid(tmp_path, mon
 
     assert not (tests_dir / "test_new.py").exists()
     assert existing.read_text(encoding="utf-8") == "def test_existing(): pass\n"
+
+
+def test_test_generation_rejects_changes_to_existing_fixture_helpers(tmp_path, monkeypatch):
+    import harness.goal.runner as runner_mod
+    from harness.tasks import load_task
+
+    task, state = _needs_generation_task(tmp_path, monkeypatch)
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    conftest = tests_dir / "conftest.py"
+    conftest.write_text("VALUE = 'original'\n", encoding="utf-8")
+
+    def writer(**kwargs):
+        conftest.write_text("VALUE = 'rewritten'\n", encoding="utf-8")
+        (tests_dir / "test_new.py").write_text("def test_new(): pass\n", encoding="utf-8")
+        return '{"test_selectors":["tests/test_new.py::test_new"],"case_selectors":{"AC1":["tests/test_new.py::test_new"]}}'
+
+    monkeypatch.setattr(runner_mod, "save_goal", lambda state: None)
+    monkeypatch.setattr(runner_mod, "run_agent_task", writer)
+    catalogs = iter((
+        TestCatalog(),
+        TestCatalog(selectors=("tests/test_new.py::test_new",), test_files=("tests/test_new.py",)),
+    ))
+    monkeypatch.setattr(runner_mod, "collect_pytest_catalog", lambda workspace: next(catalogs))
+
+    GoalRunner(state=state, history=[], context={}, binding=None)._prepare_tests(state)
+
+    assert state.phase == GoalPhase.PAUSED.value
+    assert "modified existing test files: tests/conftest.py" in state.last_error
+    assert conftest.read_text(encoding="utf-8") == "VALUE = 'original'\n"
+    assert not (tests_dir / "test_new.py").exists()
+    assert load_task(task.id).verification_state == "needs_generation"
 
 
 def test_test_generation_rollback_never_expands_nested_test_root_to_source_tree(tmp_path):
@@ -1070,6 +1191,9 @@ def test_goal_event_snapshot_exposes_task_contract_for_terminal_ui(tmp_path, mon
     assert payload["verification"] == "pytest -q"
     assert payload["stop_reason"] is None
     assert payload["final_verification"] is None
+    assert payload["resume_phase"] is None
+    assert payload["execution_approved"] is state.execution_approved
+    assert payload["task_cycles"] == state.attempts
     assert payload["tasks"] == [
         {
             "id": task.id,

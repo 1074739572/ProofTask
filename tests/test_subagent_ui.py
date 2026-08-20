@@ -121,6 +121,17 @@ def test_run_agent_task_stops_while_waiting_for_a_model_response():
     assert stats.stop_reason == "cancelled"
 
 
+def test_run_agent_task_rejects_empty_model_response():
+    from harness.agents.runner import AgentTaskStats, run_agent_task
+
+    stats = AgentTaskStats()
+    with mock.patch("harness.agents.runner.create_message", return_value=_response([])):
+        result = run_agent_task("empty response", "return JSON", "goal_intake", stats=stats)
+
+    assert "failed: empty response" in result
+    assert stats.stop_reason == "empty_response"
+
+
 def test_goal_subagent_passes_its_configured_reasoning_effort():
     from harness.agents.runner import run_agent_task
 

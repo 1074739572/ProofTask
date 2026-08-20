@@ -144,8 +144,16 @@ def handle_goal_command(query: str, history: list, context: dict, binding: Any) 
             status = runner.get_goal_status()
             return _handle_preview() if status == "No goal in this workspace." else status
         if action == "pause":
+            from harness.goal.draft import load_draft, pause_draft
+            draft = load_draft()
+            if draft is not None and draft.stage in {"catalog", "intake", "discovering", "planning"}:
+                return pause_draft()
             return _handle_pause(runner)
         if action == "cancel":
+            from harness.goal.draft import load_draft, pause_draft
+            draft = load_draft()
+            if draft is not None and draft.stage in {"catalog", "intake", "discovering", "planning"}:
+                return pause_draft(cancelled=True)
             return _handle_cancel(runner)
         if action == "resume":
             from harness.goal.draft import GoalDraftError, format_draft, load_draft, resume_draft
@@ -330,6 +338,7 @@ def _handle_approve(runner, history: list, context: dict, binding: Any) -> str:
     request = GoalRequest(
         target=draft.target,
         verification=draft.verification,
+        draft_id=draft.id,
         task_plan=draft.task_plan,
         goal_contract={
             "target": draft.target,
@@ -347,6 +356,16 @@ def _handle_approve(runner, history: list, context: dict, binding: Any) -> str:
     )
     note = _start_precondition_note(request)
     if note is not None:
+        mark_draft_start_failed(note)
+        return note
+    # Validate every execution role before consuming the Draft. This turns a
+    # late worker/evaluator route failure into one actionable report and keeps
+    # `/goal resume` meaningful after configuration is corrected.
+    from harness.goal.preflight import EXECUTION_AGENT_TYPES, preflight_goal_agents
+
+    execution_preflight = preflight_goal_agents(EXECUTION_AGENT_TYPES)
+    if not execution_preflight.ok:
+        note = execution_preflight.format(title="Goal execution provider preflight failed")
         mark_draft_start_failed(note)
         return note
     try:

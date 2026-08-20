@@ -242,6 +242,6 @@ def plan_goal_regression_repair(
         )
     except Exception as exc:
         return GoalRegressionDecision("pause", error=f"goal regression planner failed: {type(exc).__name__}: {exc}", unavailable=True)
-    if str(getattr(stats, "stop_reason", "") or "") == "provider_error":
+    if str(getattr(stats, "stop_reason", "") or "") in {"provider_error", "configuration_error"}:
         return GoalRegressionDecision("pause", error="goal regression planner provider unavailable", unavailable=True)
     return parse_goal_regression_decision(raw, {task.id for task in tasks})

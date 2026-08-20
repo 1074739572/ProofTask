@@ -18,7 +18,7 @@ from harness.evaluation import run_task_evaluation
 from harness.goal.engine import GoalEngine
 from harness.goal.models import GoalPhase, GoalStatus, GoalState, StopReason
 from harness.goal.planner import PLANNER_MAX_ROUNDS, VerificationSpec, plan_tasks
-from harness.goal.policy import NO_PROGRESS_REPLAN_LIMIT, validate_limits
+from harness.goal.policy import MAX_REPAIR_ATTEMPTS_PER_TASK, NO_PROGRESS_REPLAN_LIMIT, validate_limits
 from harness.goal.store import (
     GoalLeaseError,
     GoalStoreError,
@@ -51,6 +51,7 @@ class GoalRequest:
     # owns test generation, baselines, implementation, and every completion gate.
     task_plan: list[dict[str, Any]] | None = None
     goal_contract: dict[str, Any] | None = None
+    draft_id: str = ""
     await_execution_approval: bool = False
     worker_round_limit: int = 20
     operation_timeout_seconds: int = 1800
@@ -152,12 +153,17 @@ def goal_event_payload(state: GoalState) -> dict[str, Any]:
         "verification": state.verification,
         "phase": state.phase,
         "status": state.status,
+        "draft_id": state.draft_id,
         "current_task_id": state.current_task_id,
+        "resume_phase": state.resume_phase,
+        "execution_approved": state.execution_approved,
         "task_cycles": state.attempts,
         "total_llm_rounds": state.total_llm_rounds,
         "worker_generation": state.worker_generation,
         "worker_rollovers": state.worker_rollovers,
         "worker_round_limit": state.worker_round_limit,
+        "updated_at": state.updated_at,
+        "paused_at": state.paused_at,
         "stop_reason": state.stop_reason,
         "final_verification": dict(state.final_verification) if isinstance(state.final_verification, dict) else None,
         "last_error": state.last_error,
@@ -238,6 +244,12 @@ def get_goal_status() -> str:
 
         draft = load_draft()
         if draft is not None and draft.status != "consumed":
+            state = load_goal()
+            if state is not None and state.draft_id == draft.id:
+                from harness.goal.draft import mark_draft_consumed
+
+                mark_draft_consumed()
+                return format_goal_status(state)
             return format_draft(draft)
     except Exception:
         # Goal status should still be useful when a draft file is corrupt; the
@@ -270,6 +282,7 @@ def start_goal(request: GoalRequest, *, history: list, context: dict, binding: A
             workspace_generation=workspace_generation(), evaluation_required=request.evaluation_required,
             worker_round_limit=request.worker_round_limit,
             operation_timeout_seconds=request.operation_timeout_seconds,
+            draft_id=request.draft_id,
         )
         if request.task_plan:
             state.task_plan = [dict(item) for item in request.task_plan]
@@ -397,8 +410,12 @@ def _resume_target(state: GoalState) -> str:
         GoalPhase.IMPACT_REVIEW.value,
     }
     if candidate in task_phases:
-        if current is None or current.status == "completed":
+        if current is None:
             return GoalPhase.SELECT_TASK.value
+        if current.status == "completed":
+            # Task archival happens before the impact-review checkpoint. A
+            # restart in that small window must still review downstream tests.
+            return GoalPhase.IMPACT_REVIEW.value if candidate == GoalPhase.CLEAN_CHECK.value else GoalPhase.SELECT_TASK.value
         if current.verification_state == "needs_generation":
             return GoalPhase.PREPARE_TESTS.value
         if candidate == GoalPhase.EVALUATE.value and current.verification_state != "passing":
@@ -667,14 +684,26 @@ class GoalRunner(threading.Thread):
 
     def _initialize(self, state: GoalState) -> None:
         from harness.goal.memory import load_test_map, record_test_binding
-        from harness.tasks import create_task, load_task, save_task
+        from harness.tasks import create_task, list_tasks, load_task, save_task
 
         root = Path(state.workspace)
         if not state.task_plan:
             stats = AgentTaskStats()
             self._phase_in_flight = True
             try:
-                plans = plan_tasks(state.target, state.verification, root, cancel_check=self._interrupted, deadline=self._deadline(state), stats=stats)
+                try:
+                    plans = plan_tasks(state.target, state.verification, root, cancel_check=self._interrupted, deadline=self._deadline(state), stats=stats)
+                except Exception as exc:
+                    state.total_llm_rounds += stats.llm_rounds
+                    state.last_error = f"Goal planner unavailable: {type(exc).__name__}: {exc}"
+                    self._pause(
+                        state,
+                        "goal_planner_unavailable",
+                        stop_reason=StopReason.provider_unavailable.value
+                        if stats.stop_reason in {"provider_error", "configuration_error"}
+                        else StopReason.provider_unavailable.value,
+                    )
+                    return
             finally:
                 self._phase_in_flight = False
             state.total_llm_rounds += stats.llm_rounds
@@ -686,12 +715,21 @@ class GoalRunner(threading.Thread):
         # Task creation is deliberately idempotent. A process may stop after
         # writing one Task but before writing the next Goal checkpoint.
         names = dict(state.task_name_ids)
+        plan_names = {str(plan.get("name")) for plan in plans}
+        # Recover a Task written just before a process crash, before its Goal
+        # checkpoint could record the id. Limit reconciliation to this Goal.
+        for existing in list_tasks(include_archived=True):
+            if existing.goal_id == state.id and existing.subject in plan_names:
+                names.setdefault(existing.subject, existing.id)
         for task_id in state.task_ids:
             try:
                 existing = load_task(task_id)
             except (FileNotFoundError, OSError, TypeError, ValueError):
                 continue
-            if existing.subject in {str(plan.get("name")) for plan in plans}:
+            # ``state.task_ids`` is an explicit durable association from older
+            # Goal files, which predate Task.goal_id. Trust it for migration;
+            # unreferenced board scanning above remains limited to this Goal.
+            if existing.subject in plan_names:
                 names.setdefault(existing.subject, existing.id)
         for plan in plans:
             name = str(plan["name"])
@@ -775,7 +813,6 @@ class GoalRunner(threading.Thread):
                 if adapter.id == "pytest"
                 else adapter.discover(verification_context)
             )
-            before_hashes = self._test_file_hashes(root, before_catalog.test_files)
             write_roots = self._test_write_roots(before_catalog)
             before_tree = self._snapshot_test_tree(root, write_roots)
             impact_context = task.verification_spec.get("impact_context") or []
@@ -825,8 +862,23 @@ class GoalRunner(threading.Thread):
             state.total_llm_rounds += stats.llm_rounds
             if self._honor_control_request(state):
                 return
+            if (
+                stats.stop_reason in {"provider_error", "configuration_error"}
+                or str(raw).startswith("Error:")
+                or str(raw).startswith("[goal_test_writer] failed:")
+                or str(raw).startswith("[goal_test_writer] stopped:")
+            ):
+                self._restore_test_tree(root, before_tree, write_roots, expected_after=self._snapshot_test_tree(root, write_roots))
+                state.last_error = f"Goal test writer unavailable: {str(raw)[:3_000]}"
+                self._pause(
+                    state,
+                    "goal_test_writer_unavailable",
+                    stop_reason=StopReason.provider_unavailable.value,
+                )
+                save_goal(state)
+                return
             if goal_permission_pending():
-                self._restore_test_tree(root, before_tree, write_roots)
+                self._restore_test_tree(root, before_tree, write_roots, expected_after=self._snapshot_test_tree(root, write_roots))
                 self._pause(
                     state,
                     "goal_test_generation_permission_required",
@@ -843,7 +895,7 @@ class GoalRunner(threading.Thread):
             selectors = self._selectors_from_generation(raw, root, catalog=after_catalog)
             case_selectors = self._case_selectors_from_generation(raw, selectors, task.acceptance_cases)
             if not selectors:
-                self._restore_test_tree(root, before_tree, write_roots)
+                self._restore_test_tree(root, before_tree, write_roots, expected_after=self._snapshot_test_tree(root, write_roots))
                 self._pause(state, "test_generation_required", stop_reason=StopReason.test_generation_required.value)
                 state.last_error = f"Task {task.id} needs a collected pytest selector before execution."
                 save_goal(state)
@@ -853,23 +905,27 @@ class GoalRunner(threading.Thread):
                 if isinstance(case, dict) and case.get("id")
             }
             if not required_cases.issubset(case_selectors):
-                self._restore_test_tree(root, before_tree, write_roots)
+                self._restore_test_tree(root, before_tree, write_roots, expected_after=self._snapshot_test_tree(root, write_roots))
                 self._pause(state, "test_generation_case_mapping_required", stop_reason=StopReason.test_generation_required.value)
                 state.last_error = f"Task {task.id} test writer must map every acceptance case to collected selectors."
                 save_goal(state)
                 return
             if any(selector in before_catalog.selectors for selector in selectors):
-                self._restore_test_tree(root, before_tree, write_roots)
+                self._restore_test_tree(root, before_tree, write_roots, expected_after=self._snapshot_test_tree(root, write_roots))
                 self._pause(state, "test_generation_reused_existing_selector", stop_reason=StopReason.test_generation_required.value)
                 state.last_error = f"Task {task.id} test writer reused an existing selector; it must add focused coverage."
                 save_goal(state)
                 return
+            # The writer is allowed to add a focused test, never alter any
+            # pre-existing fixture/helper/conftest under a permitted test root.
+            # Hashing only collected nodes misses these semantic escape hatches.
+            after_tree = self._snapshot_test_tree(root, write_roots)
             changed_existing = [
-                path for path, digest in before_hashes.items()
-                if self._test_file_hashes(root, (path,)).get(path) != digest
+                path for path, contents in before_tree.items()
+                if after_tree.get(path) != contents
             ]
             if changed_existing:
-                self._restore_test_tree(root, before_tree, write_roots)
+                self._restore_test_tree(root, before_tree, write_roots, expected_after=self._snapshot_test_tree(root, write_roots))
                 self._pause(state, "test_generation_changed_existing_test", stop_reason=StopReason.test_generation_required.value)
                 state.last_error = f"Task {task.id} test writer modified existing test files: {', '.join(changed_existing)}"
                 save_goal(state)
@@ -892,7 +948,7 @@ class GoalRunner(threading.Thread):
                     if baseline.passed
                     else "generated test baseline failed outside the requested behavior"
                 )
-                self._restore_test_tree(root, before_tree, write_roots)
+                self._restore_test_tree(root, before_tree, write_roots, expected_after=self._snapshot_test_tree(root, write_roots))
                 self._pause(state, "test_generation_baseline_failed", stop_reason=StopReason.test_generation_required.value)
                 state.last_error = f"Task {task.id} test baseline is invalid: {detail}"
                 save_goal(state)
@@ -936,7 +992,7 @@ class GoalRunner(threading.Thread):
                 {
                     "path": path,
                     "sha256": bound_spec["test_hashes"].get(path),
-                    "created": path not in before_hashes,
+                    "created": path not in before_tree,
                 }
                 for path in files
             ]
@@ -1058,9 +1114,17 @@ class GoalRunner(threading.Thread):
 
     @staticmethod
     def _restore_test_tree(
-        root: Path, snapshot: dict[str, bytes], allowed_roots: tuple[str, ...]
+        root: Path,
+        snapshot: dict[str, bytes],
+        allowed_roots: tuple[str, ...],
+        *,
+        expected_after: dict[str, bytes] | None = None,
     ) -> None:
-        """Undo an invalid generation attempt without touching production code."""
+        """Undo an invalid generation attempt without touching production code.
+
+        ``expected_after`` lets the caller avoid overwriting a file that was
+        edited by someone else after the generation attempt finished.
+        """
         workspace = root.resolve()
         roots: list[Path] = []
         for rel_root in allowed_roots:
@@ -1079,6 +1143,8 @@ class GoalRunner(threading.Thread):
                 rel = path.relative_to(workspace).as_posix()
                 if rel not in snapshot:
                     try:
+                        if expected_after is not None and expected_after.get(rel) != path.read_bytes():
+                            continue
                         path.unlink()
                     except OSError:
                         pass
@@ -1090,8 +1156,11 @@ class GoalRunner(threading.Thread):
             if not path.is_relative_to(workspace) or not any(path.is_relative_to(item) for item in roots):
                 continue
             try:
-                path.parent.mkdir(parents=True, exist_ok=True)
-                if not path.exists() or path.read_bytes() != contents:
+                current = path.read_bytes() if path.exists() else None
+                if expected_after is not None and expected_after.get(rel) != current:
+                    continue
+                if current != contents:
+                    path.parent.mkdir(parents=True, exist_ok=True)
                     path.write_bytes(contents)
             except OSError:
                 continue
@@ -1150,7 +1219,11 @@ class GoalRunner(threading.Thread):
             )
             task.verification_spec = spec
             save_task(task)
-        claim_task(state.current_task_id, owner=f"goal:{state.id}")
+        claimed = claim_task(state.current_task_id, owner=f"goal:{state.id}")
+        if not claimed.startswith("Claimed"):
+            state.last_error = claimed
+            self._pause(state, "task_claim_conflict", stop_reason=StopReason.workspace_changed.value)
+            return
         record_task_start(
             state.current_task_id,
             snapshot=capture_code_snapshot(state.workspace),
@@ -1184,11 +1257,17 @@ class GoalRunner(threading.Thread):
             goal_worker = get_agent_profile("goal_worker")
             worker_error = validate_agent_model("goal_worker")
             if worker_error or goal_worker is None:
-                self._fail(
+                state.last_error = worker_error or "goal_worker agent profile is unavailable"
+                # A stale/misconfigured route is recoverable after the model or
+                # provider configuration is corrected.  Treating it as an
+                # internal terminal failure made `/goal resume` impossible and
+                # hid the actionable route error from the user.
+                self._pause(
                     state,
-                    StopReason.internal_error,
-                    worker_error or "goal_worker agent profile is unavailable",
+                    "goal_worker_configuration_unavailable",
+                    stop_reason=StopReason.provider_unavailable.value,
                 )
+                save_goal(state)
                 return
             clear_goal_permission_flags()
             set_goal_noninteractive(True)
@@ -1293,7 +1372,7 @@ class GoalRunner(threading.Thread):
             )
             stop_reason = (
                 StopReason.provider_unavailable.value
-                if evaluation.get("agent_stop_reason") == "provider_error"
+                if evaluation.get("agent_stop_reason") in {"provider_error", "configuration_error"}
                 else StopReason.evaluation_unavailable.value
             )
             self._pause(
@@ -1316,6 +1395,14 @@ class GoalRunner(threading.Thread):
 
         task = load_task(state.current_task_id)
         evaluation = task.evaluation or {"passed": False, "summary": state.last_error or "Goal verification failed", "route": "implementation_fix"}
+        if len(task.repair_history) >= MAX_REPAIR_ATTEMPTS_PER_TASK:
+            detail = (
+                f"Task {task.id} reached {MAX_REPAIR_ATTEMPTS_PER_TASK} repair plans without completion; "
+                "review its acceptance cases, evidence, and scope before resuming."
+            )
+            state.last_error = detail
+            self._pause(state, "repair_limit_reached", stop_reason=StopReason.repair_limit_reached.value)
+            return
         if evaluation.get("passed") is None:
             self._fail(
                 state,
@@ -1760,8 +1847,10 @@ class GoalRunner(threading.Thread):
         if not scope:
             return None
         current = capture_dirty_file_hashes(state.workspace)
-        baseline = set(task.start_dirty_hashes or {})
-        changed = {path for path in current if path not in baseline}
+        baseline = {str(path): str(digest) for path, digest in (task.start_dirty_hashes or {}).items()}
+        # A file that was already dirty is not exempt if this worker changed it
+        # again. Compare digests rather than merely comparing path names.
+        changed = {path for path, digest in current.items() if baseline.get(path) != str(digest)}
         outside = sorted(path for path in changed if path not in scope and not any(path.startswith(item.rstrip("/") + "/") for item in scope))
         if outside:
             return "worker changed files outside Task scope: " + ", ".join(outside[:12])
