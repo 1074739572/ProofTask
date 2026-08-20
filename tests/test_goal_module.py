@@ -5,7 +5,8 @@ from harness.goal.engine import GoalEngine, GoalTransitionError
 from harness.goal.models import GOAL_SCHEMA_VERSION, GoalPhase, GoalState
 import pytest
 
-from harness.goal.planner import GoalPlanningError, plan_tasks
+from harness.goal.planner import GoalPlanningError, build_plan_prompt, plan_tasks
+from harness.verification.catalog import TestCatalog
 from harness.goal.store import (
     GoalLeaseError,
     GoalStoreError,
@@ -62,6 +63,37 @@ def test_planner_is_a_single_tool_free_contract_call():
     assert len(plans) == 1
     assert seen["max_rounds"] == 1
     assert seen["tools_override"] == ()
+
+
+def test_planner_prompt_keeps_evidence_visible_when_manifest_has_a_large_repo_map():
+    manifest = {
+        "base_revision": "abc123",
+        "revision": 2,
+        "repo_files": [f"generated/file_{index}.ts" for index in range(50_000)],
+        "shards": [{"path": f"generated/file_{index}.ts", "symbols": ["unused"]} for index in range(50_000)],
+        "evidence": [{
+            "id": "E1",
+            "path": "node_tui/docs/requirements.md",
+            "claim": "Queued messages must be submitted after the active run completes.",
+            "symbol": "P0-01",
+            "lines": [53, 112],
+            "source_job": "requirement-1",
+        }],
+        "jobs": [{"id": "requirement-1", "role": "requirement", "status": "done"}],
+    }
+
+    prompt = build_plan_prompt(
+        "implement node_tui/docs/requirements.md",
+        "python -m pytest -q",
+        TestCatalog(selectors=tuple(f"tests/test_{index}.py::test_case" for index in range(200))),
+        manifest,
+    )
+
+    assert '"id": "E1"' in prompt
+    assert "Queued messages must be submitted" in prompt
+    assert "node_tui/docs/requirements.md" in prompt
+    assert "generated/file_49999.ts" not in prompt
+    assert len(prompt) < 30_000
 
 
 def test_engine_rejects_illegal_transition():

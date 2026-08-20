@@ -29,6 +29,10 @@ MAX_BEHAVIOR_CHARS = 600
 MAX_ACCEPTANCE_CASES = 8
 MAX_SELECTORS_PER_TASK = 16
 MAX_SKILLS_PER_TASK = 2
+PLANNER_CATALOG_LIMIT = 80
+PLANNER_EVIDENCE_LIMIT = 48
+PLANNER_GAP_LIMIT = 20
+PLANNER_SCOPE_LIMIT = 80
 
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL | re.IGNORECASE)
 _AGENT_HEADER = re.compile(r"^\[[^\]]+\] [^\n]*\n*")
@@ -257,6 +261,71 @@ def _recommended_skill_names(name: str, behavior: str, spec: VerificationSpec) -
     return ()
 
 
+def _planner_manifest_view(discovery_manifest: dict[str, Any]) -> dict[str, Any]:
+    """Keep planning evidence visible without sending the repository map.
+
+    The full manifest is deliberately retained for ``parse_plan`` to validate
+    model output.  Its ``repo_files`` and ``shards`` fields can be megabytes,
+    though, and putting them first in a character-truncated prompt hides the
+    evidence the planner actually needs.
+    """
+    evidence: list[dict[str, Any]] = []
+    scope_candidates: list[str] = []
+    seen_scopes: set[str] = set()
+
+    def add_scope(path: Any) -> None:
+        normalized = str(path or "").strip().replace("\\", "/").strip("/")
+        if not normalized or normalized in seen_scopes or len(scope_candidates) >= PLANNER_SCOPE_LIMIT:
+            return
+        seen_scopes.add(normalized)
+        scope_candidates.append(normalized)
+
+    for raw in discovery_manifest.get("evidence", []) if isinstance(discovery_manifest.get("evidence"), list) else []:
+        if not isinstance(raw, dict) or len(evidence) >= PLANNER_EVIDENCE_LIMIT:
+            continue
+        evidence_id = str(raw.get("id") or "").strip()
+        path = str(raw.get("path") or "").strip().replace("\\", "/")
+        claim = str(raw.get("claim") or "").strip()
+        if not evidence_id or not path or not claim:
+            continue
+        lines = raw.get("lines")
+        item: dict[str, Any] = {
+            "id": evidence_id[:80],
+            "path": path[:500],
+            "claim": claim[:800],
+            "symbol": str(raw.get("symbol") or "").strip()[:160],
+            "source_job": str(raw.get("source_job") or "").strip()[:80],
+        }
+        if isinstance(lines, (list, tuple)) and len(lines) == 2:
+            item["lines"] = list(lines)
+        evidence.append(item)
+        add_scope(path)
+        parts = path.split("/")
+        for index in range(1, len(parts)):
+            add_scope("/".join(parts[:index]))
+
+    jobs: list[dict[str, str]] = []
+    for raw in discovery_manifest.get("jobs", []) if isinstance(discovery_manifest.get("jobs"), list) else []:
+        if not isinstance(raw, dict) or len(jobs) >= 16:
+            continue
+        jobs.append({
+            "id": str(raw.get("id") or "")[:80],
+            "role": str(raw.get("role") or "")[:80],
+            "status": str(raw.get("status") or "")[:40],
+            "error": str(raw.get("error") or "")[:300],
+        })
+
+    return {
+        "base_revision": str(discovery_manifest.get("base_revision") or "unknown")[:120],
+        "revision": discovery_manifest.get("revision", 0),
+        "evidence": evidence,
+        "scope_candidates": scope_candidates,
+        "gaps": [str(item)[:500] for item in discovery_manifest.get("gaps", [])[:PLANNER_GAP_LIMIT] if str(item).strip()],
+        "conflicts": [str(item)[:500] for item in discovery_manifest.get("conflicts", [])[:PLANNER_GAP_LIMIT] if str(item).strip()],
+        "jobs": jobs,
+    }
+
+
 def build_plan_prompt(
     target: str,
     full_verification: str,
@@ -264,10 +333,14 @@ def build_plan_prompt(
     discovery_manifest: dict[str, Any] | None = None,
 ) -> str:
     """Prompt for the read-only planner. Output is a JSON Task array only."""
-    catalog_text = (test_catalog or TestCatalog(error="not collected")).prompt_text()
+    catalog_text = (test_catalog or TestCatalog(error="not collected")).prompt_text(limit=PLANNER_CATALOG_LIMIT)
     manifest_text = "No Discovery Manifest supplied. Use empty evidence_refs and scope_paths."
     if isinstance(discovery_manifest, dict):
-        manifest_text = "Discovery Manifest (machine-collected; cite evidence IDs exactly):\n" + json.dumps(discovery_manifest, ensure_ascii=False)[:30_000]
+        manifest_text = (
+            "Discovery evidence view (machine-collected; cite evidence IDs exactly). "
+            "The full repository map remains available only for local validation:\n"
+            + json.dumps(_planner_manifest_view(discovery_manifest), ensure_ascii=False)
+        )
     return (
         "You plan one Goal into independently verifiable Tasks.\n"
         "The confirmed Goal and system test catalog below are your complete planning evidence. "
