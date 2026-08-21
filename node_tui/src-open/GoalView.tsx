@@ -8,6 +8,7 @@ export {
   goalEventShouldFocus,
   goalIsActive,
   goalSnapshotFromEvent,
+  mergeGoalSupervisorEvent,
   goalDraftSnapshotFromEvent,
   mergeGoalDiscoveryEvent,
   mergeGoalDraftAgentEvent,
@@ -22,6 +23,8 @@ export {
   type GoalEvidence,
   type GoalFinalVerification,
   type GoalSnapshot,
+  type GoalSupervisionSnapshot,
+  type GoalSupervisorDecision,
   type GoalTaskSnapshot,
   type GoalVerificationSpec,
 } from './goal-state.ts';
@@ -33,6 +36,8 @@ import {
   type GoalDiscoveryJobSnapshot,
   type GoalDraftSnapshot,
   type GoalSnapshot,
+  type GoalSupervisionSnapshot,
+  type GoalSupervisorDecision,
   type GoalTaskSnapshot,
 } from './goal-state.ts';
 
@@ -106,6 +111,29 @@ export function goalStatusPresentation(status: string): GoalPresentation {
   if (status === 'pausing') return {tone: 'warning', icon: 'Ⅱ', text: '正在暂停'};
   if (status === 'cancelling') return {tone: 'warning', icon: '■', text: '正在取消'};
   return {tone: 'info', icon: '●', text: '执行中'};
+}
+
+const SUPERVISOR_ACTION_LABELS: Record<string, string> = {
+  continue: '继续执行',
+  watch: '持续观察',
+  redirect: '修正方向',
+  expand_scope: '扩大当前 Task 范围',
+  replan: '重新规划',
+  retry: '从检查点重试',
+  pause_user: '需要新权限',
+};
+
+export function goalSupervisorPresentation(supervision?: GoalSupervisionSnapshot): GoalPresentation {
+  if (!supervision) return {tone: 'muted', icon: '○', text: '尚未启动'};
+  if (supervision.status === 'unavailable') return {tone: 'error', icon: '×', text: '暂时不可用，确定性规则仍在运行'};
+  if (supervision.status === 'attention') return {tone: 'warning', icon: '!', text: '发现需要处理的边界'};
+  if (supervision.status === 'observing') return {tone: 'info', icon: '●', text: '并行观察中'};
+  return {tone: 'muted', icon: '○', text: supervision.status || '等待事件'};
+}
+
+function supervisorActionLabel(decision?: GoalSupervisorDecision): string {
+  const action = decision?.action || '';
+  return SUPERVISOR_ACTION_LABELS[action] || action.replaceAll('_', ' ') || '等待判断';
 }
 
 export function goalDecisionPresentation(goal: GoalSnapshot, decisions: GoalDecision[]): GoalDecisionPresentation {
@@ -634,6 +662,15 @@ export function GoalView(props: {goal: GoalSnapshot; decisions?: GoalDecision[];
   const activeDecision = () => [...decisions()].reverse().find(item => item.status === 'active');
   const decisionHistory = () => decision().history.filter(item => item.status !== 'active').slice(-2);
   const activeTools = () => (activeDecision()?.tools || []).slice(-2);
+  const supervision = () => props.goal.supervision;
+  const supervisorDecision = () => supervision()?.latest;
+  const supervisorStatus = () => goalSupervisorPresentation(supervision());
+  const supervisorHistory = () => {
+    const latestItem = supervisorDecision();
+    return (supervision()?.history || []).filter(item => !(
+      item.observation_id === latestItem?.observation_id && item.trigger === latestItem?.trigger
+    )).slice(-2);
+  };
   const activeElapsed = () => {
     const active = activeDecision();
     if (!active) return '';
@@ -718,6 +755,39 @@ export function GoalView(props: {goal: GoalSnapshot; decisions?: GoalDecision[];
             <text fg={item.status === 'failed' ? C.error : C.textMuted} wrapMode="none" truncate>  {item.status === 'done' ? '✓' : '·'} {item.agent} · {item.text}</text>
           }</For>
         </Show>
+      </box>
+
+      <box border borderStyle="rounded" borderColor={toneColor(supervisorStatus().tone)} paddingX={1} flexDirection="column" minWidth={0}>
+        <box flexDirection={compact() ? 'column' : 'row'} justifyContent="space-between" minWidth={0}>
+          <text fg={toneColor(supervisorStatus().tone)}>全局监督</text>
+          <text fg={C.textMuted} wrapMode="none" truncate>{supervision()?.model || 'goal_supervisor'}</text>
+        </box>
+        <text fg={toneColor(supervisorStatus().tone)} wrapMode="word">{supervisorStatus().icon} {supervisorStatus().text}</text>
+        <Show when={supervision()?.observed_event}>
+          <text fg={C.textMuted} wrapMode="none" truncate>正在观察 · {supervision()?.observed_event}</text>
+        </Show>
+        <Show when={supervisorDecision()}>
+          {item => <>
+            <text fg={item().stale ? C.textMuted : toneColor(supervisorStatus().tone)} wrapMode="word">
+              {supervisorActionLabel(item())}{item().stale ? ' · 已过期，仅展示' : ''} · {item().confidence || 'medium'}
+            </text>
+            <text fg={C.text} wrapMode="word">{item().summary || '监督模型未提供摘要'}</text>
+            <Show when={item().reason}><text fg={C.textMuted} wrapMode="word">原因 · {item().reason}</text></Show>
+            <Show when={item().next_step}><text fg={C.info} wrapMode="word">下一步 · {item().next_step}</text></Show>
+            <Show when={(item().scope_paths || []).length}>
+              <text fg={C.warning} wrapMode="word">范围建议 · {(item().scope_paths || []).join(', ')}</text>
+            </Show>
+            <Show when={item().error}><text fg={C.error} wrapMode="word">{item().error}</text></Show>
+          </>}
+        </Show>
+        <Show when={!supervisorDecision() && supervision()?.error}>
+          <text fg={C.error} wrapMode="word">{supervision()?.error}</text>
+        </Show>
+        <For each={supervisorHistory()}>{item =>
+          <text fg={item.unavailable ? C.error : C.textMuted} wrapMode="none" truncate>
+            {'  '}· {item.trigger || 'observation'} · {supervisorActionLabel(item)} · {item.summary || item.error || '-'}
+          </text>
+        }</For>
       </box>
 
       <Show when={props.goal.status === 'running'}>

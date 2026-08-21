@@ -129,6 +129,25 @@ const fakeGoal: GoalSnapshot = {
   task_cycles: 2,
   total_llm_rounds: 7,
   worker_rollovers: 0,
+  supervision: {
+    status: 'observing',
+    model: 'deepseek-v4-pro',
+    observed_event: 'agent_finished',
+    latest: {
+      action: 'watch',
+      summary: '执行模型正在批准范围内修改 Goal 页面，已有文件写入进展。',
+      reason: '工具记录与当前 Task 一致，尚未触发权限或失败边界。',
+      next_step: '继续观察实现完成后的类型检查和测试结果。',
+      confidence: 'high',
+      trigger: 'parallel_observation',
+      observation_id: 'obs_debug_1',
+      revision: 5,
+    },
+    history: [
+      {action: 'continue', summary: 'Task 已成功领取。', trigger: 'phase_transition'},
+      {action: 'watch', summary: '执行模型已有文件写入进展。', trigger: 'parallel_observation'},
+    ],
+  },
   tasks: [
     {id: 'task_state', subject: '归并 Agent 生命周期事件', status: 'completed', verification_state: 'passing', evidence_count: 2},
     {id: 'task_ui', subject: '实现阶段轨道和 Agent 现场面板', status: 'in_progress', verification_state: 'not_started', evidence_count: 0},

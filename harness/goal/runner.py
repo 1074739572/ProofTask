@@ -16,6 +16,8 @@ from harness.agent.cancel import clear_cancel, request_cancel
 from harness.agents.runner import AgentTaskStats, run_agent_task
 from harness.evaluation import run_task_evaluation
 from harness.goal.engine import GoalEngine
+from harness.goal.authority import goal_authority
+from harness.goal.coordinator import ParallelGoalSupervisor, SupervisorRun
 from harness.goal.language import human_language_label
 from harness.goal.models import GoalPhase, GoalStatus, GoalState, StopReason
 from harness.goal.planner import VerificationSpec, plan_tasks
@@ -49,6 +51,7 @@ class GoalBusyError(Exception):
 # conventions, write a new test, then submit the selector JSON on a final turn.
 TEST_WRITER_MAX_ROUNDS = 8
 TEST_WRITER_MAX_IDLE_CHUNKS = 3
+MAX_PERMISSION_BOUNDARY_RETRIES = 3
 
 
 def _execution_workspace(state: GoalState) -> str:
@@ -88,12 +91,22 @@ def goal_permission_pending() -> bool:
     return bool(getattr(_local, "permission_pending", False))
 
 
-def mark_goal_permission_pending() -> None:
+def goal_permission_requests() -> tuple[dict[str, Any], ...]:
+    requests = getattr(_local, "permission_requests", ())
+    return tuple(dict(item) for item in requests if isinstance(item, dict))
+
+
+def mark_goal_permission_pending(request: dict[str, Any] | None = None) -> None:
     _local.permission_pending = True
+    if request:
+        pending = list(getattr(_local, "permission_requests", ()))
+        pending.append(dict(request))
+        _local.permission_requests = pending[-12:]
 
 
 def clear_goal_permission_flags() -> None:
     _local.permission_pending = False
+    _local.permission_requests = []
     _local.noninteractive = False
 
 
@@ -169,7 +182,7 @@ def goal_event_payload(state: GoalState) -> dict[str, Any]:
                 "last_error": task.last_error,
             }
         )
-    return {
+    payload = {
         "id": state.id,
         "target": state.target,
         "verification": state.verification,
@@ -191,6 +204,9 @@ def goal_event_payload(state: GoalState) -> dict[str, Any]:
         "last_error": state.last_error,
         "tasks": tasks,
     }
+    if isinstance(state.supervision, dict) and state.supervision:
+        payload["supervision"] = dict(state.supervision)
+    return payload
 
 
 def _emit_goal(event_type: str, state: GoalState, **metadata: Any) -> None:
@@ -635,6 +651,7 @@ class GoalRunner(threading.Thread):
         self._phase_in_flight = False
         self._archived = False
         self._lease_token = lease_token
+        self._supervisor: ParallelGoalSupervisor | None = None
         self.engine = GoalEngine()
 
     def is_running(self) -> bool:
@@ -660,22 +677,495 @@ class GoalRunner(threading.Thread):
         _emit_goal("goal_phase", self._state)
         return self._state
 
-    def run(self) -> None:
+    def _start_supervisor(self) -> None:
+        from harness.agents.registry import get_agent_profile, validate_agent_model
+
         try:
+            route_error = validate_agent_model("goal_supervisor")
+            if route_error:
+                raise ValueError(route_error)
+            self._supervisor = ParallelGoalSupervisor(
+                cwd=_execution_workspace(self._state),
+                operation_timeout_seconds=self._state.operation_timeout_seconds,
+                cancel_check=self._interrupted,
+            )
+            profile = get_agent_profile("goal_supervisor")
+            current = self._state.supervision if isinstance(self._state.supervision, dict) else {}
+            self._state.supervision = {
+                **current,
+                "status": "observing",
+                "model": profile.model_id if profile is not None else "goal_supervisor",
+                "error": "",
+                "updated_at": time.time(),
+                "history": list(current.get("history") or [])[-12:],
+            }
+            save_goal(self._state)
+            _emit("goal_supervisor", goal_id=self._state.id, event="started", **self._state.supervision)
+        except Exception as exc:
+            self._supervisor = None
+            current = self._state.supervision if isinstance(self._state.supervision, dict) else {}
+            profile = get_agent_profile("goal_supervisor")
+            self._state.supervision = {
+                **current,
+                "status": "unavailable",
+                "model": profile.model_id if profile is not None else "goal_supervisor",
+                "error": f"goal supervisor could not start: {type(exc).__name__}: {exc}",
+                "updated_at": time.time(),
+                "history": list(current.get("history") or [])[-12:],
+            }
+            save_goal(self._state)
+            _emit(
+                "goal_supervisor",
+                goal_id=self._state.id,
+                event="unavailable",
+                **self._state.supervision,
+            )
+
+    @staticmethod
+    def _goal_scope_envelope(state: GoalState) -> tuple[str, ...]:
+        from harness.tasks import load_task
+
+        values: list[str] = []
+        for plan in state.task_plan:
+            if not isinstance(plan, dict):
+                continue
+            scopes = plan.get("scope_paths") if isinstance(plan.get("scope_paths"), list) else []
+            values.extend(str(item) for item in scopes if str(item).strip())
+        for task_id in state.task_ids:
+            try:
+                values.extend(str(item) for item in load_task(task_id).scope_paths if str(item).strip())
+            except (FileNotFoundError, OSError, TypeError, ValueError):
+                continue
+        normalized = []
+        for item in values:
+            value = item.replace("\\", "/").strip()
+            while value.startswith("./"):
+                value = value[2:]
+            normalized.append(value)
+        return tuple(dict.fromkeys(item for item in normalized if item))
+
+    @staticmethod
+    def _agent_stats_detail(
+        agent_type: str,
+        stats: AgentTaskStats,
+        *,
+        summary: str = "",
+        extra: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "agent_type": str(agent_type),
+            "summary": str(summary or "")[:2_000],
+            "stop_reason": str(stats.stop_reason or ""),
+            "llm_rounds": max(0, int(stats.llm_rounds)),
+            "elapsed_seconds": max(0.0, float(stats.elapsed_seconds)),
+            "tool_count": max(0, int(stats.tool_count)),
+            "tool_names": list(dict.fromkeys(str(item) for item in stats.tool_names))[-12:],
+            "read_paths": list(dict.fromkeys(str(item) for item in stats.read_paths))[-12:],
+            "write_paths": list(dict.fromkeys(str(item) for item in stats.write_paths))[-12:],
+            "tool_errors": [str(item)[:500] for item in stats.tool_errors[-6:]],
+            **dict(extra or {}),
+        }
+
+    @staticmethod
+    def _scope_candidate(
+        workspace: str | Path,
+        raw_path: str,
+    ) -> tuple[str | None, Path | None, str | None]:
+        root = Path(workspace).expanduser().resolve()
+        value = str(raw_path or "").strip()
+        if not value:
+            return None, None, "scope request omitted its path"
+        try:
+            candidate = Path(value).expanduser()
+            if not candidate.is_absolute():
+                candidate = root / candidate
+            candidate = candidate.resolve()
+            relative = candidate.relative_to(root).as_posix()
+        except (OSError, ValueError) as exc:
+            return None, None, f"scope request is outside the execution workspace: {value!r} ({exc})"
+        if not relative or relative == ".":
+            return None, None, "the execution workspace root cannot be granted as write scope"
+        protected = {".git", ".project", ".features"}
+        for part in Path(relative).parts:
+            lowered = part.casefold()
+            if lowered in protected or lowered.startswith(".env"):
+                return None, None, f"protected Goal path cannot be granted: {relative}"
+        return relative, candidate, None
+
+    def _scope_expansion_paths(
+        self,
+        state: GoalState,
+        run: SupervisorRun,
+        requests: tuple[dict[str, Any], ...],
+    ) -> tuple[tuple[str, ...], str | None]:
+        supervision = state.supervision if isinstance(state.supervision, dict) else {}
+        try:
+            current_revision = int(supervision.get("observation_revision") or 0)
+        except (TypeError, ValueError):
+            current_revision = 0
+        if run.revision != current_revision:
+            return (), "the supervisor suggestion is stale"
+        requested: set[str] = set()
+        for request in requests:
+            tool = str(request.get("tool") or "")
+            if tool not in {"write_file", "edit_file"}:
+                return (), f"{tool or 'unknown tool'} cannot receive automatic scope expansion"
+            relative, _, error = self._scope_candidate(
+                _execution_workspace(state),
+                str(request.get("path") or ""),
+            )
+            if error:
+                return (), error
+            assert relative is not None
+            requested.add(relative)
+
+        proposed: list[tuple[str, Path]] = []
+        for path in run.decision.scope_paths:
+            relative, candidate, error = self._scope_candidate(_execution_workspace(state), path)
+            if error:
+                return (), error
+            assert relative is not None and candidate is not None
+            if relative not in requested:
+                return (), f"supervisor proposed a path that was not actually requested: {relative}"
+            proposed.append((relative, candidate))
+        if not proposed:
+            return (), "supervisor requested scope expansion without an exact path"
+
+        envelope: list[tuple[str, Path]] = []
+        for path in self._goal_scope_envelope(state):
+            relative, candidate, error = self._scope_candidate(_execution_workspace(state), path)
+            if error is None and relative is not None and candidate is not None:
+                envelope.append((relative, candidate))
+        approved: list[str] = []
+        for relative, candidate in proposed:
+            inside = any(
+                relative == envelope_relative
+                or (envelope_path.is_dir() and candidate.is_relative_to(envelope_path))
+                for envelope_relative, envelope_path in envelope
+            )
+            if not inside:
+                return (), f"requested path is outside the approved Goal scope envelope: {relative}"
+            approved.append(relative)
+        return tuple(dict.fromkeys(approved)), None
+
+    def _handle_permission_boundary(
+        self,
+        state: GoalState,
+        task: Any,
+        *,
+        requests: tuple[dict[str, Any], ...],
+        agent_detail: dict[str, Any],
+    ) -> None:
+        from harness.tasks import save_task
+
+        attempts = dict(state.permission_boundary_attempts or {})
+        try:
+            prior_attempts = int(attempts.get(task.id, 0))
+        except (TypeError, ValueError):
+            prior_attempts = 0
+        attempt = max(0, prior_attempts) + 1
+        attempts[task.id] = attempt
+        state.permission_boundary_attempts = attempts
+        save_goal(state)
+        run = self._review_supervisor_boundary(
+            "permission_boundary",
+            detail={
+                "attempt": attempt,
+                "max_attempts": MAX_PERMISSION_BOUNDARY_RETRIES,
+                "requests": [dict(item) for item in requests],
+                "agent": agent_detail,
+            },
+        )
+
+        def pause(message: str) -> None:
+            task.last_error = message
+            save_task(task)
+            state.last_error = message
+            self._pause(
+                state,
+                "goal_permission_required",
+                stop_reason=StopReason.permission_wait.value,
+            )
+            current = state.supervision if isinstance(state.supervision, dict) else {}
+            state.supervision = {
+                **current,
+                "terminal_boundary_revision": len(state.transition_log),
+            }
+            save_goal(state)
+
+        if run is None:
+            pause("Global supervisor is unavailable; the requested capability remains blocked.")
+            return
+        decision = run.decision
+        if decision.unavailable:
+            pause(decision.error or "Global supervisor could not analyze the permission boundary.")
+            return
+        supervision = state.supervision if isinstance(state.supervision, dict) else {}
+        try:
+            current_revision = int(supervision.get("observation_revision") or 0)
+        except (TypeError, ValueError):
+            current_revision = 0
+        if run.revision != current_revision:
+            pause("Global supervisor returned a stale permission decision; no authority was changed.")
+            return
+
+        guidance = decision.next_step or decision.reason or decision.summary
+        if decision.action == "expand_scope":
+            if attempt > MAX_PERMISSION_BOUNDARY_RETRIES:
+                pause(
+                    f"Task reached {MAX_PERMISSION_BOUNDARY_RETRIES} automatic permission-boundary retries. "
+                    f"Latest supervisor analysis: {decision.summary}"
+                )
+                return
+            paths, error = self._scope_expansion_paths(state, run, requests)
+            if error:
+                pause(f"Scope expansion was rejected by deterministic policy: {error}")
+                return
+            task.scope_paths = list(dict.fromkeys([*task.scope_paths, *paths]))
+            task.last_error = f"Global supervisor expanded Task scope: {guidance}"
+            save_task(task)
+            state.last_error = task.last_error
+            state.no_progress_count = 0
+            save_goal(state)
+            _emit_goal("goal_status", state)
+            self._observe_supervisor(
+                "permission_scope_expanded",
+                detail={"task_id": task.id, "paths": list(paths), "attempt": attempt},
+            )
+            return
+        if decision.action in {"redirect", "retry"}:
+            if attempt > MAX_PERMISSION_BOUNDARY_RETRIES:
+                pause(
+                    f"Task reached {MAX_PERMISSION_BOUNDARY_RETRIES} automatic permission-boundary retries. "
+                    f"Latest supervisor analysis: {decision.summary}"
+                )
+                return
+            task.last_error = f"Global supervisor {decision.action}: {guidance}"
+            save_task(task)
+            state.last_error = task.last_error
+            state.no_progress_count = 0
+            save_goal(state)
+            _emit_goal("goal_status", state)
+            self._observe_supervisor(
+                "permission_worker_redirected",
+                detail={"task_id": task.id, "action": decision.action, "attempt": attempt},
+            )
+            return
+        if decision.action == "replan":
+            task.last_error = f"Global supervisor requested replanning: {guidance}"
+            save_task(task)
+            state.last_error = task.last_error
+            self._apply(state, GoalPhase.REPAIR_PLAN, "supervisor_permission_replan", error=task.last_error)
+            return
+        pause(
+            decision.summary
+            or "The permission request needs authority outside the current Goal contract."
+        )
+
+    def _supervisor_observation(
+        self,
+        event: str,
+        *,
+        detail: dict[str, Any] | None = None,
+        boundary: bool = False,
+    ) -> dict[str, Any]:
+        from harness.tasks import load_task
+
+        state = self._state
+        task_payload: dict[str, Any] | None = None
+        if state.current_task_id:
+            try:
+                task = load_task(state.current_task_id)
+                task_payload = {
+                    "id": task.id,
+                    "subject": task.subject,
+                    "status": task.status,
+                    "verification_state": task.verification_state,
+                    "scope_paths": list(task.scope_paths),
+                    "acceptance_cases": list(task.acceptance_cases),
+                    "last_error": task.last_error,
+                    "verification_spec": dict(task.verification_spec),
+                }
+            except (FileNotFoundError, OSError, TypeError, ValueError):
+                task_payload = {"id": state.current_task_id, "error": "Task state unavailable"}
+        supervision = state.supervision if isinstance(state.supervision, dict) else {}
+        try:
+            prior_revision = int(supervision.get("observation_revision") or 0)
+        except (TypeError, ValueError):
+            prior_revision = 0
+        revision = prior_revision + 1
+        state.supervision = {
+            **supervision,
+            "observation_revision": revision,
+        }
+        history = supervision.get("history") if isinstance(supervision.get("history"), list) else []
+        return {
+            "event": str(event),
+            "boundary": bool(boundary),
+            "revision": revision,
+            "at": time.time(),
+            "goal": {
+                "id": state.id,
+                "target": state.target,
+                "phase": state.phase,
+                "status": state.status,
+                "resume_phase": state.resume_phase,
+                "stop_reason": state.stop_reason,
+                "last_error": state.last_error,
+                "contract": state.goal_contract,
+                "scope_envelope": list(self._goal_scope_envelope(state)),
+            },
+            "task": task_payload,
+            "recent_transitions": list(state.transition_log[-10:]),
+            "prior_supervision": list(history[-6:]),
+            "detail": dict(detail or {}),
+        }
+
+    def _observe_supervisor(self, event: str, *, detail: dict[str, Any] | None = None) -> None:
+        if self._supervisor is None:
+            return
+        observation = self._supervisor_observation(event, detail=detail)
+        observation_id = self._supervisor.observe(observation)
+        current = self._state.supervision if isinstance(self._state.supervision, dict) else {}
+        current_status = str(current.get("status") or "")
+        self._state.supervision = {
+            **current,
+            "status": current_status if current_status in {"attention", "unavailable"} else "observing",
+            "observed_event": event,
+            "observation_id": observation_id,
+            "observed_revision": observation["revision"],
+            "updated_at": time.time(),
+        }
+        save_goal(self._state)
+        _emit(
+            "goal_supervisor",
+            goal_id=self._state.id,
+            event="observing",
+            observation_id=observation_id,
+            observed_event=event,
+            revision=observation["revision"],
+        )
+
+    def _record_supervisor_run(self, run: SupervisorRun, *, event: str) -> None:
+        decision = run.decision.to_dict()
+        current = self._state.supervision if isinstance(self._state.supervision, dict) else {}
+        try:
+            current_revision = int(current.get("observation_revision") or 0)
+        except (TypeError, ValueError):
+            current_revision = 0
+        stale = run.revision < current_revision
+        record = {
+            **decision,
+            "trigger": event,
+            "observation_id": run.observation_id,
+            "revision": run.revision,
+            "stale": stale,
+            "at": time.time(),
+        }
+        history = list(current.get("history") or [])
+        history.append(record)
+        status = str(current.get("status") or "observing") if stale else (
+            "unavailable" if run.decision.unavailable else (
+                "attention" if run.decision.action not in {"continue", "watch"} else "observing"
+            )
+        )
+        latest = current.get("latest") if stale and isinstance(current.get("latest"), dict) else record
+        self._state.supervision = {
+            **current,
+            "status": status,
+            "latest": latest,
+            "history": history[-12:],
+            "updated_at": record["at"],
+        }
+        self._state.total_llm_rounds += max(0, int(run.llm_rounds))
+        save_goal(self._state)
+        _emit(
+            "goal_supervisor",
+            goal_id=self._state.id,
+            event="decision",
+            **record,
+        )
+
+    def _poll_supervisor(self) -> None:
+        if self._supervisor is None:
+            return
+        for result in self._supervisor.poll():
+            self._record_supervisor_run(result, event="parallel_observation")
+
+    def _review_supervisor_boundary(
+        self,
+        event: str,
+        *,
+        detail: dict[str, Any] | None = None,
+    ) -> SupervisorRun | None:
+        if self._supervisor is None:
+            return None
+        self._poll_supervisor()
+        result = self._supervisor.review(
+            self._supervisor_observation(event, detail=detail, boundary=True)
+        )
+        self._record_supervisor_run(result, event=event)
+        return result
+
+    def _review_terminal_supervision(self) -> None:
+        state = self._state
+        if state.status not in {GoalStatus.PAUSED.value, GoalStatus.FAILED.value}:
+            return
+        last_transition = state.transition_log[-1] if state.transition_log else {}
+        if state.stop_reason in {
+            StopReason.user_approval_required.value,
+            StopReason.cancelled_by_user.value,
+        } or last_transition.get("reason") == "user_pause":
+            return
+        terminal_boundary_revision = (
+            state.supervision.get("terminal_boundary_revision")
+            if isinstance(state.supervision, dict)
+            else None
+        )
+        try:
+            reviewed_revision = int(terminal_boundary_revision or -1)
+        except (TypeError, ValueError):
+            reviewed_revision = -1
+        if reviewed_revision == len(state.transition_log):
+            return
+        self._review_supervisor_boundary(
+            "terminal_failure",
+            detail={
+                "phase": state.resume_phase or state.last_phase or state.phase,
+                "stop_reason": state.stop_reason,
+                "error": state.last_error,
+            },
+        )
+
+    def _close_supervisor(self) -> None:
+        supervisor, self._supervisor = self._supervisor, None
+        if supervisor is not None:
+            supervisor.close()
+
+    def run(self) -> None:
+        self._start_supervisor()
+        try:
+            self._observe_supervisor("goal_runner_started")
             self._drive()
         except Exception as exc:
             self._fail(self._state, StopReason.internal_error, f"{type(exc).__name__}: {exc}")
         finally:
             try:
-                if self._state.status in {GoalStatus.DONE.value, GoalStatus.FAILED.value, GoalStatus.CANCELLED.value}:
-                    archive_goal(self._state)
+                self._poll_supervisor()
+                self._review_terminal_supervision()
             finally:
-                release_goal_lease(self._state, self._lease_token)
+                self._close_supervisor()
+                try:
+                    if self._state.status in {GoalStatus.DONE.value, GoalStatus.FAILED.value, GoalStatus.CANCELLED.value}:
+                        archive_goal(self._state)
+                finally:
+                    release_goal_lease(self._state, self._lease_token)
             _emit_goal("goal_stopped", self._state)
 
     def _drive(self) -> None:
         while self.is_running():
             state = self._state
+            self._poll_supervisor()
             if workspace_generation() != state.workspace_generation:
                 self._fail(state, StopReason.workspace_changed, "workspace switched while goal was active")
                 return
@@ -733,6 +1223,14 @@ class GoalRunner(threading.Thread):
                 except Exception as exc:
                     state.total_llm_rounds += stats.llm_rounds
                     state.last_error = f"Goal planner unavailable: {type(exc).__name__}: {exc}"
+                    self._observe_supervisor(
+                        "agent_finished",
+                        detail=self._agent_stats_detail(
+                            "goal_planner",
+                            stats,
+                            summary=state.last_error,
+                        ),
+                    )
                     self._pause(
                         state,
                         "goal_planner_unavailable",
@@ -744,6 +1242,14 @@ class GoalRunner(threading.Thread):
             finally:
                 self._phase_in_flight = False
             state.total_llm_rounds += stats.llm_rounds
+            self._observe_supervisor(
+                "agent_finished",
+                detail=self._agent_stats_detail(
+                    "goal_planner",
+                    stats,
+                    summary=f"Planner produced {len(plans)} Task contracts.",
+                ),
+            )
             if self._honor_control_request(state):
                 return
             state.task_plan = [item.to_dict() for item in plans]
@@ -906,19 +1412,26 @@ class GoalRunner(threading.Thread):
             def invoke_writer(active_prompt: str, description: str, _slice: int, stats: AgentTaskStats) -> str:
                 self._phase_in_flight = True
                 try:
-                    clear_goal_permission_flags()
-                    set_goal_noninteractive(True)
-                    return run_agent_task(
-                        description=description,
-                        prompt=active_prompt,
-                        agent_type="goal_test_writer",
-                        cwd=str(root),
-                        max_rounds=TEST_WRITER_MAX_ROUNDS,
-                        cancel_check=self._interrupted,
-                        deadline=writer_deadline,
-                        stats=stats,
+                    with goal_authority(
+                        goal_id=state.id,
+                        task_id=task.id,
+                        phase=GoalPhase.PREPARE_TESTS.value,
+                        workspace=root,
                         write_roots=write_roots,
-                    )
+                    ):
+                        clear_goal_permission_flags()
+                        set_goal_noninteractive(True)
+                        return run_agent_task(
+                            description=description,
+                            prompt=active_prompt,
+                            agent_type="goal_test_writer",
+                            cwd=str(root),
+                            max_rounds=TEST_WRITER_MAX_ROUNDS,
+                            cancel_check=self._interrupted,
+                            deadline=writer_deadline,
+                            stats=stats,
+                            write_roots=write_roots,
+                        )
                 finally:
                     set_goal_noninteractive(False)
                     self._phase_in_flight = False
@@ -944,6 +1457,23 @@ class GoalRunner(threading.Thread):
                     },
                 )
 
+            def on_test_slice(item: Any) -> None:
+                state.total_llm_rounds += item.stats.llm_rounds
+                self._observe_supervisor(
+                    "agent_slice_finished",
+                    detail=self._agent_stats_detail(
+                        "goal_test_writer",
+                        item.stats,
+                        summary=item.progress.summary,
+                        extra={
+                            "task_id": task.id,
+                            "slice": item.number,
+                            "idle_slices": item.idle_slices,
+                            "checkpoint": dict(item.progress.checkpoint),
+                        },
+                    ),
+                )
+
             supervised = StageSupervisor(StagePolicy(
                 name="test_generation",
                 slice_rounds=TEST_WRITER_MAX_ROUNDS,
@@ -960,7 +1490,7 @@ class GoalRunner(threading.Thread):
                 continuation_description=lambda slice_number: f"continue generating tests for task {task.id} (slice {slice_number})",
                 snapshot=lambda: self._snapshot_test_tree(root, write_roots),
                 assess_progress=test_progress,
-                on_slice=lambda item: setattr(state, "total_llm_rounds", state.total_llm_rounds + item.stats.llm_rounds),
+                on_slice=on_test_slice,
             )
             stats = supervised.stats
             raw = supervised.raw
@@ -1087,6 +1617,15 @@ class GoalRunner(threading.Thread):
                 state.total_llm_rounds += retry_stats.llm_rounds
                 if self._honor_control_request(state):
                     return
+                self._observe_supervisor(
+                    "agent_finished",
+                    detail=self._agent_stats_detail(
+                        "goal_test_writer",
+                        retry_stats,
+                        summary=str(raw)[-2_000:],
+                        extra={"task_id": task.id, "source": "selector_binding_repair"},
+                    ),
+                )
                 empty_response = retry_stats.stop_reason == "empty_response"
                 selectors = self._selectors_from_generation(raw, root, catalog=after_catalog)
                 case_selectors = self._case_selectors_from_generation(raw, selectors, task.acceptance_cases)
@@ -1519,26 +2058,45 @@ class GoalRunner(threading.Thread):
                 save_goal(state)
                 return
             clear_goal_permission_flags()
-            set_goal_noninteractive(True)
-            clear_cancel()
-            summary = run_agent_task(
-                description=f"implement Goal task {task.id}",
-                prompt=prompt,
-                agent_type="goal_worker",
-                cwd=_execution_workspace(state),
-                max_rounds=state.worker_round_limit,
-                cancel_check=self._interrupted,
-                deadline=self._deadline(state),
-                stats=stats,
-                write_roots=tuple(task.scope_paths) or None,
-            )
+            with goal_authority(
+                goal_id=state.id,
+                task_id=task.id,
+                phase=GoalPhase.ACT.value,
+                workspace=_execution_workspace(state),
+                write_roots=tuple(task.scope_paths),
+            ):
+                set_goal_noninteractive(True)
+                clear_cancel()
+                summary = run_agent_task(
+                    description=f"implement Goal task {task.id}",
+                    prompt=prompt,
+                    agent_type="goal_worker",
+                    cwd=_execution_workspace(state),
+                    max_rounds=state.worker_round_limit,
+                    cancel_check=self._interrupted,
+                    deadline=self._deadline(state),
+                    stats=stats,
+                    write_roots=tuple(task.scope_paths) or None,
+                )
         finally:
             set_goal_noninteractive(False)
             self._phase_in_flight = False
         state.total_llm_rounds += stats.llm_rounds
         state.attempts += 1
+        permission_pending = goal_permission_pending()
+        permission_requests = goal_permission_requests()
+        agent_detail = self._agent_stats_detail(
+            "goal_worker",
+            stats,
+            summary=summary,
+            extra={"task_id": task.id, "worker_generation": state.worker_generation},
+        )
         scope_error = self._validate_task_scope(state, task)
         if scope_error:
+            self._observe_supervisor(
+                "agent_finished",
+                detail={**agent_detail, "scope_error": scope_error},
+            )
             emit_stage_supervision(
                 "blocked",
                 stage="implementation",
@@ -1550,6 +2108,11 @@ class GoalRunner(threading.Thread):
             state.last_error = scope_error
             save_goal(state)
             return
+        if not permission_pending:
+            attempts = dict(state.permission_boundary_attempts or {})
+            attempts.pop(task.id, None)
+            state.permission_boundary_attempts = attempts
+            self._observe_supervisor("agent_finished", detail=agent_detail)
         worker_progressed = self._progress_snapshot(state) != before
         state.no_progress_count = state.no_progress_count + 1 if not worker_progressed else 0
         emit_stage_supervision(
@@ -1570,17 +2133,13 @@ class GoalRunner(threading.Thread):
         write_handoff(state, task, phase=GoalPhase.VERIFY.value, summary=summary)
         if self._cancel_event.is_set():
             self._cancel(state, "user requested cancel")
-        elif goal_permission_pending():
-            # A non-interactive Goal must never auto-approve an ``ask`` tool
-            # decision.  This is recoverable after the user adjusts policy or
-            # grants approval, so preserve the Task checkpoint as a pause.
-            self._pause(
+        elif permission_pending:
+            self._handle_permission_boundary(
                 state,
-                "goal_permission_required",
-                stop_reason=StopReason.permission_wait.value,
+                task,
+                requests=permission_requests,
+                agent_detail=agent_detail,
             )
-            state.last_error = "a tool required permission outside the approved Goal boundary"
-            save_goal(state)
         elif self._pause_event.is_set():
             self._pause(state, "user_pause")
         elif stats.stop_reason == "provider_error":
@@ -1639,6 +2198,20 @@ class GoalRunner(threading.Thread):
         if self._honor_control_request(state):
             return
         evaluation = task.evaluation or {}
+        self._observe_supervisor(
+            "agent_finished",
+            detail=self._agent_stats_detail(
+                "evaluator",
+                stats,
+                summary=str(
+                    evaluation.get("summary")
+                    or evaluation.get("error")
+                    or evaluation.get("passed")
+                    or "evaluation completed"
+                ),
+                extra={"task_id": state.current_task_id, "verdict": evaluation.get("passed")},
+            ),
+        )
         if evaluation.get("passed") is None:
             state.last_error = str(
                 evaluation.get("error") or "evaluator did not return a valid verdict"
@@ -1696,6 +2269,15 @@ class GoalRunner(threading.Thread):
         state.total_llm_rounds += stats.llm_rounds
         if self._honor_control_request(state):
             return
+        self._observe_supervisor(
+            "agent_finished",
+            detail=self._agent_stats_detail(
+                "goal_repair_planner",
+                stats,
+                summary=decision.summary or decision.instructions or decision.error or decision.action,
+                extra={"task_id": task.id, "action": decision.action},
+            ),
+        )
         record = {"evaluation": evaluation, **decision.to_dict(), "at": time.time()}
         record_task_repair(task.id, record)
         if decision.assumptions:
@@ -1780,6 +2362,15 @@ class GoalRunner(threading.Thread):
         state.total_llm_rounds += stats.llm_rounds
         if self._honor_control_request(state):
             return
+        self._observe_supervisor(
+            "agent_finished",
+            detail=self._agent_stats_detail(
+                "goal_test_impact",
+                stats,
+                summary=decision.reason or decision.action,
+                extra={"task_id": completed.id, "action": decision.action},
+            ),
+        )
         if decision.unavailable:
             state.last_error = decision.reason or "test impact reviewer unavailable"
             self._pause(
@@ -1936,6 +2527,15 @@ class GoalRunner(threading.Thread):
         state.total_llm_rounds += stats.llm_rounds
         if self._honor_control_request(state):
             return
+        self._observe_supervisor(
+            "agent_finished",
+            detail=self._agent_stats_detail(
+                "goal_repair_planner",
+                stats,
+                summary=decision.summary or decision.instructions or decision.error or decision.action,
+                extra={"action": decision.action, "source": "full_verification"},
+            ),
+        )
         append_decisions(
             state,
             None,
@@ -2147,9 +2747,20 @@ class GoalRunner(threading.Thread):
         return time.monotonic() + state.operation_timeout_seconds
 
     def _apply(self, state: GoalState, target: GoalPhase, reason: str, *, error: str | None = None, stop_reason: str | None = None) -> None:
+        source = state.phase
         self.engine.transition(state, target, reason, error=error, stop_reason=stop_reason)
         save_goal(state)
         _emit_goal("goal_phase", state)
+        self._observe_supervisor(
+            "phase_transition",
+            detail={
+                "from": source,
+                "to": state.phase,
+                "reason": reason,
+                "error": error,
+                "stop_reason": stop_reason,
+            },
+        )
 
     def _pause(self, state: GoalState, reason: str, *, stop_reason: str | None = None) -> None:
         self._apply(state, GoalPhase.PAUSED, reason, stop_reason=stop_reason)

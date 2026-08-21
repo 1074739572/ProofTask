@@ -121,6 +121,9 @@ class GoalState:
     repair_attempts: int = 0
     worker_generation: int = 0
     worker_rollovers: int = 0
+    # Durable retry budget for supervisor-handled capability boundaries. Each
+    # Task gets its own counter so a bad suggestion cannot create a hot loop.
+    permission_boundary_attempts: dict[str, int] = field(default_factory=dict)
     workspace_generation: int = 0
     started_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
@@ -134,6 +137,9 @@ class GoalState:
     # Durable machine evidence for the Goal-level regression command. Task
     # evidence proves each unit; this records the final whole-goal gate.
     final_verification: dict[str, Any] | None = None
+    # Latest read-only global-supervisor assessment plus a bounded audit trail.
+    # This is advisory state; the runner remains the sole transition authority.
+    supervision: dict[str, Any] = field(default_factory=dict)
     # Draft-backed Goals stop after test generation and a failing baseline.
     # Only an explicit `/goal run` permits production implementation.
     execution_approved: bool = True

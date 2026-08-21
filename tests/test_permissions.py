@@ -183,33 +183,121 @@ def test_permission_hook_remembers_session_approval():
         clear_session_rules()
 
 
-def test_goal_permission_uses_the_event_ui_when_available():
-    clear_session_rules()
+def _ask_decision(resource: str):
+    return mock.Mock(
+        effect="ask",
+        resource=resource,
+        reason="matched wildcard ask rule",
+        source="config",
+        save_tool="",
+        save_resource="",
+        external_resource=None,
+    )
+
+
+def test_goal_write_inside_task_scope_is_auto_approved(tmp_path):
+    from harness.goal.authority import goal_authority
+
+    block = {"name": "write_file", "input": {"path": "src/app.py", "content": "x"}}
+    with goal_authority(
+        goal_id="goal-1",
+        task_id="task-1",
+        phase="act",
+        workspace=tmp_path,
+        write_roots=("src",),
+    ), mock.patch("harness.hooks.evaluate_permission", return_value=_ask_decision("src/app.py")), mock.patch(
+        "harness.goal.runner.is_goal_noninteractive", return_value=True
+    ), mock.patch("harness.goal.runner.mark_goal_permission_pending") as pending, mock.patch(
+        "harness.hooks.ask_permission"
+    ) as ask, mock.patch("harness.hooks.audit_permission"):
+        assert permission_hook(block) is None
+
+    pending.assert_not_called()
+    ask.assert_not_called()
+
+
+def test_goal_write_outside_task_scope_becomes_supervisor_boundary(tmp_path):
+    from harness.goal.authority import goal_authority
+
+    block = {"name": "edit_file", "input": {"path": "src/shared.py", "old_text": "a", "new_text": "b"}}
+    with goal_authority(
+        goal_id="goal-1",
+        task_id="task-1",
+        phase="act",
+        workspace=tmp_path,
+        write_roots=("src/app.py",),
+    ), mock.patch("harness.hooks.evaluate_permission", return_value=_ask_decision("src/shared.py")), mock.patch(
+        "harness.goal.runner.is_goal_noninteractive", return_value=True
+    ), mock.patch("harness.goal.runner.mark_goal_permission_pending") as pending, mock.patch(
+        "harness.hooks.ask_permission"
+    ) as ask, mock.patch("harness.hooks.audit_permission"):
+        result = permission_hook(block)
+
+    assert "Permission deferred" in result
+    assert pending.call_args.args[0]["path"] == "src/shared.py"
+    ask.assert_not_called()
+
+
+def test_goal_task_scope_is_enforced_before_a_generic_allow_rule(tmp_path):
+    from harness.goal.authority import goal_authority
+
+    decision = _ask_decision("src/shared.py")
+    decision.effect = "allow"
+    block = {"name": "write_file", "input": {"path": "src/shared.py", "content": "x"}}
+    with goal_authority(
+        goal_id="goal-1",
+        task_id="task-1",
+        phase="act",
+        workspace=tmp_path,
+        write_roots=("src/app.py",),
+    ), mock.patch("harness.hooks.evaluate_permission", return_value=decision), mock.patch(
+        "harness.goal.runner.is_goal_noninteractive", return_value=True
+    ), mock.patch("harness.goal.runner.mark_goal_permission_pending") as pending, mock.patch(
+        "harness.hooks.audit_permission"
+    ):
+        result = permission_hook(block)
+
+    assert "Permission deferred" in result
+    assert pending.call_args.args[0]["path"] == "src/shared.py"
+
+
+def test_goal_hard_deny_cannot_be_overridden_by_scope(tmp_path):
+    from harness.goal.authority import goal_authority
+
+    decision = _ask_decision("src/app.py")
+    decision.effect = "deny"
+    decision.reason = "protected by policy"
+    block = {"name": "write_file", "input": {"path": "src/app.py", "content": "x"}}
+    with goal_authority(
+        goal_id="goal-1",
+        task_id="task-1",
+        phase="act",
+        workspace=tmp_path,
+        write_roots=("src",),
+    ), mock.patch("harness.hooks.evaluate_permission", return_value=decision), mock.patch(
+        "harness.goal.runner.is_goal_noninteractive", return_value=True
+    ), mock.patch("harness.goal.runner.mark_goal_permission_pending") as pending, mock.patch(
+        "harness.hooks.audit_permission"
+    ):
+        result = permission_hook(block)
+
+    assert "Permission denied" in result
+    pending.assert_not_called()
+
+
+def test_goal_bash_request_is_deferred_and_never_scope_approved():
     block = {"name": "bash", "input": {"command": "git status"}}
-    try:
-        with mock.patch("harness.hooks.evaluate_permission") as evaluate, mock.patch(
-            "harness.hooks.events.is_enabled", return_value=True
-        ), mock.patch(
-            "harness.ui.permission_events.request_permission", return_value="session"
-        ) as request, mock.patch("harness.hooks.audit_permission"), mock.patch(
-            "harness.goal.runner.is_goal_noninteractive", return_value=True
-        ):
-            evaluate.return_value = mock.Mock(
-                effect="ask",
-                resource="git status",
-                reason="matched bash:*",
-                source="config",
-                save_tool="bash",
-                save_resource="git status",
-                external_resource=None,
-            )
-            assert permission_hook(block) is None
-        request.assert_called_once()
-        assert request.call_args.args == ("bash", "git status", "Allow bash?")
-        assert callable(request.call_args.kwargs["cancel_check"])
-        assert any(rule.tool == "bash" and rule.resource == "git status" for rule in session_rules())
-    finally:
-        clear_session_rules()
+    with mock.patch("harness.hooks.evaluate_permission", return_value=_ask_decision("git status")), mock.patch(
+        "harness.goal.runner.is_goal_noninteractive", return_value=True
+    ), mock.patch("harness.goal.runner.mark_goal_permission_pending") as pending, mock.patch(
+        "harness.ui.permission_events.request_permission"
+    ) as request, mock.patch("harness.hooks.audit_permission"):
+        result = permission_hook(block)
+
+    assert "Permission deferred" in result
+    assert pending.call_args.args[0]["tool"] == "bash"
+    assert pending.call_args.args[0]["command"] == "git status"
+    request.assert_not_called()
 
 
 def test_permission_hook_persists_always_approval():

@@ -20,6 +20,7 @@ import {
   goalSnapshotFromEvent,
   mergeGoalDiscoveryEvent,
   mergeGoalDraftAgentEvent,
+  mergeGoalSupervisorEvent,
   type GoalDecision,
   type GoalDraftSnapshot,
   type GoalSnapshot,
@@ -1158,6 +1159,45 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
           text: `Goal 监督 · ${stage}`,
           detail: detail || supervisionEvent,
         });
+        break;
+      }
+      case 'goal_supervisor': {
+        const currentGoal = goalSnapshot();
+        if (currentGoal) setGoalSnapshot(mergeGoalSupervisorEvent(currentGoal, event));
+        const supervisorEvent = value(event, 'event');
+        if (supervisorEvent === 'started') {
+          add({
+            id: `goal-supervisor-started-${value(event, 'goal_id')}`,
+            kind: 'log',
+            text: 'Goal 全局监督',
+            detail: `${value(event, 'model') || 'goal_supervisor'} 已开始并行观察`,
+          });
+        }
+        if (supervisorEvent === 'unavailable') {
+          add({
+            id: `goal-supervisor-unavailable-${value(event, 'goal_id')}`,
+            kind: 'blocked',
+            text: 'Goal 全局监督不可用',
+            detail: value(event, 'error') || '确定性 Goal 规则将继续运行',
+          });
+        }
+        if (supervisorEvent === 'decision') {
+          const action = value(event, 'action') || 'watch';
+          const summary = value(event, 'summary') || value(event, 'error') || '监督模型未提供摘要';
+          const nextStep = value(event, 'next_step');
+          const trigger = value(event, 'trigger');
+          const important = event.unavailable
+            || !['continue', 'watch'].includes(action)
+            || ['permission_boundary', 'terminal_failure'].includes(trigger);
+          if (important) {
+            add({
+              id: `goal-supervisor-${value(event, 'observation_id') || Date.now()}`,
+              kind: event.unavailable || action === 'pause_user' ? 'blocked' : 'log',
+              text: `Goal 全局监督 · ${action}`,
+              detail: [summary, nextStep ? `下一步：${nextStep}` : '', event.stale ? '建议已过期，仅展示' : ''].filter(Boolean).join(' · '),
+            });
+          }
+        }
         break;
       }
       case 'goal_discovery_job': {

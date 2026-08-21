@@ -14,6 +14,7 @@ import {
   goalSnapshotFromEvent,
   mergeGoalDiscoveryEvent,
   mergeGoalDraftAgentEvent,
+  mergeGoalSupervisorEvent,
   type GoalDraftSnapshot,
   type GoalSnapshot,
 } from '../src-open/GoalView.tsx';
@@ -138,6 +139,77 @@ test('older goal snapshots cannot replace a newer durable phase', () => {
   const current = goal({phase: 'verify', status: 'running', updated_at: 20, event_seq: 20});
   const older = goalSnapshotFromEvent({id: 'goal-1', target: 'add rate limits', phase: 'act', status: 'running', updated_at: 19, seq: 19}, current);
   assert.equal(older?.phase, 'verify');
+});
+
+test('parallel supervisor events update the Goal without replacing its execution phase', () => {
+  const current = goal({phase: 'verify', status: 'running'});
+  const observing = mergeGoalSupervisorEvent(current, {
+    type: 'goal_supervisor', goal_id: 'goal-1', event: 'observing',
+    observation_id: 'obs-1', observed_event: 'agent_finished', revision: 4,
+  });
+  const decided = mergeGoalSupervisorEvent(observing, {
+    type: 'goal_supervisor', goal_id: 'goal-1', event: 'decision',
+    observation_id: 'obs-1', trigger: 'parallel_observation', action: 'watch',
+    summary: 'Implementation is progressing.', confidence: 'high', revision: 4,
+  });
+
+  assert.equal(decided.phase, 'verify');
+  assert.equal(decided.supervision?.status, 'observing');
+  assert.equal(decided.supervision?.observed_event, 'agent_finished');
+  assert.equal(decided.supervision?.latest?.summary, 'Implementation is progressing.');
+  assert.equal(decided.supervision?.history?.length, 1);
+});
+
+test('an observation heartbeat does not erase unresolved supervisor attention', () => {
+  const current = goal({
+    supervision: {status: 'attention', latest: {action: 'redirect', summary: 'Change direction.'}},
+  });
+  const next = mergeGoalSupervisorEvent(current, {
+    type: 'goal_supervisor', goal_id: 'goal-1', event: 'observing',
+    observation_id: 'obs-2', observed_event: 'phase_transition', revision: 5,
+  });
+
+  assert.equal(next.supervision?.status, 'attention');
+  assert.equal(next.supervision?.latest?.action, 'redirect');
+});
+
+test('a stale supervisor decision is retained as history without replacing the latest boundary', () => {
+  const current = goal({
+    supervision: {
+      status: 'attention',
+      latest: {action: 'expand_scope', summary: 'Current boundary.', observation_id: 'obs-2', trigger: 'permission_boundary'},
+      history: [],
+    },
+  });
+  const next = mergeGoalSupervisorEvent(current, {
+    type: 'goal_supervisor', goal_id: 'goal-1', event: 'decision', stale: true,
+    observation_id: 'obs-1', trigger: 'parallel_observation', action: 'continue', summary: 'Older observation.',
+  });
+
+  assert.equal(next.supervision?.status, 'attention');
+  assert.equal(next.supervision?.latest?.observation_id, 'obs-2');
+  assert.equal(next.supervision?.history?.[0].stale, true);
+});
+
+test('durable Goal snapshots preserve the latest supervisor assessment', () => {
+  const snapshot = goalSnapshotFromEvent({
+    id: 'goal-1', target: 'add rate limits', phase: 'act', status: 'running', tasks: [],
+    supervision: {status: 'attention', model: 'deepseek-v4-pro', latest: {action: 'redirect', summary: 'Wrong file.'}},
+  });
+  assert.equal(snapshot?.supervision?.model, 'deepseek-v4-pro');
+  assert.equal(snapshot?.supervision?.latest?.action, 'redirect');
+});
+
+test('supervisor startup failure is visible without changing Goal execution state', () => {
+  const current = goal();
+  const next = mergeGoalSupervisorEvent(current, {
+    type: 'goal_supervisor', goal_id: 'goal-1', event: 'unavailable',
+    model: 'deepseek-v4-pro', error: 'provider route is unavailable',
+  });
+
+  assert.equal(next.status, 'running');
+  assert.equal(next.supervision?.status, 'unavailable');
+  assert.equal(next.supervision?.error, 'provider route is unavailable');
 });
 
 test('paused stop reasons expose actionable commands', () => {

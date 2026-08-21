@@ -7,6 +7,7 @@ import {
   gatePresentation,
   goalRegressionPresentation,
   goalStatusPresentation,
+  goalSupervisorPresentation,
   type GoalDecision,
   type GoalSnapshot,
   type GoalTaskSnapshot,
@@ -51,6 +52,12 @@ test('machine gate tone follows the persisted verdict', () => {
 test('paused Goal is visually distinct from a running Goal', () => {
   assert.equal(goalStatusPresentation('paused').tone, 'warning');
   assert.equal(goalStatusPresentation('running').tone, 'info');
+});
+
+test('global supervisor attention and outages are visually distinct', () => {
+  assert.equal(goalSupervisorPresentation({status: 'observing'}).tone, 'info');
+  assert.equal(goalSupervisorPresentation({status: 'attention'}).tone, 'warning');
+  assert.equal(goalSupervisorPresentation({status: 'unavailable'}).tone, 'error');
 });
 
 test('permission wait is presented as a recoverable approval state', () => {

@@ -25,6 +25,36 @@ export type GoalFinalVerification = GoalEvidence & {
   updated_at?: number;
 };
 
+export type GoalSupervisorDecision = {
+  action?: string;
+  summary?: string;
+  reason?: string;
+  next_step?: string;
+  scope_paths?: string[];
+  evidence?: string[];
+  confidence?: string;
+  unavailable?: boolean;
+  error?: string;
+  trigger?: string;
+  observation_id?: string;
+  revision?: number;
+  stale?: boolean;
+  at?: number;
+};
+
+export type GoalSupervisionSnapshot = {
+  status?: string;
+  model?: string;
+  observed_event?: string;
+  observation_id?: string;
+  observed_revision?: number;
+  observation_revision?: number;
+  latest?: GoalSupervisorDecision;
+  history?: GoalSupervisorDecision[];
+  error?: string;
+  updated_at?: number;
+};
+
 export type GoalTaskSnapshot = {
   id: string;
   subject: string;
@@ -61,6 +91,7 @@ export type GoalSnapshot = {
   paused_at?: number | null;
   stop_reason?: string | null;
   final_verification?: GoalFinalVerification | null;
+  supervision?: GoalSupervisionSnapshot;
   tasks: GoalTaskSnapshot[];
   last_error?: string | null;
   event_seq?: number;
@@ -286,10 +317,96 @@ export function goalSnapshotFromEvent(event: any, current: GoalSnapshot | null =
     final_verification: has(event, 'final_verification')
       ? (event.final_verification && typeof event.final_verification === 'object' ? event.final_verification : null)
       : base?.final_verification,
+    supervision: has(event, 'supervision')
+      ? (event.supervision && typeof event.supervision === 'object' ? event.supervision : undefined)
+      : base?.supervision,
     tasks: Array.isArray(event?.tasks) ? event.tasks : (base?.tasks ?? []),
     last_error: optionalString(event, 'last_error', base?.last_error),
     event_seq: has(event, 'seq') ? finiteNumber(event.seq) : base?.event_seq,
     event_ts: has(event, 'ts') ? finiteNumber(event.ts) : base?.event_ts,
+  };
+}
+
+export function mergeGoalSupervisorEvent(goal: GoalSnapshot, event: any): GoalSnapshot {
+  if (stringValue(event?.goal_id) !== goal.id) return goal;
+  const kind = stringValue(event?.event);
+  const current = goal.supervision || {};
+  const at = has(event, 'at') ? finiteNumber(event.at) : eventTimestamp(event, current.updated_at);
+  if (kind === 'started') {
+    return {
+      ...goal,
+      supervision: {
+        ...current,
+        status: stringValue(event?.status) || 'observing',
+        model: stringValue(event?.model) || current.model,
+        error: stringValue(event?.error) || undefined,
+        updated_at: at,
+      },
+    };
+  }
+  if (kind === 'unavailable') {
+    return {
+      ...goal,
+      supervision: {
+        ...current,
+        status: 'unavailable',
+        model: stringValue(event?.model) || current.model,
+        error: stringValue(event?.error) || 'Global supervisor is unavailable.',
+        updated_at: at,
+      },
+    };
+  }
+  if (kind === 'observing') {
+    return {
+      ...goal,
+      supervision: {
+        ...current,
+        status: ['attention', 'unavailable'].includes(current.status || '') ? current.status : 'observing',
+        observed_event: stringValue(event?.observed_event) || current.observed_event,
+        observation_id: stringValue(event?.observation_id) || current.observation_id,
+        observed_revision: has(event, 'revision') ? finiteNumber(event.revision) : current.observed_revision,
+        updated_at: at,
+      },
+    };
+  }
+  if (kind !== 'decision') return goal;
+  const decision: GoalSupervisorDecision = {
+    action: stringValue(event?.action),
+    summary: stringValue(event?.summary),
+    reason: stringValue(event?.reason),
+    next_step: stringValue(event?.next_step),
+    scope_paths: Array.isArray(event?.scope_paths) ? event.scope_paths.map(stringValue).filter(Boolean) : [],
+    evidence: Array.isArray(event?.evidence) ? event.evidence.map(stringValue).filter(Boolean) : [],
+    confidence: stringValue(event?.confidence),
+    unavailable: Boolean(event?.unavailable),
+    error: stringValue(event?.error),
+    trigger: stringValue(event?.trigger),
+    observation_id: stringValue(event?.observation_id),
+    revision: has(event, 'revision') ? finiteNumber(event.revision) : undefined,
+    stale: Boolean(event?.stale),
+    at,
+  };
+  const history = [...(current.history || [])];
+  const duplicate = history.findIndex(item => (
+    item.observation_id === decision.observation_id && item.trigger === decision.trigger
+  ));
+  if (duplicate >= 0) history[duplicate] = decision;
+  else history.push(decision);
+  const preserveCurrent = Boolean(decision.stale && current.latest);
+  return {
+    ...goal,
+    supervision: {
+      ...current,
+      status: preserveCurrent
+        ? current.status
+        : decision.unavailable
+          ? 'unavailable'
+          : ['continue', 'watch'].includes(decision.action || '') ? 'observing' : 'attention',
+      latest: preserveCurrent ? current.latest : decision,
+      history: history.slice(-12),
+      error: preserveCurrent ? current.error : decision.unavailable ? decision.error : undefined,
+      updated_at: at,
+    },
   };
 }
 

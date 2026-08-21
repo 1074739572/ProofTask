@@ -1599,7 +1599,139 @@ def test_permission_request_pauses_goal_instead_of_failing(tmp_path, monkeypatch
     assert state.phase == GoalPhase.PAUSED.value
     assert state.status == "paused"
     assert state.stop_reason == "permission_wait"
-    assert "required permission" in state.last_error
+    assert "supervisor is unavailable" in state.last_error
+
+
+def _run_supervised_permission_boundary(
+    tmp_path,
+    monkeypatch,
+    *,
+    decision,
+    requested_path="src/shared.py",
+    envelope=("src/current.py", "src/shared.py"),
+    tool="edit_file",
+):
+    import harness.goal.runner as runner_mod
+    import harness.tasks as tasks
+    from harness.goal.coordinator import SupervisorRun
+
+    monkeypatch.setattr(tasks, "TASKS_DIR", tmp_path / ".tasks")
+    task = tasks.create_task(
+        "permission task",
+        "keep working",
+        verification_spec={},
+        scope_paths=["src/current.py"],
+    )
+    tasks.claim_task(task.id)
+    state = GoalState.new(target="permission task", verification="pytest -q", workspace=str(tmp_path))
+    state.current_task_id = task.id
+    state.task_ids = [task.id]
+    state.task_plan = [{"name": "permission task", "scope_paths": list(envelope)}]
+    state.phase = GoalPhase.ACT.value
+    monkeypatch.setattr(runner_mod, "save_goal", lambda state: None)
+    monkeypatch.setattr(runner_mod, "_emit_goal", lambda *args, **kwargs: None)
+
+    def worker(*args, stats, **kwargs):
+        runner_mod.mark_goal_permission_pending({
+            "tool": tool,
+            "path": requested_path,
+            "resource": requested_path,
+            "reason": "outside current Task scope",
+            "source": "goal_write_scope",
+        })
+        stats.tool_names.append(tool)
+        stats.write_paths.append(requested_path)
+        return "worker reached a capability boundary"
+
+    monkeypatch.setattr(runner_mod, "run_agent_task", worker)
+    runner = GoalRunner(state=state, history=[], context={}, binding=None)
+    monkeypatch.setattr(runner, "_progress_snapshot", lambda _state: ("unchanged",))
+    monkeypatch.setattr(runner, "_validate_task_scope", lambda _state, _task: None)
+    monkeypatch.setattr(
+        runner,
+        "_review_supervisor_boundary",
+        lambda *args, **kwargs: SupervisorRun("obs-1", len(state.transition_log), decision),
+    )
+
+    runner._act(state)
+    return state, tasks.load_task(task.id)
+
+
+def test_supervisor_can_expand_exact_task_scope_inside_goal_envelope(tmp_path, monkeypatch):
+    from harness.goal.coordinator import SupervisorDecision
+
+    state, task = _run_supervised_permission_boundary(
+        tmp_path,
+        monkeypatch,
+        decision=SupervisorDecision(
+            "expand_scope",
+            "Shared module is part of the approved Goal.",
+            next_step="Edit the shared module and rerun the Task.",
+            scope_paths=("src/shared.py",),
+        ),
+    )
+
+    assert state.phase == GoalPhase.ACT.value
+    assert state.status == "running"
+    assert task.scope_paths == ["src/current.py", "src/shared.py"]
+    assert state.permission_boundary_attempts[task.id] == 1
+
+
+def test_supervisor_cannot_expand_scope_outside_goal_envelope(tmp_path, monkeypatch):
+    from harness.goal.coordinator import SupervisorDecision
+
+    state, task = _run_supervised_permission_boundary(
+        tmp_path,
+        monkeypatch,
+        requested_path="docs/outside.py",
+        envelope=("src/current.py", "src/shared.py"),
+        decision=SupervisorDecision(
+            "expand_scope",
+            "This path might help.",
+            scope_paths=("docs/outside.py",),
+        ),
+    )
+
+    assert state.phase == GoalPhase.PAUSED.value
+    assert state.stop_reason == "permission_wait"
+    assert task.scope_paths == ["src/current.py"]
+    assert "outside the approved Goal scope envelope" in state.last_error
+
+
+def test_supervisor_redirect_retries_act_with_durable_guidance(tmp_path, monkeypatch):
+    from harness.goal.coordinator import SupervisorDecision
+
+    state, task = _run_supervised_permission_boundary(
+        tmp_path,
+        monkeypatch,
+        decision=SupervisorDecision(
+            "redirect",
+            "The worker chose the wrong file.",
+            next_step="Use the existing adapter in src/current.py.",
+        ),
+    )
+
+    assert state.phase == GoalPhase.ACT.value
+    assert state.status == "running"
+    assert "Use the existing adapter" in task.last_error
+
+
+def test_supervisor_permission_replan_routes_to_repair_plan(tmp_path, monkeypatch):
+    from harness.goal.coordinator import SupervisorDecision
+
+    state, task = _run_supervised_permission_boundary(
+        tmp_path,
+        monkeypatch,
+        decision=SupervisorDecision(
+            "replan",
+            "Task ownership is wrong.",
+            next_step="Rebuild the Task boundary inside the frozen Goal contract.",
+        ),
+    )
+
+    assert state.phase == GoalPhase.REPAIR_PLAN.value
+    assert state.status == "running"
+    assert "Rebuild the Task boundary" in task.last_error
 
 
 def test_invalid_evaluator_output_pauses_for_a_retry(tmp_path, monkeypatch):
@@ -1733,6 +1865,22 @@ def test_goal_event_snapshot_sends_only_bounded_latest_evidence(tmp_path, monkey
     assert snapshot["latest_evidence"]["exit_code"] == 0
     assert snapshot["latest_evidence"]["selectors"] == ["tests/test_api.py::test_ok"]
     assert len(snapshot["latest_evidence"]["stdout_tail"]) == 1600
+
+
+def test_goal_event_snapshot_exposes_global_supervision(tmp_path, monkeypatch):
+    from harness.goal.runner import goal_event_payload
+
+    _task, state = _needs_generation_task(tmp_path, monkeypatch)
+    state.supervision = {
+        "status": "attention",
+        "model": "deepseek-v4-pro",
+        "latest": {"action": "redirect", "summary": "Change direction."},
+    }
+
+    payload = goal_event_payload(state)
+
+    assert payload["supervision"]["status"] == "attention"
+    assert payload["supervision"]["latest"]["action"] == "redirect"
 
 
 def test_goal_started_snapshot_is_emitted_before_worker_thread_runs(tmp_path, monkeypatch):

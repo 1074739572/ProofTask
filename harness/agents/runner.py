@@ -156,7 +156,14 @@ class AgentTaskStats:
             elif name in {"write_file", "edit_file"}:
                 self.write_paths.append(path)
         detail = str(output)
-        if detail.lower().startswith(("error", "write blocked", "read blocked", "tool error")):
+        if detail.lower().startswith((
+            "error",
+            "write blocked",
+            "read blocked",
+            "tool error",
+            "permission denied",
+            "permission deferred",
+        )):
             self.tool_errors.append(f"{name}: {detail[:300]}")
 
 
@@ -186,7 +193,8 @@ def _tools_for_agent(
             except OSError as exc:
                 return f"Write blocked: invalid path {path!r}: {exc}"
             if not any(candidate.is_relative_to(root) for root in roots):
-                return "Write blocked: this agent may modify test files only."
+                _record_goal_scope_request("write_file", path, candidate, bound_cwd)
+                return "Write blocked: path is outside the current agent write scope."
             return run_write(path=path, content=content, cwd=bound_cwd)
 
         def guarded_edit(*, path: str, old_text: str, new_text: str, occurrence: int = 1) -> str:
@@ -195,7 +203,8 @@ def _tools_for_agent(
             except OSError as exc:
                 return f"Edit blocked: invalid path {path!r}: {exc}"
             if not any(candidate.is_relative_to(root) for root in roots):
-                return "Edit blocked: this agent may modify test files only."
+                _record_goal_scope_request("edit_file", path, candidate, bound_cwd)
+                return "Edit blocked: path is outside the current agent write scope."
             return run_edit(path=path, old_text=old_text, new_text=new_text, occurrence=occurrence, cwd=bound_cwd)
 
         if "write_file" in handlers:
@@ -228,6 +237,35 @@ def _tools_for_agent(
         handlers["rag_status"] = run_rag_status
     handlers = {name: handlers[name] for name in allowed}
     return tools, handlers
+
+
+def _record_goal_scope_request(
+    tool_name: str,
+    raw_path: str,
+    candidate: Path,
+    cwd: Path,
+) -> None:
+    """Expose a Goal capability miss without weakening the write guard."""
+    try:
+        from harness.goal.authority import current_goal_authority
+        from harness.goal.runner import is_goal_noninteractive, mark_goal_permission_pending
+
+        authority = current_goal_authority()
+        if authority is None or not is_goal_noninteractive():
+            return
+        relative = candidate.relative_to(authority.workspace).as_posix()
+        mark_goal_permission_pending({
+            "tool": tool_name,
+            "resource": str(raw_path),
+            "path": relative,
+            "reason": "requested path is outside the current Task write scope",
+            "policy_reason": "agent write capability boundary",
+            "source": "goal_write_scope",
+            "external_resource": "",
+            "cwd": str(cwd),
+        })
+    except (ImportError, OSError, ValueError):
+        return
 
 
 def run_agent_task(
@@ -390,9 +428,21 @@ def run_agent_task(
                 continue
             tool_count += 1
             tool_use_id = block_field(block, "id", "")
+            name = block_field(block, "name", "")
+            tool_input = block_field(block, "input", {}) or {}
             blocked = trigger_hooks("PreToolUse", block)
             if blocked:
                 output = str(blocked)
+                renderer.subagent_tool(run_id, name, tool_input, tool_use_id=tool_use_id)
+                if stats is not None:
+                    stats.record_tool(name, tool_input, output)
+                renderer.subagent_tool(
+                    run_id,
+                    name,
+                    tool_input,
+                    output,
+                    tool_use_id=tool_use_id,
+                )
             else:
                 # A permission overlay can unblock after the caller has
                 # requested pause/cancel. Re-check before executing the tool
@@ -404,8 +454,6 @@ def run_agent_task(
                         stats.stop_reason = reason
                     renderer.subagent_end(run_id, f"stopped: {reason}", tool_count, time.time() - started, max_len=50)
                     return f"[{agent_type}] stopped: {reason}"
-                name = block_field(block, "name", "")
-                tool_input = block_field(block, "input", {}) or {}
                 handler = handlers.get(name)
                 renderer.subagent_tool(run_id, name, tool_input, tool_use_id=tool_use_id)
                 output = call_tool_handler(handler, tool_input, name)

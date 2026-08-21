@@ -103,8 +103,6 @@ def permission_hook(block):
             "save_resource": decision.save_resource,
         }
     )
-    if decision.effect == "allow":
-        return None
     if decision.effect == "deny":
         audit_permission(
             {
@@ -119,32 +117,59 @@ def permission_hook(block):
             f"({decision.reason})"
         )
 
+    # Goal file capabilities are narrower than ordinary permission rules, so
+    # enforce them even when the generic policy says ``allow``. Other allowed
+    # tools keep their normal policy behavior; unresolved ``ask`` decisions
+    # become supervisor boundaries instead of interactive prompts.
+    from harness.goal.runner import is_goal_noninteractive, mark_goal_permission_pending
+
+    goal_noninteractive = is_goal_noninteractive()
+    if goal_noninteractive and (
+        name in {"write_file", "edit_file"} or decision.effect != "allow"
+    ):
+        from harness.goal.authority import evaluate_goal_authority
+
+        scoped = evaluate_goal_authority(
+            name,
+            tool_input if isinstance(tool_input, dict) else {},
+        )
+        if scoped.allowed:
+            audit_permission(
+                {
+                    "event": "goal_scope_allow",
+                    "tool": name,
+                    "resource": decision.resource,
+                    "path": scoped.path,
+                    "reason": scoped.reason,
+                }
+            )
+            return None
+        request = {
+            "tool": name,
+            "resource": str(decision.resource or ""),
+            "path": scoped.path,
+            "reason": scoped.reason or decision.reason,
+            "policy_reason": decision.reason,
+            "source": decision.source,
+            "external_resource": str(decision.external_resource or ""),
+        }
+        if name == "bash":
+            request["command"] = str(tool_input.get("command") or "")[:2_000]
+        mark_goal_permission_pending(request)
+        audit_permission({"event": "goal_supervisor_boundary", **request})
+        return (
+            f"Permission deferred: {name} on {decision.resource!r} is outside the current Goal capability. "
+            "The global supervisor will analyze this request at the next safe checkpoint."
+        )
+
+    if decision.effect == "allow":
+        return None
+
     _hook_print(f"[permission] {name} requires approval", warn=True)
     if decision.resource and decision.resource != "*":
         _hook_print(f"  {decision.resource}")
     if decision.external_resource:
         _hook_print(f"  external: {decision.external_resource}")
-    # A classic /goal ACT has no safe way to block for terminal input, so it
-    # pauses. The event-stream TUI does have a permission overlay; use the
-    # normal request/reply broker there so the user can approve this exact
-    # tool call without broadening config rules.
-    from harness.goal.runner import is_goal_noninteractive, mark_goal_permission_pending
-
-    if is_goal_noninteractive() and not events.is_enabled():
-        mark_goal_permission_pending()
-        audit_permission(
-            {
-                "event": "goal_noninteractive_deny",
-                "tool": name,
-                "resource": decision.resource,
-                "reason": "goal ACT is non-interactive; human approval required",
-            }
-        )
-        return (
-            f"Permission denied: {name} needs human approval, but the goal "
-            "runner has no interactive permission UI. The goal will pause "
-            "(permission_wait); approve it in config and /goal resume."
-        )
     if events.is_enabled():
         from harness.agent.cancel import is_cancelled
         from harness.ui.permission_events import request_permission
