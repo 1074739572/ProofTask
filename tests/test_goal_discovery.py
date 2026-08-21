@@ -97,6 +97,69 @@ def test_discovery_supervisor_merges_only_assigned_hashed_evidence(tmp_path):
     assert all(item.path != "secret.py" for item in manifest.evidence)
 
 
+def test_discovery_derives_excerpt_when_compact_report_omits_it(tmp_path):
+    (tmp_path / "app.py").write_text("def run():\n    return 1\n", encoding="utf-8")
+
+    manifest = DiscoverySupervisor(
+        runner=lambda **kwargs: (
+            '{"evidence":[{"path":"app.py","lines":[1,2],"claim":"entry exists"}],"gaps":[]}'
+        )
+    ).run(goal_id="goal-compact", target="improve app", workspace=tmp_path, roles=("implementation",))
+
+    assert manifest.evidence[0].path == "app.py"
+    assert manifest.evidence[0].excerpt_sha256
+
+
+def test_discovery_retries_an_invalid_json_report_with_compact_format(tmp_path):
+    (tmp_path / "app.py").write_text("def run():\n    return 1\n", encoding="utf-8")
+    calls = []
+
+    def fake_runner(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            return "I found the entry point but forgot the required JSON format."
+        return '{"evidence":[{"path":"app.py","lines":[1,2],"claim":"entry exists"}],"gaps":[]}'
+
+    manifest = DiscoverySupervisor(runner=fake_runner).run(
+        goal_id="goal-retry", target="improve app", workspace=tmp_path, roles=("architecture",)
+    )
+
+    assert len(calls) == 2
+    assert calls[1]["description"] == "repair architecture discovery report format"
+    assert calls[1]["max_rounds"] == 1
+    assert manifest.jobs[0].status == "done"
+    assert manifest.evidence[0].path == "app.py"
+
+
+def test_discovery_runs_requirement_then_architecture_with_handoff(tmp_path):
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "src").mkdir()
+    (tmp_path / "docs" / "INPUT.md").write_text("Update src/app.py\n", encoding="utf-8")
+    (tmp_path / "src" / "app.py").write_text("export const enabled = true;\n", encoding="utf-8")
+    calls = []
+
+    def fake_runner(**kwargs):
+        calls.append(kwargs)
+        role = kwargs["agent_type"].removeprefix("goal_discovery_")
+        if role == "requirement":
+            return ('{"evidence":[{"path":"docs/INPUT.md","lines":[1,1],'
+                    '"claim":"the requested behavior targets the app"}],"gaps":[]}')
+        if role == "architecture":
+            assert "docs/INPUT.md: the requested behavior targets the app" in kwargs["prompt"]
+            return ('{"evidence":[{"path":"src/app.py","lines":[1,1],'
+                    '"claim":"the app has one implementation module"}],"gaps":[]}')
+        return '{"evidence":[],"gaps":[]}'
+
+    manifest = DiscoverySupervisor(runner=fake_runner, concurrency=2).run(
+        goal_id="goal-pipeline", target="implement docs/INPUT.md", workspace=tmp_path,
+        roles=("requirement", "architecture", "implementation", "tests"),
+    )
+
+    roles = [call["agent_type"].removeprefix("goal_discovery_") for call in calls]
+    assert roles[:2] == ["requirement", "architecture"]
+    assert {item.path for item in manifest.evidence} == {"docs/INPUT.md", "src/app.py"}
+
+
 def test_discovery_event_exposes_bounded_read_only_work_metadata(monkeypatch):
     import harness.goal.discovery as discovery
     import harness.ui.events as events

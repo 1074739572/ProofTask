@@ -33,7 +33,9 @@ DISCOVERY_ROLES = (
 )
 DISCOVERY_MAX_ROUNDS = 16
 DISCOVERY_FILE_LIMIT = 16
-DEFAULT_DISCOVERY_CONCURRENCY = 1
+DEFAULT_DISCOVERY_CONCURRENCY = 2
+DISCOVERY_FACT_LIMIT = 8
+DISCOVERY_GAP_LIMIT = 8
 _TARGET_PATH_RE = re.compile(
     r"(?<![A-Za-z0-9_.-])(?:(?:\.\.?)[/\\]|[A-Za-z0-9_@.+-]+[/\\])(?:[A-Za-z0-9_@.+-]+[/\\])*[A-Za-z0-9_@.+-]+"
 )
@@ -310,18 +312,59 @@ def _assigned_paths(
     return tuple(dict.fromkeys(selected))[:limit]
 
 
-def _prompt(target: str, role: str, base_revision: str, shards: tuple[FileShard, ...], paths: tuple[str, ...]) -> str:
+def _report_context(reports: Iterable[dict]) -> dict[str, list[str]]:
+    """Pass a compact, validated handoff between dependent Discovery roles."""
+    facts: list[str] = []
+    gaps: list[str] = []
+    for report in reports:
+        for item in report.get("evidence", []) if isinstance(report.get("evidence"), list) else []:
+            if not isinstance(item, dict):
+                continue
+            claim = str(item.get("claim") or "").replace("\n", " ").strip()
+            path = str(item.get("path") or "").replace("\\", "/").strip()
+            if claim and path:
+                facts.append(f"{path}: {claim[:280]}")
+        gaps.extend(
+            str(item).replace("\n", " ").strip()[:280]
+            for item in report.get("gaps", [])
+            if str(item).strip()
+        )
+    return {
+        "facts": list(dict.fromkeys(facts))[:DISCOVERY_FACT_LIMIT],
+        "gaps": list(dict.fromkeys(gaps))[:DISCOVERY_GAP_LIMIT],
+    }
+
+
+def _prompt(
+    target: str,
+    role: str,
+    base_revision: str,
+    shards: tuple[FileShard, ...],
+    paths: tuple[str, ...],
+    *,
+    prior_reports: Iterable[dict] = (),
+    retry: bool = False,
+) -> str:
     index = {item.path: item for item in shards}
     outline = [index[path].to_dict() for path in paths if path in index]
+    handoff = _report_context(prior_reports)
+    correction = (
+        "Your previous response was not valid JSON. Do not explain or quote source. "
+        "Reply with the compact schema only.\n"
+        if retry else ""
+    )
     return (
         "Collect repository evidence for a verified coding Goal.\n"
         f"Goal: {target}\nRole: {role}\nBase revision: {base_revision}\n"
+        f"Earlier validated findings: {json.dumps(handoff, ensure_ascii=False)}\n"
         f"Assigned files: {json.dumps(outline, ensure_ascii=False)}\n\n"
-        f"Read only the files needed for the role (at most {len(paths)}); reserve your final response for the report.\n"
-        "Return ONLY JSON: {\"evidence\":[{\"path\":\"assigned file\",\"symbol\":\"optional\","
-        "\"lines\":[1,2],\"excerpt\":\"exact text from those lines\",\"claim\":\"fact grounded in that file\"}],"
-        "\"candidate_scope\":[\"assigned file\"],\"related_tests\":[\"assigned test file\"],"
-        "\"gaps\":[\"missing fact\"]}. Do not invent paths or claims."
+        f"Read only assigned files (at most {len(paths)}). {correction}"
+        "Return ONLY one compact JSON object. Never include markdown, analysis, or source excerpts. "
+        "The system reads and verifies excerpts itself from path and lines. Return at most 8 evidence items and 8 gaps: "
+        "{\"evidence\":[{\"path\":\"assigned file\",\"symbol\":\"optional\",\"lines\":[1,2],"
+        "\"claim\":\"short fact\"}],\"candidate_scope\":[\"assigned file\"],"
+        "\"related_tests\":[\"assigned test file\"],\"gaps\":[\"missing fact\"]}. "
+        "Do not invent paths, line numbers, or claims."
     )
 
 
@@ -359,7 +402,8 @@ class DiscoverySupervisor:
             _emit_discovery_job(goal_id, job, event="queued")
 
         completed: list[tuple[DiscoveryJob, dict]] = []
-        def execute(job: DiscoveryJob) -> tuple[DiscoveryJob, dict]:
+
+        def execute(job: DiscoveryJob, prior_reports: tuple[dict, ...] = ()) -> tuple[DiscoveryJob, dict]:
             started = time.time()
             running = DiscoveryJob(**{**job.to_dict(), "status": "running", "started_at": started})
             save_job_state(storage_root, goal_id, running.to_dict())
@@ -377,7 +421,7 @@ class DiscoverySupervisor:
                     self._last_request_at = time.monotonic()
                 raw = self.runner(
                     description=f"discover {job.role} evidence",
-                    prompt=_prompt(target, job.role, revision, shards, job.read_paths),
+                    prompt=_prompt(target, job.role, revision, shards, job.read_paths, prior_reports=prior_reports),
                     agent_type=f"goal_discovery_{job.role}", cwd=str(root),
                     max_rounds=DISCOVERY_MAX_ROUNDS, tools_override=("read_file",),
                     read_paths=job.read_paths, deadline=deadline, cancel_check=cancel_check, stats=stats,
@@ -385,6 +429,31 @@ class DiscoverySupervisor:
             except Exception as exc:
                 return running, {"error": f"{type(exc).__name__}: {exc}", "failure_kind": "exception"}
             report = _parse_report(raw)
+            # Invalid JSON is a protocol error, not repository evidence. Give
+            # the same bounded reader one compact correction request before
+            # marking the role failed; this avoids throwing away a costly scan
+            # because a model added prose or truncated a large response.
+            if not report and stats.stop_reason not in {"configuration_error", "provider_error", "empty_response", "deadline", "cancelled"}:
+                retry_stats = AgentTaskStats()
+                try:
+                    with self._request_lock:
+                        wait = self.request_interval_s - (time.monotonic() - self._last_request_at)
+                        if wait > 0:
+                            time.sleep(wait)
+                        self._last_request_at = time.monotonic()
+                    retry_raw = self.runner(
+                        description=f"repair {job.role} discovery report format",
+                        prompt=_prompt(target, job.role, revision, shards, job.read_paths, prior_reports=prior_reports, retry=True),
+                        agent_type=f"goal_discovery_{job.role}", cwd=str(root),
+                        max_rounds=1, tools_override=("read_file",),
+                        read_paths=job.read_paths, deadline=deadline, cancel_check=cancel_check, stats=retry_stats,
+                    )
+                    report = _parse_report(retry_raw)
+                    raw = retry_raw
+                    if retry_stats.stop_reason in {"configuration_error", "provider_error", "empty_response", "deadline", "cancelled"}:
+                        stats = retry_stats
+                except Exception as exc:
+                    return running, {"error": f"format retry failed: {type(exc).__name__}: {exc}", "failure_kind": "format_retry_exception"}
             if not report:
                 report = {
                     "error": "discovery response did not contain a valid JSON evidence report",
@@ -399,28 +468,52 @@ class DiscoverySupervisor:
                 report["retryable"] = True
             return running, report
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=self.concurrency, thread_name_prefix="goal-discovery") as pool:
-            future_jobs = {pool.submit(execute, job): job for job in jobs}
-            for future in concurrent.futures.as_completed(future_jobs):
-                try:
-                    running, report = future.result()
-                except Exception as exc:
-                    # A single provider/job failure is evidence for that job,
-                    # not a reason to discard successful sibling reports.
-                    running = future_jobs[future]
-                    report = {"error": f"{type(exc).__name__}: {exc}"}
-                error = str(report.get("error") or "") or None
-                error_text = (error or "").lower()
-                retryable = bool(report.get("retryable")) or any(
-                    marker in error_text
-                    for marker in ("429", "ratelimit", "too many requests", "max retries", "provider rate limited")
-                )
-                finished = DiscoveryJob(**{**running.to_dict(), "status": "failed" if error else "done", "error": error, "retryable": retryable, "retry_after": time.time() + 30 if retryable else 0.0, "finished_at": time.time()})
-                report_path = save_report(storage_root, goal_id, finished.id, report)
-                finished = DiscoveryJob(**{**finished.to_dict(), "report_path": str(report_path.relative_to(storage_root)).replace("\\", "/")})
-                save_job_state(storage_root, goal_id, finished.to_dict())
-                _emit_discovery_job(goal_id, finished, event="failed" if error else "completed", failure_kind=report.get("failure_kind"))
-                completed.append((finished, report))
+        def persist_result(running: DiscoveryJob, report: dict) -> None:
+            error = str(report.get("error") or "") or None
+            error_text = (error or "").lower()
+            retryable = bool(report.get("retryable")) or any(
+                marker in error_text
+                for marker in ("429", "ratelimit", "too many requests", "max retries", "provider rate limited")
+            )
+            finished = DiscoveryJob(**{**running.to_dict(), "status": "failed" if error else "done", "error": error, "retryable": retryable, "retry_after": time.time() + 30 if retryable else 0.0, "finished_at": time.time()})
+            report_path = save_report(storage_root, goal_id, finished.id, report)
+            finished = DiscoveryJob(**{**finished.to_dict(), "report_path": str(report_path.relative_to(storage_root)).replace("\\", "/")})
+            save_job_state(storage_root, goal_id, finished.to_dict())
+            _emit_discovery_job(goal_id, finished, event="failed" if error else "completed", failure_kind=report.get("failure_kind"))
+            completed.append((finished, report))
+
+        def run_wave(wave: tuple[DiscoveryJob, ...], prior_reports: tuple[dict, ...]) -> tuple[dict, ...]:
+            if not wave:
+                return ()
+            reports: list[dict] = []
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(self.concurrency, len(wave)), thread_name_prefix="goal-discovery") as pool:
+                future_jobs = {pool.submit(execute, job, prior_reports): job for job in wave}
+                for future in concurrent.futures.as_completed(future_jobs):
+                    try:
+                        running, report = future.result()
+                    except Exception as exc:
+                        # A single provider/job failure is evidence for that job,
+                        # not a reason to discard successful sibling reports.
+                        running = future_jobs[future]
+                        report = {"error": f"{type(exc).__name__}: {exc}"}
+                    persist_result(running, report)
+                    reports.append(report)
+            return tuple(reports)
+
+        jobs_by_role = {job.role: job for job in jobs}
+        # Requirement establishes the intent, architecture maps it to concrete
+        # modules, then implementation and tests can inspect that shared map in
+        # parallel. History is non-critical and runs with the final wave.
+        requirement_reports = run_wave(
+            tuple(job for role, job in jobs_by_role.items() if role == "requirement"), ()
+        )
+        architecture_reports = run_wave(
+            tuple(job for role, job in jobs_by_role.items() if role == "architecture"), requirement_reports
+        )
+        run_wave(
+            tuple(job for role, job in jobs_by_role.items() if role in {"implementation", "tests", "history"}),
+            requirement_reports + architecture_reports,
+        )
 
         by_path = {item.path: item for item in shards}
         evidence: list[Evidence] = []
@@ -429,7 +522,7 @@ class DiscoverySupervisor:
             if job.error:
                 gaps.append(f"{job.role} discovery unavailable: {job.error[:300]}")
             gaps.extend(str(item)[:500] for item in report.get("gaps", []) if str(item).strip())
-            for item in report.get("evidence", []) if isinstance(report.get("evidence"), list) else []:
+            for item in (report.get("evidence", [])[:DISCOVERY_FACT_LIMIT] if isinstance(report.get("evidence"), list) else []):
                 if not isinstance(item, dict):
                     continue
                 path = str(item.get("path") or "").replace("\\", "/")
@@ -442,15 +535,18 @@ class DiscoverySupervisor:
                 except (TypeError, ValueError):
                     continue
                 claim = str(item.get("claim") or "").strip()[:1_000]
-                excerpt = str(item.get("excerpt") or "")
-                if not claim or not excerpt or begin < 1 or end < begin or end > shard.end_line:
+                supplied_excerpt = item.get("excerpt")
+                if not claim or begin < 1 or end < begin or end > shard.end_line:
                     continue
                 try:
                     source_text = (root / path).read_text(encoding="utf-8", errors="replace").splitlines()
                     actual_excerpt = "\n".join(source_text[begin - 1:end])
                 except OSError:
                     continue
-                if actual_excerpt != excerpt or hashlib.sha256(actual_excerpt.encode("utf-8")).hexdigest() != str(item.get("excerpt_sha256") or hashlib.sha256(excerpt.encode("utf-8")).hexdigest()):
+                # Legacy reporters may still include an excerpt. Verify it when
+                # present, but compact reporters provide only coordinates and
+                # the system derives the canonical text itself.
+                if supplied_excerpt is not None and actual_excerpt != str(supplied_excerpt):
                     continue
                 evidence.append(Evidence(
                     id=f"E{len(evidence) + 1}", path=path, sha256=shard.sha256, claim=claim,
