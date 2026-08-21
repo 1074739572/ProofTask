@@ -86,6 +86,9 @@ class GoalState:
     phase: str = GoalPhase.INITIALIZE.value
     status: str = GoalStatus.RUNNING.value
     workspace: str = ""
+    # Code, tests, and workers may operate in a nested project while Goal
+    # state continues to live in the workspace-level .project directory.
+    execution_workspace: str = ""
     # The plan is persisted before task creation.  Each item maps to exactly
     # one durable Task; there is no Feature projection in Goal mode.
     task_ids: list[str] = field(default_factory=list)

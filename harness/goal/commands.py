@@ -329,7 +329,8 @@ def handle_goal_draft_answer(text: str) -> str | None:
 def _handle_approve(runner, history: list, context: dict, binding: Any) -> str:
     from harness.goal.models import GoalState
     from harness.goal.runner import GoalRequest
-    from harness.goal.draft import GoalDraftError, validate_ready_draft, mark_draft_consumed, mark_draft_start_failed
+    from harness.goal.draft import GoalDraftError, draft_project_root, validate_ready_draft, mark_draft_consumed, mark_draft_start_failed
+    from harness.settings import get_workdir
 
     try:
         draft = validate_ready_draft()
@@ -338,6 +339,7 @@ def _handle_approve(runner, history: list, context: dict, binding: Any) -> str:
     request = GoalRequest(
         target=draft.target,
         verification=draft.verification,
+        execution_workspace=str(draft_project_root(draft, get_workdir())),
         draft_id=draft.id,
         task_plan=draft.task_plan,
         goal_contract={

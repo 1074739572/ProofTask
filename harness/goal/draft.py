@@ -20,7 +20,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from harness.goal.planner import TaskPlan, plan_tasks
+from harness.goal.planner import TaskPlan, discovery_readiness_error, plan_tasks
 from harness.settings import get_workdir
 from harness.verification import VerificationContext, select_adapter
 
@@ -31,6 +31,8 @@ _ACTIVE_DRAFT_STAGES = frozenset({"preflight", "catalog", "intake", "discovering
 _VERIFY_RE = re.compile(r'/goal\s+--verify\s+["\']([^"\']+)["\']')
 _DRAFT_IO_LOCK = threading.RLock()
 _AGENT_RESULT_HEADER_RE = re.compile(r"^\[[^\]]+\][^\n]*\n+")
+_PROJECT_MARKERS = frozenset({"package.json", "pyproject.toml", "pytest.ini", "setup.cfg", "setup.py"})
+_PROJECT_EXCLUDED_DIRS = frozenset({".git", ".project", ".venv", "venv", "node_modules", "dist", "build", "coverage", ".worktrees"})
 
 
 class GoalDraftError(ValueError):
@@ -51,6 +53,9 @@ class GoalDraft:
     verification: str
     verification_source: str
     status: str
+    # Relative to the workspace that owns .project. Planning and execution use
+    # this project, while durable Goal state remains in the workspace root.
+    project_root: str = "."
     verification_adapter: str = "pytest"
     questions: list[str] = field(default_factory=list)
     answers: list[str] = field(default_factory=list)
@@ -91,6 +96,38 @@ class GoalDraft:
 
 def _project_dir(workspace: Path | None = None) -> Path:
     return (workspace or get_workdir()).resolve() / ".project"
+
+
+def resolve_target_project(workspace: Path, target: str) -> Path:
+    """Return the deepest project marker explicitly named by a Goal target."""
+    root = workspace.resolve()
+    normalized = target.replace("\\", "/").lower()
+    candidates = [root]
+    for current, dirs, files in os.walk(root):
+        dirs[:] = [name for name in dirs if name not in _PROJECT_EXCLUDED_DIRS]
+        if not _PROJECT_MARKERS.intersection(files):
+            continue
+        candidate = Path(current).resolve()
+        try:
+            relative = candidate.relative_to(root).as_posix()
+        except ValueError:
+            continue
+        if relative == ".":
+            continue
+        escaped = re.escape(relative.lower())
+        if re.search(rf"(?<![a-z0-9_.-]){escaped}(?:/|$)", normalized):
+            candidates.append(candidate)
+    return max(candidates, key=lambda path: len(path.relative_to(root).parts))
+
+
+def draft_project_root(draft: GoalDraft, workspace: Path) -> Path:
+    """Resolve a Draft's scoped project without allowing it outside the workspace."""
+    root = workspace.resolve()
+    try:
+        candidate = (root / (draft.project_root or ".")).resolve()
+        return candidate if candidate.is_relative_to(root) and candidate.is_dir() else root
+    except OSError:
+        return root
 
 
 def draft_path(workspace: Path | None = None) -> Path:
@@ -497,6 +534,9 @@ def _planner_target(draft: GoalDraft) -> str:
 
 
 def _plan(draft: GoalDraft, workspace: Path, catalog, planner_runner=None, discovery_manifest=None, verification_adapter=None) -> None:
+    readiness_error = discovery_readiness_error(discovery_manifest)
+    if readiness_error:
+        raise GoalDraftError(readiness_error)
     plans = plan_tasks(
         _planner_target(draft),
         draft.verification,
@@ -524,7 +564,8 @@ def create_draft(
     existing = load_draft(root)
     if existing and existing.status not in {"consumed", "cancelled"}:
         raise GoalDraftError("A Goal draft already exists. Use /goal preview, answer, revise, approve, or discard.")
-    command, source = infer_verification(root, verification)
+    project_root = resolve_target_project(root, target)
+    command, source = infer_verification(project_root, verification)
     operation_timeout = max(1, int((limits or {}).get("operation_timeout_seconds", 1800)))
     draft_id = f"goal_draft_{int(time.time())}_{uuid.uuid4().hex[:4]}"
     draft = GoalDraft(
@@ -533,6 +574,7 @@ def create_draft(
         verification=command,
         verification_source=source,
         status="clarifying",
+        project_root=project_root.relative_to(root).as_posix() or ".",
         limits=dict(limits or {}),
         test_catalog_count=0,
         stage="preflight",
@@ -560,7 +602,7 @@ def create_draft(
         _set_stage(draft, "catalog")
         save_draft(draft, root, event="stage_started", message="Collecting verification catalog")
         with _draft_heartbeat(draft, root):
-            adapter, catalog = _collect_catalog(root, command)
+            adapter, catalog = _collect_catalog(project_root, command)
         draft.verification_adapter = getattr(adapter, "id", "pytest")
         draft.test_catalog_count = len(catalog.selectors)
         _set_stage(draft, "intake")
@@ -587,7 +629,7 @@ def create_draft(
                         description="clarify verified coding goal",
                         prompt=intake_prompt,
                         agent_type="goal_intake",
-                        cwd=str(root),
+                        cwd=str(project_root),
                         # Intake is a user-decision gate, not repository research.
                         # The planner receives the test catalog and owns the bounded
                         # code inspection that follows a clear intake.
@@ -696,12 +738,13 @@ def create_draft(
                         discovery_manifest = DiscoverySupervisor().run(
                             goal_id=draft.id,
                             target=draft.target,
-                            workspace=root,
+                            workspace=project_root,
+                            storage_workspace=root,
                             deadline=time.monotonic() + operation_timeout,
                         ).to_dict()
                 else:
                     with _draft_heartbeat(draft, root):
-                        discovery_manifest = discovery_runner(draft=draft, workspace=root)
+                        discovery_manifest = discovery_runner(draft=draft, workspace=project_root)
                 failures = _manifest_failures(discovery_manifest or {})
                 if failures and not _manifest_successes(discovery_manifest or {}):
                     draft.status = "paused"
@@ -722,7 +765,7 @@ def create_draft(
         save_draft(draft, root, event="stage_started", message="Planning verifiable tasks")
         try:
             with _draft_heartbeat(draft, root):
-                _plan(draft, root, catalog, planner_runner, discovery_manifest, adapter)
+                _plan(draft, project_root, catalog, planner_runner, discovery_manifest, adapter)
         except Exception as exc:
             draft.status = "paused"
             draft.last_error = f"Goal planning failed: {type(exc).__name__}: {exc}"
@@ -735,6 +778,7 @@ def create_draft(
 
 def _run_discovery_and_plan(draft: GoalDraft, root: Path, catalog, adapter, *, planner_runner=None, discovery_runner=None) -> None:
     operation_timeout = max(1, int(draft.limits.get("operation_timeout_seconds", 1800)))
+    project_root = draft_project_root(draft, root)
     _preflight_or_raise(draft, root, _required_resume_agents(planner_runner=planner_runner, discovery_runner=discovery_runner))
     # A retry starts a new provider/discovery attempt. Do not keep presenting
     # the previous failure while heartbeat events are emitted.
@@ -748,12 +792,13 @@ def _run_discovery_and_plan(draft: GoalDraft, root: Path, catalog, adapter, *, p
 
             with _draft_heartbeat(draft, root):
                 manifest = DiscoverySupervisor().run(
-                    goal_id=draft.id, target=_planner_target(draft), workspace=root,
+                    goal_id=draft.id, target=_planner_target(draft), workspace=project_root,
+                    storage_workspace=root,
                     deadline=time.monotonic() + operation_timeout,
                 ).to_dict()
         else:
             with _draft_heartbeat(draft, root):
-                manifest = discovery_runner(draft=draft, workspace=root)
+                manifest = discovery_runner(draft=draft, workspace=project_root)
     except Exception as exc:
         draft.status = "paused"
         draft.last_error = f"Goal discovery failed: {type(exc).__name__}: {exc}"
@@ -774,7 +819,7 @@ def _run_discovery_and_plan(draft: GoalDraft, root: Path, catalog, adapter, *, p
     save_draft(draft, root, event="stage_started", message="Planning verifiable tasks")
     try:
         with _draft_heartbeat(draft, root):
-            _plan(draft, root, catalog, planner_runner, manifest, adapter)
+            _plan(draft, project_root, catalog, planner_runner, manifest, adapter)
     except Exception as exc:
         draft.status = "paused"
         draft.last_error = f"Goal planning failed: {type(exc).__name__}: {exc}"
@@ -804,7 +849,7 @@ def answer_draft(answer: str, *, workspace: Path | None = None, planner_runner=N
     try:
         _preflight_or_raise(draft, root, _required_resume_agents(planner_runner=planner_runner, discovery_runner=discovery_runner))
         with _draft_heartbeat(draft, root):
-            adapter, catalog = _collect_catalog(root, draft.verification)
+            adapter, catalog = _collect_catalog(draft_project_root(draft, root), draft.verification)
     except GoalDraftError:
         raise
     except Exception as exc:
@@ -831,7 +876,7 @@ def answer_draft(answer: str, *, workspace: Path | None = None, planner_runner=N
             save_draft(draft, root, event="stage_started", message="Planning verifiable tasks")
             try:
                 with _draft_heartbeat(draft, root):
-                    _plan(draft, root, catalog, planner_runner, verification_adapter=adapter)
+                    _plan(draft, draft_project_root(draft, root), catalog, planner_runner, verification_adapter=adapter)
             except Exception as exc:
                 draft.status = "paused"
                 draft.last_error = f"Goal planning failed: {type(exc).__name__}: {exc}"
@@ -878,7 +923,7 @@ def resume_draft(*, workspace: Path | None = None, planner_runner=None, discover
     save_draft(draft, root, event="stage_started", message="Resuming Goal draft; refreshing verification catalog", preserve_control=False)
     try:
         with _draft_heartbeat(draft, root):
-            adapter, catalog = _collect_catalog(root, draft.verification)
+            adapter, catalog = _collect_catalog(draft_project_root(draft, root), draft.verification)
     except Exception as exc:
         draft.last_error = f"test catalog failed: {type(exc).__name__}: {exc}"
         _set_stage(draft, "paused")
@@ -905,7 +950,7 @@ def resume_draft(*, workspace: Path | None = None, planner_runner=None, discover
                     + "\n\nReply with ONLY one JSON object "
                     + '{"summary":"...","assumptions":[],"questions":["..."]}.'
                 ),
-                agent_type="goal_intake", cwd=str(root), max_rounds=1,
+                agent_type="goal_intake", cwd=str(draft_project_root(draft, root)), max_rounds=1,
                 tools_override=(), stats=stats,
                 deadline=time.monotonic() + max(1, int(draft.limits.get("operation_timeout_seconds", 1800))),
             )
@@ -992,6 +1037,7 @@ def format_draft(draft: GoalDraft) -> str:
     lines = [
         f"Goal draft: {draft.id} [{draft.status}]",
         f"  Target: {draft.target}",
+        f"  Project root: {draft.project_root}",
         f"  Global verification: {draft.verification or 'needs your answer'} ({draft.verification_source})",
         f"  Verification adapter: {draft.verification_adapter}; collected selectors: {draft.test_catalog_count}",
         f"  Stage: {draft.stage} (heartbeat {int(max(0, time.time() - draft.last_heartbeat))}s ago)",

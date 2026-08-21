@@ -143,6 +143,26 @@ def test_discovery_scopes_files_to_the_goal_and_ignores_generated_worktrees(tmp_
     assert "node_tui/src-open/App.tsx" in implementation_paths
 
 
+def test_discovery_follows_requirement_references_and_typescript_imports(tmp_path):
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "src-open").mkdir()
+    (tmp_path / "src").mkdir()
+    (tmp_path / "docs" / "INPUT.md").write_text(
+        "Change src-open/App.tsx and src/autocomplete.ts", encoding="utf-8"
+    )
+    (tmp_path / "src-open" / "App.tsx").write_text(
+        "import { footerHint } from './interaction.js';\nimport { startBackend } from '../src/backend.js';\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "src-open" / "interaction.ts").write_text("export const footerHint = () => '';\n", encoding="utf-8")
+    (tmp_path / "src" / "autocomplete.ts").write_text("export const complete = () => [];\n", encoding="utf-8")
+    (tmp_path / "src" / "backend.ts").write_text("export const startBackend = () => {};\n", encoding="utf-8")
+
+    paths = _assigned_paths("implementation", build_repo_map(tmp_path), target="implement docs/INPUT.md")
+
+    assert {"docs/INPUT.md", "src-open/App.tsx", "src-open/interaction.ts", "src/autocomplete.ts", "src/backend.ts"}.issubset(paths)
+
+
 def test_discovery_report_parser_finds_valid_json_after_non_json_prefix():
     raw = 'analysis with {not-json} before a fenced report\n```json\n{"evidence": [], "gaps": ["missing test"]}\n```'
 

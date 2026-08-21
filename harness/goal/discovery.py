@@ -37,6 +37,14 @@ DEFAULT_DISCOVERY_CONCURRENCY = 1
 _TARGET_PATH_RE = re.compile(
     r"(?<![A-Za-z0-9_.-])(?:(?:\.\.?)[/\\]|[A-Za-z0-9_@.+-]+[/\\])(?:[A-Za-z0-9_@.+-]+[/\\])*[A-Za-z0-9_@.+-]+"
 )
+_JS_IMPORT_RE = re.compile(
+    r"(?:\b(?:import|export)\s+(?:type\s+)?(?:[^'\"\n]+?\s+from\s+)?|\brequire\s*\()"
+    r"['\"]([^'\"]+)['\"]"
+)
+_FILE_REFERENCE_RE = re.compile(
+    r"(?<![A-Za-z0-9_.@+-])((?:[A-Za-z0-9_.@+-]+[/\\])+[A-Za-z0-9_.@+-]+"
+    r"\.(?:pyi|py|tsx|ts|jsx|js|json|md|txt|toml|ya?ml|css|html))"
+)
 
 
 @dataclass(frozen=True)
@@ -47,6 +55,7 @@ class FileShard:
     end_line: int
     symbols: tuple[str, ...] = ()
     imports: tuple[str, ...] = ()
+    references: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, object]:
         data = asdict(self)
@@ -136,6 +145,14 @@ def _python_outline(text: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
     return tuple(dict.fromkeys(symbols)), tuple(dict.fromkeys(imports))
 
 
+def _source_outline(path: Path, text: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    if path.suffix.lower() == ".py":
+        return _python_outline(text)
+    if path.suffix.lower() in {".js", ".jsx", ".ts", ".tsx"}:
+        return (), tuple(dict.fromkeys(match.group(1) for match in _JS_IMPORT_RE.finditer(text)))
+    return (), ()
+
+
 def build_repo_map(
     root: str | Path,
     paths: Iterable[str | Path] | None = None,
@@ -154,7 +171,11 @@ def build_repo_map(
             text = raw.decode("utf-8")
         except (OSError, UnicodeDecodeError):
             continue
-        symbols, imports = _python_outline(text) if path.suffix.lower() == ".py" else ((), ())
+        symbols, imports = _source_outline(path, text)
+        references = tuple(dict.fromkeys(
+            match.group(1).replace("\\", "/").lstrip("./")
+            for match in _FILE_REFERENCE_RE.finditer(text)
+        ))
         lines = max(1, text.count("\n") + 1)
         shards.append(FileShard(
             path=path.relative_to(base).as_posix(),
@@ -163,6 +184,7 @@ def build_repo_map(
             end_line=lines,
             symbols=symbols,
             imports=imports,
+            references=references,
         ))
     return tuple(shards)
 
@@ -197,7 +219,9 @@ def _target_scope(target: str, names: list[str]) -> tuple[str, ...]:
     roots: list[str] = []
     for path in exact:
         parts = path.split("/")
-        if len(parts) > 1:
+        # A target such as docs/INPUT.md is already inside the selected
+        # project. Treating "docs" as its own project root hides src/ and test/.
+        if len(parts) > 1 and parts[0].lower() not in {"doc", "docs", "src", "test", "tests", "lib", "app"}:
             roots.append(parts[0])
     # Targets often contain a relative path without an exact absolute match.
     for candidate in re.findall(r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+", normalized):
@@ -233,15 +257,54 @@ def _assigned_paths(
     scoped = [path for path in names if not roots or any(path == root or path.startswith(f"{root}/") for root in roots)]
     target_files = [path for path in names if path in target.replace("\\", "/")]
     is_test = lambda path: "/test" in path.lower() or path.startswith("test")
+    index = {item.path: item for item in shards}
+
+    def resolve(reference: str, source: str) -> tuple[str, ...]:
+        raw = reference.replace("\\", "/").lstrip("./")
+        candidates = [raw, (Path(source).parent / raw).as_posix()]
+        expanded: list[str] = []
+        for candidate in candidates:
+            expanded.append(candidate)
+            suffix = Path(candidate).suffix.lower()
+            if suffix in {".js", ".jsx"}:
+                expanded.extend([candidate[:-len(suffix)] + alternative for alternative in (".ts", ".tsx")])
+            elif not suffix:
+                expanded.extend(candidate + alternative for alternative in (".ts", ".tsx", ".js", ".jsx", ".py"))
+                expanded.extend((Path(candidate) / f"index{alternative}").as_posix() for alternative in (".ts", ".tsx", ".js", ".jsx", ".py"))
+        resolved = [path for path in dict.fromkeys(expanded) if path in index]
+        if not resolved:
+            # Requirement documents sometimes retain the workspace prefix
+            # (for example node_tui/src-open/App.tsx) while Discovery itself
+            # runs inside node_tui. Accept only an unambiguous suffix match.
+            suffix_matches = [path for path in names if raw.endswith("/" + path)]
+            if len(suffix_matches) == 1:
+                resolved.extend(suffix_matches)
+        return tuple(resolved)
+
+    def dependency_closure(seeds: Iterable[str]) -> list[str]:
+        selected: list[str] = []
+        pending = list(seeds)
+        while pending and len(selected) < limit:
+            path = pending.pop(0)
+            if path in selected or path not in index:
+                continue
+            selected.append(path)
+            shard = index[path]
+            for reference in (*shard.references, *shard.imports):
+                pending.extend(resolve(reference, path))
+        return selected
+
+    seeded = dependency_closure(target_files)
+    manifest_files = [path for path in scoped if Path(path).name in {"package.json", "pyproject.toml", "pytest.ini", "setup.cfg"}]
 
     if role == "tests":
-        selected = [*target_files, *(path for path in scoped if is_test(path))]
+        selected = [*target_files, *manifest_files, *(path for path in scoped if is_test(path))]
     elif role == "history":
-        selected = [*target_files, *(path for path in scoped if path.startswith("docs/") or "/docs/" in path or "/goal" in path)]
+        selected = [*target_files, *manifest_files, *(path for path in scoped if path.startswith("docs/") or "/docs/" in path or "/goal" in path)]
     elif role == "requirement":
-        selected = [*target_files, *(path for path in scoped if path.lower().endswith((".md", ".txt")))]
+        selected = [*target_files, *manifest_files, *(path for path in scoped if path.lower().endswith((".md", ".txt")))]
     else:
-        selected = [*target_files, *(path for path in scoped if not is_test(path))]
+        selected = [*seeded, *manifest_files, *(path for path in scoped if not is_test(path))]
     if not selected:
         selected = scoped or names
     return tuple(dict.fromkeys(selected))[:limit]
@@ -278,11 +341,13 @@ class DiscoverySupervisor:
         goal_id: str,
         target: str,
         workspace: str | Path,
+        storage_workspace: str | Path | None = None,
         deadline: float | None = None,
         cancel_check=None,
         roles: tuple[str, ...] = DISCOVERY_ROLES,
     ) -> DiscoveryManifest:
         root = Path(workspace).expanduser().resolve()
+        storage_root = Path(storage_workspace).expanduser().resolve() if storage_workspace is not None else root
         # Git-ignored files never enter automatic discovery. A file path named
         # directly in the user's Goal is deliberate scope, so include that one
         # bounded file without reopening an ignored directory tree.
@@ -290,14 +355,14 @@ class DiscoverySupervisor:
         revision = git_revision(root)
         jobs = [DiscoveryJob(id=f"{role}-1", role=role, read_paths=_assigned_paths(role, shards, target=target)) for role in roles]
         for job in jobs:
-            save_job_state(root, goal_id, job.to_dict())
+            save_job_state(storage_root, goal_id, job.to_dict())
             _emit_discovery_job(goal_id, job, event="queued")
 
         completed: list[tuple[DiscoveryJob, dict]] = []
         def execute(job: DiscoveryJob) -> tuple[DiscoveryJob, dict]:
             started = time.time()
             running = DiscoveryJob(**{**job.to_dict(), "status": "running", "started_at": started})
-            save_job_state(root, goal_id, running.to_dict())
+            save_job_state(storage_root, goal_id, running.to_dict())
             _emit_discovery_job(goal_id, running, event="started")
             if cancel_check is not None and cancel_check():
                 return running, {"error": "cancelled"}
@@ -351,9 +416,9 @@ class DiscoverySupervisor:
                     for marker in ("429", "ratelimit", "too many requests", "max retries", "provider rate limited")
                 )
                 finished = DiscoveryJob(**{**running.to_dict(), "status": "failed" if error else "done", "error": error, "retryable": retryable, "retry_after": time.time() + 30 if retryable else 0.0, "finished_at": time.time()})
-                report_path = save_report(root, goal_id, finished.id, report)
-                finished = DiscoveryJob(**{**finished.to_dict(), "report_path": str(report_path.relative_to(root)).replace("\\", "/")})
-                save_job_state(root, goal_id, finished.to_dict())
+                report_path = save_report(storage_root, goal_id, finished.id, report)
+                finished = DiscoveryJob(**{**finished.to_dict(), "report_path": str(report_path.relative_to(storage_root)).replace("\\", "/")})
+                save_job_state(storage_root, goal_id, finished.to_dict())
                 _emit_discovery_job(goal_id, finished, event="failed" if error else "completed", failure_kind=report.get("failure_kind"))
                 completed.append((finished, report))
 
@@ -398,7 +463,7 @@ class DiscoverySupervisor:
             shards=tuple(item.to_dict() for item in shards), evidence=tuple(evidence),
             jobs=tuple(job for job, _ in sorted(completed, key=lambda item: item[0].id)), gaps=tuple(dict.fromkeys(gaps)),
         )
-        save_manifest(root, goal_id, manifest.to_dict())
+        save_manifest(storage_root, goal_id, manifest.to_dict())
         _emit_discovery_job(goal_id, None, event="wave_completed", completed=len(completed), total=len(jobs))
         return manifest
 

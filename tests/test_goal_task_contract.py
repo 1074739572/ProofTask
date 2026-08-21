@@ -74,6 +74,21 @@ def test_plan_allows_a_discovered_directory_scope_for_new_files():
     assert plans[0].scope_paths == ("src",)
 
 
+def test_plan_rejects_a_code_task_grounded_only_in_requirement_text():
+    manifest = {
+        "repo_files": ["docs/requirements.md", "src/app.ts"],
+        "evidence": [
+            {"id": "E1", "path": "docs/requirements.md"},
+        ],
+    }
+    raw = ('[{"name":"queue","behavior":"queue messages",'
+           '"acceptance_cases":[{"id":"AC1","given":"running","when":"sent","then":"queued"}],'
+           '"depends_on":[],"scope_paths":["src/app.ts"],"evidence_refs":["E1"],'
+           '"test_strategy":"new focused test"}]')
+
+    assert parse_plan(raw, test_catalog=_catalog(), discovery_manifest=manifest) is None
+
+
 def test_plan_rejects_empty_acceptance_case_selector_mapping():
     raw = ('[{"name":"pages","behavior":"all pages return",'
            '"acceptance_cases":[{"id":"AC1","given":"pages","when":"listed","then":"none skipped"}],'

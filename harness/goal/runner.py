@@ -43,10 +43,21 @@ class GoalBusyError(Exception):
     pass
 
 
+def _execution_workspace(state: GoalState) -> str:
+    """Return the scoped project root used for code and test operations."""
+    root = Path(state.workspace).expanduser().resolve()
+    try:
+        candidate = Path(state.execution_workspace or root).expanduser().resolve()
+    except OSError:
+        return str(root)
+    return str(candidate) if candidate.is_dir() and candidate.is_relative_to(root) else str(root)
+
+
 @dataclass(frozen=True)
 class GoalRequest:
     target: str
     verification: str
+    execution_workspace: str = ""
     # A user-approved draft can seed the durable Task plan. The runner still
     # owns test generation, baselines, implementation, and every completion gate.
     task_plan: list[dict[str, Any]] | None = None
@@ -280,8 +291,16 @@ def start_goal(request: GoalRequest, *, history: list, context: dict, binding: A
             raise GoalBusyError(f"Goal {existing.id} is {existing.status}. Resume, cancel, or finish it first.")
         if existing:
             archive_goal(existing)
+        workspace_root = get_workdir().resolve()
+        try:
+            execution_workspace = Path(request.execution_workspace or workspace_root).expanduser().resolve()
+        except OSError as exc:
+            raise ValueError(f"invalid Goal execution workspace: {exc}") from exc
+        if not execution_workspace.is_dir() or not execution_workspace.is_relative_to(workspace_root):
+            raise ValueError("Goal execution workspace must be an existing directory inside the current workspace")
         state = GoalState.new(
-            target=request.target, verification=request.verification, workspace=str(get_workdir()),
+            target=request.target, verification=request.verification, workspace=str(workspace_root),
+            execution_workspace=str(execution_workspace),
             workspace_generation=workspace_generation(), evaluation_required=request.evaluation_required,
             worker_round_limit=request.worker_round_limit,
             operation_timeout_seconds=request.operation_timeout_seconds,
@@ -430,7 +449,7 @@ def _resume_target(state: GoalState) -> str:
             evaluated_snapshot = str(evaluation.get("input_snapshot") or "")
             # An old or changed evaluation input cannot safely direct a new
             # implementation attempt. Re-evaluate the current workspace first.
-            if not evaluated_snapshot or evaluated_snapshot != capture_code_snapshot(state.workspace):
+            if not evaluated_snapshot or evaluated_snapshot != capture_code_snapshot(_execution_workspace(state)):
                 return GoalPhase.EVALUATE.value
         if candidate in {GoalPhase.VERIFY.value, GoalPhase.CLEAN_CHECK.value} and current.status != "in_progress":
             return GoalPhase.CLAIM.value if current.status == "pending" else GoalPhase.SELECT_TASK.value
@@ -479,7 +498,7 @@ def _discard_legacy_interrupted_final_repair(state: GoalState) -> bool:
     # binding digest; a user-edited file is deliberately preserved.
     spec = task.verification_spec if isinstance(task.verification_spec, dict) else {}
     expected_hashes = spec.get("test_hashes") if isinstance(spec.get("test_hashes"), dict) else {}
-    workspace = Path(state.workspace).resolve()
+    workspace = Path(_execution_workspace(state)).resolve()
     for raw_path, expected_hash in expected_hashes.items():
         rel = str(raw_path).replace("\\", "/")
         candidate = (workspace / rel).resolve()
@@ -689,7 +708,7 @@ class GoalRunner(threading.Thread):
         from harness.goal.memory import load_test_map, record_test_binding
         from harness.tasks import create_task, list_tasks, load_task, save_task
 
-        root = Path(state.workspace)
+        root = Path(_execution_workspace(state))
         if not state.task_plan:
             stats = AgentTaskStats()
             self._phase_in_flight = True
@@ -797,7 +816,7 @@ class GoalRunner(threading.Thread):
         from harness.goal.memory import record_test_binding
         from harness.tasks import bind_task_verification, load_task
 
-        root = Path(state.workspace)
+        root = Path(_execution_workspace(state))
         deferred = False
         for task_id in state.task_ids:
             task = load_task(task_id)
@@ -1218,7 +1237,7 @@ class GoalRunner(threading.Thread):
         spec = task.verification_spec if isinstance(task.verification_spec, dict) else {}
         if spec.get("source") == "discovered" and not spec.get("test_hashes"):
             spec["test_hashes"] = self._test_file_hashes(
-                Path(state.workspace), spec.get("test_files") or []
+                Path(_execution_workspace(state)), spec.get("test_files") or []
             )
             task.verification_spec = spec
             save_task(task)
@@ -1229,9 +1248,9 @@ class GoalRunner(threading.Thread):
             return
         record_task_start(
             state.current_task_id,
-            snapshot=capture_code_snapshot(state.workspace),
-            diff=self._workspace_diff(state.workspace),
-            dirty_hashes=capture_dirty_file_hashes(state.workspace),
+            snapshot=capture_code_snapshot(_execution_workspace(state)),
+            diff=self._workspace_diff(_execution_workspace(state)),
+            dirty_hashes=capture_dirty_file_hashes(_execution_workspace(state)),
         )
         self._apply(state, GoalPhase.ACT, "task_claimed")
 
@@ -1279,7 +1298,7 @@ class GoalRunner(threading.Thread):
                 description=f"implement Goal task {task.id}",
                 prompt=prompt,
                 agent_type="goal_worker",
-                cwd=state.workspace,
+                cwd=_execution_workspace(state),
                 max_rounds=state.worker_round_limit,
                 cancel_check=self._interrupted,
                 deadline=self._deadline(state),
@@ -1341,7 +1360,7 @@ class GoalRunner(threading.Thread):
     def _verify(self, state: GoalState) -> None:
         task = verify_task_command(
             state.current_task_id,
-            workspace=state.workspace,
+            workspace=_execution_workspace(state),
             timeout_s=state.operation_timeout_seconds,
             cancel_check=self._interrupted,
         )
@@ -1360,7 +1379,7 @@ class GoalRunner(threading.Thread):
         stats = AgentTaskStats()
         task = run_task_evaluation(
             state.current_task_id,
-            state.workspace,
+            _execution_workspace(state),
             cancel_check=self._interrupted,
             deadline=self._deadline(state),
             stats=stats,
@@ -1418,7 +1437,7 @@ class GoalRunner(threading.Thread):
             state,
             task,
             evaluation,
-            cwd=state.workspace,
+            cwd=_execution_workspace(state),
             cancel_check=self._interrupted,
             deadline=self._deadline(state),
             stats=stats,
@@ -1502,7 +1521,7 @@ class GoalRunner(threading.Thread):
             state,
             completed,
             pending,
-            cwd=state.workspace,
+            cwd=_execution_workspace(state),
             cancel_check=self._interrupted,
             deadline=self._deadline(state),
             stats=stats,
@@ -1559,7 +1578,7 @@ class GoalRunner(threading.Thread):
         for task_id in state.task_ids:
             task = reverify_task_command(
                 task_id,
-                workspace=state.workspace,
+                workspace=_execution_workspace(state),
                 timeout_s=state.operation_timeout_seconds,
                 cancel_check=self._interrupted,
             )
@@ -1588,7 +1607,7 @@ class GoalRunner(threading.Thread):
         _emit_goal("goal_status", state)
         result = run_verification(
             state.verification,
-            workspace=Path(state.workspace),
+            workspace=Path(_execution_workspace(state)),
             timeout_s=state.operation_timeout_seconds,
             cancel_check=self._interrupted,
         )
@@ -1658,7 +1677,7 @@ class GoalRunner(threading.Thread):
         decision = plan_goal_regression_repair(
             state,
             tasks,
-            cwd=state.workspace,
+            cwd=_execution_workspace(state),
             cancel_check=self._interrupted,
             deadline=self._deadline(state),
             stats=stats,
@@ -1721,7 +1740,7 @@ class GoalRunner(threading.Thread):
                 state.last_error = "This full verification failure already has a repair Task; refusing to create a duplicate."
                 self._pause(state, "full_verification_repair_duplicate", stop_reason=StopReason.full_verification_failed.value)
                 return
-        root = Path(state.workspace)
+        root = Path(_execution_workspace(state))
         catalog = collect_pytest_catalog(root)
         if not catalog.contains(selector):
             state.last_error = f"Failed selector {selector!r} is no longer collected; repair Task was not created."
@@ -1802,7 +1821,7 @@ class GoalRunner(threading.Thread):
         if result is not None:
             evidence = evidence_from_result(
                 result,
-                workspace=state.workspace,
+                workspace=_execution_workspace(state),
                 verified_by="goal_final",
             )
             record.update(evidence.to_dict())
@@ -1835,7 +1854,7 @@ class GoalRunner(threading.Thread):
         from harness.verification.snapshot import capture_code_snapshot
 
         task = load_task(state.current_task_id)
-        return (task.evidence, task.last_error, capture_code_snapshot(state.workspace))
+        return (task.evidence, task.last_error, capture_code_snapshot(_execution_workspace(state)))
 
     @staticmethod
     def _validate_task_scope(state: GoalState, task) -> str | None:
@@ -1849,7 +1868,7 @@ class GoalRunner(threading.Thread):
         scope = {str(path).replace("\\", "/").lstrip("./") for path in (task.scope_paths or []) if path}
         if not scope:
             return None
-        current = capture_dirty_file_hashes(state.workspace)
+        current = capture_dirty_file_hashes(_execution_workspace(state))
         baseline = {str(path): str(digest) for path, digest in (task.start_dirty_hashes or {}).items()}
         # A file that was already dirty is not exempt if this worker changed it
         # again. Compare digests rather than merely comparing path names.

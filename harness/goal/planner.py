@@ -321,6 +321,59 @@ def _planner_manifest_view(discovery_manifest: dict[str, Any]) -> dict[str, Any]
     }
 
 
+_SOURCE_SUFFIXES = frozenset({".py", ".pyi", ".js", ".jsx", ".ts", ".tsx", ".java", ".go", ".rs", ".rb", ".php", ".cs"})
+_CRITICAL_DISCOVERY_GAP_MARKERS = (
+    "not in the assigned files",
+    "not assigned",
+    "no assigned source file",
+    "cannot assess current",
+    "cannot verify current",
+)
+
+
+def discovery_readiness_error(discovery_manifest: dict[str, Any] | None) -> str | None:
+    """Reject planning when Discovery admits it missed required source context."""
+    if not isinstance(discovery_manifest, dict):
+        return None
+    evidence = [item for item in discovery_manifest.get("evidence", []) if isinstance(item, dict)]
+    if not evidence:
+        return "Discovery produced no validated evidence. Continue discovery before planning."
+    critical = [
+        str(gap).replace("\n", " ").strip()
+        for gap in discovery_manifest.get("gaps", [])
+        if any(marker in str(gap).lower() for marker in _CRITICAL_DISCOVERY_GAP_MARKERS)
+    ]
+    if critical:
+        return "Discovery is missing required source context: " + " | ".join(critical[:4])
+    return None
+
+
+def _task_has_source_evidence(
+    scopes: tuple[str, ...], refs: tuple[str, ...], discovery_manifest: dict[str, Any],
+) -> bool:
+    evidence_by_id = {
+        str(item.get("id")): str(item.get("path") or "").replace("\\", "/")
+        for item in discovery_manifest.get("evidence", [])
+        if isinstance(item, dict)
+    }
+    code_scopes = [scope for scope in scopes if Path(scope).suffix.lower() in _SOURCE_SUFFIXES]
+    if not code_scopes:
+        code_scopes = [
+            scope for scope in scopes
+            if any(Path(path).suffix.lower() in _SOURCE_SUFFIXES and (path == scope or path.startswith(scope.rstrip("/") + "/"))
+                   for path in discovery_manifest.get("repo_files", []))
+        ]
+    if not code_scopes:
+        return True
+    for ref in refs:
+        path = evidence_by_id.get(ref, "")
+        if Path(path).suffix.lower() not in _SOURCE_SUFFIXES:
+            continue
+        if any(path == scope or path.startswith(scope.rstrip("/") + "/") or scope.startswith(path.rsplit("/", 1)[0] + "/") for scope in code_scopes):
+            return True
+    return False
+
+
 def build_plan_prompt(
     target: str,
     full_verification: str,
@@ -352,11 +405,12 @@ def build_plan_prompt(
         f"{catalog_text}\n\n"
         f"{manifest_text}\n\n"
         "Split the Goal into as many Tasks as its independently verifiable deliverables require:\n"
+        "- First compare every requested behavior against Discovery evidence and classify it internally as implemented, partial, missing, or unknown. Create Tasks only for partial or missing behavior; implemented behavior may need regression coverage but is not implementation work.\n"
         "- There is no target Task count. Cover every distinct deliverable; never merge work merely to reduce the count.\n"
         "- Each Task is independently implementable and machine-verifiable.\n"
         "- Each Task must include 1-8 concrete acceptance_cases using given/when/then; split a Task that needs more.\n"
         "- depends_on lists names of earlier Tasks only.\n"
-        "- scope_paths must be selected from scope_candidates or evidence.path; evidence_refs must cite evidence IDs.\n"
+        "- scope_paths must be selected from scope_candidates or evidence.path; evidence_refs must cite evidence IDs, including at least one cited source-code fact for a code Task.\n"
         "- test_strategy must explain how each acceptance case will be verified.\n"
         "- case_selectors maps each acceptance case id to exact catalog selectors; never claim coverage without a mapping.\n"
         "- Keep related implementation details together, but preserve independently testable deliverables as separate Tasks.\n"
@@ -459,6 +513,8 @@ def parse_plan(raw: str, *, test_catalog=None, discovery_manifest: dict[str, Any
         return None
     if not isinstance(data, list) or not data:
         return None
+    if discovery_readiness_error(discovery_manifest):
+        return None
     plans: list[TaskPlan] = []
     names: set[str] = set()
     for entry in data:
@@ -493,7 +549,11 @@ def parse_plan(raw: str, *, test_catalog=None, discovery_manifest: dict[str, Any
                 and any(path == scope or path.startswith(scope.rstrip("/") + "/") for path in file_paths)
                 for scope in scopes
             )
-            if not scopes or not refs or not strategy or not scopes_valid or not set(refs).issubset(evidence_ids):
+            if (
+                not scopes or not refs or not strategy or not scopes_valid
+                or not set(refs).issubset(evidence_ids)
+                or not _task_has_source_evidence(scopes, refs, discovery_manifest)
+            ):
                 return None
         selected_skills = _normalise_skill_names(entry.get("skills"))
         if not selected_skills:

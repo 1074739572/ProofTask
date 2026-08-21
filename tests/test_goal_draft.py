@@ -26,6 +26,34 @@ def test_bare_goal_creates_a_draft_instead_of_requiring_verify():
     assert parse_goal_command("/goal run")["action"] == "run"
 
 
+def test_draft_scopes_a_nested_node_project_before_collecting_tests(tmp_path):
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_root.py").write_text("def test_root(): pass\n", encoding="utf-8")
+    project = tmp_path / "node_tui"
+    (project / "docs").mkdir(parents=True)
+    (project / "test").mkdir()
+    (project / "package.json").write_text('{"scripts":{"test":"node --import tsx --test test/*.test.ts"}}', encoding="utf-8")
+    target_file = project / "docs" / "INPUT.md"
+    target_file.write_text("improve input", encoding="utf-8")
+    (project / "test" / "input.test.ts").write_text("import { test } from 'node:test';\ntest('input works', () => {});\n", encoding="utf-8")
+    seen = {}
+
+    def planner(**kwargs):
+        seen.update(kwargs)
+        return _plan_json()
+
+    draft = create_draft(
+        f"implement {target_file}", workspace=tmp_path,
+        intake_runner=lambda **_: '{"questions":[]}', planner_runner=planner,
+    )
+
+    assert draft.project_root == "node_tui"
+    assert draft.verification == "npm test"
+    assert draft.verification_adapter == "node"
+    assert draft.test_catalog_count == 1
+    assert "test/input.test.ts::input works" in seen["prompt"]
+
+
 def test_draft_waits_for_clarification_before_planning(tmp_path):
     draft = create_draft(
         "add rate limits",
@@ -449,15 +477,22 @@ def test_approved_draft_plan_seeds_the_runner(monkeypatch, tmp_path):
     monkeypatch.setattr(runner_mod, "_emit_goal", lambda *args: None)
     monkeypatch.setattr(runner_mod.GoalRunner, "start", lambda self: None)
 
+    project = tmp_path / "node_tui"
+    project.mkdir()
     plan = [{"name": "limit requests", "behavior": "limit each user", "acceptance_cases": [{"id": "AC1", "given": "x", "when": "y", "then": "z"}], "verification_spec": {"source": "needs_generation"}}]
     state = runner_mod.start_goal(
-        GoalRequest(target="limit", verification="python -m pytest -q", task_plan=plan, draft_id="draft_origin"),
+        GoalRequest(
+            target="limit", verification="npm test", execution_workspace=str(project),
+            task_plan=plan, draft_id="draft_origin",
+        ),
         history=[], context={}, binding=None,
     )
 
     assert state.task_plan == plan
     assert state.execution_approved is True
     assert state.draft_id == "draft_origin"
+    assert state.workspace == str(tmp_path)
+    assert state.execution_workspace == str(project)
 
 
 def test_execution_approval_resumes_from_the_test_review_pause(monkeypatch, tmp_path):
