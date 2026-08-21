@@ -6,10 +6,10 @@ import queue
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from harness.agent.cancel import is_cancelled
 from harness.agent.recovery import RecoveryState, with_retry
@@ -139,6 +139,25 @@ class AgentTaskStats:
     llm_rounds: int = 0
     interrupted: bool = False
     stop_reason: str = "completed"  # completed | cancelled | deadline | max_rounds | max_tokens
+    tool_count: int = 0
+    tool_names: list[str] = field(default_factory=list)
+    read_paths: list[str] = field(default_factory=list)
+    write_paths: list[str] = field(default_factory=list)
+    tool_errors: list[str] = field(default_factory=list)
+    elapsed_seconds: float = 0.0
+
+    def record_tool(self, name: str, tool_input: Any, output: object) -> None:
+        self.tool_count += 1
+        self.tool_names.append(str(name))
+        if isinstance(tool_input, dict) and tool_input.get("path"):
+            path = str(tool_input["path"]).replace("\\", "/")
+            if name == "read_file":
+                self.read_paths.append(path)
+            elif name in {"write_file", "edit_file"}:
+                self.write_paths.append(path)
+        detail = str(output)
+        if detail.lower().startswith(("error", "write blocked", "read blocked", "tool error")):
+            self.tool_errors.append(f"{name}: {detail[:300]}")
 
 
 def _tools_for_agent(
@@ -390,6 +409,8 @@ def run_agent_task(
                 handler = handlers.get(name)
                 renderer.subagent_tool(run_id, name, tool_input, tool_use_id=tool_use_id)
                 output = call_tool_handler(handler, tool_input, name)
+                if stats is not None:
+                    stats.record_tool(name, tool_input, output)
                 trigger_hooks("PostToolUse", block, output)
                 # Nested collapsed tool line: ● tool  args → result
                 renderer.subagent_tool(run_id, name, tool_input, str(output), tool_use_id=tool_use_id)
@@ -403,12 +424,15 @@ def run_agent_task(
         messages.append({"role": "user", "content": results})
 
     elapsed = time.time() - started
+    if stats is not None:
+        stats.elapsed_seconds = elapsed
 
-    if stats is not None and final_text is None:
-        # An assistant turn with neither visible text nor tool calls is not a
-        # successful completion.  Returning a generic "finished" marker lets
-        # structured Goal stages accidentally continue after an empty reply.
-        stats.stop_reason = "empty_response"
+    exhausted_rounds = final_text is None
+    if exhausted_rounds and stats is not None and stats.stop_reason == "completed":
+        # The last turn requested tools, so this is not an empty provider
+        # reply. Callers that support continuation need to distinguish the
+        # per-call round budget from a malformed or missing response.
+        stats.stop_reason = "max_rounds"
 
     # If we didn't capture a final_text (loop ran 30 rounds), extract it now
     if final_text is None:
@@ -425,7 +449,7 @@ def run_agent_task(
             f"[{agent_type} / {profile.model_id}] {description} "
             f"({tool_count} tools, {elapsed:.1f}s)\n\n{final_text}"
         )
-    if stats is not None:
+    if stats is not None and stats.stop_reason == "completed":
         stats.stop_reason = "empty_response"
     renderer.subagent_end(run_id, "failed: empty response", tool_count, elapsed, max_len=50)
     return f"[{agent_type}] failed: empty response ({tool_count} tools, {elapsed:.1f}s)"

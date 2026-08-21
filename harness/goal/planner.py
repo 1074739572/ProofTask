@@ -382,6 +382,8 @@ def build_plan_prompt(
     full_verification: str,
     test_catalog: TestCatalog | None = None,
     discovery_manifest: dict[str, Any] | None = None,
+    *,
+    human_language: str = "English",
 ) -> str:
     """Prompt for the read-only planner. Output is a JSON Task array only."""
     catalog_text = (test_catalog or TestCatalog(error="not collected")).prompt_text(limit=PLANNER_CATALOG_LIMIT)
@@ -423,6 +425,8 @@ def build_plan_prompt(
         "- Prefer systematic-debugging for a repair or regression Task, frontend-design for UI work, "
         "webapp-testing for browser/UI verification, and test-driven-development for a behavior that needs focused tests.\n"
         "- Do not use code-review here; the independent evaluator handles review.\n\n"
+        f"Write all human-readable Task names, behavior, acceptance-case text, and test_strategy in {human_language}. "
+        "Keep JSON keys, evidence IDs, paths, commands, and selectors exactly as supplied.\n\n"
         "Reply with ONLY a JSON array in this schema:\n"
         '[{"name":"paginate list","behavior":"list returns every page",'
         '"acceptance_cases":[{"id":"AC1","given":"more than one page",'
@@ -672,6 +676,7 @@ def plan_tasks(
     test_catalog: TestCatalog | None = None,
     discovery_manifest: dict[str, Any] | None = None,
     verification_adapter=None,
+    human_language: str = "English",
 ) -> list[TaskPlan]:
     """Decompose a Goal and bind only selectors the system collected."""
     from harness.agents.runner import AgentTaskStats, run_agent_task as default_runner
@@ -684,7 +689,10 @@ def plan_tasks(
     catalog = test_catalog if test_catalog is not None else verification_adapter.discover(VerificationContext(root, command=full_verification))
     runner = planner_runner or default_runner
     planner_stats = stats if stats is not None else AgentTaskStats()
-    prompt = build_plan_prompt(target, full_verification, catalog, discovery_manifest)
+    prompt = build_plan_prompt(
+        target, full_verification, catalog, discovery_manifest,
+        human_language=human_language,
+    )
     planner_call = {
         "description": "decompose goal into verifiable tasks",
         "prompt": prompt,

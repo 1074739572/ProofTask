@@ -20,11 +20,12 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+from harness.goal.language import detect_goal_language, human_language_label
 from harness.goal.planner import TaskPlan, discovery_readiness_error, plan_tasks
 from harness.settings import get_workdir
 from harness.verification import VerificationContext, select_adapter
 
-DRAFT_SCHEMA_VERSION = 3
+DRAFT_SCHEMA_VERSION = 4
 DRAFT_FILENAME = "goal-draft.json"
 _DRAFT_STATUSES = frozenset({"clarifying", "discovering", "planning", "paused", "cancelled", "ready", "approved", "failed", "consumed"})
 _ACTIVE_DRAFT_STAGES = frozenset({"preflight", "catalog", "intake", "discovering", "planning"})
@@ -57,6 +58,9 @@ class GoalDraft:
     # this project, while durable Goal state remains in the workspace root.
     project_root: str = "."
     verification_adapter: str = "pytest"
+    # Language for user-facing model artifacts. Internal protocol values such
+    # as JSON keys, paths, commands, and selectors remain unchanged.
+    language: str = "en"
     questions: list[str] = field(default_factory=list)
     answers: list[str] = field(default_factory=list)
     intake_summary: str = ""
@@ -85,7 +89,7 @@ class GoalDraft:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "GoalDraft":
         version = data.get("schema_version")
-        if version not in {2, DRAFT_SCHEMA_VERSION}:
+        if version not in {2, 3, DRAFT_SCHEMA_VERSION}:
             raise GoalDraftError("unsupported Goal draft schema")
         data = dict(data)
         if version == 2:
@@ -93,6 +97,8 @@ class GoalDraft:
             # checkpoint from its error for existing drafts, then persist v3
             # on the next write.
             data["resume_from"] = _legacy_resume_stage(data)
+        if version in {2, 3}:
+            data["language"] = detect_goal_language(str(data.get("target") or ""))
             data["schema_version"] = DRAFT_SCHEMA_VERSION
         unknown = set(data) - set(cls.__dataclass_fields__)
         if unknown:
@@ -586,6 +592,7 @@ def _plan(draft: GoalDraft, workspace: Path, catalog, planner_runner=None, disco
         test_catalog=catalog,
         discovery_manifest=discovery_manifest,
         verification_adapter=verification_adapter,
+        human_language=human_language_label(draft.language),
     )
     draft.task_plan = [plan.to_dict() for plan in plans]
     draft.status = "ready"
@@ -616,6 +623,7 @@ def create_draft(
         verification_source=source,
         status="clarifying",
         project_root=project_root.relative_to(root).as_posix() or ".",
+        language=detect_goal_language(target),
         limits=dict(limits or {}),
         test_catalog_count=0,
         stage="preflight",
@@ -782,6 +790,7 @@ def create_draft(
                             workspace=project_root,
                             storage_workspace=root,
                             deadline=time.monotonic() + operation_timeout,
+                            human_language=human_language_label(draft.language),
                         ).to_dict()
                 else:
                     with _draft_heartbeat(draft, root):
@@ -836,6 +845,7 @@ def _run_discovery_and_plan(draft: GoalDraft, root: Path, catalog, adapter, *, p
                     goal_id=draft.id, target=_planner_target(draft), workspace=project_root,
                     storage_workspace=root,
                     deadline=time.monotonic() + operation_timeout,
+                    human_language=human_language_label(draft.language),
                 ).to_dict()
         else:
             with _draft_heartbeat(draft, root):

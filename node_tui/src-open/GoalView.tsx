@@ -582,9 +582,9 @@ export function GoalDraftView(props: {draft: GoalDraftSnapshot; now?: number; wi
             <text fg={C.text} wrapMode="word">{String(index() + 1).padStart(2, '0')} · {item.name}</text>
             <text fg={C.textMuted} wrapMode="word">  {item.behavior || '未提供行为摘要'}</text>
             <text fg={C.textMuted} wrapMode="word">  验收 {item.acceptance_count || 0} 条 · {item.verification_source || 'needs_generation'}{item.selectors?.length ? ` · ${item.selectors.join(', ')}` : ''}</text>
-            <Show when={item.scope_paths?.length}><text fg={C.textMuted} wrapMode="word">  Scope · {item.scope_paths?.join(', ')}</text></Show>
-            <Show when={item.evidence_refs?.length}><text fg={C.textMuted} wrapMode="word">  Discovery evidence · {item.evidence_refs?.join(', ')}</text></Show>
-            <Show when={item.test_strategy}><text fg={C.textMuted} wrapMode="word">  Test strategy · {item.test_strategy}</text></Show>
+            <Show when={item.scope_paths?.length}><text fg={C.textMuted} wrapMode="word">  修改范围 · {item.scope_paths?.join(', ')}</text></Show>
+            <Show when={item.evidence_refs?.length}><text fg={C.textMuted} wrapMode="word">  探索证据 · {item.evidence_refs?.join(', ')}</text></Show>
+            <Show when={item.test_strategy}><text fg={C.textMuted} wrapMode="word">  测试策略 · {item.test_strategy}</text></Show>
           </box>}</For>
         </box>
       </Show>
@@ -755,15 +755,15 @@ export function GoalView(props: {goal: GoalSnapshot; decisions?: GoalDecision[];
                 }</For>
               </Show>
               <Show when={(task().scope_paths || []).length}>
-                <text fg={C.secondary}>Approved scope</text>
+                <text fg={C.secondary}>批准的修改范围</text>
                 <For each={task().scope_paths || []}>{path => <text fg={C.textMuted} wrapMode="word">  {path}</text>}</For>
               </Show>
               <Show when={(task().evidence_refs || []).length}>
-                <text fg={C.secondary}>Discovery evidence</text>
+                <text fg={C.secondary}>探索证据</text>
                 <text fg={C.textMuted} wrapMode="word">  {(task().evidence_refs || []).join(', ')}</text>
               </Show>
               <Show when={task().test_strategy}>
-                <text fg={C.secondary}>Test strategy</text>
+                <text fg={C.secondary}>测试策略</text>
                 <text fg={C.textMuted} wrapMode="word">  {task().test_strategy}</text>
               </Show>
             </box>

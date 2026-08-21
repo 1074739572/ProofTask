@@ -131,6 +131,29 @@ def test_discovery_retries_an_invalid_json_report_with_compact_format(tmp_path):
     assert manifest.evidence[0].path == "app.py"
 
 
+def test_discovery_extends_a_round_slice_when_it_reads_new_assigned_files(tmp_path):
+    (tmp_path / "app.py").write_text("def run():\n    return 1\n", encoding="utf-8")
+    calls = []
+
+    def fake_runner(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            kwargs["stats"].llm_rounds = DISCOVERY_MAX_ROUNDS
+            kwargs["stats"].stop_reason = "max_rounds"
+            kwargs["stats"].read_paths.append("app.py")
+            return "still reading"
+        return '{"evidence":[{"path":"app.py","lines":[1,2],"claim":"entry exists"}],"gaps":[]}'
+
+    manifest = DiscoverySupervisor(runner=fake_runner).run(
+        goal_id="goal-continued", target="improve app", workspace=tmp_path, roles=("implementation",)
+    )
+
+    assert len(calls) == 2
+    assert calls[1]["description"] == "continue implementation discovery (slice 2)"
+    assert manifest.jobs[0].slices == 2
+    assert manifest.jobs[0].read_paths_seen == ("app.py",)
+
+
 def test_discovery_runs_requirement_then_architecture_with_handoff(tmp_path):
     (tmp_path / "docs").mkdir()
     (tmp_path / "src").mkdir()

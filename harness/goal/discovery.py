@@ -18,6 +18,7 @@ from typing import Iterable
 from harness.agents.runner import AgentTaskStats, run_agent_task
 from harness.goal.discovery_models import DiscoveryJob, DiscoveryManifest, Evidence
 from harness.goal.discovery_store import save_job_state, save_manifest, save_report
+from harness.goal.supervision import StagePolicy, StageProgress, StageSupervisor
 
 
 EXCLUDED_DIRS = frozenset({
@@ -344,6 +345,7 @@ def _prompt(
     *,
     prior_reports: Iterable[dict] = (),
     retry: bool = False,
+    human_language: str = "English",
 ) -> str:
     index = {item.path: item for item in shards}
     outline = [index[path].to_dict() for path in paths if path in index]
@@ -359,6 +361,8 @@ def _prompt(
         f"Earlier validated findings: {json.dumps(handoff, ensure_ascii=False)}\n"
         f"Assigned files: {json.dumps(outline, ensure_ascii=False)}\n\n"
         f"Read only assigned files (at most {len(paths)}). {correction}"
+        f"Write human-readable claim and gaps text in {human_language}. "
+        "Keep JSON keys, paths, symbols, and line numbers unchanged. "
         "Return ONLY one compact JSON object. Never include markdown, analysis, or source excerpts. "
         "The system reads and verifies excerpts itself from path and lines. Return at most 8 evidence items and 8 gaps: "
         "{\"evidence\":[{\"path\":\"assigned file\",\"symbol\":\"optional\",\"lines\":[1,2],"
@@ -388,6 +392,7 @@ class DiscoverySupervisor:
         deadline: float | None = None,
         cancel_check=None,
         roles: tuple[str, ...] = DISCOVERY_ROLES,
+        human_language: str = "English",
     ) -> DiscoveryManifest:
         root = Path(workspace).expanduser().resolve()
         storage_root = Path(storage_workspace).expanduser().resolve() if storage_workspace is not None else root
@@ -410,8 +415,9 @@ class DiscoverySupervisor:
             _emit_discovery_job(goal_id, running, event="started")
             if cancel_check is not None and cancel_check():
                 return running, {"error": "cancelled"}
-            stats = AgentTaskStats()
-            try:
+            seen_paths: set[str] = set(running.read_paths_seen)
+
+            def invoke_discovery(active_prompt: str, description: str, _slice: int, stats: AgentTaskStats) -> str:
                 # Provider limits are commonly account-wide, so a local
                 # thread pool must still serialize requests to the same API.
                 with self._request_lock:
@@ -419,13 +425,73 @@ class DiscoverySupervisor:
                     if wait > 0:
                         time.sleep(wait)
                     self._last_request_at = time.monotonic()
-                raw = self.runner(
-                    description=f"discover {job.role} evidence",
-                    prompt=_prompt(target, job.role, revision, shards, job.read_paths, prior_reports=prior_reports),
+                return self.runner(
+                    description=description,
+                    prompt=active_prompt,
                     agent_type=f"goal_discovery_{job.role}", cwd=str(root),
                     max_rounds=DISCOVERY_MAX_ROUNDS, tools_override=("read_file",),
                     read_paths=job.read_paths, deadline=deadline, cancel_check=cancel_check, stats=stats,
                 )
+
+            def discovery_progress(_before: object, _after: object, stats: AgentTaskStats) -> StageProgress:
+                new_reads = [path for path in dict.fromkeys(stats.read_paths) if path not in seen_paths]
+                seen_paths.update(new_reads)
+                advanced = bool(new_reads)
+                summary = (
+                    f"read {len(new_reads)} newly assigned file(s): {', '.join(new_reads[:4])}"
+                    if new_reads else "no newly assigned files read in this slice"
+                )
+                return StageProgress(
+                    advanced=advanced,
+                    summary=summary,
+                    checkpoint={
+                        "read_paths_seen": sorted(seen_paths)[:DISCOVERY_FILE_LIMIT],
+                        "new_reads": new_reads[:DISCOVERY_FILE_LIMIT],
+                        "tool_errors": stats.tool_errors[-4:],
+                    },
+                )
+
+            def persist_slice(item) -> None:
+                nonlocal running
+                checkpoint = item.progress.checkpoint
+                running = DiscoveryJob(**{
+                    **running.to_dict(),
+                    "slices": item.number,
+                    "idle_slices": item.idle_slices,
+                    "llm_rounds": running.llm_rounds + item.stats.llm_rounds,
+                    "read_paths_seen": tuple(checkpoint.get("read_paths_seen") or ()),
+                    "last_progress": item.progress.summary,
+                    "stop_reason": item.stats.stop_reason,
+                })
+                save_job_state(storage_root, goal_id, running.to_dict())
+                _emit_discovery_job(goal_id, running, event="progress")
+
+            try:
+                supervised = StageSupervisor(StagePolicy(
+                    name=f"discovery:{job.role}",
+                    slice_rounds=DISCOVERY_MAX_ROUNDS,
+                    max_idle_slices=2,
+                )).run(
+                    invoke=invoke_discovery,
+                    initial_prompt=_prompt(
+                        target, job.role, revision, shards, job.read_paths,
+                        prior_reports=prior_reports, human_language=human_language,
+                    ),
+                    initial_description=f"discover {job.role} evidence",
+                    continuation_prompt=lambda _slice, progress, _idle: _prompt(
+                        target, job.role, revision, shards, job.read_paths,
+                        prior_reports=prior_reports, human_language=human_language,
+                    ) + (
+                        "\n\nSupervisor checkpoint: " + progress.summary + ". "
+                        "Do not repeat completed reads. Read remaining assigned files, or return the required JSON now."
+                    ),
+                    continuation_description=lambda slice_number: f"continue {job.role} discovery (slice {slice_number})",
+                    snapshot=lambda: None,
+                    assess_progress=discovery_progress,
+                    on_slice=persist_slice,
+                )
+                raw = supervised.raw
+                stats = supervised.stats
             except Exception as exc:
                 return running, {"error": f"{type(exc).__name__}: {exc}", "failure_kind": "exception"}
             report = _parse_report(raw)
@@ -443,7 +509,10 @@ class DiscoverySupervisor:
                         self._last_request_at = time.monotonic()
                     retry_raw = self.runner(
                         description=f"repair {job.role} discovery report format",
-                        prompt=_prompt(target, job.role, revision, shards, job.read_paths, prior_reports=prior_reports, retry=True),
+                        prompt=_prompt(
+                            target, job.role, revision, shards, job.read_paths,
+                            prior_reports=prior_reports, retry=True, human_language=human_language,
+                        ),
                         agent_type=f"goal_discovery_{job.role}", cwd=str(root),
                         max_rounds=1, tools_override=("read_file",),
                         read_paths=job.read_paths, deadline=deadline, cancel_check=cancel_check, stats=retry_stats,
@@ -457,7 +526,7 @@ class DiscoverySupervisor:
             if not report:
                 report = {
                     "error": "discovery response did not contain a valid JSON evidence report",
-                    "failure_kind": "invalid_report",
+                    "failure_kind": "stalled" if supervised.stalled else "invalid_report",
                     "response_tail": raw[-800:],
                 }
             if stats.stop_reason in {"configuration_error", "provider_error", "empty_response", "deadline", "cancelled"}:
@@ -587,6 +656,12 @@ def _emit_discovery_job(goal_id: str, job: DiscoveryJob | None, *, event: str, *
                 "report_path": job.report_path,
                 "started_at": job.started_at,
                 "finished_at": job.finished_at,
+                "slices": job.slices,
+                "idle_slices": job.idle_slices,
+                "llm_rounds": job.llm_rounds,
+                "read_paths_seen": list(job.read_paths_seen[:12]),
+                "last_progress": job.last_progress,
+                "stop_reason": job.stop_reason,
             })
         payload.update(extra)
         emit("goal_discovery_job", **payload)

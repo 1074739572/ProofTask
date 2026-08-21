@@ -495,6 +495,168 @@ def test_test_generation_uses_writer_and_requires_failing_baseline(tmp_path, mon
     assert bound.verification_spec["baseline_result"] == "failing"
 
 
+def test_test_generation_uses_multiple_rounds_for_inspect_write_and_final_json(tmp_path, monkeypatch):
+    import harness.goal.runner as runner_mod
+
+    task, state = _needs_generation_task(tmp_path, monkeypatch)
+    seen = []
+    monkeypatch.setattr(runner_mod, "save_goal", lambda state: None)
+
+    def writer(**kwargs):
+        seen.append(kwargs)
+        return '{"test_selectors":["tests/test_new.py::test_new"],"case_selectors":{"AC1":["tests/test_new.py::test_new"]}}'
+
+    monkeypatch.setattr(runner_mod, "run_agent_task", writer)
+    catalogs = iter((
+        TestCatalog(),
+        TestCatalog(selectors=("tests/test_new.py::test_new",), test_files=("tests/test_new.py",)),
+    ))
+    monkeypatch.setattr(runner_mod, "collect_pytest_catalog", lambda workspace: next(catalogs))
+    monkeypatch.setattr(
+        runner_mod,
+        "run_verification",
+        lambda *args, **kwargs: type("Result", (), {"passed": False, "error": None, "timed_out": False, "stdout": "assert missing behavior", "exit_code": 1, "duration_ms": 5, "command": "pytest -q tests/test_new.py::test_new"})(),
+    )
+
+    GoalRunner(state=state, history=[], context={}, binding=None)._prepare_tests(state)
+
+    assert seen[0]["max_rounds"] == runner_mod.TEST_WRITER_MAX_ROUNDS
+    assert runner_mod.TEST_WRITER_MAX_ROUNDS > 1
+
+
+def test_test_generation_continues_after_a_round_slice(tmp_path, monkeypatch):
+    import harness.goal.runner as runner_mod
+
+    _task, state = _needs_generation_task(tmp_path, monkeypatch)
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    calls = []
+    monkeypatch.setattr(runner_mod, "save_goal", lambda state: None)
+
+    def writer(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            (tests_dir / "test_new.py").write_text("def test_new(): assert False\n", encoding="utf-8")
+            kwargs["stats"].stop_reason = "max_rounds"
+            return "[goal_test_writer] still using tools"
+        return '{"test_selectors":["tests/test_new.py::test_new"],"case_selectors":{"AC1":["tests/test_new.py::test_new"]}}'
+
+    monkeypatch.setattr(runner_mod, "run_agent_task", writer)
+    catalogs = iter((
+        TestCatalog(),
+        TestCatalog(selectors=("tests/test_new.py::test_new",), test_files=("tests/test_new.py",)),
+    ))
+    monkeypatch.setattr(runner_mod, "collect_pytest_catalog", lambda workspace: next(catalogs))
+    monkeypatch.setattr(
+        runner_mod,
+        "run_verification",
+        lambda *args, **kwargs: type("Result", (), {"passed": False, "error": None, "timed_out": False, "stdout": "assert missing behavior", "exit_code": 1, "duration_ms": 5, "command": "pytest -q tests/test_new.py::test_new"})(),
+    )
+
+    GoalRunner(state=state, history=[], context={}, binding=None)._prepare_tests(state)
+
+    assert len(calls) == 2
+    assert "Continue from the current workspace state" in calls[1]["prompt"]
+    assert calls[0]["deadline"] == calls[1]["deadline"]
+
+
+def test_test_generation_stall_preserves_written_test_for_json_completion(tmp_path, monkeypatch):
+    import harness.goal.runner as runner_mod
+    from harness.tasks import load_task
+
+    task, state = _needs_generation_task(tmp_path, monkeypatch)
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    calls = []
+    monkeypatch.setattr(runner_mod, "save_goal", lambda state: None)
+
+    def writer(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            (tests_dir / "test_new.py").write_text("def test_new(): assert False\n", encoding="utf-8")
+        if len(calls) <= 4:
+            kwargs["stats"].stop_reason = "max_rounds"
+            return "[goal_test_writer] still using tools"
+        return '{"test_selectors":["tests/test_new.py::test_new"],"case_selectors":{"AC1":["tests/test_new.py::test_new"]}}'
+
+    monkeypatch.setattr(runner_mod, "run_agent_task", writer)
+    catalogs = iter((
+        TestCatalog(),
+        TestCatalog(selectors=("tests/test_new.py::test_new",), test_files=("tests/test_new.py",)),
+    ))
+    monkeypatch.setattr(runner_mod, "collect_pytest_catalog", lambda workspace: next(catalogs))
+    monkeypatch.setattr(
+        runner_mod,
+        "run_verification",
+        lambda *args, **kwargs: type("Result", (), {"passed": False, "error": None, "timed_out": False, "stdout": "assert missing behavior", "exit_code": 1, "duration_ms": 5, "command": "pytest -q tests/test_new.py::test_new"})(),
+    )
+
+    GoalRunner(state=state, history=[], context={}, binding=None)._prepare_tests(state)
+
+    assert len(calls) == 5
+    assert calls[-1]["tools_override"] == ()
+    assert (tests_dir / "test_new.py").exists()
+    assert load_task(task.id).verification_spec["source"] == "generated"
+
+
+def test_test_generation_recovers_written_test_when_writer_omits_final_json(tmp_path, monkeypatch):
+    import harness.goal.runner as runner_mod
+    from harness.tasks import load_task
+
+    task, state = _needs_generation_task(tmp_path, monkeypatch)
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    calls = []
+    monkeypatch.setattr(runner_mod, "save_goal", lambda state: None)
+
+    def writer(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            (tests_dir / "test_new.py").write_text("def test_new(): assert False\n", encoding="utf-8")
+            kwargs["stats"].stop_reason = "empty_response"
+            return "[goal_test_writer] failed: empty response (2 tools, 1.0s)"
+        return '{"test_selectors":["tests/test_new.py::test_new"],"case_selectors":{"AC1":["tests/test_new.py::test_new"]}}'
+
+    monkeypatch.setattr(runner_mod, "run_agent_task", writer)
+    catalogs = iter((
+        TestCatalog(),
+        TestCatalog(selectors=("tests/test_new.py::test_new",), test_files=("tests/test_new.py",)),
+    ))
+    monkeypatch.setattr(runner_mod, "collect_pytest_catalog", lambda workspace: next(catalogs))
+    monkeypatch.setattr(
+        runner_mod,
+        "run_verification",
+        lambda *args, **kwargs: type("Result", (), {"passed": False, "error": None, "timed_out": False, "stdout": "assert missing behavior", "exit_code": 1, "duration_ms": 5, "command": "pytest -q tests/test_new.py::test_new"})(),
+    )
+
+    GoalRunner(state=state, history=[], context={}, binding=None)._prepare_tests(state)
+
+    assert len(calls) == 2
+    assert calls[1]["tools_override"] == ()
+    assert load_task(task.id).verification_spec["source"] == "generated"
+    assert (tests_dir / "test_new.py").exists()
+
+
+def test_test_generation_empty_response_without_a_test_is_not_provider_unavailable(tmp_path, monkeypatch):
+    import harness.goal.runner as runner_mod
+
+    _task, state = _needs_generation_task(tmp_path, monkeypatch)
+    monkeypatch.setattr(runner_mod, "save_goal", lambda state: None)
+
+    def empty_writer(**kwargs):
+        kwargs["stats"].stop_reason = "empty_response"
+        return "[goal_test_writer] failed: empty response (2 tools, 1.0s)"
+
+    monkeypatch.setattr(runner_mod, "run_agent_task", empty_writer)
+    monkeypatch.setattr(runner_mod, "collect_pytest_catalog", lambda workspace: TestCatalog())
+
+    GoalRunner(state=state, history=[], context={}, binding=None)._prepare_tests(state)
+
+    assert state.phase == GoalPhase.PAUSED.value
+    assert state.stop_reason == "test_writer_empty_response"
+    assert "did not submit a final result" in state.last_error
+
+
 def test_test_generation_receives_and_preserves_cross_task_impact_context(tmp_path, monkeypatch):
     import harness.goal.runner as runner_mod
     import harness.tasks as tasks

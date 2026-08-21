@@ -344,6 +344,7 @@ def _handle_approve(runner, history: list, context: dict, binding: Any) -> str:
         task_plan=draft.task_plan,
         goal_contract={
             "target": draft.target,
+            "language": draft.language,
             "clarifications": [
                 {"question": question, "answer": answer}
                 for question, answer in zip(draft.questions, draft.answers)

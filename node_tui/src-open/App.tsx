@@ -1145,6 +1145,21 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
         }
         break;
       }
+      case 'goal_stage_supervision': {
+        const stage = value(event, 'stage') || 'stage';
+        const supervisionEvent = value(event, 'event') || 'update';
+        const summary = value(event, 'progress_summary') || value(event, 'reason') || '';
+        const slice = Number(event.slice || 0);
+        const idle = Number(event.idle_slices || 0);
+        const detail = [slice ? `切片 ${slice}` : '', summary, idle ? `连续无进展 ${idle}` : ''].filter(Boolean).join(' · ');
+        add({
+          id: `goal-supervision-${stage}-${supervisionEvent}-${slice || Date.now()}`,
+          kind: supervisionEvent === 'stalled' ? 'blocked' : 'log',
+          text: `Goal 监督 · ${stage}`,
+          detail: detail || supervisionEvent,
+        });
+        break;
+      }
       case 'goal_discovery_job': {
         const currentDraft = draftStatus();
         if (currentDraft) {

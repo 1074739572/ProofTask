@@ -41,11 +41,25 @@ class DiscoveryJob:
     finished_at: float = 0.0
     retryable: bool = False
     retry_after: float = 0.0
+    slices: int = 0
+    idle_slices: int = 0
+    llm_rounds: int = 0
+    read_paths_seen: tuple[str, ...] = ()
+    last_progress: str = ""
+    stop_reason: str = ""
+
+    def __post_init__(self) -> None:
+        # JSON persistence uses lists; normalize recovered jobs so checkpoint
+        # comparisons remain stable across a save/reload boundary.
+        object.__setattr__(self, "read_roots", tuple(self.read_roots))
+        object.__setattr__(self, "read_paths", tuple(self.read_paths))
+        object.__setattr__(self, "read_paths_seen", tuple(self.read_paths_seen))
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
         data["read_roots"] = list(self.read_roots)
         data["read_paths"] = list(self.read_paths)
+        data["read_paths_seen"] = list(self.read_paths_seen)
         return data
 
 

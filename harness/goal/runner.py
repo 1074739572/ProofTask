@@ -16,9 +16,11 @@ from harness.agent.cancel import clear_cancel, request_cancel
 from harness.agents.runner import AgentTaskStats, run_agent_task
 from harness.evaluation import run_task_evaluation
 from harness.goal.engine import GoalEngine
+from harness.goal.language import human_language_label
 from harness.goal.models import GoalPhase, GoalStatus, GoalState, StopReason
-from harness.goal.planner import PLANNER_MAX_ROUNDS, VerificationSpec, plan_tasks
+from harness.goal.planner import VerificationSpec, plan_tasks
 from harness.goal.policy import MAX_REPAIR_ATTEMPTS_PER_TASK, NO_PROGRESS_REPLAN_LIMIT, validate_limits
+from harness.goal.supervision import StagePolicy, StageProgress, StageSupervisor, emit_stage_supervision
 from harness.goal.store import (
     GoalLeaseError,
     GoalStoreError,
@@ -41,6 +43,12 @@ class GoalNotRunningError(Exception):
 
 class GoalBusyError(Exception):
     pass
+
+
+# Unlike the read-only planner, a test writer must be able to inspect existing
+# conventions, write a new test, then submit the selector JSON on a final turn.
+TEST_WRITER_MAX_ROUNDS = 8
+TEST_WRITER_MAX_IDLE_CHUNKS = 3
 
 
 def _execution_workspace(state: GoalState) -> str:
@@ -717,7 +725,11 @@ class GoalRunner(threading.Thread):
             self._phase_in_flight = True
             try:
                 try:
-                    plans = plan_tasks(state.target, state.verification, root, cancel_check=self._interrupted, deadline=self._deadline(state), stats=stats)
+                    plans = plan_tasks(
+                        state.target, state.verification, root,
+                        cancel_check=self._interrupted, deadline=self._deadline(state), stats=stats,
+                        human_language=human_language_label((state.goal_contract or {}).get("language")),
+                    )
                 except Exception as exc:
                     state.total_llm_rounds += stats.llm_rounds
                     state.last_error = f"Goal planner unavailable: {type(exc).__name__}: {exc}"
@@ -850,6 +862,11 @@ class GoalRunner(threading.Thread):
                 '{"test_selectors":["tests/test_x.py::test_name"],"case_selectors":{"AC1":["tests/test_x.py::test_name"]}}.\n\n'
                 f"Task: {task.subject}\nBehavior: {task.description}\nAcceptance cases: {json.dumps(task.acceptance_cases)}"
             )
+            prompt += (
+                "\n\nWrite only human-facing test descriptions and your final summary in "
+                f"{human_language_label((state.goal_contract or {}).get('language'))}. "
+                "Keep JSON keys, test selectors, paths, commands, and code unchanged."
+            )
             if task.test_strategy:
                 prompt += f"\nPlanning test strategy: {task.test_strategy}"
             if task.scope_paths:
@@ -870,32 +887,89 @@ class GoalRunner(threading.Thread):
                     f"{json.dumps(impact_context[-8:], ensure_ascii=False)[:5000]}\n"
                     "Add focused coverage for these interactions. Do not only repeat task-local tests."
                 )
-            stats = AgentTaskStats()
-            self._phase_in_flight = True
-            try:
-                clear_goal_permission_flags()
-                set_goal_noninteractive(True)
-                raw = run_agent_task(
-                    description=f"generate tests for task {task.id}",
-                    prompt=prompt,
-                    agent_type="goal_test_writer",
-                    cwd=str(root),
-                    max_rounds=PLANNER_MAX_ROUNDS,
-                    cancel_check=self._interrupted,
-                    deadline=self._deadline(state),
-                    stats=stats,
-                    write_roots=write_roots,
+            # A round limit is a scheduling slice, not a project-size limit.
+            # The shared supervisor extends only when a test artifact changes.
+            writer_deadline = self._deadline(state)
+            def invoke_writer(active_prompt: str, description: str, _slice: int, stats: AgentTaskStats) -> str:
+                self._phase_in_flight = True
+                try:
+                    clear_goal_permission_flags()
+                    set_goal_noninteractive(True)
+                    return run_agent_task(
+                        description=description,
+                        prompt=active_prompt,
+                        agent_type="goal_test_writer",
+                        cwd=str(root),
+                        max_rounds=TEST_WRITER_MAX_ROUNDS,
+                        cancel_check=self._interrupted,
+                        deadline=writer_deadline,
+                        stats=stats,
+                        write_roots=write_roots,
+                    )
+                finally:
+                    set_goal_noninteractive(False)
+                    self._phase_in_flight = False
+
+            def test_progress(previous: dict[str, bytes], current: dict[str, bytes], stats: AgentTaskStats) -> StageProgress:
+                created = sorted(set(current) - set(previous))
+                changed = sorted(path for path in set(current) & set(previous) if current[path] != previous[path])
+                advanced = bool(created)
+                if changed and not created:
+                    summary = "only existing test files changed; awaiting a focused new test artifact"
+                elif created:
+                    summary = f"created focused test artifact: {', '.join(created[:4])}"
+                else:
+                    summary = "no new test artifact in this slice"
+                return StageProgress(
+                    advanced=advanced,
+                    summary=summary,
+                    checkpoint={
+                        "created_test_files": created[:12],
+                        "changed_existing_test_files": changed[:12],
+                        "write_paths": stats.write_paths[-12:],
+                        "tool_errors": stats.tool_errors[-4:],
+                    },
                 )
-            finally:
-                set_goal_noninteractive(False)
-                self._phase_in_flight = False
-            state.total_llm_rounds += stats.llm_rounds
+
+            supervised = StageSupervisor(StagePolicy(
+                name="test_generation",
+                slice_rounds=TEST_WRITER_MAX_ROUNDS,
+                max_idle_slices=TEST_WRITER_MAX_IDLE_CHUNKS,
+            )).run(
+                invoke=invoke_writer,
+                initial_prompt=prompt,
+                initial_description=f"generate tests for task {task.id}",
+                continuation_prompt=lambda _slice, progress, _idle: prompt + (
+                    "\n\nContinue from the current workspace state. The prior slice reached its tool-round "
+                    f"budget. Supervisor evidence: {progress.summary}. Inspect existing new tests, then continue "
+                    "the Task. Do not modify existing test files."
+                ),
+                continuation_description=lambda slice_number: f"continue generating tests for task {task.id} (slice {slice_number})",
+                snapshot=lambda: self._snapshot_test_tree(root, write_roots),
+                assess_progress=test_progress,
+                on_slice=lambda item: setattr(state, "total_llm_rounds", state.total_llm_rounds + item.stats.llm_rounds),
+            )
+            stats = supervised.stats
+            raw = supervised.raw
+            writer_stalled = supervised.stalled
             if self._honor_control_request(state):
                 return
+
+            if stats.stop_reason == "deadline":
+                self._restore_test_tree(root, before_tree, write_roots, expected_after=self._snapshot_test_tree(root, write_roots))
+                self._pause(
+                    state,
+                    "test_generation_timeout",
+                    stop_reason=StopReason.test_generation_timeout.value,
+                )
+                state.last_error = f"Test generation reached the operation timeout for Task {task.id}."
+                save_goal(state)
+                return
+            empty_response = stats.stop_reason == "empty_response"
             if (
                 stats.stop_reason in {"provider_error", "configuration_error"}
                 or str(raw).startswith("Error:")
-                or str(raw).startswith("[goal_test_writer] failed:")
+                or (str(raw).startswith("[goal_test_writer] failed:") and not empty_response)
                 or str(raw).startswith("[goal_test_writer] stopped:")
             ):
                 self._restore_test_tree(root, before_tree, write_roots, expected_after=self._snapshot_test_tree(root, write_roots))
@@ -922,6 +996,72 @@ class GoalRunner(threading.Thread):
                 if adapter.id == "pytest"
                 else adapter.discover(verification_context)
             )
+            if empty_response or writer_stalled:
+                # A provider can complete tool calls but omit its final text.
+                # Preserve a newly written test long enough to ask for its
+                # required selector mapping without giving the retry any write
+                # tools. If no new collected selector exists, there is no
+                # durable test artifact that can safely advance this Task.
+                generated_selectors = tuple(
+                    selector for selector in after_catalog.selectors
+                    if selector not in before_catalog.selectors
+                )
+                if generated_selectors:
+                    completion_prompt = (
+                        "You already created focused tests for this Task but did not submit the required final JSON. "
+                        "Do not call tools or edit files. Reply ONLY with one JSON object mapping every acceptance case "
+                        "to the collected selectors below.\n\n"
+                        f"Task: {task.subject}\n"
+                        f"Acceptance cases: {json.dumps(task.acceptance_cases, ensure_ascii=False)}\n"
+                        f"New collected selectors: {json.dumps(generated_selectors)}\n"
+                        '{"test_selectors":["exact selector"],"case_selectors":{"AC1":["exact selector"]}}'
+                    )
+                    retry_stats = AgentTaskStats()
+                    self._phase_in_flight = True
+                    try:
+                        set_goal_noninteractive(True)
+                        raw = run_agent_task(
+                            description=f"submit generated test selectors for task {task.id}",
+                            prompt=completion_prompt,
+                            agent_type="goal_test_writer",
+                            cwd=str(root),
+                            max_rounds=1,
+                            cancel_check=self._interrupted,
+                            deadline=self._deadline(state),
+                            stats=retry_stats,
+                            tools_override=(),
+                        )
+                    finally:
+                        set_goal_noninteractive(False)
+                        self._phase_in_flight = False
+                    state.total_llm_rounds += retry_stats.llm_rounds
+                    if self._honor_control_request(state):
+                        return
+                    empty_response = retry_stats.stop_reason == "empty_response"
+                if empty_response or (writer_stalled and not generated_selectors):
+                    self._restore_test_tree(root, before_tree, write_roots, expected_after=self._snapshot_test_tree(root, write_roots))
+                    stop_reason = (
+                        StopReason.test_writer_stalled.value
+                        if writer_stalled
+                        else StopReason.test_writer_empty_response.value
+                    )
+                    detail = (
+                        f"Test writer reached {TEST_WRITER_MAX_IDLE_CHUNKS} consecutive round slices without "
+                        f"creating or changing a test artifact for Task {task.id}."
+                        if writer_stalled
+                        else (
+                            f"Test writer used tools but did not submit a final result for Task {task.id}; "
+                            "no collected new test selector was available to bind."
+                        )
+                    )
+                    self._pause(
+                        state,
+                        "goal_test_writer_stalled" if writer_stalled else "goal_test_writer_empty_response",
+                        stop_reason=stop_reason,
+                    )
+                    state.last_error = detail
+                    save_goal(state)
+                    return
             selectors = self._selectors_from_generation(raw, root, catalog=after_catalog)
             case_selectors = self._case_selectors_from_generation(raw, selectors, task.acceptance_cases)
             if not selectors:
@@ -1318,13 +1458,36 @@ class GoalRunner(threading.Thread):
             self._phase_in_flight = False
         state.total_llm_rounds += stats.llm_rounds
         state.attempts += 1
-        state.no_progress_count = state.no_progress_count + 1 if self._progress_snapshot(state) == before else 0
         scope_error = self._validate_task_scope(state, task)
         if scope_error:
+            emit_stage_supervision(
+                "blocked",
+                stage="implementation",
+                slice=state.worker_generation,
+                reason=scope_error,
+                checkpoint={"task_id": task.id},
+            )
             self._pause(state, "task_scope_violation", stop_reason=StopReason.autonomy_blocked.value)
             state.last_error = scope_error
             save_goal(state)
             return
+        worker_progressed = self._progress_snapshot(state) != before
+        state.no_progress_count = state.no_progress_count + 1 if not worker_progressed else 0
+        emit_stage_supervision(
+            "slice_finished",
+            stage="implementation",
+            slice=state.worker_generation,
+            stop_reason=stats.stop_reason,
+            rounds=stats.llm_rounds,
+            tools=stats.tool_count,
+            progress=worker_progressed,
+            progress_summary=(
+                "Task evidence or scoped code snapshot changed"
+                if worker_progressed else "no Task evidence or scoped code change in this worker slice"
+            ),
+            idle_slices=state.no_progress_count,
+            checkpoint={"task_id": task.id, "worker_rollovers": state.worker_rollovers},
+        )
         write_handoff(state, task, phase=GoalPhase.VERIFY.value, summary=summary)
         if self._cancel_event.is_set():
             self._cancel(state, "user requested cancel")

@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from harness.goal.language import human_language_label
+
 
 def _task_discovery_evidence(state: Any, task: Any) -> list[dict[str, Any]]:
     """Resolve the Task's cited Discovery facts from its originating Draft."""
@@ -66,6 +68,11 @@ def build_goal_act_prompt(
         f"Task verification state: {task.verification_state}",
         f"Bound test command: {spec.get('command') or '(missing)'}",
         "Acceptance cases:", *case_lines,
+    ]
+    language = human_language_label((getattr(state, "goal_contract", {}) or {}).get("language"))
+    lines += [
+        f"Human-facing summaries and status explanations must be written in {language}. "
+        "Keep code, paths, commands, selectors, JSON keys, and tool names unchanged.",
     ]
     scope_paths = [str(path) for path in (getattr(task, "scope_paths", None) or []) if str(path)]
     if scope_paths:

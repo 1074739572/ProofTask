@@ -132,6 +132,21 @@ def test_run_agent_task_rejects_empty_model_response():
     assert stats.stop_reason == "empty_response"
 
 
+def test_run_agent_task_marks_tool_only_round_limit_as_max_rounds():
+    from harness.agents.runner import AgentTaskStats, run_agent_task
+
+    stats = AgentTaskStats()
+    with mock.patch(
+        "harness.agents.runner.create_message",
+        return_value=_response([{
+            "type": "tool_use", "id": "tool-1", "name": "glob", "input": {"pattern": "*.py"},
+        }]),
+    ):
+        run_agent_task("inspect project", "find tests", "explore", max_rounds=1, stats=stats)
+
+    assert stats.stop_reason == "max_rounds"
+
+
 def test_goal_subagent_passes_its_configured_reasoning_effort():
     from harness.agents.runner import run_agent_task
 

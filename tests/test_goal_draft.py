@@ -492,8 +492,43 @@ def test_schema_v2_draft_loads_with_a_planning_resume_checkpoint(tmp_path):
     loaded = load_draft(tmp_path)
 
     assert loaded is not None
-    assert loaded.schema_version == 3
+    assert loaded.schema_version == 4
     assert loaded.resume_from == "planning"
+
+
+def test_schema_v3_draft_migrates_language_from_a_chinese_target(tmp_path):
+    from harness.goal.draft import GoalDraft, draft_path
+
+    legacy = GoalDraft(
+        id="legacy-language", target="优化输入交互", verification="python -m pytest -q",
+        verification_source="test", status="paused", stage="paused",
+    ).to_dict()
+    legacy.pop("language")
+    legacy["schema_version"] = 3
+    draft_path(tmp_path).parent.mkdir(parents=True, exist_ok=True)
+    draft_path(tmp_path).write_text(json.dumps(legacy), encoding="utf-8")
+
+    loaded = load_draft(tmp_path)
+
+    assert loaded is not None
+    assert loaded.schema_version == 4
+    assert loaded.language == "zh-CN"
+
+
+def test_chinese_goal_passes_chinese_contract_language_to_planner(tmp_path):
+    seen = {}
+
+    def planner(**kwargs):
+        seen.update(kwargs)
+        return _plan_json()
+
+    draft = create_draft(
+        "优化输入交互", workspace=tmp_path, verification="python -m pytest -q",
+        intake_runner=lambda **_: '{"questions":[]}', planner_runner=planner,
+    )
+
+    assert draft.language == "zh-CN"
+    assert "Simplified Chinese" in seen["prompt"]
 
 
 def test_partial_discovery_failure_keeps_planning_with_completed_evidence(tmp_path):

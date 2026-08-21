@@ -71,6 +71,21 @@ def test_cross_task_impact_context_is_explicit_in_worker_and_evaluator_prompts(t
     assert "missing required interaction coverage is never passable" in evaluator_prompt
 
 
+def test_chinese_goal_worker_prompt_requests_chinese_human_summaries(tmp_path):
+    task = SimpleNamespace(
+        id="task_language", subject="优化输入", description="改善输入体验", acceptance_cases=[],
+        verification_state="needs_generation", verification_spec={}, evidence=[], last_error=None,
+        repair_history=[], behavior="改善输入体验", verification="pytest -q", start_snapshot=None,
+        start_diff=None,
+    )
+    state = GoalState.new(target="优化输入", verification="pytest -q", workspace=str(tmp_path))
+    state.goal_contract = {"language": "zh-CN"}
+
+    prompt = build_goal_act_prompt(state, task)
+
+    assert "Simplified Chinese" in prompt
+
+
 def test_task_scoped_diff_excludes_unchanged_preexisting_dirty_files(monkeypatch, tmp_path):
     import harness.evaluation.inputs as inputs_mod
 
