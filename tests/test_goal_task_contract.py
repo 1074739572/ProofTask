@@ -29,12 +29,29 @@ def test_plan_binds_only_catalog_selectors():
     assert plans[0].verification_spec.selectors == ("tests/test_api.py::test_lists_all_pages",)
 
 
-def test_plan_requires_explicit_case_mapping_when_mapping_is_present():
+def test_invalid_existing_case_mapping_falls_back_to_test_generation():
     raw = ('[{"name":"pages","behavior":"all pages return",'
            '"acceptance_cases":[{"id":"AC1","given":"pages","when":"listed","then":"none skipped"}],'
            '"test_selectors":["tests/test_api.py::test_lists_all_pages"],"depends_on":[],'
            '"case_selectors":{"AC2":["tests/test_api.py::test_lists_all_pages"]}}]')
-    assert parse_plan(raw, test_catalog=_catalog()) is None
+    plans = parse_plan(raw, test_catalog=_catalog())
+    assert plans is not None
+    assert plans[0].verification_spec.source == "needs_generation"
+
+
+def test_partial_existing_test_mapping_falls_back_to_test_generation():
+    raw = ('[{"name":"pages","behavior":"all pages return",'
+           '"acceptance_cases":[{"id":"AC1","given":"pages","when":"listed","then":"none skipped"},'
+           '{"id":"AC2","given":"an empty page","when":"listed","then":"an empty response"}],'
+           '"test_selectors":["tests/test_api.py::test_lists_all_pages"],"depends_on":[], '
+           '"case_selectors":{"AC1":["tests/test_api.py::test_lists_all_pages"]}}]')
+
+    plans = parse_plan(raw, test_catalog=_catalog())
+
+    assert plans is not None
+    assert plans[0].verification_spec.source == "needs_generation"
+    assert not plans[0].verification_spec.selectors
+    assert not plans[0].verification_spec.case_selectors
 
 
 def test_worker_scope_gate_rejects_changed_dirty_files_and_new_outside_scope(monkeypatch, tmp_path):
@@ -89,6 +106,43 @@ def test_plan_rejects_a_code_task_grounded_only_in_requirement_text():
     assert parse_plan(raw, test_catalog=_catalog(), discovery_manifest=manifest) is None
 
 
+def test_plan_derives_source_evidence_refs_from_a_code_scope():
+    manifest = {
+        "repo_files": ["docs/requirements.md", "src/app.ts"],
+        "evidence": [
+            {"id": "E1", "path": "docs/requirements.md"},
+            {"id": "E2", "path": "src/app.ts"},
+        ],
+    }
+    raw = ('[{"name":"queue","behavior":"queue messages",'
+           '"acceptance_cases":[{"id":"AC1","given":"running","when":"sent","then":"queued"}],'
+           '"depends_on":[],"scope_paths":["src/app.ts"],"evidence_refs":["E1"],'
+           '"test_strategy":"generated focused test"}]')
+
+    plans = parse_plan(raw, test_catalog=_catalog(), discovery_manifest=manifest)
+
+    assert plans is not None
+    assert plans[0].evidence_refs == ("E1", "E2")
+
+
+def test_parse_plan_reports_all_task_contract_errors():
+    manifest = {"repo_files": ["src/app.ts"], "evidence": [{"id": "E1", "path": "src/app.ts"}]}
+    raw = ('[{"name":"one","behavior":"first",'
+           '"acceptance_cases":[{"id":"AC1","given":"x","when":"y","then":"z"}],"depends_on":[]},'
+           '{"name":"two","behavior":"second",'
+           '"acceptance_cases":[{"id":"AC1","given":"x","when":"y","then":"z"}],'
+           '"depends_on":[],"scope_paths":["outside"],"test_strategy":"focused"}]')
+
+    from harness.goal.planner import _parse_plan_result
+    plans, error = _parse_plan_result(raw, test_catalog=_catalog(), discovery_manifest=manifest)
+
+    assert plans is None
+    assert error is not None
+    assert "Task 1 (one) is missing scope_paths" in error
+    assert "Task 1 (one) is missing test_strategy" in error
+    assert "Task 2 (two) scope_paths must be discovered workspace files or directories" in error
+
+
 def test_discovery_readiness_ignores_agent_gap_prose_when_source_evidence_exists():
     manifest = {
         "evidence": [
@@ -139,13 +193,15 @@ def test_discovery_readiness_ignores_external_and_generic_role_gap_prose():
     assert discovery_readiness_error(manifest) is None
 
 
-def test_plan_rejects_empty_acceptance_case_selector_mapping():
+def test_empty_existing_case_mapping_falls_back_to_test_generation():
     raw = ('[{"name":"pages","behavior":"all pages return",'
            '"acceptance_cases":[{"id":"AC1","given":"pages","when":"listed","then":"none skipped"}],'
            '"test_selectors":["tests/test_api.py::test_lists_all_pages"],"depends_on":[],'
            '"case_selectors":{"AC1":[]}}]')
 
-    assert parse_plan(raw, test_catalog=_catalog()) is None
+    plans = parse_plan(raw, test_catalog=_catalog())
+    assert plans is not None
+    assert plans[0].verification_spec.source == "needs_generation"
 
 
 def test_unknown_selector_requires_test_generation():

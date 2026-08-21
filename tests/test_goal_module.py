@@ -90,6 +90,32 @@ def test_planner_retries_once_with_the_contract_error_and_accepts_the_repair():
     assert "needs 1-8 valid acceptance_cases" in calls[1]["prompt"]
 
 
+def test_planner_repair_receives_all_contract_errors_at_once():
+    calls = []
+
+    def planner(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            return (
+                '[{"name":"one","behavior":"first",'
+                '"acceptance_cases":[{"id":"AC1","given":"x","when":"y","then":"z"}],"depends_on":[]},'
+                '{"name":"two","behavior":"second",'
+                '"acceptance_cases":[{"id":"AC1","given":"x","when":"y","then":"z"}],"depends_on":[]}]'
+            )
+        return (
+            '[{"name":"one","behavior":"first",'
+            '"acceptance_cases":[{"id":"AC1","given":"x","when":"y","then":"z"}],'
+            '"depends_on":[],"scope_paths":["src/app.ts"],"test_strategy":"focused test"}]'
+        )
+
+    manifest = {"repo_files": ["src/app.ts"], "evidence": [{"id": "E1", "path": "src/app.ts"}]}
+    plans = plan_tasks("fix it", "pytest -q", planner_runner=planner, discovery_manifest=manifest)
+
+    assert len(plans) == 1
+    assert "Task 1 (one) is missing scope_paths" in calls[1]["prompt"]
+    assert "Task 2 (two) is missing scope_paths" in calls[1]["prompt"]
+
+
 def test_planner_does_not_cap_a_large_goal_at_eight_tasks():
     entries = []
     for index in range(20):

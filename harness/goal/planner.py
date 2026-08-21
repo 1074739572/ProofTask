@@ -25,7 +25,7 @@ PLANNER_AGENT = "goal_planner"
 PLANNER_MAX_ROUNDS = 1
 PLANNER_MAX_OUTPUT_TOKENS = 32_000
 PLANNER_FORMAT_RETRY_MAX_ROUNDS = 1
-PLANNER_REPAIR_INPUT_LIMIT = 16_000
+PLANNER_REPAIR_INPUT_LIMIT = 24_000
 MAX_BEHAVIOR_CHARS = 600
 MAX_ACCEPTANCE_CASES = 8
 MAX_SKILLS_PER_TASK = 2
@@ -402,8 +402,8 @@ def build_plan_prompt(
         "- The catalog below was collected by the system. A selector is valid only if it "
         "appears there exactly.\n"
         "- Never emit a verification command. The system builds it from test_selectors.\n"
-        "- If no catalog selector proves an acceptance case, use an empty test_selectors "
-        "array. That explicitly requests a later test-generation phase.\n"
+        "- Use existing test_selectors only when every acceptance case has an exact case_selectors mapping. "
+        "Otherwise use an empty test_selectors array; the system will generate focused tests later.\n"
         "- Do not invent files, paths, commands, or selectors.\n\n"
         f"{catalog_text}\n\n"
         f"{manifest_text}\n\n"
@@ -413,7 +413,7 @@ def build_plan_prompt(
         "- Each Task is independently implementable and machine-verifiable.\n"
         "- Each Task must include 1-8 concrete acceptance_cases using given/when/then; split a Task that needs more.\n"
         "- depends_on lists names of earlier Tasks only.\n"
-        "- scope_paths must be selected from scope_candidates or evidence.path; evidence_refs must cite evidence IDs, including at least one cited source-code fact for a code Task.\n"
+        "- scope_paths must be selected from scope_candidates or evidence.path. The system derives evidence_refs from that scope; include extra evidence IDs only when they add requirement context.\n"
         "- test_strategy must explain how each acceptance case will be verified.\n"
         "- case_selectors maps each acceptance case id to exact catalog selectors; never claim coverage without a mapping.\n"
         "- Keep related implementation details together, but preserve independently testable deliverables as separate Tasks.\n"
@@ -483,8 +483,25 @@ def _spec_from_entry(
         if isinstance(raw_mapping, dict) and isinstance(case, str) and isinstance(values, (list, tuple))
     } if isinstance(raw_mapping, dict) else {}
 
+    # Existing tests prove a Task only when every acceptance case is mapped to
+    # a collected selector. A partial mapping is useful planning context, but
+    # it is not proof: route that Task to focused test generation instead of
+    # rejecting the complete Goal plan.
+    mapping_is_complete = (
+        bool(cases)
+        and all(case_selectors.get(case.id) for case in cases)
+        and all(
+            selector in requested
+            for selectors in case_selectors.values()
+            for selector in selectors
+        )
+    )
     # Modern planner output is grounded only against an actual Test Catalog.
-    if catalog and catalog.available and requested and all(catalog.contains(item) for item in requested):
+    if (
+        catalog and catalog.available and requested
+        and all(catalog.contains(item) for item in requested)
+        and mapping_is_complete
+    ):
         files = tuple(dict.fromkeys(item.split("::", 1)[0] for item in requested))
         adapter = verification_adapter
         adapter_id = getattr(adapter, "id", getattr(catalog, "adapter", "pytest"))
@@ -502,13 +519,38 @@ def _spec_from_entry(
             case_selectors=case_selectors,
         )
     adapter_id = getattr(verification_adapter, "id", getattr(catalog, "adapter", "pytest"))
-    return VerificationSpec(adapter=adapter_id, source="needs_generation", case_selectors=case_selectors)
+    return VerificationSpec(adapter=adapter_id, source="needs_generation")
+
+
+def _inferred_evidence_refs(scopes: tuple[str, ...], discovery_manifest: dict[str, Any]) -> tuple[str, ...]:
+    """Select durable evidence for the Planner's declared workspace scope.
+
+    Evidence ids are bookkeeping identifiers, not product decisions. Deriving
+    them here avoids making a valid Task depend on a model copying ``E17``
+    correctly while preserving the source-evidence gate below.
+    """
+    refs: list[str] = []
+    for item in discovery_manifest.get("evidence", []):
+        if not isinstance(item, dict):
+            continue
+        evidence_id = str(item.get("id") or "").strip()
+        path = str(item.get("path") or "").replace("\\", "/").strip()
+        if not evidence_id or not path:
+            continue
+        if any(path == scope or path.startswith(scope.rstrip("/") + "/") for scope in scopes):
+            refs.append(evidence_id)
+    return tuple(dict.fromkeys(refs))
+
+
+def _contract_error_text(errors: list[str]) -> str:
+    unique = list(dict.fromkeys(errors))[:24]
+    return "Plan contract errors:\n" + "\n".join(f"- {error}" for error in unique)
 
 
 def _parse_plan_result(
     raw: str, *, test_catalog=None, discovery_manifest: dict[str, Any] | None = None, verification_adapter=None,
 ) -> tuple[list[TaskPlan] | None, str | None]:
-    """Parse a plan and retain the first contract failure for a repair retry."""
+    """Parse planner output and collect all repairable contract errors."""
     block = _extract_json_array(_strip_agent_header(raw or ""))
     if block is None:
         return None, "response does not contain a complete JSON array"
@@ -521,30 +563,30 @@ def _parse_plan_result(
     if discovery_readiness_error(discovery_manifest):
         return None, discovery_readiness_error(discovery_manifest)
     plans: list[TaskPlan] = []
+    errors: list[str] = []
     names: set[str] = set()
     for index, entry in enumerate(data, start=1):
         label = f"Task {index}"
         if not isinstance(entry, dict):
-            return None, f"{label} must be a JSON object"
+            errors.append(f"{label} must be a JSON object")
+            continue
         name = str(entry.get("name") or "").strip()[:80]
         behavior = str(entry.get("behavior") or "").strip()[:MAX_BEHAVIOR_CHARS]
         if not name or not behavior or name in names:
-            return None, f"{label} needs a unique non-empty name and behavior"
+            errors.append(f"{label} needs a unique non-empty name and behavior")
+            continue
         label = f"Task {index} ({name})"
         cases = _parse_acceptance_cases(entry.get("acceptance_cases"))
         if not cases:
-            return None, f"{label} needs 1-{MAX_ACCEPTANCE_CASES} valid acceptance_cases"
+            errors.append(f"{label} needs 1-{MAX_ACCEPTANCE_CASES} valid acceptance_cases")
+            continue
         dependencies = _normalise_strings(entry.get("depends_on"))
         if any(dependency not in names for dependency in dependencies):
-            return None, f"{label} depends_on must list only earlier Task names"
+            errors.append(f"{label} depends_on must list only earlier Task names")
+            continue
         spec = _spec_from_entry(entry, test_catalog, cases, verification_adapter)
-        if spec.source == "discovered":
-            if any(not spec.case_selectors.get(case.id) for case in cases):
-                return None, f"{label} must map every acceptance case to a collected selector"
-            if any(selector not in spec.selectors for values in spec.case_selectors.values() for selector in values):
-                return None, f"{label} case_selectors contains a selector outside test_selectors"
         scopes = _normalise_strings(entry.get("scope_paths"))
-        refs = _normalise_strings(entry.get("evidence_refs"))
+        requested_refs = _normalise_strings(entry.get("evidence_refs"))
         strategy = str(entry.get("test_strategy") or "")[:1000]
         if discovery_manifest is not None:
             evidence_ids = {str(item.get("id")) for item in discovery_manifest.get("evidence", []) if isinstance(item, dict)}
@@ -556,22 +598,20 @@ def _parse_plan_result(
                 and any(path == scope or path.startswith(scope.rstrip("/") + "/") for path in file_paths)
                 for scope in scopes
             )
-            if (
-                not scopes or not refs or not strategy or not scopes_valid
-                or not set(refs).issubset(evidence_ids)
-                or not _task_has_source_evidence(scopes, refs, discovery_manifest)
-            ):
-                if not scopes:
-                    return None, f"{label} is missing scope_paths"
-                if not refs:
-                    return None, f"{label} is missing evidence_refs"
-                if not strategy:
-                    return None, f"{label} is missing test_strategy"
-                if not scopes_valid:
-                    return None, f"{label} scope_paths must be discovered workspace files or directories"
-                if not set(refs).issubset(evidence_ids):
-                    return None, f"{label} evidence_refs contains an unknown evidence ID"
-                return None, f"{label} must cite source-code evidence for its code scope"
+            refs = tuple(dict.fromkeys(
+                [ref for ref in requested_refs if ref in evidence_ids]
+                + list(_inferred_evidence_refs(scopes, discovery_manifest))
+            ))
+            if not scopes:
+                errors.append(f"{label} is missing scope_paths")
+            if not strategy:
+                errors.append(f"{label} is missing test_strategy")
+            if scopes and not scopes_valid:
+                errors.append(f"{label} scope_paths must be discovered workspace files or directories")
+            if scopes and scopes_valid and not _task_has_source_evidence(scopes, refs, discovery_manifest):
+                errors.append(f"{label} has no source-code evidence for its code scope")
+        else:
+            refs = requested_refs
         selected_skills = _normalise_skill_names(entry.get("skills"))
         if not selected_skills:
             selected_skills = _recommended_skill_names(name, behavior, spec)
@@ -590,6 +630,8 @@ def _parse_plan_result(
             )
         )
         names.add(name)
+    if errors:
+        return None, _contract_error_text(errors)
     return plans, None
 
 
