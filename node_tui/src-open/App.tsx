@@ -19,6 +19,7 @@ import {
   goalIsActive,
   goalSnapshotFromEvent,
   mergeGoalDiscoveryEvent,
+  mergeGoalDraftAgentEvent,
   type GoalDecision,
   type GoalDraftSnapshot,
   type GoalSnapshot,
@@ -627,13 +628,15 @@ function LogView(props: {entries: () => Entry[]; now: () => number; active: () =
 type DebugEntries = Entry[] | (() => Entry[]);
 type DebugFlag = boolean | (() => boolean);
 type DebugGoal = GoalSnapshot | null | (() => GoalSnapshot | null);
+type DebugDraft = GoalDraftSnapshot | null | (() => GoalDraftSnapshot | null);
+type DebugDecisions = GoalDecision[] | (() => GoalDecision[]);
 type OfflineMessage = {text: string; goalContext: boolean};
 
 function resolveDebugValue<T>(value: T | (() => T) | undefined): T | undefined {
   return typeof value === 'function' ? (value as () => T)() : value;
 }
 
-export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal; debugRunning?: DebugFlag; debugStartedAt?: number; debugOverlay?: Overlay; debugUsage?: {input: number; output: number; cacheRead: number; contextUsed?: number; contextWindow?: number}; debugEffort?: {value: string; label: string; options: OverlayOption[]}; debugWelcome?: {quote: string; art: string[]}; debugUsageOpen?: boolean; debugUsageRange?: UsageRange}) {
+export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal; debugDraft?: DebugDraft; debugDecisions?: DebugDecisions; debugRunning?: DebugFlag; debugStartedAt?: number; debugOverlay?: Overlay; debugUsage?: {input: number; output: number; cacheRead: number; contextUsed?: number; contextWindow?: number}; debugEffort?: {value: string; label: string; options: OverlayOption[]}; debugWelcome?: {quote: string; art: string[]}; debugUsageOpen?: boolean; debugUsageRange?: UsageRange}) {
   const dims = useTerminalDimensions();
   const initialDebugEntries = resolveDebugValue(props?.debugEntries) ?? [];
   const [entries, setEntries] = createSignal<Entry[]>(initialDebugEntries); const [input, setInput] = createSignal('');
@@ -645,12 +648,13 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
   const [todayInput, setTodayInput] = createSignal(props?.debugUsage?.input ?? 0); const [todayOutput, setTodayOutput] = createSignal(props?.debugUsage?.output ?? 0); const [todayCacheRead, setTodayCacheRead] = createSignal(props?.debugUsage?.cacheRead ?? 0);
   const [contextUsed, setContextUsed] = createSignal(props?.debugUsage?.contextUsed ?? 0); const [contextWindow, setContextWindow] = createSignal(props?.debugUsage?.contextWindow ?? 0);
   const [goalSnapshot, setGoalSnapshot] = createSignal<GoalSnapshot | null>(resolveDebugValue(props?.debugGoal) ?? null);
-  const [lifecycleView, setLifecycleView] = createSignal<'goal' | 'draft' | 'chat'>(goalSnapshot() ? 'goal' : 'chat');
+  const initialDebugDraft = resolveDebugValue(props?.debugDraft) ?? null;
+  const [lifecycleView, setLifecycleView] = createSignal<'goal' | 'draft' | 'chat'>(goalSnapshot() ? 'goal' : initialDebugDraft ? 'draft' : 'chat');
   // A consumed/discarded draft may still have late heartbeat events from the
   // foreground operation. Ignore those events until a genuinely new draft id
   // arrives, otherwise the old Draft page can resurrect after Goal start.
   const closedDraftIds = new Set<string>();
-  const [goalDecisions, setGoalDecisions] = createSignal<GoalDecision[]>([]);
+  const [goalDecisions, setGoalDecisions] = createSignal<GoalDecision[]>(resolveDebugValue(props?.debugDecisions) ?? []);
   const [usageOpen, setUsageOpen] = createSignal(props?.debugUsageOpen ?? false);
   const [usageRange, setUsageRange] = createSignal<UsageRange>(props?.debugUsageRange ?? 7);
   const [usageRevision, setUsageRevision] = createSignal(0);
@@ -688,20 +692,21 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
   // visible until the first real submit — background backend logs must not
   // dismiss it, which is why this is not keyed off entries().length. Debug
   // renders inject a transcript directly, so they skip the welcome panel.
-  const [userStarted, setUserStarted] = createSignal(props?.debugEntries != null);
+  const hasDebugLifecycle = props?.debugEntries != null || props?.debugGoal != null || props?.debugDraft != null;
+  const [userStarted, setUserStarted] = createSignal(hasDebugLifecycle);
   // Backend readiness. The welcome panel renders immediately with a local
   // quote; when the backend's first event lands we mark it ready and swap in
   // the real daily quote. Nothing blocks on startup. Debug renders inject
   // entries directly and have no real backend, so they start ready.
-  const [backendReady, setBackendReady] = createSignal(props?.debugEntries != null);
-  const [backendState, setBackendState] = createSignal<BackendConnectionState>(props?.debugEntries != null ? 'connected' : 'disconnected');
+  const [backendReady, setBackendReady] = createSignal(hasDebugLifecycle);
+  const [backendState, setBackendState] = createSignal<BackendConnectionState>(hasDebugLifecycle ? 'connected' : 'disconnected');
   const [backendExitCode, setBackendExitCode] = createSignal<number | null>(null);
   const [queuedMessages, setQueuedMessages] = createSignal(0);
   const [offlineMessages, setOfflineMessages] = createSignal<OfflineMessage[]>([]);
   const [currentTool, setCurrentTool] = createSignal<string | null>(null);
   const [toolDone, setToolDone] = createSignal(0);
   const [toolTotal, setToolTotal] = createSignal(0);
-  const [draftStatus, setDraftStatus] = createSignal<GoalDraftSnapshot | null>(null);
+  const [draftStatus, setDraftStatus] = createSignal<GoalDraftSnapshot | null>(initialDebugDraft);
   const [pastedContent, setPastedContent] = createSignal<PasteSnapshot | null>(null);
   let lastBufferValue = '';
   let lastBufferChangedAt = 0;
@@ -918,20 +923,35 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
         text: shortGoalDecision(value(event, 'description'), goalPhaseIntent(snapshot)),
         status: 'active' as const,
         at: Date.now(),
+        startedAt: Date.now(),
+        tools: [],
       },
     ].slice(-8));
   };
-  const recordGoalSubagentRound = (id: string, text: string) => setGoalDecisions(previous => {
+  const recordGoalSubagentRound = (id: string, text: string, round?: number) => setGoalDecisions(previous => {
     const active = [...previous].reverse().find(item => item.runId === id && item.status === 'active');
     if (!active) return previous;
     const nextText = shortGoalDecision(text, active.text);
     if (nextText === active.text) return previous;
     return [
       ...previous.map(item => item.id === active.id ? {...item, status: 'done' as const} : item),
-      {...active, id: `${id}-round-${Date.now()}`, text: nextText, status: 'active' as const, at: Date.now()},
+      {...active, id: `${id}-round-${Date.now()}`, text: nextText, status: 'active' as const, round: Number.isFinite(round) ? round : (active.round || 0) + 1, at: Date.now()},
     ].slice(-8);
   });
-  const recordGoalSubagentEnd = (id: string, summary: string) => setGoalDecisions(previous => previous.map(item => {
+  const recordGoalSubagentTool = (id: string, event: any) => setGoalDecisions(previous => previous.map(item => {
+    if (item.runId !== id || item.status !== 'active') return item;
+    const name = value(event, 'name') || 'tool';
+    const runningMatch = [...(item.tools || [])].reverse().find(value => value.name === name && value.status === 'running');
+    const toolId = value(event, 'tool_use_id') || (event.ok !== null && event.ok !== undefined ? runningMatch?.id : '') || `${name}-${(item.tools || []).length}`;
+    const status = event.ok === null || event.ok === undefined ? 'running' : (event.ok ? 'done' : 'failed');
+    const tool = {id: toolId, name, summary: value(event, 'summary'), status: status as 'running' | 'done' | 'failed'};
+    const existing = (item.tools || []).findIndex(value => value.id === toolId);
+    const tools = existing >= 0
+      ? (item.tools || []).map((value, index) => index === existing ? tool : value)
+      : [...(item.tools || []), tool].slice(-6);
+    return {...item, tools, at: Date.now()};
+  }));
+  const recordGoalSubagentEnd = (id: string, summary: string, elapsed?: number) => setGoalDecisions(previous => previous.map(item => {
     if (item.runId !== id || item.status !== 'active') return item;
     const failed = /^(failed|stopped):/i.test(summary.trim());
     return {
@@ -939,6 +959,7 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
       text: shortGoalDecision(summary, item.text),
       status: failed ? 'failed' as const : 'done' as const,
       at: Date.now(),
+      elapsed: Number.isFinite(elapsed) ? elapsed : item.elapsed,
     };
   }));
   // Bash can emit hundreds of output lines per second. Accumulate them until
@@ -1040,6 +1061,13 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
   const handleBackendEvent = (event: any) => {
     try {
       if (firstEvent) { firstEvent = false; setBackendReady(true); }
+      if (String(event?.type || '').startsWith('subagent_')) {
+        const draft = draftStatus();
+        if (draft) {
+          const nextDraft = mergeGoalDraftAgentEvent(draft, event);
+          if (nextDraft !== draft) setDraftStatus(nextDraft);
+        }
+      }
       switch (event.type) {
       case 'session_status': {
         setModel(value(event, 'model') || 'model'); setMode(value(event, 'mode') || 'mode'); setCwd(value(event, 'cwd', 'working_dir')); setSession(value(event, 'session', 'session_id'));
@@ -1167,9 +1195,9 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
       case 'tool_output': { const id = value(event, 'id', 'call_id', 'tool_call_id'); const line = value(event, 'line'); if (!line) break; queueOutput(id || 'unknown', line); break; }
       case 'tool_end': { const id = value(event, 'id', 'call_id', 'tool_call_id'); const ts = Number(event.ts || 0) * 1000 || Date.now(); flushLiveBuffers(); setCurrentTool(null); setToolDone(done => done + 1); const target = (id ? entries().find(x => x.id === id) : [...entries()].reverse().find(x => x.kind === 'action' && !x.done)); if (target) update(target.id, x => ({...x, detail: value(event, 'summary') || (event.ok ? 'completed' : 'failed'), done: true, ok: Boolean(event.ok), end: ts})); break; }
       case 'subagent_start': { promoteResponseToIntent(); begin('subagent'); const id = value(event, 'id') || `subagent-${++actionCounter}`; const ts = Number(event.ts || 0) * 1000 || Date.now(); add({id, kind: 'subagent', text: value(event, 'description') || 'subagent task', agentType: value(event, 'agent_type') || 'agent', model: value(event, 'model') || 'model', status: 'running', rounds: [], tools: [], start: ts, expanded: true}); recordGoalSubagentStart(event, id); break; }
-      case 'subagent_round': { const id = value(event, 'id'); const roundText = value(event, 'text'); const label = roundText ? `Round ${Number(event.round || 0)} · "${roundText}"` : `Round ${Number(event.round || 0)}`; update(id, x => x.kind === 'subagent' ? {...x, rounds: [...(x.rounds || []), label]} : x); recordGoalSubagentRound(id, roundText); break; }
-      case 'subagent_tool': { const id = value(event, 'id'); const toolId = value(event, 'tool_use_id') || `${value(event, 'name')}-${Date.now()}`; const status = event.ok === null || event.ok === undefined ? 'running' : (event.ok ? 'done' : 'failed'); const name = value(event, 'name') || 'tool'; const summary = value(event, 'summary'); update(id, x => { if (x.kind !== 'subagent') return x; const tools = x.tools || []; const idx = tools.findIndex(tool => tool.id === toolId); const nextTool = {id: toolId, name, summary, status: status as SubagentStatus}; const nextTools = idx >= 0 ? tools.map((tool, i) => i === idx ? {...tool, ...nextTool} : tool) : [...tools, nextTool]; return {...x, tools: nextTools, toolCount: nextTools.length}; }); break; }
-      case 'subagent_end': { const id = value(event, 'id'); const ts = Number(event.ts || 0) * 1000 || Date.now(); const summary = value(event, 'summary'); update(id, x => x.kind === 'subagent' ? {...x, status: event.ok ? 'done' : 'failed', done: true, ok: Boolean(event.ok), end: ts, toolCount: Number(event.tools || x.toolCount || 0), elapsed: Number(event.elapsed || 0), summary} : x); recordGoalSubagentEnd(id, summary); break; }
+      case 'subagent_round': { const id = value(event, 'id'); const roundText = value(event, 'text'); const label = roundText ? `Round ${Number(event.round || 0)} · "${roundText}"` : `Round ${Number(event.round || 0)}`; update(id, x => x.kind === 'subagent' ? {...x, rounds: [...(x.rounds || []), label]} : x); recordGoalSubagentRound(id, roundText, Number(event.round)); break; }
+      case 'subagent_tool': { const id = value(event, 'id'); const toolId = value(event, 'tool_use_id') || `${value(event, 'name')}-${Date.now()}`; const status = event.ok === null || event.ok === undefined ? 'running' : (event.ok ? 'done' : 'failed'); const name = value(event, 'name') || 'tool'; const summary = value(event, 'summary'); update(id, x => { if (x.kind !== 'subagent') return x; const tools = x.tools || []; const idx = tools.findIndex(tool => tool.id === toolId); const nextTool = {id: toolId, name, summary, status: status as SubagentStatus}; const nextTools = idx >= 0 ? tools.map((tool, i) => i === idx ? {...tool, ...nextTool} : tool) : [...tools, nextTool]; return {...x, tools: nextTools, toolCount: nextTools.length}; }); recordGoalSubagentTool(id, event); break; }
+      case 'subagent_end': { const id = value(event, 'id'); const ts = Number(event.ts || 0) * 1000 || Date.now(); const summary = value(event, 'summary'); update(id, x => x.kind === 'subagent' ? {...x, status: event.ok ? 'done' : 'failed', done: true, ok: Boolean(event.ok), end: ts, toolCount: Number(event.tools || x.toolCount || 0), elapsed: Number(event.elapsed || 0), summary} : x); recordGoalSubagentEnd(id, summary, Number(event.elapsed)); break; }
       case 'goal_started': {
         const snapshot = goalSnapshotFromEvent(event, goalSnapshot());
         if (snapshot) { setGoalSnapshot(snapshot); syncGoalDecisionPhase(snapshot); }
@@ -1502,7 +1530,7 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
           <WelcomeView width={dims().width} height={viewportHeight()} quote={welcomeQuote()} />
         </Show>
       }>
-        <GoalDraftView draft={draftStatus()!} width={dims().width} height={viewportHeight()} />
+        <GoalDraftView draft={draftStatus()!} now={now()} width={dims().width} height={viewportHeight()} />
       </Show>
     }>
       <GoalView goal={goalSnapshot()!} decisions={goalDecisions()} now={now()} width={dims().width} height={viewportHeight()} />

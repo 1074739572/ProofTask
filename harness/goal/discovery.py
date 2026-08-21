@@ -424,6 +424,8 @@ def _emit_discovery_job(goal_id: str, job: DiscoveryJob | None, *, event: str, *
                 "error": (job.error or "")[:1_000],
                 "retryable": job.retryable,
                 "report_path": job.report_path,
+                "started_at": job.started_at,
+                "finished_at": job.finished_at,
             })
         payload.update(extra)
         emit("goal_discovery_job", **payload)

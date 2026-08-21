@@ -75,6 +75,39 @@ export type GoalDraftTaskSummary = {
 
 export type GoalClarification = {question: string; answer: string};
 
+export type GoalAgentToolSnapshot = {
+  id: string;
+  name: string;
+  summary: string;
+  status: 'running' | 'done' | 'failed';
+  at?: number;
+};
+
+export type GoalAgentRoundSnapshot = {
+  round: number;
+  text: string;
+  at?: number;
+};
+
+export type GoalAgentSnapshot = {
+  id: string;
+  agent_type: string;
+  role: string;
+  stage: string;
+  model?: string;
+  description: string;
+  status: 'running' | 'done' | 'failed';
+  rounds: GoalAgentRoundSnapshot[];
+  tools: GoalAgentToolSnapshot[];
+  tool_count: number;
+  summary?: string;
+  started_at?: number;
+  updated_at?: number;
+  finished_at?: number;
+  elapsed?: number;
+  event_seq?: number;
+};
+
 export type GoalDiscoveryJobSnapshot = {
   id: string;
   role: string;
@@ -84,6 +117,8 @@ export type GoalDiscoveryJobSnapshot = {
   tools: string[];
   error?: string;
   report_path?: string;
+  started_at?: number;
+  finished_at?: number;
   event_seq?: number;
   event_ts?: number;
 };
@@ -112,6 +147,7 @@ export type GoalDraftSnapshot = {
   question_count: number;
   task_count: number;
   tasks: GoalDraftTaskSummary[];
+  agents: GoalAgentSnapshot[];
   discovery_jobs: GoalDiscoveryJobSnapshot[];
   discovery_completed?: number;
   discovery_total?: number;
@@ -153,6 +189,29 @@ function eventIsOlder(current: {updated_at?: number; event_ts?: number; event_se
   const nextSeq = finiteNumber(event?.seq);
   const currentSeq = finiteNumber(current.event_seq);
   return nextSeq > 0 && currentSeq > 0 && nextSeq <= currentSeq;
+}
+
+function draftStageForAgent(agentType: string): string {
+  if (agentType === 'goal_intake') return 'intake';
+  if (agentType === 'goal_planner') return 'planning';
+  if (agentType.startsWith('goal_discovery_')) return 'discovering';
+  if (agentType === 'goal_test_writer') return 'prepare_tests';
+  return 'working';
+}
+
+function draftRoleForAgent(agentType: string): string {
+  if (agentType.startsWith('goal_discovery_')) return agentType.slice('goal_discovery_'.length);
+  return agentType.replace(/^goal_/, '');
+}
+
+function eventTimestamp(event: any, fallback?: number): number | undefined {
+  const value = finiteNumber(event?.ts);
+  return value > 0 ? value : fallback;
+}
+
+function subagentFailed(event: any): boolean {
+  if (event?.ok === false) return true;
+  return /^(?:failed|stopped|error):/i.test(stringValue(event?.summary).trim());
 }
 
 export function goalIsActive(goal: GoalSnapshot | null | undefined): boolean {
@@ -268,6 +327,7 @@ export function goalDraftSnapshotFromEvent(event: any, current: GoalDraftSnapsho
     question_count: has(event, 'question_count') ? finiteNumber(event.question_count) : (base?.question_count ?? 0),
     task_count: has(event, 'task_count') ? finiteNumber(event.task_count) : (base?.task_count ?? 0),
     tasks: Array.isArray(event?.tasks) ? event.tasks : (base?.tasks ?? []),
+    agents: base?.agents ?? [],
     discovery_jobs: base?.discovery_jobs ?? [],
     discovery_completed: base?.discovery_completed,
     discovery_total: base?.discovery_total,
@@ -301,6 +361,12 @@ export function mergeGoalDiscoveryEvent(draft: GoalDraftSnapshot, event: any): G
     tools: Array.isArray(event?.tools) ? event.tools.map(stringValue).filter(Boolean) : (existing?.tools ?? ['read_file']),
     error: stringValue(event?.error) || existing?.error,
     report_path: stringValue(event?.report_path) || existing?.report_path,
+    started_at: has(event, 'started_at')
+      ? finiteNumber(event.started_at)
+      : (kind === 'started' ? eventTimestamp(event, existing?.started_at) : existing?.started_at),
+    finished_at: has(event, 'finished_at')
+      ? finiteNumber(event.finished_at)
+      : (kind === 'completed' || kind === 'failed' ? eventTimestamp(event, existing?.finished_at) : existing?.finished_at),
     event_seq: has(event, 'seq') ? finiteNumber(event.seq) : existing?.event_seq,
     event_ts: has(event, 'ts') ? finiteNumber(event.ts) : existing?.event_ts,
   };
@@ -308,4 +374,85 @@ export function mergeGoalDiscoveryEvent(draft: GoalDraftSnapshot, event: any): G
     ? draft.discovery_jobs.map(job => job.id === id ? next : job)
     : [...draft.discovery_jobs, next];
   return {...draft, discovery_jobs: jobs};
+}
+
+export function mergeGoalDraftAgentEvent(draft: GoalDraftSnapshot, event: any): GoalDraftSnapshot {
+  const type = stringValue(event?.type);
+  if (!type.startsWith('subagent_')) return draft;
+  const id = stringValue(event?.id);
+  if (!id) return draft;
+  const index = draft.agents.findIndex(agent => agent.id === id);
+  const current = index >= 0 ? draft.agents[index] : undefined;
+  const at = eventTimestamp(event, current?.updated_at);
+
+  let next: GoalAgentSnapshot | undefined;
+  if (type === 'subagent_start') {
+    const agentType = stringValue(event?.agent_type);
+    if (!agentType.startsWith('goal_')) return draft;
+    next = {
+      id,
+      agent_type: agentType,
+      role: draftRoleForAgent(agentType),
+      stage: draftStageForAgent(agentType),
+      model: stringValue(event?.model) || undefined,
+      description: stringValue(event?.description) || '正在准备任务',
+      status: 'running',
+      rounds: [],
+      tools: [],
+      tool_count: 0,
+      started_at: at,
+      updated_at: at,
+      event_seq: has(event, 'seq') ? finiteNumber(event.seq) : undefined,
+    };
+  } else if (!current) {
+    return draft;
+  } else if (type === 'subagent_round') {
+    const round = finiteNumber(event?.round);
+    const item: GoalAgentRoundSnapshot = {round, text: stringValue(event?.text), at};
+    const existingRound = current.rounds.findIndex(value => value.round === round);
+    const rounds = existingRound >= 0
+      ? current.rounds.map((value, itemIndex) => itemIndex === existingRound ? item : value)
+      : [...current.rounds, item].slice(-6);
+    next = {...current, rounds, updated_at: at, event_seq: has(event, 'seq') ? finiteNumber(event.seq) : current.event_seq};
+  } else if (type === 'subagent_tool') {
+    const toolName = stringValue(event?.name) || 'tool';
+    const runningMatch = [...current.tools].reverse().find(value => value.name === toolName && value.status === 'running');
+    const toolId = stringValue(event?.tool_use_id)
+      || (event?.ok !== null && event?.ok !== undefined ? runningMatch?.id : '')
+      || `${toolName}-${current.tools.length}`;
+    const tool: GoalAgentToolSnapshot = {
+      id: toolId,
+      name: toolName,
+      summary: stringValue(event?.summary),
+      status: event?.ok === null || event?.ok === undefined ? 'running' : (event.ok ? 'done' : 'failed'),
+      at,
+    };
+    const existingTool = current.tools.findIndex(value => value.id === toolId);
+    const tools = existingTool >= 0
+      ? current.tools.map((value, itemIndex) => itemIndex === existingTool ? tool : value)
+      : [...current.tools, tool].slice(-8);
+    next = {
+      ...current,
+      tools,
+      tool_count: Math.max(current.tool_count, tools.length),
+      updated_at: at,
+      event_seq: has(event, 'seq') ? finiteNumber(event.seq) : current.event_seq,
+    };
+  } else if (type === 'subagent_end') {
+    next = {
+      ...current,
+      status: subagentFailed(event) ? 'failed' : 'done',
+      summary: stringValue(event?.summary) || current.summary,
+      tool_count: Math.max(current.tool_count, finiteNumber(event?.tools)),
+      elapsed: has(event, 'elapsed') ? finiteNumber(event.elapsed) : current.elapsed,
+      finished_at: at,
+      updated_at: at,
+      event_seq: has(event, 'seq') ? finiteNumber(event.seq) : current.event_seq,
+    };
+  }
+  if (!next) return draft;
+  const agents = index >= 0
+    ? draft.agents.map((agent, itemIndex) => itemIndex === index ? next! : agent)
+    : [...draft.agents, next].slice(-12);
+  return {...draft, agents};
 }

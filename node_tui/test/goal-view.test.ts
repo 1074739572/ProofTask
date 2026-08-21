@@ -3,6 +3,7 @@ import test from 'node:test';
 import {
   baselinePresentation,
   goalDecisionPresentation,
+  goalExecutionStageRail,
   gatePresentation,
   goalRegressionPresentation,
   goalStatusPresentation,
@@ -92,4 +93,11 @@ test('final regression only turns green with durable zero-exit evidence', () => 
     goalRegressionPresentation(goal({final_verification: {status: 'failed', exit_code: 1}})).tone,
     'error',
   );
+});
+
+test('execution rail marks the current agent position without hiding later gates', () => {
+  const rail = goalExecutionStageRail(goal({phase: 'evaluate'}));
+  assert.equal(rail.find(item => item.id === 'review')?.status, 'active');
+  assert.equal(rail.find(item => item.id === 'act')?.status, 'done');
+  assert.equal(rail.find(item => item.id === 'regression')?.status, 'pending');
 });

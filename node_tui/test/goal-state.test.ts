@@ -3,13 +3,17 @@ import test from 'node:test';
 import {
   goalBlocksChat,
   goalDraftEventShouldFocus,
+  goalDraftAgentRows,
+  goalDraftHeartbeatPresentation,
   goalDraftHasQuestion,
   goalDraftIsBusy,
+  goalDraftStageRail,
   goalDraftSnapshotFromEvent,
   goalEventShouldFocus,
   goalNextActionPresentation,
   goalSnapshotFromEvent,
   mergeGoalDiscoveryEvent,
+  mergeGoalDraftAgentEvent,
   type GoalDraftSnapshot,
   type GoalSnapshot,
 } from '../src-open/GoalView.tsx';
@@ -18,7 +22,7 @@ function draft(overrides: Partial<GoalDraftSnapshot> = {}): GoalDraftSnapshot {
   return {
     id: 'draft-1', target: 'add rate limits', status: 'clarifying', stage: 'intake',
     intake_assumptions: [], clarifications: [], question: '', question_index: 0,
-    question_count: 0, task_count: 0, tasks: [], discovery_jobs: [], ...overrides,
+    question_count: 0, task_count: 0, tasks: [], agents: [], discovery_jobs: [], ...overrides,
   };
 }
 
@@ -69,14 +73,65 @@ test('discovery events update one visible job instead of duplicating it', () => 
   assert(started);
   const withJob = mergeGoalDiscoveryEvent(started, {
     seq: 2, ts: 2, goal_id: 'draft-1', event: 'started', job_id: 'implementation-1', role: 'implementation',
-    read_path_count: 4, read_paths: ['src/a.py'], tools: ['read_file'],
+    read_path_count: 4, read_paths: ['src/a.py'], tools: ['read_file'], started_at: 1.5,
   });
   const completed = mergeGoalDiscoveryEvent(withJob, {
     seq: 3, ts: 3, goal_id: 'draft-1', event: 'completed', job_id: 'implementation-1', role: 'implementation',
+    finished_at: 2.5,
   });
   assert.equal(completed.discovery_jobs.length, 1);
   assert.equal(completed.discovery_jobs[0].status, 'done');
   assert.equal(completed.discovery_jobs[0].read_path_count, 4);
+  assert.equal(completed.discovery_jobs[0].started_at, 1.5);
+  assert.equal(completed.discovery_jobs[0].finished_at, 2.5);
+});
+
+test('draft subagent events become one live agent row with current work and tools', () => {
+  let snapshot = draft({status: 'discovering', stage: 'discovering', stage_started_at: 100, last_heartbeat: 108});
+  snapshot = mergeGoalDiscoveryEvent(snapshot, {
+    type: 'goal_discovery_job', seq: 1, ts: 100, goal_id: 'draft-1', event: 'started',
+    job_id: 'architecture-1', role: 'architecture', status: 'running', read_path_count: 6,
+    read_paths: ['src/app.ts'], tools: ['read_file'], started_at: 100,
+  });
+  snapshot = mergeGoalDraftAgentEvent(snapshot, {
+    type: 'subagent_start', seq: 2, ts: 101, id: 'run-1', agent_type: 'goal_discovery_architecture',
+    description: 'discover architecture evidence', model: 'deepseek-v4-pro',
+  });
+  snapshot = mergeGoalDraftAgentEvent(snapshot, {
+    type: 'subagent_round', seq: 3, ts: 102, id: 'run-1', round: 2, text: '正在确认事件流和状态归属',
+  });
+  snapshot = mergeGoalDraftAgentEvent(snapshot, {
+    type: 'subagent_tool', seq: 4, ts: 103, id: 'run-1',
+    name: 'read_file', summary: 'src/app.ts', ok: null,
+  });
+  snapshot = mergeGoalDraftAgentEvent(snapshot, {
+    type: 'subagent_tool', seq: 5, ts: 104, id: 'run-1',
+    name: 'read_file', summary: 'src/app.ts', ok: true,
+  });
+
+  assert.equal(snapshot.agents.length, 1);
+  assert.equal(snapshot.agents[0].tools.length, 1);
+  assert.equal(snapshot.agents[0].tools[0].status, 'done');
+  const rows = goalDraftAgentRows(snapshot, 110_000);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].label, '架构路径');
+  assert.equal(rows[0].status, 'running');
+  assert.equal(rows[0].activity, '正在确认事件流和状态归属');
+  assert.match(rows[0].meta, /第 2 轮/);
+  assert.match(rows[0].meta, /6 个文件/);
+});
+
+test('draft stage rail and heartbeat make slow discovery visible', () => {
+  const snapshot = draft({
+    status: 'discovering', stage: 'discovering', stage_started_at: 100, last_heartbeat: 105, stage_deadline: 200,
+  });
+  const rail = goalDraftStageRail(snapshot);
+  assert.equal(rail.find(item => item.id === 'discovering')?.status, 'active');
+  assert.equal(rail.find(item => item.id === 'planning')?.status, 'pending');
+  assert.equal(goalDraftHeartbeatPresentation(snapshot, 110_000).tone, 'success');
+  const stale = goalDraftHeartbeatPresentation(snapshot, 140_000);
+  assert.equal(stale.tone, 'error');
+  assert.match(stale.text, /可能停滞/);
 });
 
 test('older goal snapshots cannot replace a newer durable phase', () => {

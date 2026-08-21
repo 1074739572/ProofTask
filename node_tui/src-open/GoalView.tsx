@@ -10,7 +10,11 @@ export {
   goalSnapshotFromEvent,
   goalDraftSnapshotFromEvent,
   mergeGoalDiscoveryEvent,
+  mergeGoalDraftAgentEvent,
   type GoalAcceptanceCase,
+  type GoalAgentRoundSnapshot,
+  type GoalAgentSnapshot,
+  type GoalAgentToolSnapshot,
   type GoalClarification,
   type GoalDiscoveryJobSnapshot,
   type GoalDraftSnapshot,
@@ -23,6 +27,10 @@ export {
 } from './goal-state.ts';
 import {
   goalDraftHasQuestion,
+  goalDraftIsBusy,
+  type GoalAgentSnapshot,
+  type GoalAgentToolSnapshot,
+  type GoalDiscoveryJobSnapshot,
   type GoalDraftSnapshot,
   type GoalSnapshot,
   type GoalTaskSnapshot,
@@ -37,6 +45,10 @@ export type GoalDecision = {
   text: string;
   status: 'active' | 'done' | 'failed';
   at: number;
+  startedAt?: number;
+  elapsed?: number;
+  round?: number;
+  tools?: Array<{id: string; name: string; summary: string; status: 'running' | 'done' | 'failed'}>;
 };
 
 export type GoalTone = 'success' | 'warning' | 'error' | 'info' | 'muted';
@@ -194,6 +206,19 @@ export function goalRegressionPresentation(goal: GoalSnapshot): GoalPresentation
   return {tone: 'muted', icon: '○', text: '状态机结果：等待全部 Task 完成'};
 }
 
+function epochMs(value?: number | null): number {
+  if (!value || !Number.isFinite(value)) return 0;
+  return value < 10_000_000_000 ? value * 1000 : value;
+}
+
+function formatElapsedSeconds(value: number): string {
+  const seconds = Math.max(0, Math.floor(value));
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ${String(seconds % 60).padStart(2, '0')}s`;
+  return `${Math.floor(minutes / 60)}h ${String(minutes % 60).padStart(2, '0')}m`;
+}
+
 export type GoalNextAction = GoalPresentation & {command: string; detail: string};
 
 export function goalNextActionPresentation(goal: GoalSnapshot): GoalNextAction {
@@ -253,72 +278,305 @@ export function goalDraftNextActionPresentation(draft: GoalDraftSnapshot): GoalD
   return {tone: 'info', icon: '●', text: '后台处理中', command: '/goal pause', detail: '需要介入时可暂停；当前只读阶段不会写入实现。'};
 }
 
-function draftJobStatus(status: string): GoalPresentation {
-  if (status === 'done' || status === 'completed') return {tone: 'success', icon: '✓', text: '已完成'};
-  if (status === 'failed' || status === 'timeout' || status === 'cancelled') return {tone: 'error', icon: '×', text: '失败'};
-  if (status === 'running' || status === 'started') return {tone: 'info', icon: '●', text: '读取中'};
-  return {tone: 'muted', icon: '○', text: status || '等待'};
+type GoalRailStatus = 'done' | 'active' | 'pending' | 'blocked';
+export type GoalStageRailItem = {id: string; label: string; status: GoalRailStatus};
+
+const DRAFT_STAGES = [
+  {id: 'preflight', label: '受理'},
+  {id: 'catalog', label: '测试目录'},
+  {id: 'intake', label: '需求确认'},
+  {id: 'discovering', label: '仓库探索'},
+  {id: 'planning', label: '任务规划'},
+  {id: 'ready', label: '待批准'},
+] as const;
+
+function effectiveDraftStage(draft: GoalDraftSnapshot): string {
+  if (draft.stage === 'clarifying') return 'intake';
+  if (DRAFT_STAGES.some(item => item.id === draft.stage)) return draft.stage;
+  const lastAgent = [...(draft.agents || [])].sort((a, b) => (b.updated_at || 0) - (a.updated_at || 0))[0];
+  if (lastAgent?.stage && DRAFT_STAGES.some(item => item.id === lastAgent.stage)) return lastAgent.stage;
+  if (draft.discovery_jobs.length) return 'discovering';
+  if (draft.intake_summary) return 'intake';
+  return 'preflight';
 }
 
-export function GoalDraftView(props: {draft: GoalDraftSnapshot; width: number; height: number}) {
-  const compact = () => props.width < 76;
+export function goalDraftStageRail(draft: GoalDraftSnapshot): GoalStageRailItem[] {
+  const current = draft.status === 'ready' || draft.status === 'approved' ? 'ready' : effectiveDraftStage(draft);
+  const currentIndex = Math.max(0, DRAFT_STAGES.findIndex(item => item.id === current));
+  const blocked = draft.status === 'paused' || draft.status === 'failed' || draft.status === 'cancelled';
+  return DRAFT_STAGES.map((item, index) => ({
+    ...item,
+    status: index < currentIndex ? 'done' : index === currentIndex ? (blocked ? 'blocked' : 'active') : 'pending',
+  }));
+}
+
+export type GoalHeartbeatPresentation = GoalPresentation & {elapsed: string; deadline: string};
+
+export function goalDraftHeartbeatPresentation(draft: GoalDraftSnapshot, now = Date.now()): GoalHeartbeatPresentation {
+  const stageStarted = epochMs(draft.stage_started_at);
+  const heartbeat = epochMs(draft.last_heartbeat || draft.updated_at);
+  const deadline = epochMs(draft.stage_deadline);
+  const elapsedSeconds = stageStarted ? (now - stageStarted) / 1000 : 0;
+  const heartbeatAge = heartbeat ? Math.max(0, (now - heartbeat) / 1000) : Number.POSITIVE_INFINITY;
+  const busy = goalDraftIsBusy(draft);
+  let tone: GoalTone = 'muted';
+  let icon = '○';
+  let text = '等待阶段更新';
+  if (busy && heartbeatAge <= 10) {
+    tone = 'success'; icon = '●'; text = `心跳正常 · ${formatElapsedSeconds(heartbeatAge)} 前更新`;
+  } else if (busy && heartbeatAge <= 30) {
+    tone = 'warning'; icon = '!'; text = `${formatElapsedSeconds(heartbeatAge)} 没有新状态`;
+  } else if (busy) {
+    tone = 'error'; icon = '×'; text = heartbeat ? `可能停滞 · ${formatElapsedSeconds(heartbeatAge)} 没有心跳` : '等待首次心跳';
+  } else if (heartbeat) {
+    text = `${formatElapsedSeconds(heartbeatAge)} 前更新`;
+  }
+  const deadlineText = deadline
+    ? (deadline > now ? `剩余 ${formatElapsedSeconds((deadline - now) / 1000)}` : '已超过阶段时限')
+    : '无阶段时限';
+  return {tone, icon, text, elapsed: formatElapsedSeconds(elapsedSeconds), deadline: deadlineText};
+}
+
+const DRAFT_AGENT_LABELS: Record<string, string> = {
+  goal_intake: '需求判断',
+  goal_planner: 'Task 规划',
+  goal_test_writer: '验收测试',
+  goal_discovery_requirement: '需求边界',
+  goal_discovery_architecture: '架构路径',
+  goal_discovery_implementation: '实现定位',
+  goal_discovery_tests: '测试覆盖',
+  goal_discovery_history: '历史约束',
+};
+
+type GoalAgentRowStatus = 'queued' | 'running' | 'validating' | 'done' | 'failed';
+export type GoalAgentRow = {
+  id: string;
+  label: string;
+  agentType: string;
+  stage: string;
+  status: GoalAgentRowStatus;
+  activity: string;
+  meta: string;
+  elapsed: string;
+  tools: GoalAgentToolSnapshot[];
+  error?: string;
+  updatedAt: number;
+};
+
+function normalizedAgentStatus(status: string): GoalAgentRowStatus {
+  if (status === 'done' || status === 'completed') return 'done';
+  if (status === 'failed' || status === 'timeout' || status === 'cancelled') return 'failed';
+  if (status === 'running' || status === 'started') return 'running';
+  return 'queued';
+}
+
+function agentRowPresentation(status: GoalAgentRowStatus): GoalPresentation {
+  if (status === 'done') return {tone: 'success', icon: '✓', text: '已完成'};
+  if (status === 'failed') return {tone: 'error', icon: '×', text: '失败'};
+  if (status === 'running') return {tone: 'info', icon: '●', text: '工作中'};
+  if (status === 'validating') return {tone: 'warning', icon: '◆', text: '整理证据'};
+  return {tone: 'muted', icon: '○', text: '等待并发槽'};
+}
+
+function stageName(stage: string): string {
+  return DRAFT_STAGES.find(item => item.id === stage)?.label || stage.replaceAll('_', ' ');
+}
+
+function draftAgentLabel(agentType: string, role: string): string {
+  return DRAFT_AGENT_LABELS[agentType] || DRAFT_AGENT_LABELS[`goal_discovery_${role}`] || role.replaceAll('_', ' ');
+}
+
+function elapsedForAgent(agent: GoalAgentSnapshot | undefined, job: GoalDiscoveryJobSnapshot | undefined, now: number): string {
+  if (agent?.elapsed != null && agent.status !== 'running') return formatElapsedSeconds(agent.elapsed);
+  const start = epochMs(agent?.started_at || job?.started_at);
+  const finish = epochMs(agent?.finished_at || job?.finished_at);
+  return start ? formatElapsedSeconds(((finish || now) - start) / 1000) : '-';
+}
+
+function agentActivity(agent: GoalAgentSnapshot, label: string): string {
+  if (agent.status !== 'running' && agent.summary) return agent.summary;
+  const latestRound = agent.rounds[agent.rounds.length - 1];
+  if (latestRound?.text) return latestRound.text;
+  if (/^discover\s.+\sevidence$/i.test(agent.description)) return `正在检查${label}相关文件并形成可引用证据`;
+  return agent.description || '正在准备下一步';
+}
+
+export function goalDraftAgentRows(draft: GoalDraftSnapshot, now = Date.now()): GoalAgentRow[] {
+  const agents = draft.agents || [];
+  const usedRoles = new Set<string>();
+  const rows: GoalAgentRow[] = agents.map(agent => {
+    const job = [...draft.discovery_jobs].reverse().find(item => item.role === agent.role);
+    if (job) usedRoles.add(job.role);
+    const jobStatus = job ? normalizedAgentStatus(job.status) : undefined;
+    const status: GoalAgentRowStatus = agent.status === 'done' && jobStatus === 'running'
+      ? 'validating'
+      : agent.status === 'failed' ? 'failed' : agent.status === 'done' ? 'done' : 'running';
+    const round = agent.rounds[agent.rounds.length - 1]?.round;
+    const meta = [
+      stageName(agent.stage),
+      agent.model || 'model pending',
+      round ? `第 ${round} 轮` : '',
+      `${Math.max(agent.tool_count, agent.tools.length)} 次工具`,
+      job?.read_path_count ? `${job.read_path_count} 个文件` : '',
+    ].filter(Boolean).join(' · ');
+    return {
+      id: agent.id,
+      label: draftAgentLabel(agent.agent_type, agent.role),
+      agentType: agent.agent_type,
+      stage: agent.stage,
+      status,
+      activity: agentActivity(agent, draftAgentLabel(agent.agent_type, agent.role)),
+      meta,
+      elapsed: elapsedForAgent(agent, job, now),
+      tools: agent.tools.slice(-2),
+      error: job?.error,
+      updatedAt: epochMs(agent.updated_at) || epochMs(job?.event_ts),
+    };
+  });
+  for (const job of draft.discovery_jobs) {
+    if (usedRoles.has(job.role)) continue;
+    const status = normalizedAgentStatus(job.status);
+    const activity = status === 'queued' ? '已分配读取范围，等待可用并发槽'
+      : status === 'running' ? '正在读取分配文件并整理结构化证据'
+      : status === 'done' ? '证据报告已完成并交回规划器'
+      : job.error || '证据任务未完成';
+    rows.push({
+      id: job.id,
+      label: draftAgentLabel(`goal_discovery_${job.role}`, job.role),
+      agentType: `goal_discovery_${job.role}`,
+      stage: 'discovering',
+      status,
+      activity,
+      meta: ['仓库探索', `${job.read_path_count} 个文件`, `工具 ${job.tools.join(', ') || 'read_file'}`].join(' · '),
+      elapsed: elapsedForAgent(undefined, job, now),
+      tools: [],
+      error: job.error,
+      updatedAt: epochMs(job.event_ts),
+    });
+  }
+  if (!rows.length) {
+    const stage = effectiveDraftStage(draft);
+    const synthetic: Record<string, [string, string, string]> = {
+      preflight: ['运行协调器', 'system/preflight', '正在检查 Agent 路由、权限与验证条件'],
+      catalog: ['测试目录扫描', 'system/test-catalog', '正在收集真实测试 selector 和验证适配器'],
+      intake: ['需求判断', 'goal_intake', goalDraftHasQuestion(draft) ? '已识别需要你决定的范围问题' : '正在判断哪些问题必须由你确认'],
+      discovering: ['探索调度器', 'system/discovery', '正在切分仓库范围并分配只读证据任务'],
+      planning: ['Task 规划', 'goal_planner', '正在把仓库证据整理成可验证 Task'],
+      ready: ['运行协调器', 'system/approval', '草案已就绪，等待执行批准'],
+    };
+    const value = synthetic[stage] || synthetic.preflight;
+    rows.push({
+      id: `system-${stage}`, label: value[0], agentType: value[1], stage,
+      status: goalDraftIsBusy(draft) ? 'running' : draft.status === 'failed' ? 'failed' : 'done',
+      activity: value[2], meta: `${stageName(stage)} · 系统任务`, elapsed: goalDraftHeartbeatPresentation(draft, now).elapsed,
+      tools: [], error: draft.last_error, updatedAt: epochMs(draft.updated_at),
+    });
+  }
+  const rank: Record<GoalAgentRowStatus, number> = {running: 0, validating: 1, failed: 2, queued: 3, done: 4};
+  return rows.sort((a, b) => rank[a.status] - rank[b.status] || b.updatedAt - a.updatedAt);
+}
+
+function StageRail(props: {items: GoalStageRailItem[]; compact: boolean}) {
+  const groups = () => props.compact ? [props.items.slice(0, 3), props.items.slice(3)] : [props.items];
+  const presentation = (status: GoalRailStatus): GoalPresentation => {
+    if (status === 'done') return {tone: 'success', icon: '✓', text: ''};
+    if (status === 'active') return {tone: 'info', icon: '●', text: ''};
+    if (status === 'blocked') return {tone: 'warning', icon: '!', text: ''};
+    return {tone: 'muted', icon: '○', text: ''};
+  };
+  return <box flexDirection="column" minWidth={0}>
+    <For each={groups()}>{group => <box flexDirection="row" minWidth={0}>
+      <For each={group}>{(item, index) => <>
+        <text fg={toneColor(presentation(item.status).tone)} wrapMode="none">{presentation(item.status).icon} {item.label}</text>
+        <Show when={index() < group.length - 1}><text fg={C.textMuted} wrapMode="none">  ─  </text></Show>
+      </>}</For>
+    </box>}</For>
+  </box>;
+}
+
+export function GoalDraftView(props: {draft: GoalDraftSnapshot; now?: number; width: number; height: number}) {
+  const compact = () => props.width < 82;
   const status = () => goalDraftStagePresentation(props.draft);
   const next = () => goalDraftNextActionPresentation(props.draft);
   const activeQuestion = () => goalDraftHasQuestion(props.draft);
-  const jobSummary = () => {
-    const done = props.draft.discovery_jobs.filter(job => job.status === 'done' || job.status === 'completed').length;
-    const total = Math.max(props.draft.discovery_total || 0, props.draft.discovery_jobs.length);
-    return total ? `${done}/${total}` : `${props.draft.discovery_jobs.length}`;
-  };
+  const busy = () => goalDraftIsBusy(props.draft);
+  const heartbeat = () => goalDraftHeartbeatPresentation(props.draft, props.now || Date.now());
+  const rows = () => goalDraftAgentRows(props.draft, props.now || Date.now());
+  const activeCount = () => rows().filter(row => row.status === 'running' || row.status === 'validating').length;
+  const doneCount = () => rows().filter(row => row.status === 'done').length;
+  const nextPanel = () => <box border borderStyle="rounded" borderColor={toneColor(next().tone)} paddingX={1} flexDirection="column" minWidth={0}>
+    <box flexDirection={compact() ? 'column' : 'row'} justifyContent="space-between" minWidth={0}>
+      <text fg={toneColor(next().tone)}>{next().icon} {next().text}</text>
+      <text fg={C.primary} wrapMode="none">{next().command}</text>
+    </box>
+    <text fg={C.textMuted} wrapMode="word">{next().detail}</text>
+  </box>;
   return <scrollbox height={props.height} flexShrink={0} stickyScroll viewportOptions={{paddingRight: 1}} verticalScrollbarOptions={{visible: true}}>
     <box flexDirection="column" paddingX={1} paddingTop={1} paddingBottom={1}>
       <box flexDirection={compact() ? 'column' : 'row'} justifyContent="space-between" minWidth={0}>
-        <text fg={toneColor(status().tone)}>{status().icon} GOAL 草案 · {status().text}</text>
-        <text fg={C.warning}>{props.draft.stage}</text>
+        <text fg={toneColor(status().tone)}>{status().icon} GOAL CONTROL · {status().text}</text>
+        <text fg={C.warning}>{stageName(effectiveDraftStage(props.draft))} · {heartbeat().elapsed}</text>
       </box>
       <text fg={C.text} wrapMode="word">{props.draft.target}</text>
       <text fg={C.textMuted} wrapMode="none" truncate>{props.draft.id}</text>
 
-      <box border borderStyle="rounded" borderColor={toneColor(next().tone)} paddingX={1} flexDirection="column" minWidth={0}>
-        <text fg={toneColor(next().tone)}>下一步</text>
-        <text fg={C.text} wrapMode="word">{next().icon} {next().text}</text>
-        <text fg={C.primary} wrapMode="word">指令：{next().command}</text>
-        <text fg={C.textMuted} wrapMode="word">{next().detail}</text>
+      <box flexDirection="column" minWidth={0}>
+        <text fg={C.secondary}>阶段位置</text>
+        <StageRail items={goalDraftStageRail(props.draft)} compact={props.width < 96} />
+        <box flexDirection={compact() ? 'column' : 'row'} justifyContent="space-between" minWidth={0}>
+          <text fg={toneColor(heartbeat().tone)} wrapMode="none" truncate>{heartbeat().icon} {heartbeat().text}</text>
+          <text fg={heartbeat().deadline.startsWith('已超过') ? C.error : C.textMuted} wrapMode="none">{heartbeat().deadline}</text>
+        </box>
       </box>
 
-      <box border borderStyle="rounded" borderColor={C.textMuted} paddingX={1} flexDirection="column" minWidth={0}>
-        <text fg={C.secondary}>Intake 结论</text>
-        <text fg={C.text} wrapMode="word">{props.draft.intake_summary || (activeQuestion() ? '发现了需要你决定的范围问题。' : '正在等待 intake 结论。')}</text>
-        <Show when={props.draft.intake_assumptions.length} fallback={<text fg={C.textMuted}>没有额外假设</text>}>
+      <Show when={!busy()}>{nextPanel()}</Show>
+
+      <box border borderStyle="rounded" borderColor={activeCount() ? C.info : C.textMuted} paddingX={1} flexDirection="column" minWidth={0}>
+        <box flexDirection={compact() ? 'column' : 'row'} justifyContent="space-between" minWidth={0}>
+          <text fg={C.secondary}>AGENT 现场</text>
+          <text fg={C.textMuted}>{activeCount()} 工作中 · {doneCount()} 已完成 · {rows().length} 总数</text>
+        </box>
+        <For each={rows()}>{row => {
+          const presentation = () => agentRowPresentation(row.status);
+          return <box flexDirection="column" minWidth={0}>
+            <box flexDirection="row" justifyContent="space-between" minWidth={0}>
+              <text fg={toneColor(presentation().tone)} wrapMode="none" truncate flexGrow={1}>{presentation().icon} {row.label} · {row.agentType}</text>
+              <text fg={toneColor(presentation().tone)} wrapMode="none">{presentation().text} · {row.elapsed}</text>
+            </box>
+            <text fg={row.status === 'running' ? C.text : C.textMuted} wrapMode="word">  {row.activity}</text>
+            <text fg={C.textMuted} wrapMode="none" truncate>  └ {row.meta}</text>
+            <Show when={row.status === 'running' || row.status === 'validating'}>
+              <For each={row.tools}>{tool => <text fg={tool.status === 'failed' ? C.error : tool.status === 'running' ? C.info : C.textMuted} wrapMode="none" truncate>
+                {'    '}{tool.status === 'running' ? '●' : tool.status === 'failed' ? '×' : '✓'} {tool.name}{tool.summary ? ` · ${tool.summary}` : ''}
+              </text>}</For>
+            </Show>
+            <Show when={row.error}><text fg={C.error} wrapMode="word">  错误：{row.error}</text></Show>
+          </box>;
+        }}</For>
+        <Show when={props.draft.discovery_path}>
+          <text fg={C.textMuted} wrapMode="none" truncate>证据输出 · {props.draft.discovery_path}</text>
+        </Show>
+      </box>
+
+      <Show when={busy()}>
+        <text fg={C.textMuted} wrapMode="word">需要介入时输入 /goal pause；当前阶段不会修改实现文件。</text>
+      </Show>
+
+      <Show when={props.draft.intake_summary || props.draft.intake_assumptions.length || props.draft.clarifications.length || props.draft.question}>
+        <box border borderStyle="rounded" borderColor={C.textMuted} paddingX={1} flexDirection="column" minWidth={0}>
+          <text fg={C.secondary}>阶段产物 · Intake</text>
+          <text fg={C.text} wrapMode="word">{props.draft.intake_summary || (activeQuestion() ? '发现了需要你决定的范围问题。' : '正在等待 intake 结论。')}</text>
           <For each={props.draft.intake_assumptions}>{item => <text fg={C.textMuted} wrapMode="word">· 假设：{item}</text>}</For>
-        </Show>
-        <For each={props.draft.clarifications}>{item => <text fg={C.textMuted} wrapMode="word">✓ {item.question} → {item.answer}</text>}</For>
-        <Show when={props.draft.question}>
-          <text fg={C.warning} wrapMode="word">问题 {props.draft.question_index + 1}/{Math.max(1, props.draft.question_count)}：{props.draft.question}</text>
-        </Show>
-      </box>
-
-      <Show when={props.draft.discovery_jobs.length || props.draft.stage === 'discovering'}>
-        <box border borderStyle="rounded" borderColor={C.info} paddingX={1} flexDirection="column" minWidth={0}>
-          <text fg={C.secondary}>只读发现 · {jobSummary()} 个证据任务</text>
-          <Show when={!props.draft.discovery_jobs.length}>
-            <text fg={C.textMuted}>正在分配只读检查任务…</text>
+          <For each={props.draft.clarifications}>{item => <text fg={C.textMuted} wrapMode="word">✓ {item.question} → {item.answer}</text>}</For>
+          <Show when={props.draft.question}>
+            <text fg={C.warning} wrapMode="word">问题 {props.draft.question_index + 1}/{Math.max(1, props.draft.question_count)}：{props.draft.question}</text>
           </Show>
-          <For each={props.draft.discovery_jobs}>{job => {
-            const presentation = () => draftJobStatus(job.status);
-            const paths = () => job.read_paths.length ? job.read_paths.join(', ') : `已分配 ${job.read_path_count} 个文件`;
-            return <box flexDirection="column" minWidth={0}>
-              <text fg={toneColor(presentation().tone)} wrapMode="none" truncate>{presentation().icon} {job.role} · {presentation().text} · 工具：{job.tools.join(', ') || 'read_file'}</text>
-              <text fg={C.textMuted} wrapMode="word">  路径：{paths()}</text>
-              <Show when={job.error}><text fg={C.error} wrapMode="word">  错误：{job.error}</text></Show>
-            </box>;
-          }}</For>
         </box>
       </Show>
 
       <Show when={props.draft.tasks.length || props.draft.status === 'planning'}>
         <box border borderStyle="rounded" borderColor={C.secondary} paddingX={1} flexDirection="column" minWidth={0}>
-          <text fg={C.secondary}>Task 草案 · {props.draft.tasks.length || props.draft.task_count}</text>
+          <text fg={C.secondary}>阶段产物 · Task 草案 · {props.draft.tasks.length || props.draft.task_count}</text>
           <Show when={!props.draft.tasks.length}><text fg={C.textMuted}>规划模型正在把证据整理成可验证 Task…</text></Show>
           <For each={props.draft.tasks}>{(item, index) => <box flexDirection="column" minWidth={0}>
             <text fg={C.text} wrapMode="word">{String(index() + 1).padStart(2, '0')} · {item.name}</text>
@@ -334,8 +592,31 @@ export function GoalDraftView(props: {draft: GoalDraftSnapshot; width: number; h
   </scrollbox>;
 }
 
+const EXECUTION_STAGES = [
+  {id: 'contract', label: '任务合同', phases: ['initialize', 'select_task', 'claim']},
+  {id: 'tests', label: '测试准备', phases: ['prepare_tests']},
+  {id: 'act', label: '实现', phases: ['act', 'rollover']},
+  {id: 'verify', label: '验证', phases: ['verify']},
+  {id: 'review', label: '评审返修', phases: ['evaluate', 'repair_plan', 'impact_review']},
+  {id: 'clean', label: '清洁检查', phases: ['clean_check']},
+  {id: 'regression', label: '全局回归', phases: ['full_verify', 'done']},
+] as const;
+
+export function goalExecutionStageRail(goal: GoalSnapshot): GoalStageRailItem[] {
+  const phase = goal.phase === 'paused' && goal.resume_phase ? goal.resume_phase : goal.phase;
+  let currentIndex = EXECUTION_STAGES.findIndex(item => (item.phases as readonly string[]).includes(phase));
+  if (goal.status === 'done') currentIndex = EXECUTION_STAGES.length - 1;
+  if (currentIndex < 0) currentIndex = 0;
+  const blocked = goal.status === 'paused' || goal.status === 'failed' || goal.status === 'cancelled';
+  return EXECUTION_STAGES.map((item, index) => ({
+    id: item.id,
+    label: item.label,
+    status: goal.status === 'done' || index < currentIndex ? 'done' : index === currentIndex ? (blocked ? 'blocked' : 'active') : 'pending',
+  }));
+}
+
 export function GoalView(props: {goal: GoalSnapshot; decisions?: GoalDecision[]; now?: number; width: number; height: number}) {
-  const compact = () => props.width < 76;
+  const compact = () => props.width < 82;
   const current = () => props.goal.tasks.find(task => task.id === props.goal.current_task_id);
   const completed = () => props.goal.tasks.filter(task => task.status === 'completed').length;
   const status = () => goalStatusPresentation(props.goal.status);
@@ -347,8 +628,24 @@ export function GoalView(props: {goal: GoalSnapshot; decisions?: GoalDecision[];
   const terminal = () => TERMINAL_STATUSES.has(props.goal.status);
   const decisions = () => props.decisions || [];
   const decision = () => goalDecisionPresentation(props.goal, decisions());
-  const decisionHistory = () => decision().history.filter(item => item.status !== 'active').slice(-3);
+  const activeDecision = () => [...decisions()].reverse().find(item => item.status === 'active');
+  const decisionHistory = () => decision().history.filter(item => item.status !== 'active').slice(-2);
+  const activeTools = () => (activeDecision()?.tools || []).slice(-2);
+  const activeElapsed = () => {
+    const active = activeDecision();
+    if (!active) return '';
+    const seconds = active.elapsed ?? ((props.now || Date.now()) - (active.startedAt || active.at)) / 1000;
+    return formatElapsedSeconds(seconds);
+  };
   const decisionPulse = () => ['●', '◌', '○'][Math.floor((props.now || 0) / 520) % 3];
+  const next = () => goalNextActionPresentation(props.goal);
+  const nextPanel = () => <box border borderStyle="rounded" borderColor={toneColor(next().tone)} paddingX={1} flexDirection="column" minWidth={0}>
+    <box flexDirection={compact() ? 'column' : 'row'} justifyContent="space-between" minWidth={0}>
+      <text fg={toneColor(next().tone)}>{next().icon} {next().text}</text>
+      <text fg={C.primary} wrapMode="none">{next().command}</text>
+    </box>
+    <text fg={C.textMuted} wrapMode="word">{next().detail}</text>
+  </box>;
   const gatePanel = () => <box border borderStyle="rounded" borderColor={toneColor(gate().tone)} paddingX={1} flexDirection="column" minWidth={0} flexGrow={compact() ? 0 : 1}>
     <text fg={toneColor(gate().tone)}>机器门禁</text>
     <text fg={C.text} wrapMode="word">{gate().icon} {gate().text}</text>
@@ -382,7 +679,7 @@ export function GoalView(props: {goal: GoalSnapshot; decisions?: GoalDecision[];
         <text fg={C.warning}>{phaseLabel(props.goal.phase)}</text>
       </box>
       <text fg={C.text} wrapMode="word">{props.goal.target}</text>
-      <box flexDirection="row" minWidth={0} gap={1}>
+      <box flexDirection={compact() ? 'column' : 'row'} minWidth={0} gap={compact() ? 0 : 1}>
         <text fg={C.success} wrapMode="none">{progressBar(completed(), props.goal.tasks.length, compact() ? 10 : 18)}</text>
         <text fg={C.textMuted} wrapMode="none">{completed()}/{props.goal.tasks.length} Tasks</text>
         <text fg={C.textMuted} wrapMode="none">· 模型轮次 {props.goal.total_llm_rounds || 0}</text>
@@ -392,31 +689,37 @@ export function GoalView(props: {goal: GoalSnapshot; decisions?: GoalDecision[];
       </box>
       <text fg={C.textMuted} wrapMode="none" truncate>{props.goal.id}</text>
 
-      {(() => {
-        const next = goalNextActionPresentation(props.goal);
-        return <box border borderStyle="rounded" borderColor={toneColor(next.tone)} paddingX={1} flexDirection="column" minWidth={0}>
-          <text fg={toneColor(next.tone)}>下一步</text>
-          <text fg={C.text} wrapMode="word">{next.icon} {next.text}</text>
-          <text fg={C.primary} wrapMode="word">指令：{next.command}</text>
-          <text fg={C.textMuted} wrapMode="word">{next.detail}</text>
-        </box>;
-      })()}
+      <box flexDirection="column" minWidth={0}>
+        <text fg={C.secondary}>执行链路</text>
+        <StageRail items={goalExecutionStageRail(props.goal)} compact={props.width < 112} />
+      </box>
 
-      <box border borderStyle="rounded" borderColor={toneColor(decision().tone)} paddingX={1} flexDirection="column" minWidth={0} height={compact() ? 8 : 9} flexShrink={0}>
-        <box flexDirection="row" justifyContent="space-between" minWidth={0}>
-          <text fg={toneColor(decision().tone)}>{decision().title}</text>
-          <text fg={C.textMuted} wrapMode="none" truncate>{decision().owner}</text>
+      <Show when={props.goal.status !== 'running'}>{nextPanel()}</Show>
+
+      <box border borderStyle="rounded" borderColor={toneColor(decision().tone)} paddingX={1} flexDirection="column" minWidth={0} height={compact() ? 9 : 8} flexShrink={0}>
+        <box flexDirection={compact() ? 'column' : 'row'} justifyContent="space-between" minWidth={0}>
+          <text fg={toneColor(decision().tone)}>AGENT 现场</text>
+          <text fg={C.textMuted} wrapMode="none" truncate>{decision().owner}{activeElapsed() ? ` · ${activeElapsed()}` : ''}</text>
         </box>
         <text fg={toneColor(decision().tone)} wrapMode="word">{props.goal.status === 'running' ? decisionPulse() : decision().icon} {decision().text}</text>
-        <Show when={props.goal.status === 'running'}>
-          <text fg={C.textMuted} wrapMode="none">正在接收模型决策，最新内容会自动更新</text>
+        <Show when={activeDecision()}>
+          {active => <text fg={C.textMuted} wrapMode="none" truncate>
+            {phaseLabel(active().phase)}{active().round ? ` · 第 ${active().round} 轮` : ''} · {(active().tools || []).length} 次工具
+          </text>}
         </Show>
+        <For each={activeTools()}>{tool => <text fg={tool.status === 'failed' ? C.error : tool.status === 'running' ? C.info : C.textMuted} wrapMode="none" truncate>
+          {'  '}{tool.status === 'running' ? '●' : tool.status === 'failed' ? '×' : '✓'} {tool.name}{tool.summary ? ` · ${tool.summary}` : ''}
+        </text>}</For>
         <Show when={decisionHistory().length} fallback={<text fg={C.textMuted}>等待第一个模型决策</text>}>
           <For each={decisionHistory()}>{item =>
-            <text fg={item.status === 'failed' ? C.error : C.textMuted} wrapMode="none" truncate>  {item.status === 'done' ? '✓' : '·'} {item.text}</text>
+            <text fg={item.status === 'failed' ? C.error : C.textMuted} wrapMode="none" truncate>  {item.status === 'done' ? '✓' : '·'} {item.agent} · {item.text}</text>
           }</For>
         </Show>
       </box>
+
+      <Show when={props.goal.status === 'running'}>
+        <text fg={C.textMuted} wrapMode="word">需要介入时输入 /goal pause；当前 Agent 到达安全检查点后会暂停。</text>
+      </Show>
 
       <box border borderStyle="rounded" borderColor={C.textMuted} paddingX={1} flexDirection="column" minWidth={0}>
         <text fg={C.secondary}>任务图</text>

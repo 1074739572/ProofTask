@@ -107,6 +107,7 @@ def test_discovery_event_exposes_bounded_read_only_work_metadata(monkeypatch):
     job = DiscoveryJob(
         id="implementation-1", role="implementation",
         read_paths=tuple(f"src/module_{index}.py" for index in range(14)),
+        started_at=123.0,
     )
 
     discovery._emit_discovery_job("goal-1", job, event="started")
@@ -116,6 +117,7 @@ def test_discovery_event_exposes_bounded_read_only_work_metadata(monkeypatch):
     assert payload["tools"] == ["read_file"]
     assert payload["read_path_count"] == 14
     assert payload["read_paths"] == [f"src/module_{index}.py" for index in range(12)]
+    assert payload["started_at"] == 123.0
 
 
 def test_discovery_scopes_files_to_the_goal_and_ignores_generated_worktrees(tmp_path):
