@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import json
+
 from harness.goal.planner import TaskPlan, discovery_readiness_error, parse_plan
 from harness.goal.models import GoalPhase, GoalState
 from harness.goal.runner import GoalRunner
 from harness.verification.catalog import TestCatalog
+from harness.verification.node_adapter import NodeTestCatalog
 
 
 def _catalog() -> TestCatalog:
@@ -461,6 +464,176 @@ def _needs_generation_task(tmp_path, monkeypatch):
     state.current_task_id = task.id
     state.phase = GoalPhase.PREPARE_TESTS.value
     return task, state
+
+
+def _needs_generation_node_task(tmp_path, monkeypatch):
+    import harness.tasks as tasks
+
+    task, state = _needs_generation_task(tmp_path, monkeypatch)
+    task.verification_spec["adapter"] = "node"
+    tasks.save_task(task)
+    state.verification = "node --import tsx --test"
+    return task, state
+
+
+def _patch_node_catalogs(monkeypatch, *catalogs):
+    from harness.verification.node_adapter import NodeTestAdapter
+
+    discovered = iter(catalogs)
+    monkeypatch.setattr(NodeTestAdapter, "discover", lambda self, context: next(discovered))
+
+
+def _failing_node_baseline(command="node --import tsx --test test/new.test.ts"):
+    return type("Result", (), {
+        "passed": False,
+        "error": None,
+        "timed_out": False,
+        "stdout": "assert missing behavior",
+        "exit_code": 1,
+        "duration_ms": 5,
+        "command": command,
+    })()
+
+
+def test_node_test_generation_prompt_uses_node_conventions(tmp_path, monkeypatch):
+    import harness.goal.runner as runner_mod
+    from harness.tasks import load_task
+
+    task, state = _needs_generation_node_task(tmp_path, monkeypatch)
+    prompts = []
+    monkeypatch.setattr(runner_mod, "save_goal", lambda state: None)
+    monkeypatch.setattr(
+        runner_mod,
+        "run_agent_task",
+        lambda **kwargs: prompts.append(kwargs["prompt"]) or (
+            '{"test_selectors":["test/new.test.ts::new behavior"],'
+            '"case_selectors":{"AC1":["test/new.test.ts::new behavior"]}}'
+        ),
+    )
+    _patch_node_catalogs(
+        monkeypatch,
+        NodeTestCatalog((), ()),
+        NodeTestCatalog(("test/new.test.ts::new behavior",), ("test/new.test.ts",)),
+    )
+    monkeypatch.setattr(runner_mod, "run_verification", lambda *args, **kwargs: _failing_node_baseline())
+
+    GoalRunner(state=state, history=[], context={}, binding=None)._prepare_tests(state)
+
+    assert "test/example.test.ts::behavior name" in prompts[0]
+    assert "test/**/*.test.ts" in prompts[0]
+    assert ".py" not in prompts[0]
+    assert load_task(task.id).verification_spec["adapter"] == "node"
+
+
+def test_node_test_generation_repairs_wrong_model_selector_from_machine_catalog(tmp_path, monkeypatch):
+    import harness.goal.runner as runner_mod
+    from harness.tasks import load_task
+
+    task, state = _needs_generation_node_task(tmp_path, monkeypatch)
+    calls = []
+    actual_selector = "test/new.test.ts::actual behavior"
+    wrong_selector = "test/new.test.ts::invented behavior"
+
+    def writer(**kwargs):
+        calls.append(kwargs)
+        selector = wrong_selector if len(calls) == 1 else actual_selector
+        return json.dumps({
+            "test_selectors": [selector],
+            "case_selectors": {"AC1": [selector]},
+        })
+
+    monkeypatch.setattr(runner_mod, "save_goal", lambda state: None)
+    monkeypatch.setattr(runner_mod, "run_agent_task", writer)
+    _patch_node_catalogs(
+        monkeypatch,
+        NodeTestCatalog((), ()),
+        NodeTestCatalog((actual_selector,), ("test/new.test.ts",)),
+    )
+    monkeypatch.setattr(runner_mod, "run_verification", lambda *args, **kwargs: _failing_node_baseline())
+
+    GoalRunner(state=state, history=[], context={}, binding=None)._prepare_tests(state)
+
+    bound = load_task(task.id)
+    assert len(calls) == 2
+    assert calls[1]["tools_override"] == ()
+    assert actual_selector in calls[1]["prompt"]
+    assert wrong_selector not in calls[1]["prompt"]
+    assert bound.verification_spec["selectors"] == [actual_selector]
+    assert state.phase == GoalPhase.SELECT_TASK.value
+
+
+def test_test_generation_repairs_incomplete_acceptance_case_mapping(tmp_path, monkeypatch):
+    import harness.goal.runner as runner_mod
+    from harness.tasks import load_task
+
+    task, state = _needs_generation_node_task(tmp_path, monkeypatch)
+    calls = []
+    selector = "test/new.test.ts::new behavior"
+
+    def writer(**kwargs):
+        calls.append(kwargs)
+        mapping = {} if len(calls) == 1 else {"AC1": [selector]}
+        return json.dumps({"test_selectors": [selector], "case_selectors": mapping})
+
+    monkeypatch.setattr(runner_mod, "save_goal", lambda state: None)
+    monkeypatch.setattr(runner_mod, "run_agent_task", writer)
+    _patch_node_catalogs(
+        monkeypatch,
+        NodeTestCatalog((), ()),
+        NodeTestCatalog((selector,), ("test/new.test.ts",)),
+    )
+    monkeypatch.setattr(runner_mod, "run_verification", lambda *args, **kwargs: _failing_node_baseline())
+
+    GoalRunner(state=state, history=[], context={}, binding=None)._prepare_tests(state)
+
+    assert len(calls) == 2
+    assert calls[1]["tools_override"] == ()
+    assert load_task(task.id).verification_spec["case_selectors"] == {"AC1": [selector]}
+
+
+def test_test_generation_failed_selector_repair_persists_node_diagnostic(tmp_path, monkeypatch):
+    import harness.goal.runner as runner_mod
+
+    _task, state = _needs_generation_node_task(tmp_path, monkeypatch)
+    test_dir = tmp_path / "test"
+    test_dir.mkdir()
+    generated_file = test_dir / "new.test.ts"
+    actual_selector = "test/new.test.ts::actual behavior"
+    returned_selectors = (
+        "test/new.test.ts::invented behavior",
+        "test/other.test.ts::still invented",
+    )
+    calls = []
+
+    def writer(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            generated_file.write_text("test('actual behavior', () => {});\n", encoding="utf-8")
+        selector = returned_selectors[len(calls) - 1]
+        return json.dumps({
+            "test_selectors": [selector],
+            "case_selectors": {"AC1": [selector]},
+        })
+
+    monkeypatch.setattr(runner_mod, "save_goal", lambda state: None)
+    monkeypatch.setattr(runner_mod, "run_agent_task", writer)
+    _patch_node_catalogs(
+        monkeypatch,
+        NodeTestCatalog((), ()),
+        NodeTestCatalog((actual_selector,), ("test/new.test.ts",)),
+    )
+
+    GoalRunner(state=state, history=[], context={}, binding=None)._prepare_tests(state)
+
+    diagnostic = json.loads(state.last_error.split("Diagnostic: ", 1)[1])
+    assert state.phase == GoalPhase.PAUSED.value
+    assert state.stop_reason == "test_generation_required"
+    assert diagnostic["adapter"] == "node"
+    assert diagnostic["generated_selectors"] == [actual_selector]
+    assert diagnostic["requested_selectors"] == [returned_selectors[1]]
+    assert "did not resolve in the node catalog" in diagnostic["mismatch"]
+    assert returned_selectors[1] in diagnostic["response_tail"]
+    assert not generated_file.exists()
 
 
 def test_test_generation_uses_writer_and_requires_failing_baseline(tmp_path, monkeypatch):

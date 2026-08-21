@@ -856,10 +856,23 @@ class GoalRunner(threading.Thread):
             impact_context = task.verification_spec.get("impact_context") or []
             if not isinstance(impact_context, list):
                 impact_context = []
+            if adapter.id == "node":
+                selector_example = "test/example.test.ts::behavior name"
+                adapter_test_guidance = (
+                    "For Node, follow the existing test/**/*.test.ts conventions and return the exact "
+                    "discovered test name after the file path. "
+                )
+            else:
+                selector_example = "tests/test_x.py::test_name"
+                adapter_test_guidance = ""
+            response_example = json.dumps({
+                "test_selectors": [selector_example],
+                "case_selectors": {"AC1": [selector_example]},
+            })
             prompt = (
                 f"Create a NEW focused {adapter.id} test file for this Task before implementation. You may modify only test files; "
-                "do not edit existing test files or production code. Use existing test conventions. After writing tests, reply ONLY with JSON: "
-                '{"test_selectors":["tests/test_x.py::test_name"],"case_selectors":{"AC1":["tests/test_x.py::test_name"]}}.\n\n'
+                f"do not edit existing test files or production code. Use existing test conventions. {adapter_test_guidance}"
+                f"After writing tests, reply ONLY with JSON: {response_example}.\n\n"
                 f"Task: {task.subject}\nBehavior: {task.description}\nAcceptance cases: {json.dumps(task.acceptance_cases)}"
             )
             prompt += (
@@ -996,95 +1009,153 @@ class GoalRunner(threading.Thread):
                 if adapter.id == "pytest"
                 else adapter.discover(verification_context)
             )
-            if empty_response or writer_stalled:
-                # A provider can complete tool calls but omit its final text.
-                # Preserve a newly written test long enough to ask for its
-                # required selector mapping without giving the retry any write
-                # tools. If no new collected selector exists, there is no
-                # durable test artifact that can safely advance this Task.
-                generated_selectors = tuple(
-                    selector for selector in after_catalog.selectors
-                    if selector not in before_catalog.selectors
-                )
-                if generated_selectors:
-                    completion_prompt = (
-                        "You already created focused tests for this Task but did not submit the required final JSON. "
-                        "Do not call tools or edit files. Reply ONLY with one JSON object mapping every acceptance case "
-                        "to the collected selectors below.\n\n"
-                        f"Task: {task.subject}\n"
-                        f"Acceptance cases: {json.dumps(task.acceptance_cases, ensure_ascii=False)}\n"
-                        f"New collected selectors: {json.dumps(generated_selectors)}\n"
-                        '{"test_selectors":["exact selector"],"case_selectors":{"AC1":["exact selector"]}}'
-                    )
-                    retry_stats = AgentTaskStats()
-                    self._phase_in_flight = True
-                    try:
-                        set_goal_noninteractive(True)
-                        raw = run_agent_task(
-                            description=f"submit generated test selectors for task {task.id}",
-                            prompt=completion_prompt,
-                            agent_type="goal_test_writer",
-                            cwd=str(root),
-                            max_rounds=1,
-                            cancel_check=self._interrupted,
-                            deadline=self._deadline(state),
-                            stats=retry_stats,
-                            tools_override=(),
-                        )
-                    finally:
-                        set_goal_noninteractive(False)
-                        self._phase_in_flight = False
-                    state.total_llm_rounds += retry_stats.llm_rounds
-                    if self._honor_control_request(state):
-                        return
-                    empty_response = retry_stats.stop_reason == "empty_response"
-                if empty_response or (writer_stalled and not generated_selectors):
-                    self._restore_test_tree(root, before_tree, write_roots, expected_after=self._snapshot_test_tree(root, write_roots))
-                    stop_reason = (
-                        StopReason.test_writer_stalled.value
-                        if writer_stalled
-                        else StopReason.test_writer_empty_response.value
-                    )
-                    detail = (
-                        f"Test writer reached {TEST_WRITER_MAX_IDLE_CHUNKS} consecutive round slices without "
-                        f"creating or changing a test artifact for Task {task.id}."
-                        if writer_stalled
-                        else (
-                            f"Test writer used tools but did not submit a final result for Task {task.id}; "
-                            "no collected new test selector was available to bind."
-                        )
-                    )
-                    self._pause(
-                        state,
-                        "goal_test_writer_stalled" if writer_stalled else "goal_test_writer_empty_response",
-                        stop_reason=stop_reason,
-                    )
-                    state.last_error = detail
-                    save_goal(state)
-                    return
-            selectors = self._selectors_from_generation(raw, root, catalog=after_catalog)
-            case_selectors = self._case_selectors_from_generation(raw, selectors, task.acceptance_cases)
-            if not selectors:
-                self._restore_test_tree(root, before_tree, write_roots, expected_after=self._snapshot_test_tree(root, write_roots))
-                self._pause(state, "test_generation_required", stop_reason=StopReason.test_generation_required.value)
-                state.last_error = f"Task {task.id} needs a collected pytest selector before execution."
-                save_goal(state)
-                return
+            generated_selectors = tuple(
+                selector for selector in after_catalog.selectors
+                if selector not in before_catalog.selectors
+            )
+            generated_selector_set = set(generated_selectors)
             required_cases = {
                 str(case.get("id")) for case in task.acceptance_cases
                 if isinstance(case, dict) and case.get("id")
             }
+            selectors = self._selectors_from_generation(raw, root, catalog=after_catalog)
+            case_selectors = self._case_selectors_from_generation(raw, selectors, task.acceptance_cases)
+            requested_selectors = self._requested_selectors_from_generation(raw)
+
+            def contract_mismatches(*, response_empty: bool, response_stalled: bool) -> list[str]:
+                mismatches: list[str] = []
+                if response_empty:
+                    mismatches.append("test writer returned an empty response")
+                if response_stalled:
+                    mismatches.append("test writer stalled before submitting selector JSON")
+                if not requested_selectors:
+                    mismatches.append("response did not contain test_selectors")
+                if requested_selectors and not selectors:
+                    mismatches.append(f"returned selectors did not resolve in the {adapter.id} catalog")
+                unexpected = [selector for selector in selectors if selector not in generated_selector_set]
+                if unexpected:
+                    mismatches.append(
+                        "returned selectors were existing or non-generated: " + ", ".join(unexpected)
+                    )
+                missing_cases = sorted(required_cases - set(case_selectors))
+                if missing_cases:
+                    mismatches.append("case_selectors did not cover: " + ", ".join(missing_cases))
+                return mismatches
+
+            original_empty_response = empty_response
+            original_writer_stalled = writer_stalled
+            initial_requested_selectors = requested_selectors
+            initial_mismatches = contract_mismatches(
+                response_empty=empty_response,
+                response_stalled=writer_stalled,
+            )
+            repair_attempted = bool(initial_mismatches)
+            if repair_attempted:
+                # The writer may have created a valid test but named it
+                # differently in its final JSON. Give a tool-free completion
+                # turn only the machine-observed new selectors, never the full
+                # catalog or a model-invented fallback.
+                completion_prompt = (
+                    "The focused tests have already been written, but the prior selector JSON could not be safely bound. "
+                    "Do not call tools or edit files. Reply ONLY with one JSON object mapping every acceptance case "
+                    "to selectors from the machine-collected list below. Do not use any selector outside this list.\n\n"
+                    f"Verification adapter: {adapter.id}\n"
+                    f"Task: {task.subject}\n"
+                    f"Acceptance cases: {json.dumps(task.acceptance_cases, ensure_ascii=False)}\n"
+                    f"Machine-collected new selectors: {json.dumps(generated_selectors, ensure_ascii=False)}\n"
+                    "The JSON must contain a test_selectors array and a case_selectors object whose keys are "
+                    "acceptance-case IDs and whose values are selector arrays."
+                )
+                retry_stats = AgentTaskStats()
+                self._phase_in_flight = True
+                try:
+                    set_goal_noninteractive(True)
+                    raw = run_agent_task(
+                        description=f"repair generated test selector binding for task {task.id}",
+                        prompt=completion_prompt,
+                        agent_type="goal_test_writer",
+                        cwd=str(root),
+                        max_rounds=1,
+                        cancel_check=self._interrupted,
+                        deadline=self._deadline(state),
+                        stats=retry_stats,
+                        tools_override=(),
+                    )
+                finally:
+                    set_goal_noninteractive(False)
+                    self._phase_in_flight = False
+                state.total_llm_rounds += retry_stats.llm_rounds
+                if self._honor_control_request(state):
+                    return
+                empty_response = retry_stats.stop_reason == "empty_response"
+                selectors = self._selectors_from_generation(raw, root, catalog=after_catalog)
+                case_selectors = self._case_selectors_from_generation(raw, selectors, task.acceptance_cases)
+                requested_selectors = self._requested_selectors_from_generation(raw)
+
+            final_mismatches = contract_mismatches(
+                response_empty=empty_response,
+                response_stalled=False,
+            )
+
+            def mismatch_diagnostic() -> str:
+                details: dict[str, Any] = {
+                    "adapter": adapter.id,
+                    "mismatch": "; ".join(final_mismatches) or "unknown selector contract mismatch",
+                    "generated_selectors": list(generated_selectors),
+                    "requested_selectors": list(requested_selectors),
+                    "response_tail": str(raw)[-1_200:],
+                }
+                if repair_attempted:
+                    details["initial_mismatch"] = "; ".join(initial_mismatches)
+                    details["initial_requested_selectors"] = list(initial_requested_selectors)
+                return json.dumps(details, ensure_ascii=False)
+
+            if not generated_selectors and (original_empty_response or original_writer_stalled):
+                stop_reason = (
+                    StopReason.test_writer_stalled.value
+                    if original_writer_stalled
+                    else StopReason.test_writer_empty_response.value
+                )
+                detail = (
+                    f"Test writer reached {TEST_WRITER_MAX_IDLE_CHUNKS} consecutive round slices without "
+                    f"creating a new collected test artifact for Task {task.id}."
+                    if original_writer_stalled
+                    else (
+                        f"Test writer used tools but did not submit a final result for Task {task.id}; "
+                        "no machine-collected new test selector was available to bind."
+                    )
+                )
+                state.last_error = f"{detail} Diagnostic: {mismatch_diagnostic()}"
+                self._restore_test_tree(root, before_tree, write_roots, expected_after=self._snapshot_test_tree(root, write_roots))
+                self._pause(
+                    state,
+                    "goal_test_writer_stalled" if original_writer_stalled else "goal_test_writer_empty_response",
+                    stop_reason=stop_reason,
+                )
+                return
+            if not selectors:
+                state.last_error = (
+                    f"Task {task.id} needs a machine-collected {adapter.id} selector before execution. "
+                    f"Diagnostic: {mismatch_diagnostic()}"
+                )
+                self._restore_test_tree(root, before_tree, write_roots, expected_after=self._snapshot_test_tree(root, write_roots))
+                self._pause(state, "test_generation_required", stop_reason=StopReason.test_generation_required.value)
+                return
             if not required_cases.issubset(case_selectors):
+                state.last_error = (
+                    f"Task {task.id} test writer must map every acceptance case to machine-collected selectors. "
+                    f"Diagnostic: {mismatch_diagnostic()}"
+                )
                 self._restore_test_tree(root, before_tree, write_roots, expected_after=self._snapshot_test_tree(root, write_roots))
                 self._pause(state, "test_generation_case_mapping_required", stop_reason=StopReason.test_generation_required.value)
-                state.last_error = f"Task {task.id} test writer must map every acceptance case to collected selectors."
-                save_goal(state)
                 return
-            if any(selector in before_catalog.selectors for selector in selectors):
+            if any(selector not in generated_selector_set for selector in selectors):
+                state.last_error = (
+                    f"Task {task.id} test writer reused an existing or non-generated selector; it must add focused coverage. "
+                    f"Diagnostic: {mismatch_diagnostic()}"
+                )
                 self._restore_test_tree(root, before_tree, write_roots, expected_after=self._snapshot_test_tree(root, write_roots))
                 self._pause(state, "test_generation_reused_existing_selector", stop_reason=StopReason.test_generation_required.value)
-                state.last_error = f"Task {task.id} test writer reused an existing selector; it must add focused coverage."
-                save_goal(state)
                 return
             # The writer is allowed to add a focused test, never alter any
             # pre-existing fixture/helper/conftest under a permitted test root.
@@ -1191,12 +1262,20 @@ class GoalRunner(threading.Thread):
         )
 
     @staticmethod
-    def _selectors_from_generation(raw: str, workspace: Path, *, catalog=None) -> tuple[str, ...]:
+    def _requested_selectors_from_generation(raw: str) -> tuple[str, ...]:
         try:
-            data = json.loads(raw[raw.find("{") : raw.rfind("}") + 1])
-            requested = tuple(str(item) for item in data.get("test_selectors", []))
+            text = str(raw or "")
+            data = json.loads(text[text.find("{") : text.rfind("}") + 1])
         except (ValueError, TypeError, json.JSONDecodeError):
             return ()
+        requested = data.get("test_selectors") if isinstance(data, dict) else None
+        if not isinstance(requested, list):
+            return ()
+        return tuple(str(item) for item in requested if item is not None)
+
+    @staticmethod
+    def _selectors_from_generation(raw: str, workspace: Path, *, catalog=None) -> tuple[str, ...]:
+        requested = GoalRunner._requested_selectors_from_generation(raw)
         catalog = catalog or collect_pytest_catalog(workspace)
         if not requested:
             return ()
