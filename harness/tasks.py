@@ -71,6 +71,9 @@ class Task:
     # against this list before any verification result can advance the Task.
     scope_paths: list[str] = field(default_factory=list)
     evidence_refs: list[str] = field(default_factory=list)
+    # Planner rationale for turning acceptance cases into focused proof. It
+    # must reach test preparation instead of disappearing at Task projection.
+    test_strategy: str = ""
     discovery_revision: int = 0
 
     @property
@@ -124,6 +127,7 @@ def create_task(
     evaluation_required: bool = False,
     scope_paths: list[str] | None = None,
     evidence_refs: list[str] | None = None,
+    test_strategy: str = "",
     discovery_revision: int = 0,
 ) -> Task:
     spec = dict(verification_spec or {})
@@ -143,6 +147,7 @@ def create_task(
         evaluation_required=evaluation_required,
         scope_paths=list(scope_paths or []),
         evidence_refs=list(evidence_refs or []),
+        test_strategy=str(test_strategy or "")[:1000],
         discovery_revision=max(0, int(discovery_revision or 0)),
     )
     save_task(task)

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from harness.goal.commands import parse_goal_command
@@ -396,6 +398,102 @@ def test_answer_replans_through_discovery_and_resume_retries_paused_draft(tmp_pa
     )
     assert resumed.status == "ready"
     assert len(discovery_calls) == 2
+
+
+def test_resume_planner_failure_reuses_saved_discovery_manifest(tmp_path, monkeypatch):
+    import harness.goal.draft as draft_module
+    from harness.goal.discovery_store import save_manifest
+
+    discovery_calls = []
+    planner_calls = []
+    manifest = {
+        "repo_files": ["src/rate.py"],
+        "evidence": [{"id": "E1", "path": "src/rate.py"}],
+        "jobs": [{"id": "implementation-1", "status": "done"}],
+        "revision": 1,
+    }
+
+    def discovery(**kwargs):
+        discovery_calls.append(kwargs["draft"].id)
+        save_manifest(tmp_path, kwargs["draft"].id, manifest)
+        return manifest
+
+    def planner(draft, *_args, **_kwargs):
+        planner_calls.append(draft.id)
+        if len(planner_calls) == 1:
+            raise ValueError("planner returned an invalid task contract")
+        draft.task_plan = [{"name": "limit requests"}]
+        draft.status = "ready"
+
+    monkeypatch.setattr(draft_module, "_plan", planner)
+    with pytest.raises(ValueError, match="Goal planning failed"):
+        draft_module.create_draft(
+            "add rate limits", workspace=tmp_path, verification="python -m pytest -q",
+            intake_runner=lambda **_: '{"questions":[]}', discovery_runner=discovery,
+        )
+
+    paused = draft_module.load_draft(tmp_path)
+    assert paused is not None
+    assert paused.resume_from == "planning"
+
+    resumed = draft_module.resume_draft(workspace=tmp_path, discovery_runner=lambda **_: pytest.fail("Discovery must not rerun"))
+
+    assert resumed.status == "ready"
+    assert discovery_calls == [paused.id]
+    assert planner_calls == [paused.id, paused.id]
+
+
+def test_resume_discovery_failure_runs_discovery_again(tmp_path, monkeypatch):
+    import harness.goal.draft as draft_module
+
+    attempts = []
+    manifest = {"repo_files": [], "evidence": [], "jobs": [], "revision": 1}
+
+    def discovery(**_kwargs):
+        attempts.append("discovery")
+        if len(attempts) == 1:
+            raise RuntimeError("provider timeout")
+        return manifest
+
+    monkeypatch.setattr(
+        draft_module,
+        "_plan",
+        lambda draft, *_args, **_kwargs: setattr(draft, "status", "ready"),
+    )
+    with pytest.raises(ValueError, match="Goal discovery failed"):
+        draft_module.create_draft(
+            "add rate limits", workspace=tmp_path, verification="python -m pytest -q",
+            intake_runner=lambda **_: '{"questions":[]}', discovery_runner=discovery,
+        )
+
+    paused = draft_module.load_draft(tmp_path)
+    assert paused is not None
+    assert paused.resume_from == "discovering"
+
+    resumed = draft_module.resume_draft(workspace=tmp_path, discovery_runner=discovery)
+
+    assert resumed.status == "ready"
+    assert attempts == ["discovery", "discovery"]
+
+
+def test_schema_v2_draft_loads_with_a_planning_resume_checkpoint(tmp_path):
+    from harness.goal.draft import GoalDraft, draft_path
+
+    legacy = GoalDraft(
+        id="legacy-planning", target="add rate limits", verification="python -m pytest -q",
+        verification_source="test", status="paused", stage="paused",
+        last_error="Goal planning failed: invalid contract",
+    ).to_dict()
+    legacy.pop("resume_from")
+    legacy["schema_version"] = 2
+    draft_path(tmp_path).parent.mkdir(parents=True, exist_ok=True)
+    draft_path(tmp_path).write_text(json.dumps(legacy), encoding="utf-8")
+
+    loaded = load_draft(tmp_path)
+
+    assert loaded is not None
+    assert loaded.schema_version == 3
+    assert loaded.resume_from == "planning"
 
 
 def test_partial_discovery_failure_keeps_planning_with_completed_evidence(tmp_path):

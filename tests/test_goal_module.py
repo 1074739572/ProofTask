@@ -68,6 +68,28 @@ def test_planner_is_a_single_tool_free_contract_call():
     assert seen["tools_override"] == ()
 
 
+def test_planner_retries_once_with_the_contract_error_and_accepts_the_repair():
+    calls = []
+
+    def planner(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            return '[{"name":"limit requests","behavior":"each user is limited","depends_on":[]}]'
+        return (
+            '[{"name":"limit requests","behavior":"each user is limited",'
+            '"acceptance_cases":[{"id":"AC1","given":"a user exceeds the limit",'
+            '"when":"a request arrives","then":"the request is rejected"}],'
+            '"test_selectors":[],"depends_on":[]}]'
+        )
+
+    plans = plan_tasks("limit requests", "pytest -q", planner_runner=planner)
+
+    assert len(plans) == 1
+    assert len(calls) == 2
+    assert calls[1]["max_rounds"] == 1
+    assert "needs 1-8 valid acceptance_cases" in calls[1]["prompt"]
+
+
 def test_planner_does_not_cap_a_large_goal_at_eight_tasks():
     entries = []
     for index in range(20):

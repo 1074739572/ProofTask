@@ -6,6 +6,31 @@ import json
 from typing import Any
 
 
+def _task_discovery_evidence(state: Any, task: Any) -> list[dict[str, Any]]:
+    """Resolve the Task's cited Discovery facts from its originating Draft."""
+    draft_id = str(getattr(state, "draft_id", "") or "").strip()
+    refs = {str(item) for item in (getattr(task, "evidence_refs", None) or []) if str(item)}
+    if not draft_id or not refs:
+        return []
+    try:
+        from harness.goal.discovery_store import load_manifest
+
+        manifest = load_manifest(getattr(state, "workspace", ""), draft_id) or {}
+    except (OSError, TypeError, ValueError):
+        return []
+    facts: list[dict[str, Any]] = []
+    for item in manifest.get("evidence", []) if isinstance(manifest, dict) else []:
+        if not isinstance(item, dict) or str(item.get("id") or "") not in refs:
+            continue
+        facts.append({
+            "id": str(item.get("id") or ""),
+            "path": str(item.get("path") or ""),
+            "lines": item.get("lines") if isinstance(item.get("lines"), list) else [],
+            "claim": str(item.get("claim") or "")[:800],
+        })
+    return facts[:12]
+
+
 def build_goal_act_prompt(
     state: Any,
     task: Any,
@@ -42,6 +67,15 @@ def build_goal_act_prompt(
         f"Bound test command: {spec.get('command') or '(missing)'}",
         "Acceptance cases:", *case_lines,
     ]
+    scope_paths = [str(path) for path in (getattr(task, "scope_paths", None) or []) if str(path)]
+    if scope_paths:
+        lines += ["Approved write scope:", *[f"  - {path}" for path in scope_paths]]
+    test_strategy = str(getattr(task, "test_strategy", "") or "").strip()
+    if test_strategy:
+        lines += ["Planned test strategy:", test_strategy]
+    discovery_facts = _task_discovery_evidence(state, task)
+    if discovery_facts:
+        lines += ["Discovery evidence cited by this Task:", json.dumps(discovery_facts, ensure_ascii=False)]
     if selectors:
         lines += ["Bound pytest selectors:", *[f"  - {item}" for item in selectors]]
     if impact_context:
@@ -87,6 +121,7 @@ def build_goal_act_prompt(
     lines += [
         "Requirements:",
         "- Stay within this Task and its acceptance cases.",
+        "- Modify only files in the approved write scope. If the scope is insufficient, stop and report the blocker.",
         "- Do not regress the upstream behavior described in the Cross-Task impact context.",
         "- Do not delete, weaken, skip, or edit a bound test just to pass it.",
         "- Do not ask the user ordinary requirement questions. Resolve ambiguity from the Goal Contract, repository conventions, and the smallest verifiable change.",

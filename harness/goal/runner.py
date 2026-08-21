@@ -152,6 +152,9 @@ def goal_event_payload(state: GoalState) -> dict[str, Any]:
                 "blocked_by": list(task.blockedBy) if isinstance(task.blockedBy, list) else [],
                 "acceptance_cases": task.acceptance_cases if isinstance(task.acceptance_cases, list) else [],
                 "skills": list(task.skill_names) if isinstance(task.skill_names, list) else [],
+                "scope_paths": list(task.scope_paths) if isinstance(task.scope_paths, list) else [],
+                "evidence_refs": list(task.evidence_refs) if isinstance(task.evidence_refs, list) else [],
+                "test_strategy": str(task.test_strategy or ""),
                 "verification_spec": task.verification_spec if isinstance(task.verification_spec, dict) else {},
                 "evidence_count": len(evidence_items),
                 "latest_evidence": evidence_summary,
@@ -766,6 +769,7 @@ class GoalRunner(threading.Thread):
                 evaluation_required=state.evaluation_required,
                 scope_paths=list(plan.get("scope_paths") or []),
                 evidence_refs=list(plan.get("evidence_refs") or []),
+                test_strategy=str(plan.get("test_strategy") or ""),
                 discovery_revision=int(plan.get("discovery_revision") or 0),
             )
             names[name] = task.id
@@ -846,6 +850,10 @@ class GoalRunner(threading.Thread):
                 '{"test_selectors":["tests/test_x.py::test_name"],"case_selectors":{"AC1":["tests/test_x.py::test_name"]}}.\n\n'
                 f"Task: {task.subject}\nBehavior: {task.description}\nAcceptance cases: {json.dumps(task.acceptance_cases)}"
             )
+            if task.test_strategy:
+                prompt += f"\nPlanning test strategy: {task.test_strategy}"
+            if task.scope_paths:
+                prompt += f"\nApproved Task scope: {json.dumps(task.scope_paths)}"
             from harness.goal.skills import assigned_skill_context, normalize_goal_skills
 
             test_skills = normalize_goal_skills(task.skill_names)
@@ -1303,6 +1311,7 @@ class GoalRunner(threading.Thread):
                 cancel_check=self._interrupted,
                 deadline=self._deadline(state),
                 stats=stats,
+                write_roots=tuple(task.scope_paths) or None,
             )
         finally:
             set_goal_noninteractive(False)

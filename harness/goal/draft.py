@@ -24,7 +24,7 @@ from harness.goal.planner import TaskPlan, discovery_readiness_error, plan_tasks
 from harness.settings import get_workdir
 from harness.verification import VerificationContext, select_adapter
 
-DRAFT_SCHEMA_VERSION = 2
+DRAFT_SCHEMA_VERSION = 3
 DRAFT_FILENAME = "goal-draft.json"
 _DRAFT_STATUSES = frozenset({"clarifying", "discovering", "planning", "paused", "cancelled", "ready", "approved", "failed", "consumed"})
 _ACTIVE_DRAFT_STAGES = frozenset({"preflight", "catalog", "intake", "discovering", "planning"})
@@ -73,6 +73,10 @@ class GoalDraft:
     input_hash: str = ""
     discovery_path: str = ""
     last_error: str | None = None
+    # The durable checkpoint used by /goal resume.  The visible stage becomes
+    # "paused" after an error, so it cannot by itself tell us whether the
+    # expensive Discovery work needs to be repeated.
+    resume_from: str = "preflight"
     schema_version: int = DRAFT_SCHEMA_VERSION
 
     def to_dict(self) -> dict[str, Any]:
@@ -80,8 +84,16 @@ class GoalDraft:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "GoalDraft":
-        if data.get("schema_version") != DRAFT_SCHEMA_VERSION:
+        version = data.get("schema_version")
+        if version not in {2, DRAFT_SCHEMA_VERSION}:
             raise GoalDraftError("unsupported Goal draft schema")
+        data = dict(data)
+        if version == 2:
+            # Version 2 stored only the visible paused stage.  Infer the
+            # checkpoint from its error for existing drafts, then persist v3
+            # on the next write.
+            data["resume_from"] = _legacy_resume_stage(data)
+            data["schema_version"] = DRAFT_SCHEMA_VERSION
         unknown = set(data) - set(cls.__dataclass_fields__)
         if unknown:
             raise GoalDraftError(f"unsupported Goal draft fields: {sorted(unknown)}")
@@ -118,6 +130,20 @@ def resolve_target_project(workspace: Path, target: str) -> Path:
         if re.search(rf"(?<![a-z0-9_.-]){escaped}(?:/|$)", normalized):
             candidates.append(candidate)
     return max(candidates, key=lambda path: len(path.relative_to(root).parts))
+
+
+def _legacy_resume_stage(data: dict[str, Any]) -> str:
+    error = str(data.get("last_error") or "").lower()
+    if "intake" in error:
+        return "intake"
+    if "catalog" in error:
+        return "catalog"
+    if "planning" in error or "planner" in error:
+        return "planning"
+    if "discovery" in error:
+        return "discovering"
+    stage = str(data.get("stage") or "")
+    return stage if stage in _ACTIVE_DRAFT_STAGES else "discovering"
 
 
 def draft_project_root(draft: GoalDraft, workspace: Path) -> Path:
@@ -163,6 +189,8 @@ def _draft_event_payload(draft: GoalDraft, *, event: str, message: str | None = 
         selectors = spec.get("selectors") if isinstance(spec.get("selectors"), list) else []
         cases = plan.get("acceptance_cases") if isinstance(plan.get("acceptance_cases"), list) else []
         dependencies = plan.get("depends_on") if isinstance(plan.get("depends_on"), list) else []
+        scope_paths = plan.get("scope_paths") if isinstance(plan.get("scope_paths"), list) else []
+        evidence_refs = plan.get("evidence_refs") if isinstance(plan.get("evidence_refs"), list) else []
         task_summaries.append(
             {
                 "name": str(plan.get("name") or "Unnamed Task")[:300],
@@ -171,6 +199,9 @@ def _draft_event_payload(draft: GoalDraft, *, event: str, message: str | None = 
                 "acceptance_count": len(cases),
                 "verification_source": str(spec.get("source") or "needs_generation")[:80],
                 "selectors": [str(item)[:500] for item in selectors[:8]],
+                "scope_paths": [str(item)[:500] for item in scope_paths[:12]],
+                "evidence_refs": [str(item)[:120] for item in evidence_refs[:12]],
+                "test_strategy": str(plan.get("test_strategy") or "")[:1_000],
             }
         )
     payload: dict[str, Any] = {
@@ -181,6 +212,7 @@ def _draft_event_payload(draft: GoalDraft, *, event: str, message: str | None = 
         "verification_adapter": draft.verification_adapter[:80],
         "status": draft.status,
         "stage": draft.stage,
+        "resume_from": draft.resume_from,
         "event": event,
         "updated_at": draft.updated_at,
         "stage_started_at": draft.stage_started_at,
@@ -319,6 +351,8 @@ def _set_stage(draft: GoalDraft, stage: str, *, deadline: float | None = None) -
     draft.stage = stage
     draft.stage_started_at = now
     draft.last_heartbeat = now
+    if stage in _ACTIVE_DRAFT_STAGES:
+        draft.resume_from = stage
     if deadline is not None:
         draft.stage_deadline = deadline
 
@@ -455,13 +489,13 @@ def _required_draft_agents(*, intake_runner=None, planner_runner=None, discovery
     return tuple(dict.fromkeys(required))
 
 
-def _required_resume_agents(*, planner_runner=None, discovery_runner=None) -> tuple[str, ...]:
+def _required_resume_agents(*, planner_runner=None, discovery_runner=None, include_discovery: bool = True) -> tuple[str, ...]:
     from harness.goal.preflight import DISCOVERY_AGENT_TYPES
 
     required = []
     if planner_runner is None:
         required.append("goal_planner")
-        if discovery_runner is None:
+        if include_discovery and discovery_runner is None:
             required.extend(DISCOVERY_AGENT_TYPES)
     return tuple(dict.fromkeys(required))
 
@@ -498,6 +532,13 @@ def _manifest_successes(manifest: dict[str, Any]) -> list[dict[str, Any]]:
         if isinstance(job, dict) and str(job.get("status") or "") in {"done", "completed"}
         and not str(job.get("error") or "").strip()
     ]
+
+
+def _is_reusable_discovery_manifest(manifest: object) -> bool:
+    """Return whether a saved manifest is structurally safe to plan from."""
+    if not isinstance(manifest, dict):
+        return False
+    return all(isinstance(manifest.get(key), list) for key in ("repo_files", "evidence", "jobs"))
 
 
 def _format_discovery_failures(failures: list[dict[str, Any]]) -> str:
@@ -828,6 +869,38 @@ def _run_discovery_and_plan(draft: GoalDraft, root: Path, catalog, adapter, *, p
         raise GoalDraftError(draft.last_error) from exc
 
 
+def _run_plan_from_manifest(
+    draft: GoalDraft,
+    root: Path,
+    catalog,
+    adapter,
+    manifest: dict[str, Any],
+    *,
+    planner_runner=None,
+) -> None:
+    """Resume a Planner-only failure without paying for Discovery again."""
+    operation_timeout = max(1, int(draft.limits.get("operation_timeout_seconds", 1800)))
+    project_root = draft_project_root(draft, root)
+    _preflight_or_raise(
+        draft,
+        root,
+        _required_resume_agents(planner_runner=planner_runner, include_discovery=False),
+    )
+    draft.last_error = None
+    draft.status = "planning"
+    _set_stage(draft, "planning", deadline=time.time() + operation_timeout)
+    save_draft(draft, root, event="stage_started", message="Resuming task planning from saved discovery evidence")
+    try:
+        with _draft_heartbeat(draft, root):
+            _plan(draft, project_root, catalog, planner_runner, manifest, adapter)
+    except Exception as exc:
+        draft.status = "paused"
+        draft.last_error = f"Goal planning failed: {type(exc).__name__}: {exc}"
+        _set_stage(draft, "paused")
+        save_draft(draft, root, event="failed", message="Goal planning failed")
+        raise GoalDraftError(draft.last_error) from exc
+
+
 def answer_draft(answer: str, *, workspace: Path | None = None, planner_runner=None, discovery_runner=None) -> GoalDraft:
     root = (workspace or get_workdir()).resolve()
     draft = load_draft(root)
@@ -905,7 +978,8 @@ def resume_draft(*, workspace: Path | None = None, planner_runner=None, discover
     from harness.agent.cancel import clear_cancel
 
     clear_cancel()
-    retry_intake = (draft.last_error or "").lower().startswith("goal intake")
+    resume_from = draft.resume_from or _legacy_resume_stage(draft.to_dict())
+    retry_intake = resume_from == "intake" or (draft.last_error or "").lower().startswith("goal intake")
     if draft.unanswered_question:
         draft.status = "clarifying"
         draft.last_error = None
@@ -977,6 +1051,21 @@ def resume_draft(*, workspace: Path | None = None, planner_runner=None, discover
             save_draft(draft, root, event="completed", message="Waiting for clarification")
             return draft
         draft.last_error = None
+    if resume_from == "planning":
+        from harness.goal.discovery_store import load_manifest
+
+        manifest = load_manifest(root, draft.id)
+        if _is_reusable_discovery_manifest(manifest):
+            _run_plan_from_manifest(
+                draft,
+                root,
+                catalog,
+                adapter,
+                manifest,
+                planner_runner=planner_runner,
+            )
+            save_draft(draft, root, event="completed" if draft.status == "ready" else "updated")
+            return draft
     _run_discovery_and_plan(draft, root, catalog, adapter, planner_runner=planner_runner, discovery_runner=discovery_runner)
     save_draft(draft, root, event="completed" if draft.status == "ready" else "updated")
     return draft

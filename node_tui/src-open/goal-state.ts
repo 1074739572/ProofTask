@@ -32,6 +32,9 @@ export type GoalTaskSnapshot = {
   verification_state: string;
   blocked_by?: string[];
   acceptance_cases?: GoalAcceptanceCase[];
+  scope_paths?: string[];
+  evidence_refs?: string[];
+  test_strategy?: string;
   verification_spec?: GoalVerificationSpec;
   evidence_count?: number;
   latest_evidence?: GoalEvidence | null;
@@ -71,6 +74,9 @@ export type GoalDraftTaskSummary = {
   acceptance_count?: number;
   verification_source?: string;
   selectors?: string[];
+  scope_paths?: string[];
+  evidence_refs?: string[];
+  test_strategy?: string;
 };
 
 export type GoalClarification = {question: string; answer: string};

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from harness.goal.planner import TaskPlan, parse_plan
+from harness.goal.planner import TaskPlan, discovery_readiness_error, parse_plan
 from harness.goal.models import GoalPhase, GoalState
 from harness.goal.runner import GoalRunner
 from harness.verification.catalog import TestCatalog
@@ -87,6 +87,56 @@ def test_plan_rejects_a_code_task_grounded_only_in_requirement_text():
            '"test_strategy":"new focused test"}]')
 
     assert parse_plan(raw, test_catalog=_catalog(), discovery_manifest=manifest) is None
+
+
+def test_discovery_readiness_ignores_agent_gap_prose_when_source_evidence_exists():
+    manifest = {
+        "evidence": [
+            {"id": "E1", "path": "src/autocomplete.ts"},
+            {"id": "E2", "path": "src-open/App.tsx"},
+        ],
+        "gaps": [
+            "src/autocomplete.ts not in assigned files - cannot verify current completion features",
+            "src-open/App.tsx not in assigned files - cannot assess current interaction behavior",
+        ],
+    }
+
+    assert discovery_readiness_error(manifest) is None
+
+
+def test_discovery_readiness_does_not_treat_assigned_paths_as_read_evidence():
+    manifest = {
+        "repo_files": ["docs/requirements.md", "src/autocomplete.ts"],
+        "evidence": [{"id": "E1", "path": "docs/requirements.md"}],
+        "jobs": [{"status": "done", "read_paths": ["src/autocomplete.ts"]}],
+    }
+
+    assert discovery_readiness_error(manifest) == "Discovery produced no validated source-code evidence. Continue discovery before planning."
+
+
+def test_discovery_readiness_rejects_uncovered_source_context():
+    manifest = {
+        "repo_files": ["docs/requirements.md", "src/autocomplete.ts"],
+        "evidence": [{"id": "E1", "path": "docs/requirements.md"}],
+    }
+
+    error = discovery_readiness_error(manifest)
+
+    assert error is not None
+    assert "source-code evidence" in error
+
+
+def test_discovery_readiness_ignores_external_and_generic_role_gap_prose():
+    manifest = {
+        "repo_files": ["docs/requirements.md", "src/app.ts"],
+        "evidence": [{"id": "E1", "path": "src/app.ts"}],
+        "gaps": [
+            "dsh-TUI reference files (lib/types/components/PromptInput.js) are not assigned",
+            "No assigned source file contains current TUI interaction logic",
+        ],
+    }
+
+    assert discovery_readiness_error(manifest) is None
 
 
 def test_plan_rejects_empty_acceptance_case_selector_mapping():
@@ -1255,6 +1305,9 @@ def test_goal_event_snapshot_exposes_task_contract_for_terminal_ui(tmp_path, mon
                 "blocked_by": [],
                 "acceptance_cases": task.acceptance_cases,
                 "skills": [],
+                "scope_paths": [],
+                "evidence_refs": [],
+                "test_strategy": "",
                 "verification_spec": task.verification_spec,
             "evidence_count": 0,
             "latest_evidence": None,

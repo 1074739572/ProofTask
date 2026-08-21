@@ -24,6 +24,8 @@ PLANNER_AGENT = "goal_planner"
 # unbounded explore loop before a draft can be saved.
 PLANNER_MAX_ROUNDS = 1
 PLANNER_MAX_OUTPUT_TOKENS = 32_000
+PLANNER_FORMAT_RETRY_MAX_ROUNDS = 1
+PLANNER_REPAIR_INPUT_LIMIT = 16_000
 MAX_BEHAVIOR_CHARS = 600
 MAX_ACCEPTANCE_CASES = 8
 MAX_SKILLS_PER_TASK = 2
@@ -322,29 +324,30 @@ def _planner_manifest_view(discovery_manifest: dict[str, Any]) -> dict[str, Any]
 
 
 _SOURCE_SUFFIXES = frozenset({".py", ".pyi", ".js", ".jsx", ".ts", ".tsx", ".java", ".go", ".rs", ".rb", ".php", ".cs"})
-_CRITICAL_DISCOVERY_GAP_MARKERS = (
-    "not in the assigned files",
-    "not assigned",
-    "no assigned source file",
-    "cannot assess current",
-    "cannot verify current",
-)
-
-
 def discovery_readiness_error(discovery_manifest: dict[str, Any] | None) -> str | None:
-    """Reject planning when Discovery admits it missed required source context."""
+    """Reject planning only when system-validated evidence is insufficient.
+
+    Agent-reported gaps are advisory prose. They can describe role-local
+    assignments, external reference projects, or uncertainty, so parsing them
+    as a global gate makes planning depend on wording instead of facts.
+    """
     if not isinstance(discovery_manifest, dict):
         return None
     evidence = [item for item in discovery_manifest.get("evidence", []) if isinstance(item, dict)]
     if not evidence:
         return "Discovery produced no validated evidence. Continue discovery before planning."
-    critical = [
-        str(gap).replace("\n", " ").strip()
-        for gap in discovery_manifest.get("gaps", [])
-        if any(marker in str(gap).lower() for marker in _CRITICAL_DISCOVERY_GAP_MARKERS)
-    ]
-    if critical:
-        return "Discovery is missing required source context: " + " | ".join(critical[:4])
+    repo_source_paths = {
+        str(path or "").replace("\\", "/").strip()
+        for path in discovery_manifest.get("repo_files", [])
+        if Path(str(path or "")).suffix.lower() in _SOURCE_SUFFIXES
+    }
+    source_evidence_paths = {
+        str(item.get("path") or "").replace("\\", "/").strip()
+        for item in evidence
+        if Path(str(item.get("path") or "")).suffix.lower() in _SOURCE_SUFFIXES
+    }
+    if repo_source_paths and not source_evidence_paths:
+        return "Discovery produced no validated source-code evidence. Continue discovery before planning."
     return None
 
 
@@ -369,7 +372,7 @@ def _task_has_source_evidence(
         path = evidence_by_id.get(ref, "")
         if Path(path).suffix.lower() not in _SOURCE_SUFFIXES:
             continue
-        if any(path == scope or path.startswith(scope.rstrip("/") + "/") or scope.startswith(path.rsplit("/", 1)[0] + "/") for scope in code_scopes):
+        if any(path == scope or path.startswith(scope.rstrip("/") + "/") for scope in code_scopes):
             return True
     return False
 
@@ -502,40 +505,44 @@ def _spec_from_entry(
     return VerificationSpec(adapter=adapter_id, source="needs_generation", case_selectors=case_selectors)
 
 
-def parse_plan(raw: str, *, test_catalog=None, discovery_manifest: dict[str, Any] | None = None, verification_adapter=None) -> list[TaskPlan] | None:
-    """Parse planner output into validated TaskPlans without raising."""
+def _parse_plan_result(
+    raw: str, *, test_catalog=None, discovery_manifest: dict[str, Any] | None = None, verification_adapter=None,
+) -> tuple[list[TaskPlan] | None, str | None]:
+    """Parse a plan and retain the first contract failure for a repair retry."""
     block = _extract_json_array(_strip_agent_header(raw or ""))
     if block is None:
-        return None
+        return None, "response does not contain a complete JSON array"
     try:
         data = json.loads(block)
     except json.JSONDecodeError:
-        return None
+        return None, "response contains malformed JSON"
     if not isinstance(data, list) or not data:
-        return None
+        return None, "plan must be a non-empty JSON array"
     if discovery_readiness_error(discovery_manifest):
-        return None
+        return None, discovery_readiness_error(discovery_manifest)
     plans: list[TaskPlan] = []
     names: set[str] = set()
-    for entry in data:
+    for index, entry in enumerate(data, start=1):
+        label = f"Task {index}"
         if not isinstance(entry, dict):
-            return None
+            return None, f"{label} must be a JSON object"
         name = str(entry.get("name") or "").strip()[:80]
         behavior = str(entry.get("behavior") or "").strip()[:MAX_BEHAVIOR_CHARS]
         if not name or not behavior or name in names:
-            return None
+            return None, f"{label} needs a unique non-empty name and behavior"
+        label = f"Task {index} ({name})"
         cases = _parse_acceptance_cases(entry.get("acceptance_cases"))
         if not cases:
-            return None
+            return None, f"{label} needs 1-{MAX_ACCEPTANCE_CASES} valid acceptance_cases"
         dependencies = _normalise_strings(entry.get("depends_on"))
         if any(dependency not in names for dependency in dependencies):
-            return None
+            return None, f"{label} depends_on must list only earlier Task names"
         spec = _spec_from_entry(entry, test_catalog, cases, verification_adapter)
         if spec.source == "discovered":
             if any(not spec.case_selectors.get(case.id) for case in cases):
-                return None
+                return None, f"{label} must map every acceptance case to a collected selector"
             if any(selector not in spec.selectors for values in spec.case_selectors.values() for selector in values):
-                return None
+                return None, f"{label} case_selectors contains a selector outside test_selectors"
         scopes = _normalise_strings(entry.get("scope_paths"))
         refs = _normalise_strings(entry.get("evidence_refs"))
         strategy = str(entry.get("test_strategy") or "")[:1000]
@@ -554,7 +561,17 @@ def parse_plan(raw: str, *, test_catalog=None, discovery_manifest: dict[str, Any
                 or not set(refs).issubset(evidence_ids)
                 or not _task_has_source_evidence(scopes, refs, discovery_manifest)
             ):
-                return None
+                if not scopes:
+                    return None, f"{label} is missing scope_paths"
+                if not refs:
+                    return None, f"{label} is missing evidence_refs"
+                if not strategy:
+                    return None, f"{label} is missing test_strategy"
+                if not scopes_valid:
+                    return None, f"{label} scope_paths must be discovered workspace files or directories"
+                if not set(refs).issubset(evidence_ids):
+                    return None, f"{label} evidence_refs contains an unknown evidence ID"
+                return None, f"{label} must cite source-code evidence for its code scope"
         selected_skills = _normalise_skill_names(entry.get("skills"))
         if not selected_skills:
             selected_skills = _recommended_skill_names(name, behavior, spec)
@@ -573,7 +590,32 @@ def parse_plan(raw: str, *, test_catalog=None, discovery_manifest: dict[str, Any
             )
         )
         names.add(name)
+    return plans, None
+
+
+def parse_plan(raw: str, *, test_catalog=None, discovery_manifest: dict[str, Any] | None = None, verification_adapter=None) -> list[TaskPlan] | None:
+    """Parse planner output into validated TaskPlans without raising."""
+    plans, _ = _parse_plan_result(
+        raw,
+        test_catalog=test_catalog,
+        discovery_manifest=discovery_manifest,
+        verification_adapter=verification_adapter,
+    )
     return plans
+
+
+def _format_repair_prompt(original_prompt: str, raw: str, error: str) -> str:
+    """Ask the planner to repair only its structured response, not rediscover work."""
+    previous = _strip_agent_header(raw).strip()[:PLANNER_REPAIR_INPUT_LIMIT]
+    return (
+        f"{original_prompt}\n\n"
+        "Your previous response was rejected before any execution began. "
+        f"Contract error: {error}.\n"
+        "Return a corrected COMPLETE JSON array now. Preserve valid planning intent, "
+        "but fix the contract error. Do not explain the correction, do not call tools, "
+        "and do not omit required fields.\n"
+        f"Previous response (may be truncated):\n{previous}"
+    )
 
 
 def plan_tasks(
@@ -600,9 +642,10 @@ def plan_tasks(
     catalog = test_catalog if test_catalog is not None else verification_adapter.discover(VerificationContext(root, command=full_verification))
     runner = planner_runner or default_runner
     planner_stats = stats if stats is not None else AgentTaskStats()
+    prompt = build_plan_prompt(target, full_verification, catalog, discovery_manifest)
     planner_call = {
         "description": "decompose goal into verifiable tasks",
-        "prompt": build_plan_prompt(target, full_verification, catalog, discovery_manifest),
+        "prompt": prompt,
         "agent_type": PLANNER_AGENT,
         "cwd": str(root),
         "max_rounds": PLANNER_MAX_ROUNDS,
@@ -618,7 +661,12 @@ def plan_tasks(
         raise GoalPlanningError(f"Goal planner request failed: {type(exc).__name__}: {exc}") from exc
     if raw.startswith(f"[{PLANNER_AGENT}] failed:") or raw.startswith(f"[{PLANNER_AGENT}] stopped:"):
         raise GoalPlanningError(f"Goal planner is unavailable: {raw}")
-    plans = parse_plan(raw, test_catalog=catalog, discovery_manifest=discovery_manifest, verification_adapter=verification_adapter)
+    plans, contract_error = _parse_plan_result(
+        raw,
+        test_catalog=catalog,
+        discovery_manifest=discovery_manifest,
+        verification_adapter=verification_adapter,
+    )
     if plans:
         return plans
     if planner_stats.stop_reason == "max_tokens":
@@ -626,7 +674,31 @@ def plan_tasks(
             f"Goal planner exhausted its {PLANNER_MAX_OUTPUT_TOKENS}-token output budget before returning "
             "a complete Task contract; no execution was started."
         )
-    detail = raw.strip().replace("\n", " ")[:500] or "empty response"
+    repair_call = dict(planner_call)
+    repair_call["description"] = "repair Goal Task contract JSON"
+    repair_call["prompt"] = _format_repair_prompt(prompt, raw, contract_error or "unknown contract error")
+    repair_call["max_rounds"] = PLANNER_FORMAT_RETRY_MAX_ROUNDS
+    try:
+        repaired_raw = runner(**repair_call)
+    except Exception as exc:
+        raise GoalPlanningError(f"Goal planner contract repair failed: {type(exc).__name__}: {exc}") from exc
+    if repaired_raw.startswith(f"[{PLANNER_AGENT}] failed:") or repaired_raw.startswith(f"[{PLANNER_AGENT}] stopped:"):
+        raise GoalPlanningError(f"Goal planner contract repair is unavailable: {repaired_raw}")
+    plans, repair_error = _parse_plan_result(
+        repaired_raw,
+        test_catalog=catalog,
+        discovery_manifest=discovery_manifest,
+        verification_adapter=verification_adapter,
+    )
+    if plans:
+        return plans
+    if planner_stats.stop_reason == "max_tokens":
+        raise GoalPlanningError(
+            f"Goal planner contract repair exhausted its {PLANNER_MAX_OUTPUT_TOKENS}-token output budget before "
+            "returning a complete Task contract; no execution was started."
+        )
+    detail = repaired_raw.strip().replace("\n", " ")[:500] or "empty response"
     raise GoalPlanningError(
-        f"Goal planner returned no valid Task contract; no execution was started. Response: {detail}"
+        "Goal planner returned no valid Task contract after one repair attempt; "
+        f"first error: {contract_error or 'unknown'}; repair error: {repair_error or 'unknown'}. Response: {detail}"
     )
