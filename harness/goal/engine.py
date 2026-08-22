@@ -43,7 +43,7 @@ LEGAL: dict[str, set[str]] = _with_terminal_escapes(
         GoalPhase.CLAIM.value: {GoalPhase.ACT.value},
         GoalPhase.ACT.value: {GoalPhase.ROLLOVER.value, GoalPhase.VERIFY.value, GoalPhase.REPAIR_PLAN.value},
         GoalPhase.ROLLOVER.value: {GoalPhase.VERIFY.value},
-        GoalPhase.VERIFY.value: {GoalPhase.ACT.value, GoalPhase.EVALUATE.value, GoalPhase.CLEAN_CHECK.value, GoalPhase.SELECT_TASK.value, GoalPhase.FULL_VERIFY.value},
+        GoalPhase.VERIFY.value: {GoalPhase.ACT.value, GoalPhase.EVALUATE.value, GoalPhase.CLEAN_CHECK.value, GoalPhase.SELECT_TASK.value, GoalPhase.FULL_VERIFY.value, GoalPhase.REPAIR_PLAN.value},
         GoalPhase.EVALUATE.value: {GoalPhase.CLEAN_CHECK.value, GoalPhase.REPAIR_PLAN.value},
         GoalPhase.REPAIR_PLAN.value: {GoalPhase.ACT.value, GoalPhase.PREPARE_TESTS.value, GoalPhase.SELECT_TASK.value},
         GoalPhase.CLEAN_CHECK.value: {GoalPhase.DONE.value, GoalPhase.ACT.value, GoalPhase.IMPACT_REVIEW.value},

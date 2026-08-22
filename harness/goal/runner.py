@@ -2302,13 +2302,14 @@ class GoalRunner(threading.Thread):
                 "goal_worker_provider_error",
                 stop_reason=StopReason.provider_unavailable.value,
             )
-        elif state.no_progress_count >= NO_PROGRESS_REPLAN_LIMIT:
-            state.last_error = f"{state.no_progress_count} workers made no observable progress"
-            self._apply(state, GoalPhase.REPAIR_PLAN, "worker_no_progress", error=state.last_error)
         elif stats.stop_reason == "max_rounds":
             state.worker_rollovers += 1
             self._apply(state, GoalPhase.ROLLOVER, "worker_round_limit_reached")
         else:
+            # Always verify after a worker slice, even when it made no new
+            # write. Existing implementation may already satisfy the Task,
+            # and skipping verification here used to create act -> repair
+            # loops that never tested the current code.
             self._apply(state, GoalPhase.VERIFY, "goal_worker_finished")
 
     def _rollover(self, state: GoalState) -> None:
@@ -2336,6 +2337,13 @@ class GoalRunner(threading.Thread):
             return
         state.consecutive_failures += 1
         state.last_error = task.last_error
+        if state.no_progress_count >= NO_PROGRESS_REPLAN_LIMIT:
+            state.last_error = (
+                f"{state.no_progress_count} workers made no observable progress; "
+                f"verification still fails: {task.last_error}"
+            )
+            self._apply(state, GoalPhase.REPAIR_PLAN, "worker_no_progress_after_verification", error=state.last_error)
+            return
         self._apply(state, GoalPhase.ACT, "task_verification_failed", error=task.last_error)
 
     def _evaluate(self, state: GoalState) -> None:

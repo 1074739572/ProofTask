@@ -1908,7 +1908,7 @@ def test_worker_round_limit_creates_a_durable_rollover(tmp_path, monkeypatch):
     assert state.phase == GoalPhase.VERIFY.value
 
 
-def test_no_progress_routes_to_repair_instead_of_failing(tmp_path, monkeypatch):
+def test_no_progress_still_routes_through_verification(tmp_path, monkeypatch):
     import harness.goal.runner as runner_mod
     import harness.tasks as tasks
 
@@ -1928,12 +1928,12 @@ def test_no_progress_routes_to_repair_instead_of_failing(tmp_path, monkeypatch):
 
     runner._act(state)
 
-    assert state.phase == GoalPhase.REPAIR_PLAN.value
+    assert state.phase == GoalPhase.VERIFY.value
     assert state.status == "running"
-    assert "no observable progress" in state.last_error
+    assert state.last_error is None
 
 
-def test_round_limit_with_repeated_no_progress_routes_to_repair(tmp_path, monkeypatch):
+def test_round_limit_with_repeated_no_progress_still_routes_through_verification(tmp_path, monkeypatch):
     import harness.goal.runner as runner_mod
     import harness.tasks as tasks
 
@@ -1958,8 +1958,33 @@ def test_round_limit_with_repeated_no_progress_routes_to_repair(tmp_path, monkey
 
     runner._act(state)
 
+    assert state.phase == GoalPhase.ROLLOVER.value
+    assert state.worker_rollovers == 1
+
+
+def test_repeated_no_progress_routes_to_repair_only_after_failed_verification(tmp_path, monkeypatch):
+    import harness.goal.runner as runner_mod
+    import harness.tasks as tasks
+
+    monkeypatch.setattr(tasks, "TASKS_DIR", tmp_path / ".tasks")
+    task = tasks.create_task("stuck task", "keep working", verification_spec={})
+    tasks.claim_task(task.id)
+    state = GoalState.new(target="stuck task", verification="pytest -q", workspace=str(tmp_path))
+    state.current_task_id = task.id
+    state.task_ids = [task.id]
+    state.phase = GoalPhase.VERIFY.value
+    state.no_progress_count = 2
+    monkeypatch.setattr(runner_mod, "save_goal", lambda state: None)
+    monkeypatch.setattr(runner_mod, "_emit_goal", lambda *args, **kwargs: None)
+    failed = tasks.load_task(task.id)
+    failed.verification_state = "failing"
+    failed.last_error = "bound test failed"
+    monkeypatch.setattr(runner_mod, "verify_task_command", lambda *args, **kwargs: failed)
+
+    runner_mod.GoalRunner(state=state, history=[], context={}, binding=None)._verify(state)
+
     assert state.phase == GoalPhase.REPAIR_PLAN.value
-    assert state.worker_rollovers == 0
+    assert "verification still fails" in state.last_error
 
 
 def test_provider_error_pauses_without_consuming_repair_budget(tmp_path, monkeypatch):
