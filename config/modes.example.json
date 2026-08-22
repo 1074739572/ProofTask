@@ -9,11 +9,12 @@
       "disable_tools": [
         "write_file",
         "edit_file",
+        "patch_file",
         "bash",
         "task",
         "spawn_teammate"
       ],
-      "allowed_tools": ["read_file", "glob", "load_skill", "rag_search", "rag_status", "todo_write"],
+      "allowed_tools": ["read_file", "glob", "search_text", "load_skill", "rag_search", "rag_status", "todo_write"],
       "prompt": "Execution mode: MY-REVIEW (custom)\n- Read-only: use read_file and glob only.\n- Output findings as a structured review (severity, file, suggestion).\n- Do not modify any files.\n- End with a short todo_write checklist if fixes are needed later."
     },
     "my-grill": {
@@ -25,11 +26,12 @@
       "disable_tools": [
         "write_file",
         "edit_file",
+        "patch_file",
         "bash",
         "task",
         "spawn_teammate"
       ],
-      "allowed_tools": ["read_file", "glob", "load_skill", "rag_search", "rag_status", "todo_write"],
+      "allowed_tools": ["read_file", "glob", "search_text", "load_skill", "rag_search", "rag_status", "todo_write"],
       "prompt": "Execution mode: MY-GRILL\n- Follow builtin grill-me.\n- Stay locked until the user confirms."
     }
   }

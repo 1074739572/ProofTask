@@ -34,7 +34,15 @@ from harness.teams import (
     run_review_plan,
     spawn_teammate_thread,
 )
-from harness.tools.filesystem import run_bash, run_edit, run_glob, run_read, run_write
+from harness.tools.filesystem import (
+    run_bash,
+    run_edit,
+    run_glob,
+    run_patch_file,
+    run_read,
+    run_search_text,
+    run_write,
+)
 from harness.tools.todo import run_todo_write
 from harness.tools.web_search import run_web_search
 from harness.todos.schema import TODO_WRITE_TOOL
@@ -349,6 +357,51 @@ BUILTIN_TOOLS = [
             "type": "object",
             "properties": {"pattern": {"type": "string"}},
             "required": ["pattern"],
+        },
+    },
+    {
+        "name": "search_text",
+        "description": (
+            "Search workspace text with line-numbered, capped results without "
+            "running shell commands. Binary files and paths outside the workspace "
+            "are skipped."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "pattern": {"type": "string"},
+                "path": {"type": "string"},
+                "max_results": {"type": "integer"},
+                "case_sensitive": {"type": "boolean"},
+            },
+            "required": ["pattern"],
+        },
+    },
+    {
+        "name": "patch_file",
+        "description": (
+            "Apply multiple exact replacements atomically with optional stale-file "
+            "protection. The file is written only when every hunk matches."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "expected_sha256": {"type": "string"},
+                "hunks": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "old_text": {"type": "string"},
+                            "new_text": {"type": "string"},
+                            "occurrence": {"type": "integer"},
+                        },
+                        "required": ["old_text", "new_text"],
+                    },
+                },
+            },
+            "required": ["path", "hunks"],
         },
     },
     TODO_WRITE_TOOL,
@@ -697,6 +750,8 @@ BUILTIN_HANDLERS = {
     "write_file": run_write,
     "edit_file": run_edit,
     "glob": run_glob,
+    "search_text": run_search_text,
+    "patch_file": run_patch_file,
     "todo_write": run_todo_write,
     "load_skill": load_skill,
     "create_task": run_create_task,
