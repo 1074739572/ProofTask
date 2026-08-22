@@ -17,6 +17,12 @@ def test_python_module_execution_stays_limited_to_pytest():
     assert not check_verification_command("python -c 'print(1)'").allowed
 
 
+def test_workspace_bun_runner_is_allowed_for_node_tests():
+    command = "./node_modules/@oven/bun-windows-x64/bin/bun.exe test test/footer-state.test.ts"
+
+    assert check_verification_command(command).allowed
+
+
 def test_task_pytest_command_uses_the_same_module_form_as_goal_default():
     command = build_pytest_command(["tests/test_goal_module.py::test_goal_state_has_no_default_lifetime_budget"])
 

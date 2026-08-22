@@ -43,6 +43,7 @@ ALLOWED_PROGRAMS = frozenset(
         "ruff",
         "mypy",
         "node",
+        "bun",
         "npm",
         "npx",
         "go",
@@ -152,6 +153,7 @@ def _leading_program(tokens: list[str]) -> str:
         return ""
     prog = tokens[0]
     # Windows may invoke `python.exe` / `py.exe` — normalize the extension.
+    prog = prog.replace("\\", "/").rsplit("/", 1)[-1]
     if prog.lower().endswith(".exe"):
         prog = prog[:-4]
     return prog.lower()

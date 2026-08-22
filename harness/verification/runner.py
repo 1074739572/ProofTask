@@ -177,6 +177,19 @@ def run_verification(
     if script_error is not None:
         return _reject(f"policy rejected: {script_error}")
 
+    # Windows CreateProcess does not consistently resolve a relative
+    # executable against ``cwd`` when shell=False. Resolve explicit program
+    # paths inside the verification workspace so local runners such as Bun can
+    # be used without opening an arbitrary executable path.
+    program = argv[0]
+    if "/" in program or "\\" in program:
+        try:
+            resolved_program = (cwd / program).resolve()
+            if resolved_program.is_file() and resolved_program.is_relative_to(cwd.resolve()):
+                argv[0] = str(resolved_program)
+        except OSError:
+            pass
+
     snapshot_before = capture_code_snapshot(cwd)
     timeout = timeout_s if timeout_s is not None else DEFAULT_VERIFY_TIMEOUT_S
     timeout = max(1.0, min(float(timeout), 3600.0))

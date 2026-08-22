@@ -33,6 +33,20 @@ RUBRIC: list[str] = [
 MAX_DIFF_CHARS = 30_000
 MAX_BOUND_TEST_CHARS = 12_000
 
+# Never place credential/configuration material into an evaluator prompt. A
+# task cannot legitimately require changing these files; permissions already
+# deny them, and reading an untracked backup would leak secrets to a model.
+_SENSITIVE_UNTRACKED_NAMES = frozenset({"id_rsa", "id_ed25519"})
+
+
+def _is_sensitive_untracked(path: str) -> bool:
+    name = Path(path).name.lower()
+    return (
+        name in _SENSITIVE_UNTRACKED_NAMES
+        or name.startswith(".env")
+        or name.endswith((".pem", ".key", ".p12", ".pfx"))
+    )
+
 
 @dataclass
 class EvaluationInputs:
@@ -194,7 +208,12 @@ def _git_diff(workspace: Path, paths: set[str] | None = None) -> str:
         for line in status.stdout.splitlines():
             if line.startswith("?? "):
                 rel = line[3:].strip()
-                if rel and (paths is None or rel.replace("\\", "/") in paths):
+                normalized = rel.replace("\\", "/")
+                if (
+                    rel
+                    and not _is_sensitive_untracked(normalized)
+                    and (paths is None or normalized in paths)
+                ):
                     untracked.append(rel)
         for rel in untracked[:50]:
             path = workspace / rel
@@ -222,6 +241,17 @@ def _task_scoped_diff(task, workspace: Path) -> str:
         path for path, digest in current.items()
         if baseline.get(path) != digest
     }
+    scope_paths = {
+        str(path).replace("\\", "/").strip("/")
+        for path in (getattr(task, "scope_paths", None) or [])
+        if str(path).strip("/")
+    }
+    if scope_paths:
+        changed = {
+            path
+            for path in changed
+            if any(path == scope or path.startswith(f"{scope}/") for scope in scope_paths)
+        }
     # A pre-existing dirty file that became clean was touched too, but has no
     # current patch to render. The machine verification/evidence still records
     # that outcome; never leak unrelated unchanged baseline files into review.

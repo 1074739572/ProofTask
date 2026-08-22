@@ -5,7 +5,7 @@
     "dev": ".\\node_modules\\@oven\\bun-windows-x64\\bin\\bun.exe src-open/index.tsx",
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.ink.json --noEmit",
-    "test": "node --import tsx --test test/*.test.ts",
+    "test": ".\\node_modules\\@oven\\bun-windows-x64\\bin\\bun.exe test test",
     "debug": ".\\node_modules\\@oven\\bun-windows-x64\\bin\\bun.exe src-open/debug.tsx",
     "debug:goal": ".\\node_modules\\@oven\\bun-windows-x64\\bin\\bun.exe src-open/debug.tsx 120 36 goal-draft",
     "debug:measure": ".\\node_modules\\@oven\\bun-windows-x64\\bin\\bun.exe src-open/measure_flash.tsx",

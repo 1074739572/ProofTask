@@ -35,6 +35,7 @@ import {
 } from '../src/autocomplete.ts';
 import {
   appendHistory,
+  createMessageQueue,
   foldedPasteLabel,
   footerHint,
   likelyPaste,
@@ -710,12 +711,14 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
   const [backendState, setBackendState] = createSignal<BackendConnectionState>(hasDebugLifecycle ? 'connected' : 'disconnected');
   const [backendExitCode, setBackendExitCode] = createSignal<number | null>(null);
   const [queuedMessages, setQueuedMessages] = createSignal(0);
+  const [localPendingMessages, setLocalPendingMessages] = createSignal(0);
   const [offlineMessages, setOfflineMessages] = createSignal<OfflineMessage[]>([]);
   const [currentTool, setCurrentTool] = createSignal<string | null>(null);
   const [toolDone, setToolDone] = createSignal(0);
   const [toolTotal, setToolTotal] = createSignal(0);
   const [draftStatus, setDraftStatus] = createSignal<GoalDraftSnapshot | null>(initialDebugDraft);
   const [pastedContent, setPastedContent] = createSignal<PasteSnapshot | null>(null);
+  const messageQueue = createMessageQueue(command => send(command));
   let lastBufferValue = '';
   let lastBufferChangedAt = 0;
   let suppressContentChange = false;
@@ -1019,6 +1022,11 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
     setRunning(debugRunning);
     if (debugRunning && !startedAt()) setStartedAt(props?.debugStartedAt ?? Date.now());
     if (!debugRunning && startedAt()) setStartedAt(0);
+  });
+  createEffect(() => {
+    const busy = running();
+    messageQueue.setBusy(busy);
+    setLocalPendingMessages(messageQueue.pendingCount());
   });
   createEffect(() => {
     if (running()) {
@@ -1566,13 +1574,18 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
     if (!isCommand) add({id: `prompt-${Date.now()}`, kind: 'prompt', text});
     if (!isCommand) pendingPrompts.push(text);
     setUserStarted(true);
-    const sent = send({type: 'user_message', text, goal_context: goalContext});
+    const command = {type: 'user_message', text, goal_context: goalContext};
+    // Slash commands are control-plane operations and must never wait behind
+    // chat messages. Ordinary messages use the local FIFO while the agent is
+    // busy and drain on the next running -> idle transition.
+    const sent = isCommand ? send(command) : messageQueue.submit(command);
+    setLocalPendingMessages(messageQueue.pendingCount());
     if (!sent) {
       if (!isCommand) pendingPrompts = pendingPrompts.filter(item => item !== text);
       setOfflineMessages(previous => [...previous, {text, goalContext}].slice(-32));
       showToast('Backend unavailable; message saved for reconnect');
-    } else if (running() && !isGoalControl) {
-      showToast(`Message queued (${queuedMessages() + 1} pending)`);
+    } else if (running() && !isGoalControl && !isCommand) {
+      showToast(`Message queued (${localPendingMessages()} pending)`);
     }
     setComposerText('');
     setPastedContent(null);
@@ -1586,11 +1599,13 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
     running: running(),
     phase: phase(),
     elapsed: elapsed(),
-    pending: queuedMessages(),
+    pending: localPendingMessages(),
     currentTool: currentTool() || undefined,
     toolsDone: toolDone(),
     toolsTotal: toolTotal(),
     backend: backendState(),
+    permissionWait: overlay()?.kind === 'permission',
+    completionOpen: Boolean(completion().mode && completion().options.length),
     composerLines: composerLines(),
     paste: pastedContent(),
     toast: toast()?.text || null,
@@ -1661,7 +1676,7 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
       <Show when={false && !running() && !toast() && !overlay() && backendReady()}>
         <text fg={C.textMuted} wrapMode="none" truncate>{footerStatusText(dims().width, model(), effortShortLabel(effortLabel(), effort()), contextUsed(), contextWindow(), todayInput() + todayOutput())}</text>
       </Show>
-      <Show when={!overlay()}>
+      <Show when={!overlay() || overlay()?.kind === 'permission'}>
         <text fg={backendState() === 'disconnected' ? C.warning : running() ? C.warning : C.textMuted} wrapMode="none" truncate>{footerText()}</text>
       </Show>
     </box>

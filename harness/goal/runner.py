@@ -468,10 +468,20 @@ def _resume_target(state: GoalState) -> str:
         # exhausted repair checkpoint would pause immediately without ever
         # verifying the current implementation.
         state.repair_attempts = 0
+        state.repair_epoch += 1
         state.no_progress_count = 0
         state.consecutive_failures = 0
         state.last_error = "Repair budget reset after explicit resume; verify the current Task."
         candidate = GoalPhase.ACT.value
+    # A recoverable pause can happen after verification/evaluation already
+    # passed (for example, a stale scope snapshot). Do not spend another model
+    # turn re-running the implementation worker; continue from the next
+    # deterministic gate instead.
+    if current is not None and current.status == "in_progress" and current.verification_state == "passing":
+        if state.evaluation_required and (current.evaluation or {}).get("passed") is True:
+            candidate = GoalPhase.CLEAN_CHECK.value
+        elif state.evaluation_required and candidate in {GoalPhase.ACT.value, GoalPhase.REPAIR_PLAN.value}:
+            candidate = GoalPhase.EVALUATE.value
     task_phases = {
         GoalPhase.CLAIM.value,
         GoalPhase.ACT.value,
@@ -2417,7 +2427,17 @@ class GoalRunner(threading.Thread):
 
         task = load_task(state.current_task_id)
         evaluation = task.evaluation or {"passed": False, "summary": state.last_error or "Goal verification failed", "route": "implementation_fix"}
-        if len(task.repair_history) >= MAX_REPAIR_ATTEMPTS_PER_TASK:
+        if state.repair_epoch > 0:
+            repair_count = sum(
+                1
+                for item in task.repair_history
+                if isinstance(item, dict) and item.get("repair_epoch") == state.repair_epoch
+            )
+        else:
+            # Legacy Goals predate repair epochs; their complete history is
+            # the only available circuit-breaker evidence.
+            repair_count = len(task.repair_history)
+        if repair_count >= MAX_REPAIR_ATTEMPTS_PER_TASK:
             detail = (
                 f"Task {task.id} reached {MAX_REPAIR_ATTEMPTS_PER_TASK} repair plans without completion; "
                 "review its acceptance cases, evidence, and scope before resuming."
@@ -2480,7 +2500,12 @@ class GoalRunner(threading.Thread):
         )
         # Record both model decisions and deterministic format fallbacks so the
         # UI/audit trail explains why the current Task was resumed.
-        record = {"evaluation": evaluation, **decision.to_dict(), "at": time.time()}
+        record = {
+            "evaluation": evaluation,
+            **decision.to_dict(),
+            "repair_epoch": state.repair_epoch,
+            "at": time.time(),
+        }
         if decision.format_fallback:
             record["event"] = "repair_planner_format_fallback"
         record_task_repair(task.id, record)
@@ -2982,6 +3007,16 @@ class GoalRunner(threading.Thread):
             GoalRunner._scope_relative_path(state, str(path)): str(digest)
             for path, digest in (task.start_dirty_hashes or {}).items()
         }
+        # Generated verification files are part of the Task contract even
+        # when the planner's production scope only names source directories.
+        # Without this allowance, a successful test-generation step is later
+        # rejected as an autonomy violation by the worker scope gate.
+        verification_spec = task.verification_spec if isinstance(task.verification_spec, dict) else {}
+        test_scope = {
+            GoalRunner._scope_relative_path(state, str(path))
+            for path in (verification_spec.get("test_files") or [])
+            if path
+        }
         # A file that was already dirty is not exempt if this worker changed it
         # again. Compare digests rather than merely comparing path names.
         changed = {
@@ -2989,7 +3024,17 @@ class GoalRunner(threading.Thread):
             for path, digest in current.items()
             if baseline.get(GoalRunner._scope_relative_path(state, str(path))) != str(digest)
         }
-        outside = sorted(path for path in changed if path not in scope and not any(path.startswith(item.rstrip("/") + "/") for item in scope))
+        outside = sorted(
+            path
+            for path in changed
+            if path not in test_scope
+            and path not in scope
+            and not any(path.startswith(item.rstrip("/") + "/") for item in scope)
+            and not any(
+                part.lower() in {"test", "tests", "__tests__"}
+                for part in Path(path).parts
+            )
+        )
         if outside:
             return "worker changed files outside Task scope: " + ", ".join(outside[:12])
         return None

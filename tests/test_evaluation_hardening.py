@@ -105,6 +105,52 @@ def test_task_scoped_diff_excludes_unchanged_preexisting_dirty_files(monkeypatch
     assert requested == [{"edited.py", "new.py"}]
 
 
+def test_task_scoped_diff_honors_declared_scope_paths(monkeypatch, tmp_path):
+    import harness.evaluation.inputs as inputs_mod
+
+    task = SimpleNamespace(
+        start_dirty_hashes={},
+        scope_paths=["node_tui/src-open/App.tsx", "node_tui/src-open/interaction.ts"],
+    )
+    monkeypatch.setattr(
+        "harness.verification.snapshot.capture_dirty_file_hashes",
+        lambda _workspace: {
+            "node_tui/src-open/App.tsx": "changed",
+            "node_tui/src-open/interaction.ts": "changed",
+            "harness/goal/runner.py": "unrelated",
+            ".env.bak_20260818": "secret",
+        },
+    )
+    requested = []
+    monkeypatch.setattr(
+        inputs_mod,
+        "_git_diff",
+        lambda _workspace, paths=None: requested.append(paths) or "task diff",
+    )
+
+    assert inputs_mod._task_scoped_diff(task, tmp_path) == "task diff"
+    assert requested == [{"node_tui/src-open/App.tsx", "node_tui/src-open/interaction.ts"}]
+
+
+def test_untracked_credential_backups_are_not_rendered(monkeypatch, tmp_path):
+    import harness.evaluation.inputs as inputs_mod
+
+    class Result:
+        returncode = 0
+        stdout = "?? .env.bak_20260818\n?? notes.md\n"
+
+    def run(command, **kwargs):
+        if command[1] == "status":
+            return Result()
+        return type("DiffResult", (), {"returncode": 0, "stdout": "tracked diff"})()
+
+    monkeypatch.setattr(inputs_mod.subprocess, "run", run)
+    rendered = inputs_mod._git_diff(tmp_path)
+
+    assert "tracked diff" in rendered
+    assert ".env.bak_20260818" not in rendered
+
+
 def test_evaluator_input_explains_that_a_clean_diff_is_not_a_scope_failure():
     feature = SimpleNamespace(
         behavior="behavior",

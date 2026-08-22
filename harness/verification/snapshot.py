@@ -71,6 +71,33 @@ def _is_harness_metadata(path: Path) -> bool:
     return bool(path.parts and path.parts[0] in _HARNESS_METADATA_ROOTS)
 
 
+def _workspace_git_path(raw_path: bytes, workspace: Path, repository: Path) -> tuple[Path, str] | None:
+    """Resolve a Git path relative to a possibly nested execution workspace."""
+    value = raw_path.decode("utf-8", errors="surrogateescape")
+    relative = Path(value)
+    workspace = workspace.resolve()
+    repository = repository.resolve()
+    workspace_candidate = (workspace / relative).resolve()
+    repository_candidate = (repository / relative).resolve()
+    candidates = (
+        (workspace_candidate, repository_candidate)
+        if workspace_candidate.is_file() or not repository_candidate.is_file()
+        else (repository_candidate, workspace_candidate)
+    )
+    for candidate in candidates:
+        if not candidate.is_file():
+            continue
+        try:
+            return candidate, candidate.relative_to(workspace).as_posix()
+        except ValueError:
+            continue
+    # Keep a deleted path under the workspace visible to the dirty-file gate.
+    try:
+        return repository_candidate, repository_candidate.relative_to(workspace).as_posix()
+    except ValueError:
+        return None
+
+
 def capture_code_snapshot(workspace: str | Path | None = None) -> str:
     """Return a content-aware workspace fingerprint, or ``''`` outside git.
 
@@ -128,15 +155,18 @@ def capture_dirty_file_hashes(workspace: str | Path | None = None) -> dict[str, 
     untracked = _git_bytes("ls-files", "--others", "--exclude-standard", "-z", cwd=ws)
     if changed is None or untracked is None:
         return {}
+    root = _git("rev-parse", "--show-toplevel", cwd=ws)
+    repository = Path(root.strip()).resolve() if root else ws
     result: dict[str, str] = {}
     for raw_path in (*changed.split(b"\0"), *untracked.split(b"\0")):
         if not raw_path:
             continue
-        relative = Path(raw_path.decode("utf-8", errors="surrogateescape"))
-        if _is_harness_metadata(relative):
+        resolved = _workspace_git_path(raw_path, ws, repository)
+        if resolved is None:
             continue
-        path = ws / relative
-        key = relative.as_posix()
+        path, key = resolved
+        if _is_harness_metadata(Path(key)):
+            continue
         if not path.is_file():
             result[key] = "<missing>"
             continue

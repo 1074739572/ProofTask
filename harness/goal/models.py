@@ -119,6 +119,9 @@ class GoalState:
     no_progress_count: int = 0
     total_llm_rounds: int = 0
     repair_attempts: int = 0
+    # Explicit Resume starts a fresh bounded repair epoch while preserving
+    # prior Task repair history for audit and diagnosis.
+    repair_epoch: int = 0
     worker_generation: int = 0
     worker_rollovers: int = 0
     # Durable retry budget for supervisor-handled capability boundaries. Each

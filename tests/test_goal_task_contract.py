@@ -96,6 +96,51 @@ def test_worker_scope_gate_normalizes_nested_execution_workspace_paths(monkeypat
     assert runner_mod.GoalRunner._validate_task_scope(state, task) is None
 
 
+def test_worker_scope_gate_allows_task_bound_generated_test_files(monkeypatch, tmp_path):
+    from harness.goal import runner as runner_mod
+    from harness.tasks import Task
+
+    state = GoalState.new(target="x", verification="bun test", workspace=str(tmp_path))
+    task = Task(
+        id="task_test_scope", subject="x", description="x", status="in_progress", owner="goal:x",
+        blockedBy=[], scope_paths=["src"],
+        verification_spec={"test_files": ["test/footer-state.test.ts"]},
+    )
+    monkeypatch.setattr(
+        "harness.verification.snapshot.capture_dirty_file_hashes",
+        lambda _workspace: {
+            "src/app.ts": "new",
+            "test/footer-state.test.ts": "new",
+            "test/message-queue.test.ts": "preexisting-test",
+        },
+    )
+
+    assert runner_mod.GoalRunner._validate_task_scope(state, task) is None
+
+
+def test_nested_workspace_dirty_hashes_ignore_sibling_repository_files(monkeypatch, tmp_path):
+    from harness.verification import snapshot
+
+    execution = tmp_path / "node_tui"
+    execution.mkdir()
+    (execution / "src-open").mkdir()
+    (execution / "src-open" / "interaction.ts").write_text("changed", encoding="utf-8")
+    (tmp_path / "harness").mkdir()
+    (tmp_path / "harness" / "goal.py").write_text("unrelated", encoding="utf-8")
+
+    def fake_git_bytes(*args, cwd):
+        if args[:2] == ("diff", "--name-only"):
+            return b"node_tui/src-open/interaction.ts\0harness/goal.py\0"
+        return b""
+
+    monkeypatch.setattr(snapshot, "_git_bytes", fake_git_bytes)
+    monkeypatch.setattr(snapshot, "_git", lambda *args, cwd: str(tmp_path) + "\n")
+
+    hashes = snapshot.capture_dirty_file_hashes(execution)
+
+    assert set(hashes) == {"src-open/interaction.ts"}
+
+
 def test_plan_allows_a_discovered_directory_scope_for_new_files():
     manifest = {
         "repo_files": ["src/existing.py"],
@@ -486,9 +531,69 @@ def test_resume_starts_a_new_bounded_repair_epoch_after_limit(tmp_path, monkeypa
 
     assert target == GoalPhase.ACT.value
     assert state.repair_attempts == 0
+    assert state.repair_epoch == 1
     assert state.no_progress_count == 0
     assert "new bounded repair epoch" not in state.last_error
     assert "verify the current Task" in state.last_error
+
+
+def test_resume_skips_implementation_when_task_verification_and_evaluation_pass(tmp_path, monkeypatch):
+    import harness.tasks as tasks
+    import harness.goal.runner as runner_mod
+
+    monkeypatch.setattr(tasks, "TASKS_DIR", tmp_path / ".tasks")
+    task = tasks.create_task(
+        "already verified", "keep the verified behavior", verification_spec={"source": "generated"},
+        evaluation_required=True,
+    )
+    tasks.claim_task(task.id)
+    task = tasks.load_task(task.id)
+    task.verification_state = "passing"
+    task.evaluation = {"passed": True}
+    tasks.save_task(task)
+    state = GoalState.new(target="resume", verification="pytest -q", workspace=str(tmp_path), evaluation_required=True)
+    state.initialization_complete = True
+    state.execution_approved = True
+    state.current_task_id = task.id
+    state.task_ids = [task.id]
+    state.resume_phase = GoalPhase.ACT.value
+
+    assert runner_mod._resume_target(state) == GoalPhase.CLEAN_CHECK.value
+
+
+def test_new_repair_epoch_does_not_count_legacy_task_history(tmp_path, monkeypatch):
+    import harness.goal.repair as repair_mod
+    import harness.goal.runner as runner_mod
+    import harness.tasks as tasks
+    from harness.goal.repair import RepairDecision
+
+    monkeypatch.setattr(tasks, "TASKS_DIR", tmp_path / ".tasks")
+    task = tasks.create_task("current", "still failing", verification_spec={})
+    tasks.claim_task(task.id)
+    task = tasks.load_task(task.id)
+    task.repair_history = [{"attempt": index} for index in range(4)]
+    tasks.save_task(task)
+    state = GoalState.new(target="repair", verification="pytest -q", workspace=str(tmp_path))
+    state.initialization_complete = True
+    state.execution_approved = True
+    state.current_task_id = task.id
+    state.task_ids = [task.id]
+    state.phase = GoalPhase.REPAIR_PLAN.value
+    state.repair_epoch = 1
+    state.repair_attempts = 0
+    monkeypatch.setattr(runner_mod, "save_goal", lambda _state: None)
+    monkeypatch.setattr(runner_mod, "_emit_goal", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        repair_mod,
+        "plan_task_repair",
+        lambda *args, **kwargs: RepairDecision("implementation_fix", "apply the verified fix"),
+    )
+
+    runner_mod.GoalRunner(state=state, history=[], context={}, binding=None)._repair_plan(state)
+
+    assert state.phase == GoalPhase.ACT.value
+    repaired = tasks.load_task(task.id)
+    assert repaired.repair_history[-1]["repair_epoch"] == 1
 
 
 def test_repair_planner_corrects_invalid_json_once_before_falling_back(tmp_path):
