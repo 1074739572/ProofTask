@@ -396,6 +396,14 @@ def resume_goal(*, history: list, context: dict, binding: Any, approve_execution
                 state.execution_approved = True
             elif approve_execution:
                 raise GoalNotRunningError("No Goal is waiting for execution approval.")
+            elif not state.execution_approved:
+                # Older draft-backed Goals stopped after every Task had a test
+                # binding.  Lazy preparation instead approves the frozen
+                # contract once and lets each runnable Task bind its test when
+                # it is selected. A non-approval pause from that legacy flow
+                # must therefore resume execution rather than rebuilding a
+                # future Task's tests first.
+                state.execution_approved = True
 
             # Pauses are outside the active execution budget. This also makes
             # a draft safely resumable the next day after test review.
@@ -404,6 +412,7 @@ def resume_goal(*, history: list, context: dict, binding: Any, approve_execution
                 state.paused_at = None
 
             target = _resume_target(state)
+            _consume_supervisor_recovery(state)
             GoalEngine().transition(state, target, "goal_resumed")
             state.stop_reason = None
             save_goal(state)
@@ -433,10 +442,10 @@ def _resume_target(state: GoalState) -> str:
         return GoalPhase.INITIALIZE.value
     if not state.execution_approved:
         return GoalPhase.PREPARE_TESTS.value
-    candidate = state.resume_phase or GoalPhase.SELECT_TASK.value
+    candidate = _supervisor_recovery_target(state) or state.resume_phase or GoalPhase.SELECT_TASK.value
     allowed = {
         phase.value for phase in (
-            GoalPhase.SELECT_TASK, GoalPhase.CLAIM, GoalPhase.ACT,
+            GoalPhase.PREPARE_TESTS, GoalPhase.SELECT_TASK, GoalPhase.CLAIM, GoalPhase.ACT,
             GoalPhase.ROLLOVER, GoalPhase.VERIFY, GoalPhase.EVALUATE, GoalPhase.REPAIR_PLAN,
             GoalPhase.IMPACT_REVIEW, GoalPhase.CLEAN_CHECK, GoalPhase.FULL_VERIFY,
         )
@@ -464,7 +473,11 @@ def _resume_target(state: GoalState) -> str:
         if current.status == "completed":
             # Task archival happens before the impact-review checkpoint. A
             # restart in that small window must still review downstream tests.
-            return GoalPhase.IMPACT_REVIEW.value if candidate == GoalPhase.CLEAN_CHECK.value else GoalPhase.SELECT_TASK.value
+            return (
+                GoalPhase.IMPACT_REVIEW.value
+                if candidate in {GoalPhase.CLEAN_CHECK.value, GoalPhase.IMPACT_REVIEW.value}
+                else GoalPhase.SELECT_TASK.value
+            )
         if current.verification_state == "needs_generation":
             return GoalPhase.PREPARE_TESTS.value
         if candidate == GoalPhase.EVALUATE.value and current.verification_state != "passing":
@@ -480,13 +493,67 @@ def _resume_target(state: GoalState) -> str:
                 return GoalPhase.EVALUATE.value
         if candidate in {GoalPhase.VERIFY.value, GoalPhase.CLEAN_CHECK.value} and current.status != "in_progress":
             return GoalPhase.CLAIM.value if current.status == "pending" else GoalPhase.SELECT_TASK.value
-        if candidate in {GoalPhase.ACT.value, GoalPhase.ROLLOVER.value, GoalPhase.REPAIR_PLAN.value} and current.status == "pending":
+        # A paused repair checkpoint contains the only durable repair
+        # direction. Claiming first would silently discard it and send a
+        # worker back to the same failed approach.
+        if candidate in {GoalPhase.ACT.value, GoalPhase.ROLLOVER.value} and current.status == "pending":
             return GoalPhase.CLAIM.value
         return candidate
 
     # SELECT_TASK will find the first runnable test-generation task.  Do not
     # preempt the saved checkpoint merely because a blocked future Task exists.
     return candidate
+
+
+def _supervisor_recovery_target(state: GoalState) -> str | None:
+    """Return a fresh, deterministic terminal-supervisor recovery target.
+
+    Terminal supervision runs after a runner stops, so it cannot safely move a
+    Goal back to ``running`` by itself.  Instead it leaves one versioned
+    directive which the normal resume path consumes.  The revision guard makes
+    an old observation advisory only after any later state transition.
+    """
+    supervision = state.supervision if isinstance(state.supervision, dict) else {}
+    directive = supervision.get("recovery")
+    if not isinstance(directive, dict) or directive.get("consumed_at"):
+        return None
+    try:
+        revision = int(directive.get("transition_revision"))
+    except (TypeError, ValueError):
+        return None
+    if revision != len(state.transition_log):
+        return None
+    action = str(directive.get("action") or "")
+    target = str(directive.get("target_phase") or "")
+    if action not in {"retry", "redirect", "replan"}:
+        return None
+    if target not in {
+        GoalPhase.PREPARE_TESTS.value,
+        GoalPhase.SELECT_TASK.value,
+        GoalPhase.CLAIM.value,
+        GoalPhase.ACT.value,
+        GoalPhase.ROLLOVER.value,
+        GoalPhase.VERIFY.value,
+        GoalPhase.EVALUATE.value,
+        GoalPhase.REPAIR_PLAN.value,
+        GoalPhase.IMPACT_REVIEW.value,
+        GoalPhase.CLEAN_CHECK.value,
+        GoalPhase.FULL_VERIFY.value,
+    }:
+        return None
+    return target
+
+
+def _consume_supervisor_recovery(state: GoalState) -> None:
+    """Mark the one-shot directive consumed before a new runner is launched."""
+    supervision = state.supervision if isinstance(state.supervision, dict) else {}
+    directive = supervision.get("recovery")
+    if not isinstance(directive, dict) or _supervisor_recovery_target(state) is None:
+        return
+    state.supervision = {
+        **supervision,
+        "recovery": {**directive, "consumed_at": time.time()},
+    }
 
 
 def _discard_legacy_interrupted_final_repair(state: GoalState) -> bool:
@@ -1070,13 +1137,18 @@ class GoalRunner(threading.Thread):
             )
         )
         latest = current.get("latest") if stale and isinstance(current.get("latest"), dict) else record
-        self._state.supervision = {
+        updated_supervision = {
             **current,
             "status": status,
             "latest": latest,
             "history": history[-12:],
             "updated_at": record["at"],
         }
+        if event == "terminal_failure" and not stale and not run.decision.unavailable:
+            directive = self._terminal_recovery_directive(run)
+            if directive is not None:
+                updated_supervision["recovery"] = directive
+        self._state.supervision = updated_supervision
         self._state.total_llm_rounds += max(0, int(run.llm_rounds))
         save_goal(self._state)
         _emit(
@@ -1085,6 +1157,27 @@ class GoalRunner(threading.Thread):
             event="decision",
             **record,
         )
+
+    def _terminal_recovery_directive(self, run: SupervisorRun) -> dict[str, Any] | None:
+        """Translate only safe terminal advice into a one-shot resume route."""
+        action = run.decision.action
+        if action not in {"retry", "redirect", "replan"}:
+            return None
+        if action == "replan":
+            target = GoalPhase.REPAIR_PLAN.value if self._state.current_task_id else GoalPhase.SELECT_TASK.value
+        else:
+            target = self._state.resume_phase or self._state.last_phase or GoalPhase.SELECT_TASK.value
+        guidance = run.decision.next_step or run.decision.reason or run.decision.summary
+        return {
+            "action": action,
+            "target_phase": target,
+            "guidance": guidance[:4_000],
+            "task_id": self._state.current_task_id,
+            "observation_id": run.observation_id,
+            "revision": run.revision,
+            "transition_revision": len(self._state.transition_log),
+            "created_at": time.time(),
+        }
 
     def _poll_supervisor(self) -> None:
         if self._supervisor is None:
@@ -1334,13 +1427,23 @@ class GoalRunner(threading.Thread):
         return any(load_task(task_id).verification_state == "needs_generation" for task_id in state.task_ids)
 
     def _prepare_tests(self, state: GoalState) -> None:
-        """Generate and bind tests before any implementation Task is selected."""
+        """Generate and bind tests for one runnable Task at a time.
+
+        A future Task's difficult test seam must not block implementation of a
+        Task that already has a valid red baseline.  The active Task is tried
+        first so repair/test-gap checkpoints retain their ownership.
+        """
         from harness.goal.memory import record_test_binding
         from harness.tasks import bind_task_verification, load_task
 
         root = Path(_execution_workspace(state))
         deferred = False
-        for task_id in state.task_ids:
+        task_ids = (
+            (state.current_task_id,)
+            if state.current_task_id
+            else tuple(task_id for task_id in state.task_ids if task_id)
+        )
+        for task_id in task_ids:
             task = load_task(task_id)
             if task.verification_state != "needs_generation":
                 continue
@@ -1350,6 +1453,10 @@ class GoalRunner(threading.Thread):
             if any(load_task(dep).status != "completed" for dep in task.blockedBy):
                 deferred = True
                 continue
+            # Every generated artifact, checkpoint, supervisor snapshot, and
+            # pause must identify the Task that is actually being prepared.
+            state.current_task_id = task.id
+            save_goal(state)
             adapter = select_adapter(root, task.verification_spec.get("adapter") or state.verification)
             verification_context = VerificationContext(root, command=state.verification)
             before_catalog = (
@@ -1388,6 +1495,17 @@ class GoalRunner(threading.Thread):
                 f"{human_language_label((state.goal_contract or {}).get('language'))}. "
                 "Keep JSON keys, test selectors, paths, commands, and code unchanged."
             )
+            recovery = (state.supervision or {}).get("recovery") if isinstance(state.supervision, dict) else None
+            if (
+                isinstance(recovery, dict)
+                and recovery.get("guidance")
+                and recovery.get("task_id") == task.id
+                and recovery.get("target_phase") == GoalPhase.PREPARE_TESTS.value
+            ):
+                prompt += (
+                    "\n\nGlobal supervisor recovery direction (follow it only within the frozen Task and test-only "
+                    f"boundary): {str(recovery['guidance'])[:4_000]}"
+                )
             if task.test_strategy:
                 prompt += f"\nPlanning test strategy: {task.test_strategy}"
             if task.scope_paths:
@@ -1447,8 +1565,14 @@ class GoalRunner(threading.Thread):
                 changed = sorted(path for path in set(current) & set(previous) if current[path] != previous[path])
                 all_created = sorted(set(current) - set(before_tree))
                 writer_has_test_artifact = bool(all_created)
-                advanced = bool(created)
-                if changed and not created:
+                # A writer commonly creates a focused test in one slice and
+                # finishes its assertions in the next. Changes to a file that
+                # was created during this attempt are real progress too.
+                changed_new_artifacts = [path for path in changed if path not in before_tree]
+                advanced = bool(created or changed_new_artifacts)
+                if changed and not created and changed_new_artifacts:
+                    summary = "refined a focused test artifact: " + ", ".join(changed_new_artifacts[:4])
+                elif changed and not created:
                     summary = "only existing test files changed; awaiting a focused new test artifact"
                 elif created:
                     summary = f"created focused test artifact: {', '.join(created[:4])}"
@@ -1808,6 +1932,9 @@ class GoalRunner(threading.Thread):
                 bound.verification_spec,
                 kind="integration" if len(bound.verification_spec.get("owners") or []) > 1 else "task",
             )
+            # Test preparation is deliberately lazy. The next Task is chosen
+            # only after this one has been implemented and reviewed.
+            break
         if not state.execution_approved:
             # A previous test-generation retry may have left a transient
             # diagnostic behind. Once bindings are ready, status must reflect
@@ -2174,12 +2301,12 @@ class GoalRunner(threading.Thread):
                 "goal_worker_provider_error",
                 stop_reason=StopReason.provider_unavailable.value,
             )
-        elif stats.stop_reason == "max_rounds":
-            state.worker_rollovers += 1
-            self._apply(state, GoalPhase.ROLLOVER, "worker_round_limit_reached")
         elif state.no_progress_count >= NO_PROGRESS_REPLAN_LIMIT:
             state.last_error = f"{state.no_progress_count} workers made no observable progress"
             self._apply(state, GoalPhase.REPAIR_PLAN, "worker_no_progress", error=state.last_error)
+        elif stats.stop_reason == "max_rounds":
+            state.worker_rollovers += 1
+            self._apply(state, GoalPhase.ROLLOVER, "worker_round_limit_reached")
         else:
             self._apply(state, GoalPhase.VERIFY, "goal_worker_finished")
 
@@ -2303,10 +2430,6 @@ class GoalRunner(threading.Thread):
                 extra={"task_id": task.id, "action": decision.action},
             ),
         )
-        record = {"evaluation": evaluation, **decision.to_dict(), "at": time.time()}
-        record_task_repair(task.id, record)
-        if decision.assumptions:
-            append_decisions(state, task, list(decision.assumptions), source="repair_planner")
         if decision.unavailable:
             state.last_error = decision.error or "repair planner unavailable"
             format_error = state.last_error.startswith((
@@ -2326,6 +2449,13 @@ class GoalRunner(threading.Thread):
                 ),
             )
             return
+        # Transport and JSON-contract failures are not repair attempts. They
+        # must not exhaust the Task's circuit breaker before a planner has
+        # produced any actionable direction.
+        record = {"evaluation": evaluation, **decision.to_dict(), "at": time.time()}
+        record_task_repair(task.id, record)
+        if decision.assumptions:
+            append_decisions(state, task, list(decision.assumptions), source="repair_planner")
         if decision.action == "blocked":
             self._fail(state, StopReason.autonomy_blocked, decision.error or decision.summary or "repair planner blocked")
             return
@@ -2541,10 +2671,13 @@ class GoalRunner(threading.Thread):
             self._pause(state, "full_verification_tasks_unavailable", stop_reason=StopReason.full_verification_failed.value)
             return
         stats = AgentTaskStats()
+        root = Path(_execution_workspace(state))
+        adapter = select_adapter(root, state.verification)
         decision = plan_goal_regression_repair(
             state,
             tasks,
             cwd=_execution_workspace(state),
+            adapter_id=adapter.id,
             cancel_check=self._interrupted,
             deadline=self._deadline(state),
             stats=stats,
@@ -2584,7 +2717,12 @@ class GoalRunner(threading.Thread):
             return
 
         final = state.final_verification if isinstance(state.final_verification, dict) else {}
-        selector = self._failed_pytest_selector(str(final.get("stdout_tail") or ""))
+        selector = self._failed_verification_selector(
+            str(final.get("stdout_tail") or ""),
+            adapter=adapter,
+            workspace=root,
+            command=state.verification,
+        )
         if decision.action == "reopen_existing":
             task = reopen_task_for_goal_repair(
                 str(decision.task_id),
@@ -2602,9 +2740,9 @@ class GoalRunner(threading.Thread):
             return
 
         # A new Task is valid only after the model explicitly chose it and a
-        # concrete failing pytest selector gives it a machine-verifiable gate.
+        # concrete failing selector gives it a machine-verifiable gate.
         if selector is None:
-            state.last_error = f"{detail}. The planner requested a repair Task but no failing pytest selector was recorded."
+            state.last_error = f"{detail}. The planner requested a repair Task but no failing {adapter.id} selector was recorded."
             self._pause(state, "full_verification_repair_unbound", stop_reason=StopReason.full_verification_failed.value)
             return
         fingerprint = hashlib.sha256(
@@ -2616,8 +2754,11 @@ class GoalRunner(threading.Thread):
                 state.last_error = "This full verification failure already has a repair Task; refusing to create a duplicate."
                 self._pause(state, "full_verification_repair_duplicate", stop_reason=StopReason.full_verification_failed.value)
                 return
-        root = Path(_execution_workspace(state))
-        catalog = collect_pytest_catalog(root)
+        catalog = (
+            collect_pytest_catalog(root)
+            if adapter.id == "pytest"
+            else adapter.discover(VerificationContext(root, command=state.verification))
+        )
         if not catalog.contains(selector):
             state.last_error = f"Failed selector {selector!r} is no longer collected; repair Task was not created."
             self._pause(state, "full_verification_repair_selector_unavailable", stop_reason=StopReason.full_verification_failed.value)
@@ -2625,8 +2766,8 @@ class GoalRunner(threading.Thread):
         test_file = selector.split("::", 1)[0]
         name = f"goal regression repair {state.repair_attempts + 1}"
         verification_spec = {
-            "adapter": "pytest",
-            "command": build_pytest_command((selector,)),
+            "adapter": adapter.id,
+            "command": adapter.build_command((selector,)),
             "test_files": [test_file],
             "selectors": [selector],
             "source": "discovered",
@@ -2685,6 +2826,30 @@ class GoalRunner(threading.Thread):
             match = re.match(r"^FAILED\s+([^\s]+\.py::[^\s]+)", line.strip())
             if match:
                 return match.group(1).replace("\\", "/")
+        return None
+
+    @classmethod
+    def _failed_verification_selector(cls, output: str, *, adapter, workspace: Path, command: str) -> str | None:
+        """Return one collected failing selector without assuming pytest.
+
+        pytest reports the full node id directly. Node's built-in runner reports
+        a test title, so resolve that title against the adapter's discovered
+        catalog and refuse ambiguous matches.
+        """
+        if adapter.id == "pytest":
+            return cls._failed_pytest_selector(output)
+        catalog = adapter.discover(VerificationContext(workspace, command=command))
+        for line in output.splitlines():
+            match = re.match(r"^(?:not ok\s+\d+\s+-|[✖x])\s*(.+?)(?:\s+\([^)]*\))?$", line.strip(), re.IGNORECASE)
+            if not match:
+                continue
+            title = match.group(1).strip()
+            matches = [
+                selector for selector in catalog.selectors
+                if selector.split("::", 1)[-1] == title
+            ]
+            if len(matches) == 1:
+                return matches[0]
         return None
 
     def _record_final_verification(self, state: GoalState, *, status: str, result=None, error: str | None = None) -> None:

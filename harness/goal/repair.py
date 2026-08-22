@@ -178,10 +178,11 @@ def plan_task_repair(
     runner=None,
 ) -> RepairDecision:
     invoke = runner or run_agent_task
+    prompt = build_repair_prompt(state, task, evaluation)
     try:
         raw = invoke(
             description=f"repair plan for task {task.id}",
-            prompt=build_repair_prompt(state, task, evaluation),
+            prompt=prompt,
             agent_type=REPAIR_AGENT,
             cwd=cwd,
             max_rounds=PLANNER_MAX_ROUNDS,
@@ -191,7 +192,67 @@ def plan_task_repair(
         )
     except Exception as exc:
         return RepairDecision("blocked", "", error=f"repair planner failed: {type(exc).__name__}: {exc}", unavailable=True)
-    return parse_repair_decision(raw)
+    if stats is not None and getattr(stats, "stop_reason", "") in {
+        "provider_error", "configuration_error", "deadline", "cancelled",
+    }:
+        return RepairDecision(
+            "blocked", "",
+            error=f"repair planner stopped: {stats.stop_reason}",
+            unavailable=True,
+        )
+    decision = parse_repair_decision(raw)
+    if not decision.unavailable or not (decision.error or "").startswith((
+        "repair planner returned no JSON",
+        "invalid repair JSON:",
+        "repair planner output is not an object",
+        "unsupported repair action:",
+        "repair action needs instructions",
+    )):
+        return decision
+
+    # A completed model turn with malformed structured output is not a repair
+    # attempt. Give it one bounded correction turn before the runner pauses;
+    # the original evidence is retained in the correction prompt.
+    correction_stats = type(stats)() if stats is not None else None
+    try:
+        corrected = invoke(
+            description=f"repair plan for task {task.id} (JSON correction)",
+            prompt=(
+                prompt
+                + "\n\nYour previous response did not match the required JSON contract. "
+                "Return ONLY one valid JSON object, with an allowed action and non-empty instructions when required. "
+                "Previous response:\n"
+                + str(raw)[-2_000:]
+            ),
+            agent_type=REPAIR_AGENT,
+            cwd=cwd,
+            max_rounds=PLANNER_MAX_ROUNDS,
+            cancel_check=cancel_check,
+            deadline=deadline,
+            stats=correction_stats,
+        )
+    except Exception as exc:
+        return RepairDecision("blocked", "", error=f"repair planner correction failed: {type(exc).__name__}: {exc}", unavailable=True)
+    if stats is not None and correction_stats is not None:
+        stats.llm_rounds += correction_stats.llm_rounds
+        if correction_stats.stop_reason:
+            stats.stop_reason = correction_stats.stop_reason
+    if correction_stats is not None and correction_stats.stop_reason in {
+        "provider_error", "configuration_error", "deadline", "cancelled",
+    }:
+        return RepairDecision(
+            "blocked", "",
+            error=f"repair planner correction stopped: {correction_stats.stop_reason}",
+            unavailable=True,
+        )
+    corrected_decision = parse_repair_decision(corrected)
+    if corrected_decision.unavailable:
+        return RepairDecision(
+            "blocked", "",
+            error=f"{corrected_decision.error} after JSON correction",
+            unavailable=True,
+        )
+    return corrected_decision
 
 
 def plan_goal_regression_repair(
@@ -199,6 +260,7 @@ def plan_goal_regression_repair(
     tasks: list,
     *,
     cwd: str,
+    adapter_id: str = "pytest",
     cancel_check: Callable[[], bool] | None = None,
     deadline: float | None = None,
     stats=None,
@@ -216,12 +278,12 @@ def plan_goal_regression_repair(
         for task in tasks
     ]
     prompt = (
-        "Analyze one failed Goal-level pytest verification. Return ONLY JSON:\n"
+        f"Analyze one failed Goal-level {adapter_id} verification. Return ONLY JSON:\n"
         '{"action":"reopen_existing|create_repair_task|pause","task_id":"existing task id or null",'
         '"instructions":"...","summary":"..."}\n\n'
         "Rules:\n"
         "- First prefer reopen_existing when one completed Goal Task owns or caused the regression.\n"
-        "- create_repair_task is allowed only for a concrete, collected FAILED pytest selector that cannot reasonably belong to an existing Task. It creates implementation work only; never request generated tests.\n"
+        "- create_repair_task is allowed only for one concrete, collected failing selector from the active verification adapter that cannot reasonably belong to an existing Task. It creates implementation work only; never request generated tests.\n"
         "- pause for interrupted runs, unavailable infrastructure, unclear ownership, or missing concrete evidence.\n"
         "- Do not change the Goal contract or weaken a test.\n\n"
         f"Goal contract:\n{json.dumps(state.goal_contract, ensure_ascii=False)[:4000]}\n\n"

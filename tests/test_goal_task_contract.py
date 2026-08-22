@@ -327,6 +327,43 @@ def test_resume_routes_completed_clean_checkpoint_through_impact_review(tmp_path
     assert runner_mod._resume_target(state) == GoalPhase.IMPACT_REVIEW.value
 
 
+def test_resume_retries_paused_impact_review_for_completed_task(tmp_path, monkeypatch):
+    import harness.goal.runner as runner_mod
+    import harness.tasks as tasks
+
+    monkeypatch.setattr(tasks, "TASKS_DIR", tmp_path / ".tasks")
+    task = tasks.create_task("completed", "implemented", verification_spec={})
+    task.status = "completed"
+    tasks.save_task(task, archived=True)
+    (tmp_path / ".tasks" / f"{task.id}.json").unlink()
+    state = GoalState.new(target="resume", verification="python -m pytest -q", workspace=str(tmp_path))
+    state.initialization_complete = True
+    state.task_plan = [{"name": "completed"}]
+    state.task_name_ids = {"completed": task.id}
+    state.task_ids = [task.id]
+    state.current_task_id = task.id
+    state.resume_phase = GoalPhase.IMPACT_REVIEW.value
+
+    assert runner_mod._resume_target(state) == GoalPhase.IMPACT_REVIEW.value
+
+
+def test_resume_retries_paused_repair_plan_for_pending_task(tmp_path, monkeypatch):
+    import harness.goal.runner as runner_mod
+    import harness.tasks as tasks
+
+    monkeypatch.setattr(tasks, "TASKS_DIR", tmp_path / ".tasks")
+    task = tasks.create_task("repair", "needs a repair decision", verification_spec={})
+    state = GoalState.new(target="resume", verification="python -m pytest -q", workspace=str(tmp_path))
+    state.initialization_complete = True
+    state.task_plan = [{"name": "repair"}]
+    state.task_name_ids = {"repair": task.id}
+    state.task_ids = [task.id]
+    state.current_task_id = task.id
+    state.resume_phase = GoalPhase.REPAIR_PLAN.value
+
+    assert runner_mod._resume_target(state) == GoalPhase.REPAIR_PLAN.value
+
+
 def test_initialize_recovers_orphan_task_written_before_goal_checkpoint(tmp_path, monkeypatch):
     import harness.goal.runner as runner_mod
     import harness.tasks as tasks
@@ -405,6 +442,73 @@ def test_repair_planning_pauses_after_repeated_task_repairs(tmp_path, monkeypatc
 
     assert state.phase == GoalPhase.PAUSED.value
     assert state.stop_reason == "repair_limit_reached"
+
+
+def test_repair_planner_corrects_invalid_json_once_before_pausing(tmp_path):
+    from harness.agents.runner import AgentTaskStats
+    from harness.goal.repair import plan_task_repair
+    from harness.tasks import Task
+
+    state = GoalState.new(target="repair", verification="pytest -q", workspace=str(tmp_path))
+    task = Task(
+        id="task_repair",
+        subject="repair",
+        description="restore behavior",
+        status="in_progress",
+        owner="goal:test",
+        blockedBy=[],
+    )
+    replies = iter(("I would change the adapter.", '{"action":"implementation_fix","instructions":"Repair the adapter and rerun the bound test."}'))
+
+    def runner(**kwargs):
+        kwargs["stats"].llm_rounds = 1
+        return next(replies)
+
+    stats = AgentTaskStats()
+    decision = plan_task_repair(
+        state,
+        task,
+        {"passed": False, "summary": "bound test failed"},
+        cwd=str(tmp_path),
+        stats=stats,
+        runner=runner,
+    )
+
+    assert decision.action == "implementation_fix"
+    assert not decision.unavailable
+    assert stats.llm_rounds == 2
+
+
+def test_repair_planner_preserves_provider_failure_over_missing_json(tmp_path):
+    from harness.agents.runner import AgentTaskStats
+    from harness.goal.repair import plan_task_repair
+    from harness.tasks import Task
+
+    state = GoalState.new(target="repair", verification="pytest -q", workspace=str(tmp_path))
+    task = Task(
+        id="task_repair",
+        subject="repair",
+        description="restore behavior",
+        status="in_progress",
+        owner="goal:test",
+        blockedBy=[],
+    )
+
+    def unavailable(**kwargs):
+        kwargs["stats"].stop_reason = "provider_error"
+        return "provider unavailable"
+
+    decision = plan_task_repair(
+        state,
+        task,
+        {"passed": False},
+        cwd=str(tmp_path),
+        stats=AgentTaskStats(),
+        runner=unavailable,
+    )
+
+    assert decision.unavailable
+    assert decision.error == "repair planner stopped: provider_error"
 
 
 def test_test_generation_expands_a_collected_test_file_to_real_node_ids(tmp_path):
@@ -667,6 +771,91 @@ def test_test_generation_uses_writer_and_requires_failing_baseline(tmp_path, mon
     assert state.phase == GoalPhase.SELECT_TASK.value
     assert bound.verification_spec["source"] == "generated"
     assert bound.verification_spec["baseline_result"] == "failing"
+
+
+def test_test_generation_binds_only_the_current_runnable_task(tmp_path, monkeypatch):
+    import harness.goal.runner as runner_mod
+    import harness.tasks as tasks
+
+    monkeypatch.setattr(tasks, "TASKS_DIR", tmp_path / ".tasks")
+    first = tasks.create_task(
+        "first", "first missing behavior",
+        acceptance_cases=[{"id": "AC1", "given": "x", "when": "y", "then": "z"}],
+        verification_spec={"source": "needs_generation"},
+    )
+    second = tasks.create_task(
+        "second", "future missing behavior",
+        acceptance_cases=[{"id": "AC1", "given": "x", "when": "y", "then": "z"}],
+        verification_spec={"source": "needs_generation"},
+    )
+    state = GoalState.new(target="lazy tests", verification="pytest -q", workspace=str(tmp_path))
+    state.task_ids = [first.id, second.id]
+    state.current_task_id = first.id
+    state.phase = GoalPhase.PREPARE_TESTS.value
+    calls = []
+    monkeypatch.setattr(runner_mod, "save_goal", lambda state: None)
+    monkeypatch.setattr(
+        runner_mod,
+        "run_agent_task",
+        lambda **kwargs: calls.append(kwargs) or (
+            '{"test_selectors":["tests/test_first.py::test_first"],'
+            '"case_selectors":{"AC1":["tests/test_first.py::test_first"]}}'
+        ),
+    )
+    catalogs = iter((
+        TestCatalog(),
+        TestCatalog(selectors=("tests/test_first.py::test_first",), test_files=("tests/test_first.py",)),
+    ))
+    monkeypatch.setattr(runner_mod, "collect_pytest_catalog", lambda workspace: next(catalogs))
+    monkeypatch.setattr(
+        runner_mod,
+        "run_verification",
+        lambda *args, **kwargs: type("Result", (), {"passed": False, "error": None, "timed_out": False, "stdout": "assert missing behavior", "exit_code": 1, "duration_ms": 5, "command": "pytest -q tests/test_first.py::test_first"})(),
+    )
+
+    GoalRunner(state=state, history=[], context={}, binding=None)._prepare_tests(state)
+
+    assert len(calls) == 1
+    assert tasks.load_task(first.id).verification_spec["source"] == "generated"
+    assert tasks.load_task(second.id).verification_state == "needs_generation"
+    assert state.current_task_id == first.id
+
+
+def test_test_generation_without_a_current_task_persists_the_actual_task(tmp_path, monkeypatch):
+    import harness.goal.runner as runner_mod
+    import harness.tasks as tasks
+
+    monkeypatch.setattr(tasks, "TASKS_DIR", tmp_path / ".tasks")
+    bound = tasks.create_task("bound", "already covered", verification_spec={"source": "generated"})
+    target = tasks.create_task(
+        "target", "needs coverage",
+        acceptance_cases=[{"id": "AC1", "given": "x", "when": "y", "then": "z"}],
+        verification_spec={"source": "needs_generation"},
+    )
+    state = GoalState.new(target="identity", verification="pytest -q", workspace=str(tmp_path))
+    state.task_ids = [bound.id, target.id]
+    state.current_task_id = None
+    state.phase = GoalPhase.PREPARE_TESTS.value
+    monkeypatch.setattr(runner_mod, "save_goal", lambda state: None)
+    monkeypatch.setattr(
+        runner_mod,
+        "run_agent_task",
+        lambda **kwargs: '{"test_selectors":["tests/test_target.py::test_target"],"case_selectors":{"AC1":["tests/test_target.py::test_target"]}}',
+    )
+    catalogs = iter((
+        TestCatalog(),
+        TestCatalog(selectors=("tests/test_target.py::test_target",), test_files=("tests/test_target.py",)),
+    ))
+    monkeypatch.setattr(runner_mod, "collect_pytest_catalog", lambda workspace: next(catalogs))
+    monkeypatch.setattr(
+        runner_mod,
+        "run_verification",
+        lambda *args, **kwargs: type("Result", (), {"passed": False, "error": None, "timed_out": False, "stdout": "assert missing behavior", "exit_code": 1, "duration_ms": 5, "command": "pytest -q tests/test_target.py::test_target"})(),
+    )
+
+    GoalRunner(state=state, history=[], context={}, binding=None)._prepare_tests(state)
+
+    assert state.current_task_id == target.id
 
 
 def test_test_generation_uses_multiple_rounds_for_inspect_write_and_final_json(tmp_path, monkeypatch):
@@ -1502,6 +1691,45 @@ def test_goal_regression_analysis_can_create_a_bound_sixth_repair_task(tmp_path,
     assert repair.verification_spec["source"] == "discovered"
 
 
+def test_node_goal_regression_creates_a_node_bound_repair_task(tmp_path, monkeypatch):
+    import harness.goal.repair as repair_mod
+    import harness.goal.runner as runner_mod
+    import harness.tasks as tasks
+    from harness.goal.repair import GoalRegressionDecision
+    from harness.verification.node_adapter import NodeTestAdapter
+
+    monkeypatch.setattr(tasks, "TASKS_DIR", tmp_path / ".tasks")
+    state = GoalState.new(target="x", verification="npm test", workspace=str(tmp_path))
+    state.phase = GoalPhase.FULL_VERIFY.value
+    state.final_verification = {
+        "stdout_tail": "not ok 1 - queue drains in FIFO order",
+        "exit_code": 1,
+    }
+    monkeypatch.setattr(runner_mod, "save_goal", lambda current: None)
+    monkeypatch.setattr(runner_mod, "_emit_goal", lambda *args: None)
+    monkeypatch.setattr(
+        repair_mod,
+        "plan_goal_regression_repair",
+        lambda *args, **kwargs: GoalRegressionDecision(
+            "create_repair_task", None, "restore queue ordering", "new Node repair"
+        ),
+    )
+    catalog = NodeTestCatalog(
+        ("test/queue.test.ts::queue drains in FIFO order",),
+        ("test/queue.test.ts",),
+    )
+    monkeypatch.setattr(NodeTestAdapter, "discover", lambda self, context: catalog)
+
+    GoalRunner(state=state, history=[], context={}, binding=None)._queue_goal_repair(
+        state, "full verification failed with exit code 1"
+    )
+
+    repair = tasks.load_task(state.current_task_id)
+    assert repair.verification_spec["adapter"] == "node"
+    assert repair.verification_spec["command"] == "node --import tsx --test test/queue.test.ts"
+    assert repair.verification_spec["selectors"] == ["test/queue.test.ts::queue drains in FIFO order"]
+
+
 def test_replan_returns_current_task_to_additive_test_preparation(tmp_path, monkeypatch):
     import harness.goal.repair as repair_mod
     import harness.goal.runner as runner_mod
@@ -1645,6 +1873,35 @@ def test_no_progress_routes_to_repair_instead_of_failing(tmp_path, monkeypatch):
     assert state.phase == GoalPhase.REPAIR_PLAN.value
     assert state.status == "running"
     assert "no observable progress" in state.last_error
+
+
+def test_round_limit_with_repeated_no_progress_routes_to_repair(tmp_path, monkeypatch):
+    import harness.goal.runner as runner_mod
+    import harness.tasks as tasks
+
+    monkeypatch.setattr(tasks, "TASKS_DIR", tmp_path / ".tasks")
+    task = tasks.create_task("stuck task", "keep working", verification_spec={})
+    tasks.claim_task(task.id)
+    state = GoalState.new(target="stuck task", verification="pytest -q", workspace=str(tmp_path))
+    state.current_task_id = task.id
+    state.task_ids = [task.id]
+    state.phase = GoalPhase.ACT.value
+    state.no_progress_count = 1
+    monkeypatch.setattr(runner_mod, "save_goal", lambda state: None)
+    monkeypatch.setattr(runner_mod, "_emit_goal", lambda *args: None)
+
+    def capped_worker(*args, stats, **kwargs):
+        stats.stop_reason = "max_rounds"
+        return "still exploring"
+
+    monkeypatch.setattr(runner_mod, "run_agent_task", capped_worker)
+    runner = GoalRunner(state=state, history=[], context={}, binding=None)
+    monkeypatch.setattr(runner, "_progress_snapshot", lambda state: ("unchanged",))
+
+    runner._act(state)
+
+    assert state.phase == GoalPhase.REPAIR_PLAN.value
+    assert state.worker_rollovers == 0
 
 
 def test_provider_error_pauses_without_consuming_repair_budget(tmp_path, monkeypatch):
@@ -1832,6 +2089,53 @@ def test_supervisor_permission_replan_routes_to_repair_plan(tmp_path, monkeypatc
     assert state.phase == GoalPhase.REPAIR_PLAN.value
     assert state.status == "running"
     assert "Rebuild the Task boundary" in task.last_error
+
+
+def test_terminal_supervisor_replan_is_consumed_as_a_safe_resume_directive(tmp_path, monkeypatch):
+    import harness.goal.runner as runner_mod
+    from harness.goal.coordinator import SupervisorDecision, SupervisorRun
+
+    state = GoalState.new(target="recover", verification="pytest -q", workspace=str(tmp_path))
+    state.phase = GoalPhase.PAUSED.value
+    state.status = "paused"
+    state.resume_phase = GoalPhase.ACT.value
+    state.current_task_id = "task-current"
+    state.transition_log = [{"from": "act", "to": "paused", "reason": "worker_stalled"}]
+    state.supervision = {"observation_revision": 4, "history": []}
+    monkeypatch.setattr(runner_mod, "save_goal", lambda _state: None)
+    monkeypatch.setattr(runner_mod, "_emit", lambda *args, **kwargs: None)
+    runner = GoalRunner(state=state, history=[], context={}, binding=None)
+
+    runner._record_supervisor_run(
+        SupervisorRun(
+            "obs-4", 4,
+            SupervisorDecision("replan", "The task needs a narrower repair plan.", next_step="Reassess the failing seam."),
+        ),
+        event="terminal_failure",
+    )
+
+    assert runner_mod._supervisor_recovery_target(state) == GoalPhase.REPAIR_PLAN.value
+    assert state.supervision["recovery"]["task_id"] == "task-current"
+    runner_mod._consume_supervisor_recovery(state)
+    assert state.supervision["recovery"]["consumed_at"]
+    assert runner_mod._supervisor_recovery_target(state) is None
+
+
+def test_stale_terminal_supervisor_recovery_cannot_override_newer_checkpoint(tmp_path, monkeypatch):
+    import harness.goal.runner as runner_mod
+
+    state = GoalState.new(target="recover", verification="pytest -q", workspace=str(tmp_path))
+    state.resume_phase = GoalPhase.ACT.value
+    state.transition_log = [{"from": "act", "to": "paused"}, {"from": "paused", "to": "act"}]
+    state.supervision = {
+        "recovery": {
+            "action": "redirect",
+            "target_phase": GoalPhase.REPAIR_PLAN.value,
+            "transition_revision": 1,
+        },
+    }
+
+    assert runner_mod._supervisor_recovery_target(state) is None
 
 
 def test_invalid_evaluator_output_pauses_for_a_retry(tmp_path, monkeypatch):

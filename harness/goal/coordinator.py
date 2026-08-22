@@ -319,32 +319,12 @@ class ParallelGoalSupervisor:
             return results
 
     def review(self, observation: dict[str, Any]) -> SupervisorRun:
-        observation_id = self.observe(observation)
-        deadline = time.monotonic() + self.timeout_seconds
-        deferred: list[SupervisorRun] = []
-        while time.monotonic() < deadline and not self._cancelled():
-            with self._lock:
-                result = self._take_finished_locked()
-            if result is not None:
-                if result.observation_id == observation_id:
-                    with self._lock:
-                        self._ready.extend(deferred)
-                    return result
-                deferred.append(result)
-            time.sleep(0.05)
-        with self._lock:
-            self._ready.extend(deferred)
-        return SupervisorRun(
-            observation_id,
-            int(observation.get("revision") or 0),
-            SupervisorDecision(
-                "watch",
-                "Global supervisor did not finish before the boundary deadline.",
-                unavailable=True,
-                error="goal supervisor boundary review timed out",
-            ),
-            stop_reason="deadline",
-        )
+        # Permission and terminal-failure boundaries decide the next state.
+        # They must not wait behind a long-running advisory observation: doing
+        # so made the decision time out at the exact point it was needed.
+        item = dict(observation)
+        item.setdefault("observation_id", f"obs_{uuid.uuid4().hex[:12]}")
+        return self._run(item)
 
     def close(self) -> None:
         with self._lock:

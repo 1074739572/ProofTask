@@ -354,7 +354,11 @@ def _handle_approve(runner, history: list, context: dict, binding: Any) -> str:
                 "from this contract and repository evidence. Do not ask the user."
             ),
         },
-        await_execution_approval=True,
+        # Approval covers the frozen Goal contract, Task scopes, and test
+        # strategy. Tests are then generated lazily inside those boundaries;
+        # requiring a second `/goal run` would reintroduce a manual gate after
+        # every automated safety check has already been established.
+        await_execution_approval=False,
         **draft.limits,
     )
     note = _start_precondition_note(request)
@@ -379,11 +383,10 @@ def _handle_approve(runner, history: list, context: dict, binding: Any) -> str:
     mark_draft_consumed()
     assert isinstance(state, GoalState)
     return (
-        f"Goal test preparation started: {state.id} [INITIALIZE]\n"
+        f"Goal execution started: {state.id} [INITIALIZE]\n"
         f"  Target: {state.target}\n"
         f"  Verification: {state.verification}\n"
-        "  The Goal will pause after generated tests have a failing baseline.\n"
-        "  Review them, then run: /goal run\n"
+        "  Each runnable Task generates and verifies its focused test before implementation.\n"
         f"  Worker round limit: {state.worker_round_limit}; "
         f"operation timeout: {state.operation_timeout_seconds}s\n"
         "  Goal lifetime: unbounded (workers automatically hand off)."

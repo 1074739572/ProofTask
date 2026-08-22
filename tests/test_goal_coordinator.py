@@ -142,6 +142,39 @@ def test_boundary_review_preserves_an_earlier_parallel_result_for_polling():
     assert [item.decision.summary for item in earlier] == ["parallel"]
 
 
+def test_boundary_review_bypasses_a_blocked_parallel_observation():
+    parallel_started = threading.Event()
+    release_parallel = threading.Event()
+
+    def analyzer(observation, **_kwargs):
+        event = str(observation["event"])
+        if event == "parallel":
+            parallel_started.set()
+            release_parallel.wait(timeout=2)
+        return SupervisorRun(
+            str(observation["observation_id"]),
+            int(observation["revision"]),
+            SupervisorDecision("retry", event),
+        )
+
+    supervisor = ParallelGoalSupervisor(
+        cwd=".",
+        operation_timeout_seconds=5,
+        analyzer=analyzer,
+    )
+    try:
+        supervisor.observe({"event": "parallel", "revision": 1})
+        assert parallel_started.wait(timeout=1)
+        started = time.monotonic()
+        boundary = supervisor.review({"event": "terminal_failure", "revision": 2})
+    finally:
+        release_parallel.set()
+        supervisor.close()
+
+    assert boundary.decision.summary == "terminal_failure"
+    assert time.monotonic() - started < 0.5
+
+
 def test_terminal_permission_boundary_is_not_analyzed_twice(tmp_path, monkeypatch):
     from harness.goal.models import GoalPhase, GoalState, GoalStatus
     from harness.goal.runner import GoalRunner
