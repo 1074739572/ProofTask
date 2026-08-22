@@ -59,6 +59,7 @@ def test_patch_file_uses_file_path_permission_rules():
 def test_inspect_and_git_tools_are_read_only_by_default():
     assert evaluate_permission("inspect_file", {"path": "src/app.py"}).effect == "allow"
     assert evaluate_permission("inspect_file", {"path": ".env"}).effect == "deny"
+    assert evaluate_permission("search_text", {"pattern": "needle"}).effect == "allow"
     assert evaluate_permission("git_status", {}).effect == "allow"
     assert evaluate_permission("git_diff", {}).effect == "allow"
 

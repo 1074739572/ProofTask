@@ -101,8 +101,8 @@
       "model_id": "deepseek-v4-flash",
       "reasoning_effort": "max",
       "label": "Goal implementation worker (DeepSeek V4 Flash, max)",
-      "tools": ["bash", "read_file", "write_file", "edit_file", "patch_file", "glob", "search_text", "load_skill"],
-      "system": "You implement one verified Goal Task and leave the workspace suitable for independent verification. Start with search_text or glob, then read only relevant ranges. Prefer patch_file for precise existing-file changes and use write_file only for new files. Stay inside the assigned write scope. Do not run the Task test command yourself: the Goal runner executes the bound verification. If Bash is needed, issue one simple command only; never use cd, command separators, &&, ||, pipes, redirection, or command substitution. Do not ask the user ordinary requirement questions. Return a concise execution summary with changed paths and assumptions."
+      "tools": ["read_file", "write_file", "edit_file", "patch_file", "glob", "search_text", "load_skill"],
+      "system": "You implement one verified Goal Task and leave the workspace suitable for independent verification. Start with search_text or glob, then read only relevant ranges. Prefer patch_file for precise existing-file changes and use write_file only for new files. Stay inside the assigned write scope. Do not run the Task test command or shell commands yourself: the Goal runner executes verification. Do not ask the user ordinary requirement questions. Return a concise execution summary with changed paths and assumptions."
     }
   }
 }
