@@ -15,7 +15,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable
 
-from harness.agents.runner import AgentTaskStats, run_agent_task
+from harness.agents.runner import AgentTaskConversation, AgentTaskStats, run_agent_task
 from harness.goal.discovery_models import DiscoveryJob, DiscoveryManifest, Evidence
 from harness.goal.discovery_store import save_job_state, save_manifest, save_report
 from harness.goal.supervision import StagePolicy, StageProgress, StageSupervisor
@@ -416,6 +416,7 @@ class DiscoverySupervisor:
             if cancel_check is not None and cancel_check():
                 return running, {"error": "cancelled"}
             seen_paths: set[str] = set(running.read_paths_seen)
+            discovery_conversation = AgentTaskConversation()
 
             def invoke_discovery(active_prompt: str, description: str, _slice: int, stats: AgentTaskStats) -> str:
                 # Provider limits are commonly account-wide, so a local
@@ -431,6 +432,7 @@ class DiscoverySupervisor:
                     agent_type=f"goal_discovery_{job.role}", cwd=str(root),
                     max_rounds=DISCOVERY_MAX_ROUNDS, tools_override=("read_file",),
                     read_paths=job.read_paths, deadline=deadline, cancel_check=cancel_check, stats=stats,
+                    conversation=discovery_conversation,
                 )
 
             def discovery_progress(_before: object, _after: object, stats: AgentTaskStats) -> StageProgress:
@@ -478,11 +480,9 @@ class DiscoverySupervisor:
                         prior_reports=prior_reports, human_language=human_language,
                     ),
                     initial_description=f"discover {job.role} evidence",
-                    continuation_prompt=lambda _slice, progress, _idle: _prompt(
-                        target, job.role, revision, shards, job.read_paths,
-                        prior_reports=prior_reports, human_language=human_language,
-                    ) + (
-                        "\n\nSupervisor checkpoint: " + progress.summary + ". "
+                    continuation_prompt=lambda _slice, progress, _idle: (
+                        "Continue the same discovery conversation. All prior source contents, tool results, and "
+                        "instructions remain available above. Supervisor checkpoint: " + progress.summary + ". "
                         "Do not repeat completed reads. Read remaining assigned files, or return the required JSON now."
                     ),
                     continuation_description=lambda slice_number: f"continue {job.role} discovery (slice {slice_number})",

@@ -167,6 +167,33 @@ class AgentTaskStats:
             self.tool_errors.append(f"{name}: {detail[:300]}")
 
 
+@dataclass
+class AgentTaskConversation:
+    """In-memory message history shared by restartable agent slices."""
+
+    messages: list[dict[str, Any]] = field(default_factory=list)
+
+    def continue_with(self, prompt: str) -> list[dict[str, Any]]:
+        if not self.messages:
+            self.messages.append({"role": "user", "content": prompt})
+            return self.messages
+
+        instruction = {"type": "text", "text": prompt}
+        last = self.messages[-1]
+        if last.get("role") != "user":
+            self.messages.append({"role": "user", "content": prompt})
+            return self.messages
+
+        content = last.get("content")
+        if isinstance(content, list):
+            content.append(instruction)
+        elif isinstance(content, str):
+            last["content"] = f"{content}\n\n{prompt}"
+        else:
+            last["content"] = prompt
+        return self.messages
+
+
 def _tools_for_agent(
     allowed: list[str], cwd: Path | None = None, write_roots: tuple[str, ...] | None = None,
     read_roots: tuple[str, ...] | None = None, read_paths: tuple[str, ...] | None = None,
@@ -284,6 +311,7 @@ def run_agent_task(
     read_paths: tuple[str, ...] | None = None,
     reasoning_effort_override: str | None = None,
     max_tokens: int = 8_000,
+    conversation: AgentTaskConversation | None = None,
 ) -> str:
     error = validate_agent_model(agent_type, reasoning_effort=reasoning_effort_override)
     if error:
@@ -313,7 +341,11 @@ def run_agent_task(
         return f"Error: {exc}"
     workdir = str(agent_cwd)
     system = f"{profile.system}\n\nWorking directory: {workdir}"
-    messages = [{"role": "user", "content": prompt}]
+    messages = (
+        conversation.continue_with(prompt)
+        if conversation is not None
+        else [{"role": "user", "content": prompt}]
+    )
 
     # Every subagent run gets its own id so the TUI can group all nested
     # round/tool events into one scoped block instead of leaking them into the
@@ -497,6 +529,10 @@ def run_agent_task(
             f"[{agent_type} / {profile.model_id}] {description} "
             f"({tool_count} tools, {elapsed:.1f}s)\n\n{final_text}"
         )
+    if stats is not None and stats.stop_reason == "max_rounds":
+        summary = "round slice exhausted; continuation required"
+        renderer.subagent_end(run_id, summary, tool_count, elapsed, max_len=50)
+        return f"[{agent_type}] {summary} ({tool_count} tools, {elapsed:.1f}s)"
     if stats is not None and stats.stop_reason == "completed":
         stats.stop_reason = "empty_response"
     renderer.subagent_end(run_id, "failed: empty response", tool_count, elapsed, max_len=50)

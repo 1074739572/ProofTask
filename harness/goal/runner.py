@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from harness.agent.cancel import clear_cancel, request_cancel
-from harness.agents.runner import AgentTaskStats, run_agent_task
+from harness.agents.runner import AgentTaskConversation, AgentTaskStats, run_agent_task
 from harness.evaluation import run_task_evaluation
 from harness.goal.engine import GoalEngine
 from harness.goal.authority import goal_authority
@@ -1378,6 +1378,8 @@ class GoalRunner(threading.Thread):
             prompt = (
                 f"Create a NEW focused {adapter.id} test file for this Task before implementation. You may modify only test files; "
                 f"do not edit existing test files or production code. Use existing test conventions. {adapter_test_guidance}"
+                "The test file must be machine-collectable even though its pre-implementation baseline is expected "
+                "to fail on the missing behavior. An explanation or empty selector list is not a valid result. "
                 f"After writing tests, reply ONLY with JSON: {response_example}.\n\n"
                 f"Task: {task.subject}\nBehavior: {task.description}\nAcceptance cases: {json.dumps(task.acceptance_cases)}"
             )
@@ -1409,6 +1411,8 @@ class GoalRunner(threading.Thread):
             # A round limit is a scheduling slice, not a project-size limit.
             # The shared supervisor extends only when a test artifact changes.
             writer_deadline = self._deadline(state)
+            writer_conversation = AgentTaskConversation()
+            writer_has_test_artifact = False
             def invoke_writer(active_prompt: str, description: str, _slice: int, stats: AgentTaskStats) -> str:
                 self._phase_in_flight = True
                 try:
@@ -1431,14 +1435,18 @@ class GoalRunner(threading.Thread):
                             deadline=writer_deadline,
                             stats=stats,
                             write_roots=write_roots,
+                            conversation=writer_conversation,
                         )
                 finally:
                     set_goal_noninteractive(False)
                     self._phase_in_flight = False
 
             def test_progress(previous: dict[str, bytes], current: dict[str, bytes], stats: AgentTaskStats) -> StageProgress:
+                nonlocal writer_has_test_artifact
                 created = sorted(set(current) - set(previous))
                 changed = sorted(path for path in set(current) & set(previous) if current[path] != previous[path])
+                all_created = sorted(set(current) - set(before_tree))
+                writer_has_test_artifact = bool(all_created)
                 advanced = bool(created)
                 if changed and not created:
                     summary = "only existing test files changed; awaiting a focused new test artifact"
@@ -1451,6 +1459,7 @@ class GoalRunner(threading.Thread):
                     summary=summary,
                     checkpoint={
                         "created_test_files": created[:12],
+                        "new_test_artifacts": all_created[:12],
                         "changed_existing_test_files": changed[:12],
                         "write_paths": stats.write_paths[-12:],
                         "tool_errors": stats.tool_errors[-4:],
@@ -1482,15 +1491,23 @@ class GoalRunner(threading.Thread):
                 invoke=invoke_writer,
                 initial_prompt=prompt,
                 initial_description=f"generate tests for task {task.id}",
-                continuation_prompt=lambda _slice, progress, _idle: prompt + (
-                    "\n\nContinue from the current workspace state. The prior slice reached its tool-round "
-                    f"budget. Supervisor evidence: {progress.summary}. Inspect existing new tests, then continue "
-                    "the Task. Do not modify existing test files."
+                continuation_prompt=lambda _slice, progress, _idle: (
+                    "Continue the same test-writing conversation. All prior assistant messages, source contents, "
+                    "and tool results remain available above. Use that retained evidence to create an accurate "
+                    "machine-collectable focused test and submit non-empty selector JSON. The missing product "
+                    "behavior should make the baseline fail; it is not a reason to return an empty result. "
+                    "Re-read source when useful. "
+                    f"Supervisor evidence: {progress.summary}. Do not modify existing test files."
                 ),
                 continuation_description=lambda slice_number: f"continue generating tests for task {task.id} (slice {slice_number})",
                 snapshot=lambda: self._snapshot_test_tree(root, write_roots),
                 assess_progress=test_progress,
                 on_slice=on_test_slice,
+                continue_when=lambda raw, stats, _progress: (
+                    stats.stop_reason == "completed"
+                    and not writer_has_test_artifact
+                    and not self._requested_selectors_from_generation(raw)
+                ),
             )
             stats = supervised.stats
             raw = supervised.raw
@@ -1512,7 +1529,12 @@ class GoalRunner(threading.Thread):
             if (
                 stats.stop_reason in {"provider_error", "configuration_error"}
                 or str(raw).startswith("Error:")
-                or (str(raw).startswith("[goal_test_writer] failed:") and not empty_response)
+                or (
+                    str(raw).startswith("[goal_test_writer] failed:")
+                    and not empty_response
+                    and not writer_stalled
+                    and stats.stop_reason != "max_rounds"
+                )
                 or str(raw).startswith("[goal_test_writer] stopped:")
             ):
                 self._restore_test_tree(root, before_tree, write_roots, expected_after=self._snapshot_test_tree(root, write_roots))
@@ -1579,7 +1601,10 @@ class GoalRunner(threading.Thread):
                 response_empty=empty_response,
                 response_stalled=writer_stalled,
             )
-            repair_attempted = bool(initial_mismatches)
+            # A tool-free selector repair is useful only after the machine has
+            # actually collected a new selector. Empty lists cannot recover a
+            # writer that never created a test artifact.
+            repair_attempted = bool(initial_mismatches and generated_selectors)
             if repair_attempted:
                 # The writer may have created a valid test but named it
                 # differently in its final JSON. Give a tool-free completion

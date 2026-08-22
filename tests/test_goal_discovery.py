@@ -154,6 +154,32 @@ def test_discovery_extends_a_round_slice_when_it_reads_new_assigned_files(tmp_pa
     assert manifest.jobs[0].read_paths_seen == ("app.py",)
 
 
+def test_discovery_continues_max_tokens_with_the_same_conversation(tmp_path):
+    (tmp_path / "app.py").write_text("def run():\n    return 1\n", encoding="utf-8")
+    calls = []
+
+    def fake_runner(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            kwargs["stats"].stop_reason = "max_tokens"
+            kwargs["stats"].read_paths.append("app.py")
+            return "partial evidence report"
+        return '{"evidence":[{"path":"app.py","lines":[1,2],"claim":"entry exists"}],"gaps":[]}'
+
+    manifest = DiscoverySupervisor(runner=fake_runner).run(
+        goal_id="goal-token-continued",
+        target="improve app",
+        workspace=tmp_path,
+        roles=("implementation",),
+    )
+
+    assert len(calls) == 2
+    assert calls[0]["conversation"] is calls[1]["conversation"]
+    assert calls[1]["prompt"].startswith("Continue the same discovery conversation")
+    assert manifest.jobs[0].slices == 2
+    assert manifest.evidence[0].path == "app.py"
+
+
 def test_discovery_runs_requirement_then_architecture_with_handoff(tmp_path):
     (tmp_path / "docs").mkdir()
     (tmp_path / "src").mkdir()

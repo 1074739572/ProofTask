@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import io
 import threading
 from unittest import mock
@@ -142,9 +143,90 @@ def test_run_agent_task_marks_tool_only_round_limit_as_max_rounds():
             "type": "tool_use", "id": "tool-1", "name": "glob", "input": {"pattern": "*.py"},
         }]),
     ):
-        run_agent_task("inspect project", "find tests", "explore", max_rounds=1, stats=stats)
+        result = run_agent_task("inspect project", "find tests", "explore", max_rounds=1, stats=stats)
 
     assert stats.stop_reason == "max_rounds"
+    assert "round slice exhausted" in result
+
+
+def test_run_agent_task_continuation_retains_prior_source_and_tool_results():
+    from harness.agents.runner import AgentTaskConversation, AgentTaskStats, run_agent_task
+
+    captured_messages = []
+    responses = iter((
+        _response([{
+            "type": "tool_use", "id": "tool-1", "name": "read_file",
+            "input": {"path": "harness/agents/runner.py", "limit": 1},
+        }]),
+        _response([{"type": "text", "text": "continued from retained source"}]),
+    ))
+
+    def respond(**kwargs):
+        captured_messages.append(copy.deepcopy(kwargs["messages"]))
+        return next(responses)
+
+    conversation = AgentTaskConversation()
+    first_stats = AgentTaskStats()
+    second_stats = AgentTaskStats()
+    with mock.patch("harness.agents.runner.create_message", side_effect=respond):
+        run_agent_task(
+            "inspect source", "read the implementation", "explore",
+            max_rounds=1, stats=first_stats, conversation=conversation,
+        )
+        result = run_agent_task(
+            "continue implementation", "use the retained source and continue", "explore",
+            max_rounds=1, stats=second_stats, conversation=conversation,
+        )
+
+    assert first_stats.stop_reason == "max_rounds"
+    assert "continued from retained source" in result
+    continued = captured_messages[1]
+    assert continued[0] == {"role": "user", "content": "read the implementation"}
+    assert continued[1]["role"] == "assistant"
+    assert continued[1]["content"][0]["type"] == "tool_use"
+    assert continued[2]["role"] == "user"
+    assert continued[2]["content"][0]["type"] == "tool_result"
+    assert continued[2]["content"][-1] == {
+        "type": "text", "text": "use the retained source and continue",
+    }
+
+
+def test_run_agent_task_continuation_retains_max_token_partial_response():
+    from harness.agents.runner import AgentTaskConversation, AgentTaskStats, run_agent_task
+
+    captured_messages = []
+    responses = iter((
+        _response(
+            [{"type": "text", "text": "partial test design"}],
+            stop_reason="max_tokens",
+        ),
+        _response([{"type": "text", "text": "completed selector JSON"}]),
+    ))
+
+    def respond(**kwargs):
+        captured_messages.append(copy.deepcopy(kwargs["messages"]))
+        return next(responses)
+
+    conversation = AgentTaskConversation()
+    first_stats = AgentTaskStats()
+    second_stats = AgentTaskStats()
+    with mock.patch("harness.agents.runner.create_message", side_effect=respond):
+        run_agent_task(
+            "write tests", "inspect and write focused tests", "goal_test_writer",
+            max_rounds=1, stats=first_stats, conversation=conversation,
+        )
+        result = run_agent_task(
+            "continue tests", "continue after the truncated response", "goal_test_writer",
+            max_rounds=1, stats=second_stats, conversation=conversation,
+        )
+
+    assert first_stats.stop_reason == "max_tokens"
+    assert "completed selector JSON" in result
+    continued = captured_messages[1]
+    assert continued[0] == {"role": "user", "content": "inspect and write focused tests"}
+    assert continued[1]["role"] == "assistant"
+    assert continued[1]["content"][0]["text"] == "partial test design"
+    assert continued[2] == {"role": "user", "content": "continue after the truncated response"}
 
 
 def test_goal_subagent_passes_its_configured_reasoning_effort():

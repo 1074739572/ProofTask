@@ -13,6 +13,9 @@ from typing import Any, Callable
 from harness.agents.runner import AgentTaskStats
 
 
+RESUMABLE_STOP_REASONS = frozenset({"max_rounds", "max_tokens"})
+
+
 @dataclass(frozen=True)
 class StagePolicy:
     name: str
@@ -69,12 +72,14 @@ class StageSupervisor:
         snapshot: Callable[[], Any],
         assess_progress: Callable[[Any, Any, AgentTaskStats], StageProgress],
         on_slice: Callable[[StageSlice], None] | None = None,
+        continue_when: Callable[[str, AgentTaskStats, StageProgress], bool] | None = None,
     ) -> SupervisedRun:
-        """Run until a final response, interruption, provider error, or stall.
+        """Run until the output contract is met, execution stops, or work stalls.
 
-        ``max_rounds`` means the agent was still using tools when its current
-        slice ended.  It is not a failure and is the only condition that can
-        cause an automatic continuation.
+        ``max_rounds`` and ``max_tokens`` are per-request scheduling limits,
+        not stage failures. Both continue from the retained conversation by
+        default. Callers may also reject a nominally completed slice when
+        observable artifacts are still missing.
         """
 
         before = snapshot()
@@ -112,7 +117,10 @@ class StageSupervisor:
                 idle_slices=idle_slices,
                 checkpoint=checkpoint,
             )
-            if stats.stop_reason != "max_rounds":
+            should_continue = stats.stop_reason in RESUMABLE_STOP_REASONS or bool(
+                continue_when and continue_when(raw, stats, progress)
+            )
+            if not should_continue:
                 return SupervisedRun(raw, stats, slice_number, idle_slices, False, checkpoint)
             if idle_slices >= self.policy.max_idle_slices:
                 emit_stage_supervision(
