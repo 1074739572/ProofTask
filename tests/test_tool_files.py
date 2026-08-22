@@ -11,6 +11,8 @@ from harness.tools.filesystem import (
     run_write,
     safe_path,
     run_bash,
+    run_patch_file,
+    run_search_text,
 )
 
 
@@ -155,6 +157,53 @@ def test_glob_no_recursive_match_without_starstar(tmp_path):
     (tmp_path / "nested" / "deep.py").write_text("", encoding="utf-8")
     out = run_glob("*.py", cwd=tmp_path)
     assert out == "(no matches)"
+
+
+def test_search_text_returns_capped_line_numbered_matches(tmp_path):
+    (tmp_path / "a.py").write_text("alpha\nneedle one\nneedle two\n", encoding="utf-8")
+    out = run_search_text("needle", cwd=tmp_path, max_results=1)
+    assert "a.py:2: needle one" in out
+    assert "limited to 1 results" in out
+
+
+def test_search_text_skips_binary_files(tmp_path):
+    (tmp_path / "data.bin").write_bytes(b"needle\x00value")
+    assert run_search_text("needle", cwd=tmp_path) == "(no matches)"
+
+
+def test_patch_file_is_atomic_and_reports_hashes(tmp_path):
+    path = tmp_path / "patch.txt"
+    path.write_text("one\ntwo\nthree\n", encoding="utf-8")
+    out = run_patch_file(
+        "patch.txt",
+        [
+            {"old_text": "one", "new_text": "ONE"},
+            {"old_text": "three", "new_text": "THREE"},
+        ],
+        cwd=tmp_path,
+    )
+    assert "sha256" in out
+    assert path.read_text(encoding="utf-8") == "ONE\ntwo\nTHREE\n"
+
+
+def test_patch_file_does_not_partially_write_on_failed_hunk(tmp_path):
+    path = tmp_path / "patch.txt"
+    path.write_text("one\ntwo\n", encoding="utf-8")
+    out = run_patch_file(
+        "patch.txt",
+        [{"old_text": "one", "new_text": "ONE"}, {"old_text": "missing", "new_text": "x"}],
+        cwd=tmp_path,
+    )
+    assert "hunk 2" in out
+    assert path.read_text(encoding="utf-8") == "one\ntwo\n"
+
+
+def test_patch_file_rejects_stale_hash(tmp_path):
+    path = tmp_path / "patch.txt"
+    path.write_text("one\n", encoding="utf-8")
+    out = run_patch_file("patch.txt", [{"old_text": "one", "new_text": "ONE"}], expected_sha256="stale", cwd=tmp_path)
+    assert "file changed since inspection" in out
+    assert path.read_text(encoding="utf-8") == "one\n"
 
 
 # ---------- safe_path ----------

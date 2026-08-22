@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import queue
+import re
 import threading
 import time
 import uuid
@@ -21,7 +22,15 @@ from harness.project.session import serialize_messages
 from harness.settings import get_workdir
 from harness.skills_loader import load_skill
 from harness.tools.dispatch import call_tool_handler, extract_text, has_tool_use
-from harness.tools.filesystem import run_bash, run_edit, run_glob, run_read, run_write
+from harness.tools.filesystem import (
+    run_bash,
+    run_edit,
+    run_glob,
+    run_patch_file,
+    run_read,
+    run_search_text,
+    run_write,
+)
 from harness.ui.renderer import renderer
 
 _BASE_TOOL_DEFS = {
@@ -81,6 +90,44 @@ _BASE_TOOL_DEFS = {
             "required": ["pattern"],
         },
     },
+    "search_text": {
+        "name": "search_text",
+        "description": "Search text in workspace files without running shell commands.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "pattern": {"type": "string"},
+                "path": {"type": "string"},
+                "max_results": {"type": "integer"},
+                "case_sensitive": {"type": "boolean"},
+            },
+            "required": ["pattern"],
+        },
+    },
+    "patch_file": {
+        "name": "patch_file",
+        "description": "Apply multiple exact file replacements atomically with an optional content hash.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "expected_sha256": {"type": "string"},
+                "hunks": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "old_text": {"type": "string"},
+                            "new_text": {"type": "string"},
+                            "occurrence": {"type": "integer"},
+                        },
+                        "required": ["old_text", "new_text"],
+                    },
+                },
+            },
+            "required": ["path", "hunks"],
+        },
+    },
     "load_skill": {
         "name": "load_skill",
         "description": "Load a named workflow skill. This read-only tool does not grant new tools or permissions.",
@@ -128,6 +175,8 @@ _BASE_HANDLERS = {
     "write_file": run_write,
     "edit_file": run_edit,
     "glob": run_glob,
+    "search_text": run_search_text,
+    "patch_file": run_patch_file,
     "load_skill": load_skill,
 }
 
@@ -144,6 +193,7 @@ class AgentTaskStats:
     read_paths: list[str] = field(default_factory=list)
     write_paths: list[str] = field(default_factory=list)
     tool_errors: list[str] = field(default_factory=list)
+    write_audits: list[str] = field(default_factory=list)
     elapsed_seconds: float = 0.0
 
     def record_tool(self, name: str, tool_input: Any, output: object) -> None:
@@ -156,6 +206,10 @@ class AgentTaskStats:
             elif name in {"write_file", "edit_file"}:
                 self.write_paths.append(path)
         detail = str(output)
+        if name in {"write_file", "edit_file", "patch_file"}:
+            audit = re.search(r"sha256\s+([0-9a-f]{12,64})\s*->\s*([0-9a-f]{12,64})", detail, re.IGNORECASE)
+            if audit:
+                self.write_audits.append(audit.group(0))
         if detail.lower().startswith((
             "error",
             "write blocked",
@@ -209,6 +263,8 @@ def _tools_for_agent(
         "write_file": partial(run_write, cwd=bound_cwd),
         "edit_file": partial(run_edit, cwd=bound_cwd),
         "glob": partial(run_glob, cwd=bound_cwd),
+        "search_text": partial(run_search_text, cwd=bound_cwd),
+        "patch_file": partial(run_patch_file, cwd=bound_cwd),
         "load_skill": load_skill,
     }
     if write_roots:
@@ -238,6 +294,20 @@ def _tools_for_agent(
             handlers["write_file"] = guarded_write
         if "edit_file" in handlers:
             handlers["edit_file"] = guarded_edit
+        if "patch_file" in handlers:
+            base_patch = handlers["patch_file"]
+
+            def guarded_patch(*, path: str, hunks: list[dict], expected_sha256: str = "") -> str:
+                try:
+                    candidate = (bound_cwd / path).resolve()
+                except OSError as exc:
+                    return f"Patch blocked: invalid path {path!r}: {exc}"
+                if not any(candidate.is_relative_to(root) for root in roots):
+                    _record_goal_scope_request("patch_file", path, candidate, bound_cwd)
+                    return "Patch blocked: path is outside the current agent write scope."
+                return base_patch(path=path, hunks=hunks, expected_sha256=expected_sha256)
+
+            handlers["patch_file"] = guarded_patch
     if read_roots is not None or read_paths is not None:
         roots = tuple((bound_cwd / root).resolve() for root in (read_roots or ()))
         paths = tuple((bound_cwd / path).resolve() for path in (read_paths or ()))
@@ -254,6 +324,27 @@ def _tools_for_agent(
 
         if "read_file" in handlers:
             handlers["read_file"] = guarded_read
+        if "search_text" in handlers:
+            base_search = handlers["search_text"]
+
+            def guarded_search(
+                *, pattern: str, path: str = ".", max_results: int = 100, case_sensitive: bool = True,
+            ) -> str:
+                try:
+                    candidate = (bound_cwd / path).resolve()
+                except OSError as exc:
+                    return f"Search blocked: invalid path {path!r}: {exc}"
+                allowed_path = candidate in paths or any(candidate.is_relative_to(root) for root in roots)
+                if not allowed_path:
+                    return "Search blocked: this agent may only search its assigned discovery paths."
+                return base_search(
+                    pattern=pattern,
+                    path=path,
+                    max_results=max_results,
+                    case_sensitive=case_sensitive,
+                )
+
+            handlers["search_text"] = guarded_search
     if "rag_search" in allowed:
         from harness.rag.tools import run_rag_search
 
@@ -352,6 +443,25 @@ def run_agent_task(
     # main timeline as flat logs.
     run_id = uuid.uuid4().hex[:8]
     renderer.subagent_start(run_id, agent_type, description, profile.model_id)
+    usage_context: dict[str, str] = {
+        "agent_type": agent_type,
+        "agent_run_id": run_id,
+    }
+    try:
+        # Capture Goal authority on this thread before the model request moves
+        # to its cancellable daemon. Thread-local authority does not cross
+        # that boundary by itself.
+        from harness.goal.authority import current_goal_authority
+
+        authority = current_goal_authority()
+        if authority is not None:
+            usage_context.update({
+                "goal_id": authority.goal_id,
+                "task_id": authority.task_id,
+                "goal_phase": authority.phase,
+            })
+    except ImportError:
+        pass
     started = time.time()
     tool_count = 0
     round_num = 0
@@ -395,6 +505,7 @@ def run_agent_task(
                                 messages=messages,
                                 tools=tools,
                                 max_tokens=max(1, int(max_tokens)),
+                                usage_context=usage_context,
                             ),
                             recovery,
                         ),

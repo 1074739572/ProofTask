@@ -19,8 +19,13 @@ class UsageEvent:
     model: str
     hit: int
     miss: int
-    out: int
+    out: int | None
     source: str = ""
+    agent_type: str = ""
+    agent_run_id: str = ""
+    goal_id: str = ""
+    task_id: str = ""
+    goal_phase: str = ""
 
     @property
     def input_tokens(self) -> int:
@@ -34,6 +39,11 @@ class UsageEvent:
             "miss": self.miss,
             "out": self.out,
             "source": self.source,
+            "agent_type": self.agent_type,
+            "agent_run_id": self.agent_run_id,
+            "goal_id": self.goal_id,
+            "task_id": self.task_id,
+            "goal_phase": self.goal_phase,
         }
 
     @classmethod
@@ -43,8 +53,13 @@ class UsageEvent:
             model=str(data.get("model", "unknown")),
             hit=int(data.get("hit", 0) or 0),
             miss=int(data.get("miss", 0) or 0),
-            out=int(data.get("out", 0) or 0),
+            out=(int(data["out"]) if data.get("out") is not None else None),
             source=str(data.get("source", "")),
+            agent_type=str(data.get("agent_type", "")),
+            agent_run_id=str(data.get("agent_run_id", "")),
+            goal_id=str(data.get("goal_id", "")),
+            task_id=str(data.get("task_id", "")),
+            goal_phase=str(data.get("goal_phase", "")),
         )
 
 
@@ -54,6 +69,7 @@ class UsageTotals:
     miss: int = 0
     out: int = 0
     calls: int = 0
+    unknown_output_calls: int = 0
     by_model: dict[str, dict[str, int]] = field(default_factory=dict)
 
     @property
@@ -68,14 +84,20 @@ class UsageTotals:
     def add_event(self, event: UsageEvent) -> None:
         self.hit += event.hit
         self.miss += event.miss
-        self.out += event.out
+        if event.out is None:
+            self.unknown_output_calls += 1
+        else:
+            self.out += event.out
         self.calls += 1
         bucket = self.by_model.setdefault(
-            event.model, {"hit": 0, "miss": 0, "out": 0, "calls": 0}
+            event.model, {"hit": 0, "miss": 0, "out": 0, "calls": 0, "unknown_output_calls": 0}
         )
         bucket["hit"] += event.hit
         bucket["miss"] += event.miss
-        bucket["out"] += event.out
+        if event.out is not None:
+            bucket["out"] += event.out
+        else:
+            bucket["unknown_output_calls"] = bucket.get("unknown_output_calls", 0) + 1
         bucket["calls"] += 1
 
 
@@ -93,19 +115,26 @@ def record_usage(
     *,
     model: str,
     cache: CacheUsage | None,
+    context: dict[str, str] | None = None,
     when: datetime | None = None,
 ) -> UsageEvent | None:
     """Append one API call to today's ledger. No-op if usage is missing."""
     if cache is None:
         return None
     now = when or datetime.now()
+    metadata = context or {}
     event = UsageEvent(
         ts=now.strftime("%H:%M:%S"),
         model=model or "unknown",
         hit=cache.hit_tokens,
         miss=cache.miss_tokens,
-        out=int(cache.output_tokens or 0),
+        out=cache.output_tokens,
         source=cache.source,
+        agent_type=str(metadata.get("agent_type") or ""),
+        agent_run_id=str(metadata.get("agent_run_id") or ""),
+        goal_id=str(metadata.get("goal_id") or ""),
+        task_id=str(metadata.get("task_id") or ""),
+        goal_phase=str(metadata.get("goal_phase") or ""),
     )
     path = day_path(now.date())
     with path.open("a", encoding="utf-8") as handle:

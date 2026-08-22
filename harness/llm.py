@@ -17,7 +17,7 @@ def _format_llm_tag(profile) -> str:
     return tag
 
 
-def _log_cache_usage(response, *, model_id: str) -> None:
+def _log_cache_usage(response, *, model_id: str, usage_context: dict[str, str] | None = None) -> None:
     """Persist usage; do not spam the terminal on every LLM round."""
     from harness.ui.tool_display import hooks_verbose
 
@@ -25,7 +25,7 @@ def _log_cache_usage(response, *, model_id: str) -> None:
     if parsed is None:
         return
     try:
-        record_usage(model=model_id, cache=parsed)
+        record_usage(model=model_id, cache=parsed, context=usage_context)
     except OSError as exc:
         renderer.warn(f"usage ledger write failed: {exc}")
     from harness.ui.events import emit, is_enabled
@@ -33,8 +33,10 @@ def _log_cache_usage(response, *, model_id: str) -> None:
         emit(
             "usage_update",
             input_tokens=parsed.input_tokens,
-            output_tokens=int(parsed.output_tokens or 0),
+            output_tokens=parsed.output_tokens,
+            output_tokens_known=parsed.output_tokens is not None,
             cache_read_tokens=parsed.hit_tokens,
+            **dict(usage_context or {}),
         )
     if not hooks_verbose():
         return
@@ -54,6 +56,7 @@ def create_message(
     model_id: str | None = None,
     reasoning_effort: str | None = None,
     inherit_interactive_effort: bool = True,
+    usage_context: dict[str, str] | None = None,
 ):
     from harness.ui.events import emit as _emit, is_enabled as _is_enabled
 
@@ -78,7 +81,7 @@ def create_message(
             on_delta=on_delta,
         )
 
-    _log_cache_usage(response, model_id=profile.id)
+    _log_cache_usage(response, model_id=profile.id, usage_context=usage_context)
 
     reported = getattr(response, "model", None)
     if reported and reported != profile.api_model:

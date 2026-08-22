@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from collections.abc import Mapping
 
 
 @dataclass(frozen=True)
@@ -27,12 +28,25 @@ def parse_cache_usage(usage) -> CacheUsage | None:
     if usage is None:
         return None
 
-    output = getattr(usage, "output_tokens", None)
+    # Anthropic names this ``output_tokens``. OpenAI-compatible providers
+    # (including DeepSeek's cache-aware responses) use ``completion_tokens``.
+    # Read both before taking a cache-field branch so cached requests do not
+    # silently become "0 output" in the local usage ledger.
+    def field(name: str, default=None):
+        if isinstance(usage, Mapping):
+            return usage.get(name, default)
+        return getattr(usage, name, default)
+
+    output = field("output_tokens")
+    if output is None:
+        output = field("completion_tokens")
+    if output is not None:
+        output = int(output)
 
     # DeepSeek / Anthropic prompt caching (Messages API)
-    read = getattr(usage, "cache_read_input_tokens", None)
-    create = getattr(usage, "cache_creation_input_tokens", None)
-    input_tokens = getattr(usage, "input_tokens", None)
+    read = field("cache_read_input_tokens")
+    create = field("cache_creation_input_tokens")
+    input_tokens = field("input_tokens")
     if read is not None or create is not None:
         hit = int(read or 0)
         billed_input = int(input_tokens or 0)
@@ -46,8 +60,8 @@ def parse_cache_usage(usage) -> CacheUsage | None:
             source="cache_read_input_tokens",
         )
 
-    hit = getattr(usage, "prompt_cache_hit_tokens", None)
-    miss = getattr(usage, "prompt_cache_miss_tokens", None)
+    hit = field("prompt_cache_hit_tokens")
+    miss = field("prompt_cache_miss_tokens")
     if hit is not None or miss is not None:
         return CacheUsage(
             hit_tokens=int(hit or 0),
@@ -57,17 +71,18 @@ def parse_cache_usage(usage) -> CacheUsage | None:
         )
 
     # OpenAI-style usage: prompt_tokens + completion_tokens
-    prompt = getattr(usage, "prompt_tokens", None)
-    completion = getattr(usage, "completion_tokens", None)
+    prompt = field("prompt_tokens")
+    completion = field("completion_tokens")
     if prompt is not None:
         # Check for cached tokens in prompt_tokens_details
-        details = getattr(usage, "prompt_tokens_details", None)
-        cached = int(getattr(details, "cached_tokens", 0) or 0) if details else 0
+        details = field("prompt_tokens_details")
+        cached_value = details.get("cached_tokens", 0) if isinstance(details, Mapping) else getattr(details, "cached_tokens", 0)
+        cached = int(cached_value or 0) if details else 0
         miss = int(prompt) - cached if cached else int(prompt)
         return CacheUsage(
             hit_tokens=cached,
             miss_tokens=max(0, miss),
-            output_tokens=int(completion or 0) if completion else None,
+            output_tokens=int(completion) if completion is not None else output,
             source="openai_prompt_tokens",
         )
 

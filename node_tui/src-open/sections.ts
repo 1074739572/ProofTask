@@ -3,7 +3,8 @@ import type {TodoItem} from '../src/types.js';
 export type EntryKind = 'prompt' | 'response' | 'action' | 'blocked' | 'files' | 'log' | 'intent' | 'tasks' | 'summary' | 'subagent';
 export type SubagentStatus = 'running' | 'done' | 'failed';
 export type SubagentToolRow = {id: string; name: string; summary: string; status: SubagentStatus};
-export type Entry = {id: string; kind: EntryKind; text: string; detail?: string; done?: boolean; ok?: boolean; start?: number; end?: number; output?: string[]; expanded?: boolean; streaming?: boolean; toolCount?: number; paths?: string[]; tasks?: TodoItem[]; tokens?: {inp: number; out: number; cache: number}; agentType?: string; model?: string; status?: SubagentStatus; rounds?: string[]; tools?: SubagentToolRow[]; summary?: string; elapsed?: number};
+export type TokenUsage = {inp: number; out: number; cache: number; outputKnown?: boolean};
+export type Entry = {id: string; kind: EntryKind; text: string; detail?: string; done?: boolean; ok?: boolean; start?: number; end?: number; output?: string[]; expanded?: boolean; streaming?: boolean; toolCount?: number; paths?: string[]; tasks?: TodoItem[]; tokens?: TokenUsage; agentType?: string; model?: string; status?: SubagentStatus; rounds?: string[]; tools?: SubagentToolRow[]; summary?: string; elapsed?: number};
 // One recorded invocation inside a merged action row. Consecutive same-name
 // calls collapse into a single live row ("Called N times", Claude Code style),
 // but each call keeps its own summary/timing so the expanded turn summary can
@@ -26,7 +27,7 @@ export type Section =
   | {kind: 'log'; id: string; text: string; detail: string}
   | {kind: 'intent'; id: string; text: string}
   | {kind: 'tasks'; id: string; entryId: string; tasks: TodoItem[]; expanded: boolean}
-  | {kind: 'summary'; id: string; entryId: string; text: string; toolCount: number; elapsed: number; paths: string[]; tokens: {inp: number; out: number; cache: number}; steps: SummaryStep[]; expanded: boolean};
+  | {kind: 'summary'; id: string; entryId: string; text: string; toolCount: number; elapsed: number; paths: string[]; tokens: TokenUsage; steps: SummaryStep[]; expanded: boolean};
 
 // A merged row unfolds back into one step per recorded call, in call order.
 function toolSteps(row: ActionRow): SummaryStep[] {

@@ -26,7 +26,7 @@ def test_orchestrate_role_bindings_and_permissions() -> None:
 
     assert modes["orchestrate"]["lead_model_hint"] == "gpt-5.6-sol"
     assert agents["explore"]["model_id"] == "mimo-v2.5-pro"
-    assert set(agents["explore"]["tools"]) <= {"bash", "read_file", "glob"}
+    assert set(agents["explore"]["tools"]) <= {"bash", "read_file", "glob", "search_text"}
     assert not ({"write_file", "edit_file"} & set(agents["explore"]["tools"]))
     assert models["mimo-v2.5-pro"]["provider"] == "xiaomi-mimo"
     assert providers["xiaomi-mimo"]["type"] == "openai"

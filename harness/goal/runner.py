@@ -829,6 +829,7 @@ class GoalRunner(threading.Thread):
             "tool_names": list(dict.fromkeys(str(item) for item in stats.tool_names))[-12:],
             "read_paths": list(dict.fromkeys(str(item) for item in stats.read_paths))[-12:],
             "write_paths": list(dict.fromkeys(str(item) for item in stats.write_paths))[-12:],
+            "write_audits": list(dict.fromkeys(str(item) for item in stats.write_audits))[-12:],
             "tool_errors": [str(item)[:500] for item in stats.tool_errors[-6:]],
             **dict(extra or {}),
         }

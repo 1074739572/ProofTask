@@ -58,6 +58,34 @@ def test_usage_update_emitted_when_event_stream_enabled():
         events.disable_event_stream()
 
 
+def test_usage_update_keeps_agent_context_and_unknown_output_visible():
+    import io
+    import json
+    from harness.ui import events
+
+    response = SimpleNamespace(usage=SimpleNamespace(
+        prompt_cache_hit_tokens=8,
+        prompt_cache_miss_tokens=2,
+    ))
+    sink = io.StringIO()
+    events.enable_event_stream(sink)
+    try:
+        with patch("harness.llm.record_usage") as record:
+            _log_cache_usage(
+                response,
+                model_id="deepseek-v4-pro",
+                usage_context={"agent_type": "goal_test_writer", "agent_run_id": "run-1"},
+            )
+        record.assert_called_once()
+        assert record.call_args.kwargs["context"]["agent_type"] == "goal_test_writer"
+        payload = [json.loads(line) for line in sink.getvalue().splitlines() if line.strip()][-1]
+        assert payload["agent_run_id"] == "run-1"
+        assert payload["output_tokens"] is None
+        assert payload["output_tokens_known"] is False
+    finally:
+        events.disable_event_stream()
+
+
 def test_no_usage_update_when_usage_missing():
     import io
     from harness.ui import events

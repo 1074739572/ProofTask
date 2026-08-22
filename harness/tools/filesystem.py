@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import difflib
+import hashlib
 import itertools
+import re
 import os
 import signal
 import subprocess
@@ -584,5 +586,98 @@ def run_glob(pattern: str, cwd: Path | None = None) -> str:
             if (base / match).resolve().is_relative_to(base):
                 results.append(match)
         return "\n".join(sorted(results)) if results else "(no matches)"
+    except Exception as exc:
+        return f"Error: {exc}"
+
+
+def run_search_text(
+    pattern: str,
+    path: str = ".",
+    *,
+    max_results: int = 100,
+    case_sensitive: bool = True,
+    cwd: Path | None = None,
+) -> str:
+    """Search text without giving an Agent a shell escape hatch.
+
+    Results are line-numbered and capped. Binary files and paths outside the
+    bound workspace are skipped, so discovery can search broadly without
+    dumping an entire repository into the model context.
+    """
+    try:
+        base = safe_path(path, cwd)
+        if base.is_file():
+            candidates = [base]
+        elif base.is_dir():
+            candidates = [item for item in base.rglob("*") if item.is_file()]
+        else:
+            return f"Error: path not found: {path}"
+        try:
+            regex = re.compile(str(pattern), 0 if case_sensitive else re.IGNORECASE)
+        except re.error as exc:
+            return f"Error: invalid search pattern: {exc}"
+        limit = max(1, min(int(max_results or 100), 500))
+        matches: list[str] = []
+        for target in sorted(candidates):
+            try:
+                with target.open("rb") as fh:
+                    probe = fh.read(_BINARY_SNIFF_BYTES)
+                if b"\x00" in probe:
+                    continue
+                encoding = _pick_encoding(target)
+                with target.open("r", encoding=encoding, errors="replace") as fh:
+                    for line_no, line in enumerate(fh, 1):
+                        if regex.search(line):
+                            relative = target.relative_to(cwd or get_workdir()).as_posix()
+                            matches.append(f"{relative}:{line_no}: {line.rstrip()}"[:MAX_READ_CHARS])
+                            if len(matches) >= limit:
+                                return "\n".join(matches) + f"\n... (limited to {limit} results)"
+            except (OSError, UnicodeError, ValueError):
+                continue
+        return "\n".join(matches) if matches else "(no matches)"
+    except Exception as exc:
+        return f"Error: {exc}"
+
+
+def run_patch_file(
+    path: str,
+    hunks: list[dict],
+    *,
+    expected_sha256: str = "",
+    cwd: Path | None = None,
+) -> str:
+    """Apply several exact replacements atomically and report content hashes."""
+    try:
+        target = safe_path(path, cwd)
+        before = target.read_text(encoding="utf-8")
+        before_hash = hashlib.sha256(before.encode("utf-8")).hexdigest()
+        if expected_sha256 and expected_sha256 != before_hash:
+            return f"Error: file changed since inspection; expected sha256 {expected_sha256}, got {before_hash}"
+        if not isinstance(hunks, list) or not hunks:
+            return "Error: patch_file requires at least one hunk"
+        updated = before
+        for index, hunk in enumerate(hunks, 1):
+            if not isinstance(hunk, dict):
+                return f"Error: hunk {index} is not an object"
+            old_text = str(hunk.get("old_text") or "")
+            new_text = str(hunk.get("new_text") or "")
+            if not old_text:
+                return f"Error: hunk {index} has empty old_text"
+            occurrence = int(hunk.get("occurrence") or 1)
+            if old_text not in updated:
+                hint = _closest_line_hint(old_text, updated)
+                return f"Error: hunk {index} text not found in {path}" + (f". {hint}" if hint else ".")
+            count = updated.count(old_text)
+            if occurrence < 1 or occurrence > count:
+                return f"Error: hunk {index} occurrence {occurrence} out of range; found {count}"
+            replaced = _replace_nth(updated, old_text, new_text, occurrence)
+            if replaced is None:
+                return f"Error: hunk {index} could not be applied"
+            updated = replaced
+        if len(updated) > MAX_WRITE_CHARS:
+            return f"Error: patched content too large ({len(updated)} chars > {MAX_WRITE_CHARS})"
+        target.write_text(updated, encoding="utf-8")
+        after_hash = hashlib.sha256(updated.encode("utf-8")).hexdigest()
+        return f"Patched {path} ({len(hunks)} hunks) sha256 {before_hash[:12]} -> {after_hash[:12]}"
     except Exception as exc:
         return f"Error: {exc}"

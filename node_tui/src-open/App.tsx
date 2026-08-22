@@ -282,6 +282,12 @@ function SubagentCard(props: {agent: Entry; frame: () => string; compact?: boole
     const elapsed = a.elapsed != null ? ` · ${a.elapsed.toFixed(1)}s` : '';
     return `${toolCount} tools${elapsed}`;
   };
+  const usage = () => {
+    const tokens = agent().tokens;
+    if (!tokens || tokens.inp <= 0) return '';
+    const output = tokens.outputKnown === false ? 'out unknown' : `out ${formatTokens(tokens.out)}`;
+    return `in ${formatTokens(tokens.inp)} / ${output}`;
+  };
   return <box flexDirection="column" minWidth={0} paddingLeft={1}>
     <box flexDirection="row" minWidth={0} gap={1}>
       <text fg={subagentColor(status())} wrapMode="none">•</text>
@@ -289,6 +295,7 @@ function SubagentCard(props: {agent: Entry; frame: () => string; compact?: boole
       <text fg={C.secondary} wrapMode="none" truncate>{agent().agentType || 'agent'}</text>
       <text fg={C.textMuted} wrapMode="none" truncate>· {agent().model || 'model'}</text>
       <text fg={C.textMuted} wrapMode="none" truncate>· {stats()}</text>
+      <Show when={usage()}><text fg={C.textMuted} wrapMode="none" truncate>{usage()}</text></Show>
     </box>
     <box minWidth={0} paddingLeft={2}>
       <text fg={C.text} wrapMode="word">{agent().text}</text>
@@ -1231,12 +1238,28 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
         break;
       }
       case 'usage_update': {
+        const outputKnown = event.output_tokens_known !== false;
+        const output = outputKnown ? Number(event.output_tokens || 0) : 0;
         setTodayInput(total => total + Number(event.input_tokens || 0));
-        setTodayOutput(total => total + Number(event.output_tokens || 0));
+        setTodayOutput(total => total + output);
         setTodayCacheRead(total => total + Number(event.cache_read_tokens || 0));
         turnTokens.inp += Number(event.input_tokens || 0);
-        turnTokens.out += Number(event.output_tokens || 0);
+        turnTokens.out += output;
         turnTokens.cache += Number(event.cache_read_tokens || 0);
+        const runId = value(event, 'agent_run_id');
+        if (runId) update(runId, entry => {
+          if (entry.kind !== 'subagent') return entry;
+          const previous = entry.tokens || {inp: 0, out: 0, cache: 0, outputKnown: true};
+          return {
+            ...entry,
+            tokens: {
+              inp: previous.inp + Number(event.input_tokens || 0),
+              out: previous.out + output,
+              cache: previous.cache + Number(event.cache_read_tokens || 0),
+              outputKnown: previous.outputKnown !== false && outputKnown,
+            },
+          };
+        });
         break;
       }
       case 'user_message': if (!event.silent) { const prompt = value(event, 'text'); responseId = ''; const pendingIndex = pendingPrompts.indexOf(prompt); if (pendingIndex >= 0) pendingPrompts = pendingPrompts.filter((_, i) => i !== pendingIndex); else add({id: `prompt-${Date.now()}`, kind: 'prompt', text: prompt}); } break;

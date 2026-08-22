@@ -78,10 +78,12 @@ def _model_rows(totals: UsageTotals, *, limit: int = 8) -> list[str]:
     for model, row in ranked:
         inp = row["hit"] + row["miss"]
         rate = row["hit"] / inp if inp else 0.0
+        output = "?" if row.get("unknown_output_calls", 0) else format_tokens(row["out"])
         lines.append(
             f"  {model:<22} {bar(inp / peak, width=12)}  "
             f"in {format_tokens(inp):>6}  hit {_pct(rate):>3}  "
-            f"out {format_tokens(row['out']):>5}  x{row['calls']}"
+            f"out {output:>5}  x{row['calls']}"
+            + (f" ({row['unknown_output_calls']} unknown)" if row.get("unknown_output_calls", 0) else "")
         )
     return lines
 
@@ -96,7 +98,8 @@ def _summary_block(title: str, totals: UsageTotals) -> str:
         f"    hit    {hit_bar}  {format_tokens(totals.hit):>8}  {_pct(totals.hit_rate)}",
         f"    miss   {bar(1 - totals.hit_rate if totals.input_tokens else 0, width=22)}  "
         f"{format_tokens(totals.miss):>8}  {_pct(1 - totals.hit_rate if totals.input_tokens else 0)}",
-        f"  Output   {format_tokens(totals.out):>8} tok",
+        f"  Output   {format_tokens(totals.out):>8} tok"
+        + (f" ({totals.unknown_output_calls} calls unknown)" if totals.unknown_output_calls else ""),
         f"  Calls    {totals.calls:>8}",
         "",
         "  By model",
@@ -153,16 +156,18 @@ def format_month_report(year: int, month: int) -> str:
             series.append((day, day_totals))
             for model, row in day_totals.by_model.items():
                 bucket = all_totals.by_model.setdefault(
-                    model, {"hit": 0, "miss": 0, "out": 0, "calls": 0}
+                    model, {"hit": 0, "miss": 0, "out": 0, "calls": 0, "unknown_output_calls": 0}
                 )
                 bucket["hit"] += row["hit"]
                 bucket["miss"] += row["miss"]
                 bucket["out"] += row["out"]
                 bucket["calls"] += row["calls"]
+                bucket["unknown_output_calls"] += row.get("unknown_output_calls", 0)
             all_totals.hit += day_totals.hit
             all_totals.miss += day_totals.miss
             all_totals.out += day_totals.out
             all_totals.calls += day_totals.calls
+            all_totals.unknown_output_calls += day_totals.unknown_output_calls
 
     title = f"Usage - {year:04d}-{month:02d} (month)"
     if all_totals.calls == 0:
@@ -200,14 +205,16 @@ def format_year_report(year: int) -> str:
         grand.miss += month_totals.miss
         grand.out += month_totals.out
         grand.calls += month_totals.calls
+        grand.unknown_output_calls += month_totals.unknown_output_calls
         for model, row in month_totals.by_model.items():
             bucket = grand.by_model.setdefault(
-                model, {"hit": 0, "miss": 0, "out": 0, "calls": 0}
+                model, {"hit": 0, "miss": 0, "out": 0, "calls": 0, "unknown_output_calls": 0}
             )
             bucket["hit"] += row["hit"]
             bucket["miss"] += row["miss"]
             bucket["out"] += row["out"]
             bucket["calls"] += row["calls"]
+            bucket["unknown_output_calls"] += row.get("unknown_output_calls", 0)
 
     title = f"Usage - {year} (year)"
     if grand.calls == 0:
