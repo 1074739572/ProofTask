@@ -457,6 +457,21 @@ def _resume_target(state: GoalState) -> str:
     # waiting for their dependencies.  Otherwise a review pause on Task A is
     # incorrectly routed through test generation for Task B and returns to ACT.
     current = tasks.get(state.current_task_id or "")
+    if (
+        state.stop_reason == StopReason.repair_limit_reached.value
+        and candidate == GoalPhase.REPAIR_PLAN.value
+        and current is not None
+        and current.status == "in_progress"
+    ):
+        # An explicit user resume starts a new, bounded repair epoch. The old
+        # repair history remains audit evidence, but routing back into the
+        # exhausted repair checkpoint would pause immediately without ever
+        # verifying the current implementation.
+        state.repair_attempts = 0
+        state.no_progress_count = 0
+        state.consecutive_failures = 0
+        state.last_error = "Repair budget reset after explicit resume; verify the current Task."
+        candidate = GoalPhase.ACT.value
     task_phases = {
         GoalPhase.CLAIM.value,
         GoalPhase.ACT.value,

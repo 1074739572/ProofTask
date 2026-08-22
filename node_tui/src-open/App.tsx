@@ -1295,14 +1295,14 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
         if (snapshot) { setGoalSnapshot(snapshot); syncGoalDecisionPhase(snapshot); }
         const status = snapshot?.status || value(event, 'status');
         const active = status === 'running' || status === 'pausing' || status === 'cancelling';
-        const passiveHydration = event.type === 'goal_status' && event.hydrated === true && !active;
         if (goalEventShouldFocus(event, snapshot)) setLifecycleView('goal');
-        if (!passiveHydration) {
-          setRunning(active || goalDraftIsBusy(draftStatus()));
-          setPhase(active ? `goal: ${snapshot?.phase || value(event, 'phase')}` : (status === 'paused' ? 'goal: paused' : 'idle'));
-          if (!active && !draftStatus()) setStartedAt(0);
-          add({id: `goal-${value(event, 'id')}-${Date.now()}`, kind: 'log', text: 'Goal', detail: `${value(event, 'phase')} (${status})`});
-        }
+        // Hydrated status is still authoritative for the running indicator.
+        // Skipping paused hydration left the UI stuck on "working" after a
+        // quick resume that immediately stopped at a durable checkpoint.
+        setRunning(active || goalDraftIsBusy(draftStatus()));
+        setPhase(active ? `goal: ${snapshot?.phase || value(event, 'phase')}` : (status === 'paused' ? 'goal: paused' : 'idle'));
+        if (!active && !draftStatus()) setStartedAt(0);
+        add({id: `goal-${value(event, 'id')}-${Date.now()}`, kind: 'log', text: 'Goal', detail: `${value(event, 'phase')} (${status})`});
         break;
       }
       case 'goal_stopped': {

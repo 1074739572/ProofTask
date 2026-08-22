@@ -731,7 +731,15 @@ def run_event_stream() -> None:
                     from harness.goal.commands import handle_goal_command, parse_goal_subcommand
 
                     note = handle_goal_command(text, history, context, binding)
-                    if parse_goal_subcommand(text) == "status":
+                    subcommand = parse_goal_subcommand(text)
+                    if subcommand == "resume":
+                        from harness.goal.runner import emit_current_goal_status
+
+                        # Resume may reach a durable pause checkpoint before
+                        # this control command returns; publish that final
+                        # snapshot so the TUI cannot remain stuck on "working".
+                        emit_current_goal_status(include_terminal=True)
+                    elif subcommand == "status":
                         from harness.goal.draft import emit_current_draft_status
 
                         draft = emit_current_draft_status(event="status")

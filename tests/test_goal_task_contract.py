@@ -463,6 +463,34 @@ def test_repair_planning_pauses_after_repeated_task_repairs(tmp_path, monkeypatc
     assert state.stop_reason == "repair_limit_reached"
 
 
+def test_resume_starts_a_new_bounded_repair_epoch_after_limit(tmp_path, monkeypatch):
+    import harness.goal.runner as runner_mod
+    import harness.tasks as tasks
+
+    monkeypatch.setattr(tasks, "TASKS_DIR", tmp_path / ".tasks")
+    task = tasks.create_task("current", "still failing", verification_spec={})
+    tasks.claim_task(task.id)
+    state = GoalState.new(target="repair", verification="pytest -q", workspace=str(tmp_path))
+    state.initialization_complete = True
+    state.execution_approved = True
+    state.task_plan = [{"name": task.subject, "scope_paths": []}]
+    state.task_name_ids = {task.subject: task.id}
+    state.task_ids = [task.id]
+    state.current_task_id = task.id
+    state.resume_phase = GoalPhase.REPAIR_PLAN.value
+    state.stop_reason = "repair_limit_reached"
+    state.repair_attempts = 4
+    state.no_progress_count = 3
+
+    target = runner_mod._resume_target(state)
+
+    assert target == GoalPhase.ACT.value
+    assert state.repair_attempts == 0
+    assert state.no_progress_count == 0
+    assert "new bounded repair epoch" not in state.last_error
+    assert "verify the current Task" in state.last_error
+
+
 def test_repair_planner_corrects_invalid_json_once_before_falling_back(tmp_path):
     from harness.agents.runner import AgentTaskStats
     from harness.goal.repair import plan_task_repair
