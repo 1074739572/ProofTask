@@ -24,6 +24,7 @@ class RepairDecision:
     summary: str = ""
     error: str | None = None
     unavailable: bool = False
+    format_fallback: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -33,7 +34,8 @@ class RepairDecision:
             "summary": self.summary,
             "error": self.error,
             "unavailable": self.unavailable,
-    }
+            "format_fallback": self.format_fallback,
+        }
 
 
 @dataclass(frozen=True)
@@ -115,6 +117,29 @@ def parse_repair_decision(raw: str) -> RepairDecision:
         instructions,
         tuple(assumptions[:8]),
         summary=str(data.get("summary") or "").strip()[:1_000],
+    )
+
+
+def fallback_repair_decision(error: str | None) -> RepairDecision:
+    """Keep the current Task moving when the planner's structured output is unusable."""
+    detail = str(error or "repair planner returned unusable JSON").strip()
+    return RepairDecision(
+        action="implementation_fix",
+        instructions=(
+            "Resume the current Task and implement the smallest code fix supported by the "
+            "existing verification evidence and frozen Goal Contract. Do not regenerate, "
+            "remove, or weaken tests. Run the bound verification before reporting completion."
+        ),
+        assumptions=(
+            {
+                "decision": "Continue the current implementation repair without a model-generated plan.",
+                "basis": "The repair planner returned unusable structured output; Task evidence and test bindings remain available.",
+            },
+        ),
+        summary="Repair planner returned invalid JSON; deterministic fallback continued the current Task.",
+        error=f"repair planner format fallback: {detail}",
+        unavailable=False,
+        format_fallback=True,
     )
 
 
@@ -247,11 +272,7 @@ def plan_task_repair(
         )
     corrected_decision = parse_repair_decision(corrected)
     if corrected_decision.unavailable:
-        return RepairDecision(
-            "blocked", "",
-            error=f"{corrected_decision.error} after JSON correction",
-            unavailable=True,
-        )
+        return fallback_repair_decision(f"{corrected_decision.error} after JSON correction")
     return corrected_decision
 
 

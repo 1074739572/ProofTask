@@ -444,7 +444,7 @@ def test_repair_planning_pauses_after_repeated_task_repairs(tmp_path, monkeypatc
     assert state.stop_reason == "repair_limit_reached"
 
 
-def test_repair_planner_corrects_invalid_json_once_before_pausing(tmp_path):
+def test_repair_planner_corrects_invalid_json_once_before_falling_back(tmp_path):
     from harness.agents.runner import AgentTaskStats
     from harness.goal.repair import plan_task_repair
     from harness.tasks import Task
@@ -477,6 +477,42 @@ def test_repair_planner_corrects_invalid_json_once_before_pausing(tmp_path):
     assert decision.action == "implementation_fix"
     assert not decision.unavailable
     assert stats.llm_rounds == 2
+
+
+def test_repair_planner_uses_deterministic_fallback_after_two_invalid_json_replies(tmp_path):
+    from harness.agents.runner import AgentTaskStats
+    from harness.goal.repair import plan_task_repair
+    from harness.tasks import Task
+
+    state = GoalState.new(target="repair", verification="pytest -q", workspace=str(tmp_path))
+    task = Task(
+        id="task_repair",
+        subject="repair",
+        description="restore behavior",
+        status="in_progress",
+        owner="goal:test",
+        blockedBy=[],
+    )
+    replies = iter(("plain text", "still not JSON"))
+
+    def runner(**kwargs):
+        kwargs["stats"].llm_rounds = 1
+        return next(replies)
+
+    decision = plan_task_repair(
+        state,
+        task,
+        {"passed": False, "summary": "bound test failed"},
+        cwd=str(tmp_path),
+        stats=AgentTaskStats(),
+        runner=runner,
+    )
+
+    assert decision.action == "implementation_fix"
+    assert decision.format_fallback
+    assert not decision.unavailable
+    assert "Do not regenerate" in decision.instructions
+    assert "after JSON correction" in (decision.error or "")
 
 
 def test_repair_planner_preserves_provider_failure_over_missing_json(tmp_path):
@@ -1768,7 +1804,7 @@ def test_replan_returns_current_task_to_additive_test_preparation(tmp_path, monk
     assert repaired.repair_history[-1]["action"] == "replan"
 
 
-def test_repair_plan_json_format_failure_is_not_marked_provider_unavailable(tmp_path, monkeypatch):
+def test_repair_plan_json_format_failure_resumes_current_task(tmp_path, monkeypatch):
     import harness.goal.repair as repair_mod
     import harness.goal.runner as runner_mod
     import harness.tasks as tasks
@@ -1791,8 +1827,11 @@ def test_repair_plan_json_format_failure_is_not_marked_provider_unavailable(tmp_
 
     GoalRunner(state=state, history=[], context={}, binding=None)._repair_plan(state)
 
-    assert state.phase == GoalPhase.PAUSED.value
-    assert state.stop_reason == "repair_plan_format_error"
+    assert state.phase == GoalPhase.ACT.value
+    assert state.stop_reason in {None, ""}
+    repaired = tasks.load_task(task.id)
+    assert repaired.repair_history[-1]["event"] == "repair_planner_format_fallback"
+    assert repaired.repair_history[-1]["format_fallback"] is True
 
 
 def test_goal_worker_context_excludes_stale_cli_state():

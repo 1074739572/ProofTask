@@ -2389,7 +2389,7 @@ class GoalRunner(threading.Thread):
 
     def _repair_plan(self, state: GoalState) -> None:
         from harness.goal.memory import append_decisions
-        from harness.goal.repair import plan_task_repair
+        from harness.goal.repair import fallback_repair_decision, plan_task_repair
         from harness.tasks import load_task, record_task_repair, request_task_test_repair
 
         task = load_task(state.current_task_id)
@@ -2422,15 +2422,6 @@ class GoalRunner(threading.Thread):
         state.total_llm_rounds += stats.llm_rounds
         if self._honor_control_request(state):
             return
-        self._observe_supervisor(
-            "agent_finished",
-            detail=self._agent_stats_detail(
-                "goal_repair_planner",
-                stats,
-                summary=decision.summary or decision.instructions or decision.error or decision.action,
-                extra={"task_id": task.id, "action": decision.action},
-            ),
-        )
         if decision.unavailable:
             state.last_error = decision.error or "repair planner unavailable"
             format_error = state.last_error.startswith((
@@ -2440,20 +2431,35 @@ class GoalRunner(threading.Thread):
                 "unsupported repair action:",
                 "repair action needs instructions",
             ))
-            self._pause(
-                state,
-                "repair_planner_format_error" if format_error else "repair_planner_unavailable",
-                stop_reason=(
-                    StopReason.repair_plan_format_error.value
-                    if format_error
-                    else StopReason.provider_unavailable.value
-                ),
-            )
-            return
-        # Transport and JSON-contract failures are not repair attempts. They
-        # must not exhaust the Task's circuit breaker before a planner has
-        # produced any actionable direction.
+            if not format_error:
+                self._pause(
+                    state,
+                    "repair_planner_unavailable",
+                    stop_reason=StopReason.provider_unavailable.value,
+                )
+                return
+            # A malformed model response is recoverable: use a bounded local
+            # direction and let the normal repair-attempt/no-progress limits
+            # prevent an endless loop.
+            decision = fallback_repair_decision(state.last_error)
+        self._observe_supervisor(
+            "agent_finished",
+            detail=self._agent_stats_detail(
+                "goal_repair_planner",
+                stats,
+                summary=decision.summary or decision.instructions or decision.error or decision.action,
+                extra={
+                    "task_id": task.id,
+                    "action": decision.action,
+                    "format_fallback": decision.format_fallback,
+                },
+            ),
+        )
+        # Record both model decisions and deterministic format fallbacks so the
+        # UI/audit trail explains why the current Task was resumed.
         record = {"evaluation": evaluation, **decision.to_dict(), "at": time.time()}
+        if decision.format_fallback:
+            record["event"] = "repair_planner_format_fallback"
         record_task_repair(task.id, record)
         if decision.assumptions:
             append_decisions(state, task, list(decision.assumptions), source="repair_planner")
