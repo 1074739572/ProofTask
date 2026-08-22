@@ -13,6 +13,9 @@ from harness.tools.filesystem import (
     run_bash,
     run_patch_file,
     run_search_text,
+    run_inspect_file,
+    run_git_diff,
+    run_git_status,
 )
 
 
@@ -169,6 +172,33 @@ def test_search_text_returns_capped_line_numbered_matches(tmp_path):
 def test_search_text_skips_binary_files(tmp_path):
     (tmp_path / "data.bin").write_bytes(b"needle\x00value")
     assert run_search_text("needle", cwd=tmp_path) == "(no matches)"
+
+
+def test_search_text_skips_generated_directories_and_oversized_files(tmp_path):
+    generated = tmp_path / "node_modules"
+    generated.mkdir()
+    (generated / "vendor.js").write_text("needle", encoding="utf-8")
+    (tmp_path / "large.txt").write_bytes(b"needle" * 1_000_000)
+    (tmp_path / "source.py").write_text("needle", encoding="utf-8")
+    out = run_search_text("needle", cwd=tmp_path)
+    assert "source.py:1" in out
+    assert "vendor.js" not in out
+    assert "large.txt" not in out
+
+
+def test_inspect_file_reports_metadata_and_hash(tmp_path):
+    path = tmp_path / "info.txt"
+    path.write_text("one\ntwo\n", encoding="utf-8")
+    out = run_inspect_file("info.txt", cwd=tmp_path)
+    assert "size_bytes:" in out
+    assert "lines: 2" in out
+    assert "encoding: utf-8" in out
+    assert "sha256:" in out
+
+
+def test_git_read_tools_are_bounded_and_non_shell(tmp_path):
+    assert "exit_code=" in run_git_status(cwd=tmp_path)
+    assert "exit_code=" in run_git_diff(cwd=tmp_path)
 
 
 def test_patch_file_is_atomic_and_reports_hashes(tmp_path):

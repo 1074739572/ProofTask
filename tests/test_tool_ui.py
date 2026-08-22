@@ -23,8 +23,9 @@ def test_mutation_tracker_records_writes():
     tracker = TurnMutationTracker()
     tracker.note("write_file", {"path": "a.py"}, "Wrote 10 bytes to a.py")
     tracker.note("edit_file", {"path": "b.py"}, "Edited b.py")
+    tracker.note("patch_file", {"path": "c.py", "hunks": [{}]}, "Patched c.py")
     tracker.note("bash", {"command": "ls"}, "ok")
     tracker.note("write_file", {"path": "a.py"}, "Wrote again")
     tracker.note("write_file", {"path": "c.py"}, "Error: Permission denied")
-    assert tracker.paths == ["a.py", "b.py"]
+    assert tracker.paths == ["a.py", "b.py", "c.py"]
     assert mutated_path_from_tool("read_file", {"path": "x"}, "hi") is None

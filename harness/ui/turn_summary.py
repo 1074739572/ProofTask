@@ -6,7 +6,7 @@ from typing import Any
 
 from harness.ui.tool_display import is_failure_tool_output
 
-_FILE_MUTATORS = frozenset({"write_file", "edit_file"})
+_FILE_MUTATORS = frozenset({"write_file", "edit_file", "patch_file"})
 
 
 def mutated_path_from_tool(

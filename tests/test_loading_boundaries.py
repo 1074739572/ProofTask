@@ -91,7 +91,7 @@ def test_read_only_modes_hide_mutating_tools():
             tools, handlers = get_tool_pool()
             names = {tool["name"] for tool in tools} | set(handlers)
             assert not (names & forbidden), (mode, names & forbidden)
-            assert "search_text" in names
+            assert {"search_text", "inspect_file", "git_status", "git_diff"} <= names
     finally:
         set_mode("direct")
 
@@ -103,8 +103,8 @@ def test_global_safe_file_tools_are_registered_with_handlers():
     set_mode("direct")
     tools, handlers = get_tool_pool()
     names = {tool["name"] for tool in tools}
-    assert {"search_text", "patch_file"} <= names
-    assert {"search_text", "patch_file"} <= set(handlers)
+    assert {"search_text", "patch_file", "inspect_file", "git_status", "git_diff"} <= names
+    assert {"search_text", "patch_file", "inspect_file", "git_status", "git_diff"} <= set(handlers)
 
 
 def test_mcp_name_collision_is_reported_and_skipped():

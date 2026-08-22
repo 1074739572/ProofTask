@@ -49,6 +49,20 @@ def test_windows_file_paths_use_the_same_protected_path_rules():
     ).effect == "deny"
 
 
+def test_patch_file_uses_file_path_permission_rules():
+    rules = {"patch_file": {"*": "allow", ".project/goal.json": "deny"}}
+    assert evaluate_permission(
+        "patch_file", {"path": ".project\\goal.json", "hunks": []}, rules=rules
+    ).effect == "deny"
+
+
+def test_inspect_and_git_tools_are_read_only_by_default():
+    assert evaluate_permission("inspect_file", {"path": "src/app.py"}).effect == "allow"
+    assert evaluate_permission("inspect_file", {"path": ".env"}).effect == "deny"
+    assert evaluate_permission("git_status", {}).effect == "allow"
+    assert evaluate_permission("git_diff", {}).effect == "allow"
+
+
 def test_sandbox_protects_absolute_goal_paths_and_keeps_verification_available(tmp_path, monkeypatch):
     import harness.permissions.engine as engine
 

@@ -244,7 +244,7 @@ class Renderer:
         self._write(stats_line, style=theme.MUTED)
 
     def files_changed(self, paths: list[str]) -> None:
-        """End-of-turn summary of files write_file/edit_file touched."""
+        """End-of-turn summary of files changed by any file mutator."""
         if not paths:
             return
         events.emit("files_changed", paths=paths)

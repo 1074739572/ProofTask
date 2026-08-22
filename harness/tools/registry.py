@@ -38,6 +38,9 @@ from harness.tools.filesystem import (
     run_bash,
     run_edit,
     run_glob,
+    run_git_diff,
+    run_git_status,
+    run_inspect_file,
     run_patch_file,
     run_read,
     run_search_text,
@@ -404,6 +407,33 @@ BUILTIN_TOOLS = [
             "required": ["path", "hunks"],
         },
     },
+    {
+        "name": "inspect_file",
+        "description": "Return bounded file metadata (size, line count, encoding, and SHA256) without reading its contents.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        },
+    },
+    {
+        "name": "git_status",
+        "description": "Show concise read-only Git status for the workspace without running a shell command.",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "git_diff",
+        "description": "Show a bounded read-only Git diff for the workspace or one file.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "staged": {"type": "boolean"},
+                "max_chars": {"type": "integer"},
+            },
+            "required": [],
+        },
+    },
     TODO_WRITE_TOOL,
     {
         "name": "load_skill",
@@ -752,6 +782,9 @@ BUILTIN_HANDLERS = {
     "glob": run_glob,
     "search_text": run_search_text,
     "patch_file": run_patch_file,
+    "inspect_file": run_inspect_file,
+    "git_status": run_git_status,
+    "git_diff": run_git_diff,
     "todo_write": run_todo_write,
     "load_skill": load_skill,
     "create_task": run_create_task,

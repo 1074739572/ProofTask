@@ -203,7 +203,7 @@ class AgentTaskStats:
             path = str(tool_input["path"]).replace("\\", "/")
             if name == "read_file":
                 self.read_paths.append(path)
-            elif name in {"write_file", "edit_file"}:
+            elif name in {"write_file", "edit_file", "patch_file"}:
                 self.write_paths.append(path)
         detail = str(output)
         if name in {"write_file", "edit_file", "patch_file"}:

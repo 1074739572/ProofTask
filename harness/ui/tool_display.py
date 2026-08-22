@@ -65,14 +65,19 @@ def summarize_tool_input(name: str, tool_input: dict | None) -> str:
     args = tool_input or {}
     if name == "bash":
         return _short(str(args.get("command", "")), 90)
-    if name in {"read_file", "write_file", "edit_file"}:
+    if name in {"read_file", "write_file", "edit_file", "patch_file", "inspect_file"}:
         path = str(args.get("path", ""))
         extra = ""
         if name == "read_file" and args.get("offset") is not None:
             extra = f" @{args.get('offset')}"
             if args.get("limit") is not None:
                 extra += f"+{args.get('limit')}"
+        if name == "patch_file":
+            extra = f" ({len(args.get('hunks') or [])} hunks)"
         return _short(path + extra, 90)
+    if name in {"git_status", "git_diff"}:
+        path = str(args.get("path", ""))
+        return _short(name + (f" {path}" if path else ""), 90)
     if name == "glob":
         return _short(str(args.get("pattern", "")), 90)
     if name == "todo_write":

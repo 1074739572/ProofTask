@@ -38,7 +38,7 @@ class WritingGuard:
     def check_write(self, name: str, tool_input: dict | None) -> tuple[bool, str]:
         if not self.active:
             return False, ""
-        if name not in ("write_file", "edit_file"):
+        if name not in ("write_file", "edit_file", "patch_file"):
             return False, ""
         path = (tool_input or {}).get("path", "")
         if not is_output_prose_path(str(path)):

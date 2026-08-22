@@ -84,7 +84,7 @@ def evaluate_goal_authority(tool_name: str, tool_input: dict[str, Any] | None) -
     authority = current_goal_authority()
     if authority is None:
         return GoalAuthorityDecision(False, "no active Goal authority")
-    if tool_name not in {"write_file", "edit_file"}:
+    if tool_name not in {"write_file", "edit_file", "patch_file"}:
         return GoalAuthorityDecision(False, f"{tool_name} is not eligible for Goal scope auto-approval")
     raw_path = str((tool_input or {}).get("path") or "").strip()
     if not raw_path:

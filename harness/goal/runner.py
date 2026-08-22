@@ -876,7 +876,7 @@ class GoalRunner(threading.Thread):
         requested: set[str] = set()
         for request in requests:
             tool = str(request.get("tool") or "")
-            if tool not in {"write_file", "edit_file"}:
+            if tool not in {"write_file", "edit_file", "patch_file"}:
                 return (), f"{tool or 'unknown tool'} cannot receive automatic scope expansion"
             relative, _, error = self._scope_candidate(
                 _execution_workspace(state),

@@ -43,7 +43,7 @@ def _json_preview(data: dict) -> str:
 
 
 def _path_value(tool_name: str, data: dict) -> str:
-    if tool_name in ("read_file", "write_file", "edit_file"):
+    if tool_name in ("read_file", "write_file", "edit_file", "patch_file", "inspect_file", "git_diff"):
         return str(data.get("path") or "")
     return ""
 
@@ -55,7 +55,7 @@ def _normalize_resource(tool_name: str, resource: str) -> str:
     backslashes. Matching the raw input let the same protected file have two
     different permission outcomes.
     """
-    if tool_name in ("read_file", "write_file", "edit_file"):
+    if tool_name in ("read_file", "write_file", "edit_file", "patch_file", "inspect_file", "git_diff"):
         normalized = resource.replace("\\", "/")
         # Policies are workspace-relative. Without canonicalizing an absolute
         # path inside the workspace, `.project/goal.json` can evade a deny rule
@@ -104,7 +104,7 @@ def context_for_tool(tool_name: str, tool_input: dict | None) -> ToolPermissionC
         return ToolPermissionContext(
             tool_name, _normalize_resource(tool_name, str(data.get("command") or ""))
         )
-    if tool_name in ("read_file", "write_file", "edit_file"):
+    if tool_name in ("read_file", "write_file", "edit_file", "patch_file", "inspect_file", "git_diff"):
         return ToolPermissionContext(
             tool_name,
             _normalize_resource(tool_name, str(data.get("path") or "")),

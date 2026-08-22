@@ -79,7 +79,7 @@ def permission_hook(block):
                 "a separate terminal, tell the user the exact command to run."
             )
 
-    if name in ("write_file", "edit_file"):
+    if name in ("write_file", "edit_file", "patch_file"):
         path = tool_input.get("path", "")
         try:
             safe_path(path)
@@ -125,7 +125,7 @@ def permission_hook(block):
 
     goal_noninteractive = is_goal_noninteractive()
     if goal_noninteractive and (
-        name in {"write_file", "edit_file"} or decision.effect != "allow"
+        name in {"write_file", "edit_file", "patch_file"} or decision.effect != "allow"
     ):
         from harness.goal.authority import evaluate_goal_authority
 
@@ -267,7 +267,7 @@ def stop_hook(messages: list):
 def project_write_hook(block, output):
     name = block_field(block, "name", "")
     tool_input = block_field(block, "input", {}) or {}
-    if name in ("write_file", "edit_file"):
+    if name in ("write_file", "edit_file", "patch_file"):
         path = tool_input.get("path", "")
         if path:
             try:

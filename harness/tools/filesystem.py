@@ -10,6 +10,7 @@ import os
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -419,6 +420,20 @@ MAX_READ_CHARS = 400_000  # hard cap for full-file reads; page with limit/offset
 MAX_WRITE_CHARS = 2_000_000  # write_file content cap (chars)
 _BINARY_SNIFF_BYTES = 8192
 _ENCODING_PROBE_BYTES = 65_536
+MAX_SEARCH_FILE_BYTES = 4_000_000
+_SEARCH_EXCLUDED_DIRS = frozenset({
+    ".git",
+    ".goal-smoke",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    "__pycache__",
+    "node_modules",
+    "dist",
+    "build",
+    ".venv",
+    "venv",
+})
 
 
 def _count_lines_bytes(target: Path) -> int:
@@ -606,10 +621,23 @@ def run_search_text(
     """
     try:
         base = safe_path(path, cwd)
+        file_limit = max(1, min(int(MAX_SEARCH_FILE_BYTES), MAX_WRITE_CHARS))
         if base.is_file():
-            candidates = [base]
+            candidates = [base] if base.stat().st_size <= file_limit else []
         elif base.is_dir():
-            candidates = [item for item in base.rglob("*") if item.is_file()]
+            candidates = []
+            for item in base.rglob("*"):
+                if not item.is_file():
+                    continue
+                try:
+                    relative_parts = item.relative_to(base).parts
+                    if any(part in _SEARCH_EXCLUDED_DIRS for part in relative_parts):
+                        continue
+                    if item.stat().st_size > file_limit:
+                        continue
+                except OSError:
+                    continue
+                candidates.append(item)
         else:
             return f"Error: path not found: {path}"
         try:
@@ -637,6 +665,79 @@ def run_search_text(
         return "\n".join(matches) if matches else "(no matches)"
     except Exception as exc:
         return f"Error: {exc}"
+
+
+def run_inspect_file(path: str, cwd: Path | None = None) -> str:
+    """Return bounded file metadata without loading its contents into context."""
+    try:
+        target = safe_path(path, cwd)
+        if target.is_dir():
+            return f"Error: {path} is a directory"
+        stat = target.stat()
+        with target.open("rb") as fh:
+            digest = hashlib.sha256()
+            probe = fh.read(_BINARY_SNIFF_BYTES)
+            digest.update(probe)
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                digest.update(chunk)
+        binary = b"\x00" in probe
+        lines = "n/a" if binary else str(_count_lines_bytes(target))
+        encoding = "binary" if binary else _pick_encoding(target)
+        relative = target.relative_to(cwd or get_workdir()).as_posix()
+        return (
+            f"path: {relative}\nsize_bytes: {stat.st_size}\nlines: {lines}\n"
+            f"encoding: {encoding}\nsha256: {digest.hexdigest()}"
+        )
+    except Exception as exc:
+        return f"Error: {exc}"
+
+
+def _run_git_read(command: list[str], cwd: Path | None = None, max_chars: int = 50_000) -> str:
+    try:
+        base = (cwd or get_workdir()).resolve()
+        completed = subprocess.run(
+            command,
+            cwd=base,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+            check=False,
+        )
+        output = (completed.stdout or completed.stderr).strip()
+        if not output:
+            output = "(no output)"
+        if len(output) > max_chars:
+            output = output[:max_chars] + f"\n... (truncated at {max_chars} chars)"
+        return f"[exit_code={completed.returncode}]\n{output}"
+    except subprocess.TimeoutExpired:
+        return "Error: git command timed out after 15 seconds"
+    except Exception as exc:
+        return f"Error: {exc}"
+
+
+def run_git_status(cwd: Path | None = None) -> str:
+    """Show concise repository status without exposing a shell."""
+    return _run_git_read(["git", "status", "--short", "--branch"], cwd)
+
+
+def run_git_diff(
+    path: str = "",
+    *,
+    staged: bool = False,
+    max_chars: int = 50_000,
+    cwd: Path | None = None,
+) -> str:
+    """Show a bounded diff for the workspace or one safe relative path."""
+    command = ["git", "diff"]
+    if staged:
+        command.append("--cached")
+    if path:
+        target = safe_path(path, cwd)
+        relative = target.relative_to(cwd or get_workdir()).as_posix()
+        command.extend(["--", relative])
+    return _run_git_read(command, cwd, max(1_000, min(int(max_chars or 50_000), 100_000)))
 
 
 def run_patch_file(
@@ -676,7 +777,23 @@ def run_patch_file(
             updated = replaced
         if len(updated) > MAX_WRITE_CHARS:
             return f"Error: patched content too large ({len(updated)} chars > {MAX_WRITE_CHARS})"
-        target.write_text(updated, encoding="utf-8")
+        temp_path: str | None = None
+        try:
+            fd, temp_path = tempfile.mkstemp(
+                dir=str(target.parent), prefix=f".{target.name}.", suffix=".tmp"
+            )
+            with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
+                fh.write(updated)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(temp_path, target)
+            temp_path = None
+        finally:
+            if temp_path:
+                try:
+                    os.unlink(temp_path)
+                except OSError:
+                    pass
         after_hash = hashlib.sha256(updated.encode("utf-8")).hexdigest()
         return f"Patched {path} ({len(hunks)} hunks) sha256 {before_hash[:12]} -> {after_hash[:12]}"
     except Exception as exc:
