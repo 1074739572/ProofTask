@@ -2905,6 +2905,40 @@ class GoalRunner(threading.Thread):
         return (task.evidence, task.last_error, capture_code_snapshot(_execution_workspace(state)))
 
     @staticmethod
+    def _scope_relative_path(state: GoalState, raw_path: str) -> str:
+        """Normalize git-root and execution-workspace paths to one scope form."""
+        value = str(raw_path or "").strip().replace("\\", "/")
+        if not value:
+            return ""
+        execution = Path(_execution_workspace(state)).expanduser().resolve()
+        repository = Path(state.workspace or execution).expanduser().resolve()
+        try:
+            candidate = Path(value).expanduser()
+            if candidate.is_absolute():
+                resolved = candidate.resolve()
+            else:
+                execution_prefix = ""
+                try:
+                    execution_prefix = execution.relative_to(repository).as_posix()
+                except ValueError:
+                    pass
+                # Git commands run from a nested workspace can still report
+                # paths relative to the repository root (for example,
+                # node_tui/src-open/interaction.ts). Prefer that interpretation
+                # when the path carries the execution workspace prefix.
+                if execution_prefix and (value == execution_prefix or value.startswith(execution_prefix + "/")):
+                    resolved = (repository / candidate).resolve()
+                else:
+                    resolved = (execution / candidate).resolve()
+                    if not resolved.is_relative_to(execution):
+                        resolved = (repository / candidate).resolve()
+            if resolved.is_relative_to(execution):
+                return resolved.relative_to(execution).as_posix()
+        except (OSError, ValueError):
+            pass
+        return value.lstrip("./")
+
+    @staticmethod
     def _validate_task_scope(state: GoalState, task) -> str | None:
         """Reject production changes outside the planner's declared scope.
 
@@ -2913,14 +2947,25 @@ class GoalRunner(threading.Thread):
         """
         from harness.verification.snapshot import capture_dirty_file_hashes
 
-        scope = {str(path).replace("\\", "/").lstrip("./") for path in (task.scope_paths or []) if path}
+        scope = {
+            GoalRunner._scope_relative_path(state, str(path))
+            for path in (task.scope_paths or [])
+            if path
+        }
         if not scope:
             return None
         current = capture_dirty_file_hashes(_execution_workspace(state))
-        baseline = {str(path): str(digest) for path, digest in (task.start_dirty_hashes or {}).items()}
+        baseline = {
+            GoalRunner._scope_relative_path(state, str(path)): str(digest)
+            for path, digest in (task.start_dirty_hashes or {}).items()
+        }
         # A file that was already dirty is not exempt if this worker changed it
         # again. Compare digests rather than merely comparing path names.
-        changed = {path for path, digest in current.items() if baseline.get(path) != str(digest)}
+        changed = {
+            GoalRunner._scope_relative_path(state, str(path)): digest
+            for path, digest in current.items()
+            if baseline.get(GoalRunner._scope_relative_path(state, str(path))) != str(digest)
+        }
         outside = sorted(path for path in changed if path not in scope and not any(path.startswith(item.rstrip("/") + "/") for item in scope))
         if outside:
             return "worker changed files outside Task scope: " + ", ".join(outside[:12])

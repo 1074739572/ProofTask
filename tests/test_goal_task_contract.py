@@ -77,6 +77,25 @@ def test_worker_scope_gate_rejects_changed_dirty_files_and_new_outside_scope(mon
     assert "README.md" in error
 
 
+def test_worker_scope_gate_normalizes_nested_execution_workspace_paths(monkeypatch, tmp_path):
+    from harness.goal import runner as runner_mod
+    from harness.tasks import Task
+
+    execution = tmp_path / "node_tui"
+    execution.mkdir()
+    state = GoalState.new(target="x", verification="npm test", workspace=str(tmp_path))
+    state.execution_workspace = str(execution)
+    task = Task(
+        id="task_nested_scope", subject="x", description="x", status="in_progress", owner="goal:x",
+        blockedBy=[], scope_paths=["src-open/interaction.ts"],
+    )
+    monkeypatch.setattr("harness.verification.snapshot.capture_dirty_file_hashes", lambda _workspace: {
+        "node_tui/src-open/interaction.ts": "new",
+    })
+
+    assert runner_mod.GoalRunner._validate_task_scope(state, task) is None
+
+
 def test_plan_allows_a_discovered_directory_scope_for_new_files():
     manifest = {
         "repo_files": ["src/existing.py"],
