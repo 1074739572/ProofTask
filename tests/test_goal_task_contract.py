@@ -118,6 +118,34 @@ def test_worker_scope_gate_allows_task_bound_generated_test_files(monkeypatch, t
     assert runner_mod.GoalRunner._validate_task_scope(state, task) is None
 
 
+def test_keybinding_task_requires_a_pure_logic_test_boundary():
+    from harness.tasks import Task
+
+    task = Task(
+        id="task_keys", subject="cursor and character keybindings", description="move the cursor and edit input",
+        status="pending", owner=None, blockedBy=[],
+    )
+
+    assert GoalRunner._requires_pure_logic_test(task) is True
+
+
+def test_pure_logic_test_cannot_import_a_complete_app_entry(tmp_path):
+    from harness.tasks import Task
+
+    test_file = tmp_path / "test" / "composer.test.ts"
+    test_file.parent.mkdir()
+    test_file.write_text("import * as App from '../src-open/App.tsx';\n", encoding="utf-8")
+    task = Task(
+        id="task_keys", subject="cursor and character keybindings", description="move the cursor and edit input",
+        status="pending", owner=None, blockedBy=[],
+    )
+
+    error = GoalRunner._generated_test_architecture_error(tmp_path, task, ("test/composer.test.ts",))
+
+    assert error is not None
+    assert "complete application entry" in error
+
+
 def test_nested_workspace_dirty_hashes_ignore_sibling_repository_files(monkeypatch, tmp_path):
     from harness.verification import snapshot
 
@@ -535,6 +563,32 @@ def test_resume_starts_a_new_bounded_repair_epoch_after_limit(tmp_path, monkeypa
     assert state.no_progress_count == 0
     assert "new bounded repair epoch" not in state.last_error
     assert "verify the current Task" in state.last_error
+
+
+def test_resume_verifies_a_workspace_change_before_starting_another_worker(tmp_path, monkeypatch):
+    import harness.goal.runner as runner_mod
+    import harness.tasks as tasks
+
+    monkeypatch.setattr(tasks, "TASKS_DIR", tmp_path / ".tasks")
+    task = tasks.create_task("current", "changed after pause", verification_spec={})
+    tasks.claim_task(task.id)
+    task = tasks.load_task(task.id)
+    task.start_snapshot = "before"
+    tasks.save_task(task)
+    state = GoalState.new(target="repair", verification="pytest -q", workspace=str(tmp_path))
+    state.initialization_complete = True
+    state.execution_approved = True
+    state.task_plan = [{"name": task.subject, "scope_paths": []}]
+    state.task_name_ids = {task.subject: task.id}
+    state.task_ids = [task.id]
+    state.current_task_id = task.id
+    state.resume_phase = GoalPhase.REPAIR_PLAN.value
+    state.stop_reason = "repair_limit_reached"
+    monkeypatch.setattr("harness.verification.snapshot.capture_code_snapshot", lambda _workspace: "after")
+
+    assert runner_mod._resume_target(state) == GoalPhase.VERIFY.value
+    assert state.repair_epoch == 1
+    assert "Workspace changed" in state.last_error
 
 
 def test_resume_skips_implementation_when_task_verification_and_evaluation_pass(tmp_path, monkeypatch):

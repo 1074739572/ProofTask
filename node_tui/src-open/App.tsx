@@ -49,6 +49,60 @@ import {
 
 export type OverlayOption = {name: string; description: string; value: string};
 export type Overlay = {kind: 'permission' | 'picker'; id: string; title: string; pickerId?: string; options: OverlayOption[]};
+export type ComposerKeyEvent = {
+  name?: string;
+  ctrl?: boolean;
+  shift?: boolean;
+  meta?: boolean;
+  alt?: boolean;
+};
+
+export type ComposerKeyAction =
+  | 'beginning-of-line'
+  | 'end-of-line'
+  | 'delete-char-forward'
+  | 'open-effort'
+  | 'history-previous'
+  | 'history-next'
+  | 'history-search'
+  | 'toggle-paste'
+  | 'clear-screen'
+  | 'interrupt';
+
+export type ComposerEditState = {text: string; cursor: number};
+
+export function resolveComposerKeyBinding(event: ComposerKeyEvent): ComposerKeyAction | null {
+  if (!event?.ctrl || event.meta || event.alt) return null;
+  const name = String(event.name || '').toLowerCase();
+  if (name === 'e' && event.shift) return 'open-effort';
+  switch (name) {
+    case 'a': return 'beginning-of-line';
+    case 'd': return 'delete-char-forward';
+    case 'e': return 'end-of-line';
+    case 'p': return 'history-previous';
+    case 'n': return 'history-next';
+    case 'r': return 'history-search';
+    case 'o': return 'toggle-paste';
+    case 'l': return 'clear-screen';
+    case 'k': return 'interrupt';
+    default: return null;
+  }
+}
+
+export function applyComposerKeyAction(state: ComposerEditState, action: ComposerKeyAction): ComposerEditState {
+  const text = String(state.text || '');
+  const cursor = Math.max(0, Math.min(Number.isFinite(state.cursor) ? state.cursor : text.length, text.length));
+  if (action === 'beginning-of-line') return {...state, text, cursor: text.lastIndexOf('\n', Math.max(0, cursor - 1)) + 1};
+  if (action === 'end-of-line') {
+    const end = text.indexOf('\n', cursor);
+    return {...state, text, cursor: end < 0 ? text.length : end};
+  }
+  if (action === 'delete-char-forward' && cursor < text.length) {
+    return {...state, text: text.slice(0, cursor) + text.slice(cursor + 1), cursor};
+  }
+  return {...state, text, cursor};
+}
+
 // Multiline composer: Enter submits, Shift+Enter inserts a newline.
 const textareaBindings = [
   {name: 'return', action: 'submit'},
@@ -228,7 +282,12 @@ function formatElapsed(start?: number, end?: number, now = 0): string {
   if (ms < 60000) return ` (${(ms / 1000).toFixed(1)}s)`;
   return ` (${Math.floor(ms / 60000)}m${Math.round((ms % 60000) / 1000)}s)`;
 }
-const markdownSyntax = SyntaxStyle.fromStyles({
+let markdownSyntax: ReturnType<typeof SyntaxStyle.fromStyles> | null = null;
+
+function getMarkdownSyntax(): ReturnType<typeof SyntaxStyle.fromStyles> {
+  // Focused logic tests import this module without OpenTUI's native renderer.
+  // Construct the renderer-backed style only when a markdown view is rendered.
+  return markdownSyntax || (markdownSyntax = SyntaxStyle.fromStyles({
   default: {fg: C.text},
   keyword: {fg: C.secondary, bold: true},
   string: {fg: C.success},
@@ -260,7 +319,8 @@ const markdownSyntax = SyntaxStyle.fromStyles({
   'markup.raw': {fg: C.warning},
   'markup.quote': {fg: C.textMuted, italic: true},
   'markup.list': {fg: C.textMuted},
-});
+  }));
+}
 
 function subagentColor(status?: SubagentStatus): string {
   if (status === 'failed') return C.error;
@@ -340,7 +400,7 @@ function SectionView(props: {section: Section; frame: () => string; now: () => n
     <Show when={props.section.kind === 'response'}>
       <box minWidth={0} paddingLeft={1}>
         <markdown
-          syntaxStyle={markdownSyntax}
+          syntaxStyle={getMarkdownSyntax()}
           streaming={props.section.kind === 'response' && props.section.streaming}
           internalBlockMode="top-level"
           tableOptions={{style: 'grid'}}
@@ -848,6 +908,16 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
     setInput(text);
     textareaRef?.setText?.(text);
     queueMicrotask(() => { suppressContentChange = false; });
+  };
+  const applyComposerEditAction = (action: ComposerKeyAction) => {
+    const current = {text: input(), cursor: textareaRef?.cursorOffset ?? input().length};
+    const next = applyComposerKeyAction(current, action);
+    if (next.text !== current.text) setComposerText(next.text);
+    queueMicrotask(() => {
+      if (typeof textareaRef?.setCursorByOffset === 'function') textareaRef.setCursorByOffset(next.cursor);
+      else if (textareaRef) textareaRef.cursorOffset = next.cursor;
+      refreshCompletion(next.text);
+    });
   };
   const recordHistory = (text: string) => {
     const next = appendHistory(inputHistory(), text);
@@ -1450,17 +1520,18 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
   };
   useKeyboard((event: any) => {
     const name = String(event?.name || '').toLowerCase();
+    const action = resolveComposerKeyBinding(event);
     if (event?.ctrl && name === 'q') { send({type: 'exit'}); try { backendClient?.stop(); } catch { /* best effort */ } process.exit(0); }
-    if (event?.ctrl && name === 'k') { send({type: 'interrupt'}); event.preventDefault?.(); return; }
-    if (event?.ctrl && name === 'r') {
+    if (action === 'interrupt') { send({type: 'interrupt'}); event.preventDefault?.(); return; }
+    if (action === 'history-search') {
       if (backendState() === 'disconnected') reconnectBackend();
       else { setHistoryDraft(input()); setHistorySearchOpen(true); setHistorySearchIndex(0); showToast('History search: type a query, Enter selects, Esc cancels'); }
       event.preventDefault?.();
       return;
     }
-    if (event?.ctrl && name === 'p') { recallHistory(-1); event.preventDefault?.(); return; }
-    if (event?.ctrl && name === 'n') { recallHistory(1); event.preventDefault?.(); return; }
-    if (event?.ctrl && name === 'o') {
+    if (action === 'history-previous') { recallHistory(-1); event.preventDefault?.(); return; }
+    if (action === 'history-next') { recallHistory(1); event.preventDefault?.(); return; }
+    if (action === 'toggle-paste') {
       const paste = pastedContent();
       if (paste) { const next = {...paste, expanded: !paste.expanded}; setPastedContent(next); setComposerText(next.expanded ? next.text : foldedPasteLabel(next)); }
       event.preventDefault?.();
@@ -1515,10 +1586,15 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
       event.preventDefault?.();
       return;
     }
-    if (event?.ctrl && name === 'e') { openEffortPicker(); event.preventDefault?.(); return; }
+    if (action === 'open-effort') { openEffortPicker(); event.preventDefault?.(); return; }
+    if (action === 'beginning-of-line' || action === 'end-of-line' || action === 'delete-char-forward') {
+      applyComposerEditAction(action);
+      event.preventDefault?.();
+      return;
+    }
     // Do not consume Ctrl+C: terminals and IDEs use it to copy a mouse selection.
     // Ctrl+Shift+C is handled by OpenTUI as copy-selection; Ctrl+K interrupts a run.
-    if (event?.ctrl && name === 'l') { setEntries([]); setGoalSnapshot(null); setUserStarted(false); send({type: 'clear'}); }
+    if (action === 'clear-screen') { setEntries([]); setGoalSnapshot(null); setUserStarted(false); send({type: 'clear'}); event.preventDefault?.(); return; }
     // Input history: with an empty composer, ↑ recalls past commands and ↓
     // walks back toward the newest, past the end clears the input. When the
     // composer has text, ↑/↓ move the cursor inside the multiline buffer.

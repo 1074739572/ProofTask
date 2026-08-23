@@ -25,6 +25,24 @@ skill (MIT; see `LICENSE.txt`).
 - A passing test written after implementation is evidence of coverage, but not
   evidence that it could have caught the original defect.
 
+## Test Architecture
+
+Choose the smallest executable boundary before writing a test.
+
+- For key bindings, cursor/text editing, queues, reducers, parsing, formatting,
+  and state transitions, test a pure logic module. Do not import a complete UI
+  application entry such as `App.tsx`, `index.tsx`, or a native renderer merely
+  to reach a helper.
+- For rendered component behavior, use the repository's component/browser test
+  harness only when that harness is available. Native terminal or renderer
+  initialization belongs in a small integration test, not a normal unit test.
+- Use the test runner declared by the project. Do not invent a Node loader when
+  the project vendors or declares another runner such as Bun.
+- When a needed helper does not yet exist, target an existing narrow module in
+  the approved production scope and make the missing API fail as a behavior
+  assertion. Do not make the baseline fail because the test imports an absent
+  module or cannot initialize infrastructure.
+
 ## Goal Boundaries
 
 - The Goal runner owns the bound command and records its evidence. Do not

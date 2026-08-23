@@ -21,8 +21,11 @@ Security gates before any subprocess spawns:
 from __future__ import annotations
 
 import ctypes
+import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from dataclasses import dataclass
@@ -141,6 +144,7 @@ def run_verification(
     workspace: str | Path | None = None,
     timeout_s: float | None = None,
     cancel_check: Callable[[], bool] | None = None,
+    _allow_isolated_bun_retry: bool = True,
 ) -> VerificationRunResult:
     """Validate + run one verification command under controlled execution.
 
@@ -290,7 +294,7 @@ def run_verification(
                 "(verification must be read-only)",
             )
 
-    return VerificationRunResult(
+    outcome = VerificationRunResult(
         command=command,
         exit_code=info["exit_code"],
         stdout=output,
@@ -298,3 +302,88 @@ def run_verification(
         duration_ms=(time.monotonic() - started) * 1000.0,
         error=None,  # exit code is carried in exit_code; error = couldn't run/abnormal
     )
+    if _allow_isolated_bun_retry and _needs_isolated_bun_retry(command, outcome, cwd):
+        return _retry_bun_in_isolated_workspace(command, cwd, timeout_s=timeout_s, cancel_check=cancel_check, original=outcome)
+    return outcome
+
+
+def _needs_isolated_bun_retry(command: str, result: VerificationRunResult, workspace: Path) -> bool:
+    """Detect Bun's Windows source-file sharing failure, not test failures."""
+    if result.passed or result.timed_out or result.error is not None:
+        return False
+    try:
+        program = split_verification_command(command)[0].replace("\\", "/").lower()
+    except (IndexError, ValueError):
+        return False
+    if not (program.endswith("bun") or program.endswith("bun.exe")):
+        return False
+    output = result.stdout.replace("\\", "/").lower()
+    workspace_text = str(workspace).replace("\\", "/").lower()
+    return "eperm reading" in output and workspace_text in output
+
+
+def _retry_bun_in_isolated_workspace(
+    command: str,
+    workspace: Path,
+    *,
+    timeout_s: float | None,
+    cancel_check: Callable[[], bool] | None,
+    original: VerificationRunResult,
+) -> VerificationRunResult:
+    """Retry only Bun's Windows file-sharing failure from a disposable copy."""
+    node_modules = workspace / "node_modules"
+    if not node_modules.is_dir():
+        return original
+    temp_root = Path(tempfile.mkdtemp(prefix="harness-bun-verify-"))
+    isolated = temp_root / "workspace"
+    ignored = shutil.ignore_patterns(
+        "node_modules", ".git", ".project", ".tasks", ".features", ".goal-smoke", ".env", ".env.*",
+    )
+    try:
+        shutil.copytree(workspace, isolated, ignore=ignored)
+        if not _link_isolated_node_modules(node_modules, isolated / "node_modules"):
+            return original
+        tokens = split_verification_command(command)
+        if not tokens:
+            return original
+        program = Path(tokens[0])
+        if not program.is_absolute():
+            source_program = (workspace / program).resolve()
+            if source_program.is_file():
+                tokens[0] = str(source_program)
+        isolated_command = subprocess.list2cmdline(tokens)
+        retried = run_verification(
+            isolated_command,
+            workspace=isolated,
+            timeout_s=timeout_s,
+            cancel_check=cancel_check,
+            _allow_isolated_bun_retry=False,
+        )
+        if not retried.passed:
+            return original
+        retried.command = command
+        retried.stdout = "Bun retry used an isolated workspace after Windows EPERM.\n" + retried.stdout
+        return retried
+    except OSError:
+        return original
+    finally:
+        shutil.rmtree(temp_root, ignore_errors=True)
+
+
+def _link_isolated_node_modules(source: Path, target: Path) -> bool:
+    """Link dependencies without copying a large immutable package tree."""
+    try:
+        if os.name != "nt":
+            os.symlink(source, target, target_is_directory=True)
+            return True
+        # A Junction does not require Developer Mode, unlike a directory
+        # symlink.  Both paths are system-derived and never model-provided.
+        result = subprocess.run(
+            ["cmd.exe", "/d", "/c", "mklink", "/J", str(target), str(source)],
+            capture_output=True,
+            stdin=subprocess.DEVNULL,
+            timeout=10,
+        )
+        return result.returncode == 0 and target.is_dir()
+    except (OSError, subprocess.TimeoutExpired):
+        return False

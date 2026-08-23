@@ -57,6 +57,23 @@ class NodeTestCatalog:
 class NodeTestAdapter:
     id = "node"
 
+    def __init__(self, workspace: str | Path | None = None):
+        self._workspace = Path(workspace).expanduser().resolve() if workspace is not None else None
+
+    def _runner_command(self) -> str:
+        """Prefer the project's Bun runtime when it is explicitly vendored.
+
+        OpenTUI modules can be imported by focused TS tests, but Node's loader
+        cannot initialize their native FFI.  The repository's Bun runner is
+        part of the project contract and supports those imports correctly.
+        Keep the Node default for generic projects and direct adapter tests.
+        """
+        if self._workspace is not None:
+            bun = self._workspace / "node_modules" / "@oven" / "bun-windows-x64" / "bin" / "bun.exe"
+            if bun.is_file():
+                return "./node_modules/@oven/bun-windows-x64/bin/bun.exe test"
+        return "node --import tsx --test"
+
     def discover(self, context: VerificationContext) -> NodeTestCatalog:
         root = context.workspace.resolve()
         patterns = context.test_roots or ("test", "tests")
@@ -75,14 +92,18 @@ class NodeTestAdapter:
             selectors.extend(f"{rel}::{name}" for name in dict.fromkeys(names))
             if not names:
                 selectors.append(rel)
-        return NodeTestCatalog(tuple(selectors), tuple(dict.fromkeys(item.split("::", 1)[0] for item in selectors)))
+        return NodeTestCatalog(
+            tuple(selectors),
+            tuple(dict.fromkeys(item.split("::", 1)[0] for item in selectors)),
+            command=self._runner_command(),
+        )
 
     def normalize_selector(self, value: str) -> str:
         return str(value).strip().replace("\\", "/")
 
     def build_command(self, selectors: Sequence[str]) -> str:
         files = list(dict.fromkeys(self.normalize_selector(item).split("::", 1)[0] for item in selectors if item))
-        return "node --import tsx --test " + " ".join(files)
+        return self._runner_command() + " " + " ".join(files)
 
     def run(self, command: str, context: VerificationContext, *, timeout_s: float | None = None):
         return run_verification(command, workspace=context.workspace, timeout_s=timeout_s)

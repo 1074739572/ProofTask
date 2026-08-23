@@ -90,6 +90,33 @@ export function searchHistory(history: readonly string[], query: string): string
  * - pendingCount()/pending() 供页脚与 toast 展示本地待发数量与队列状态，
  *   不再只依赖后端的 queue_status/message_queued 事件。
  */
+/**
+ * Shell 风格 kill ring（P1-01 Ctrl+U/Ctrl+W/Ctrl+Y）：
+ * - entries[0] 是最近一次 kill 的文本，Ctrl+Y 只取头部；
+ * - lastOp 记录上一次操作：连续 kill（lastOp === 'kill'）会前插合并成单条，
+ *   使 Ctrl+W、Ctrl+W、Ctrl+U 后 Ctrl+Y 能按原序还原整段文本（readline 语义）；
+ * - yank 会打断累积，之后的 kill 另起新条目。
+ */
+export type KillRing = {entries: string[]; lastOp: 'kill' | 'yank' | null};
+
+export function createKillRing(): KillRing {
+  return {entries: [], lastOp: null};
+}
+
+export function killRingPush(ring: KillRing, killed: string): KillRing {
+  const text = String(killed || '');
+  if (!text) return ring;
+  if (ring.lastOp === 'kill' && ring.entries.length > 0) {
+    return {entries: [text + ring.entries[0], ...ring.entries.slice(1)], lastOp: 'kill'};
+  }
+  return {entries: [text, ...ring.entries], lastOp: 'kill'};
+}
+
+export function killRingYank(ring: KillRing): {ring: KillRing; text: string} {
+  if (ring.entries.length === 0) return {ring, text: ''};
+  return {ring: {...ring, lastOp: 'yank'}, text: ring.entries[0]};
+}
+
 export type MessageQueue = {
   setBusy: (busy: boolean) => void;
   submit: (command: Record<string, unknown>) => boolean;

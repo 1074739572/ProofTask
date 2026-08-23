@@ -463,16 +463,31 @@ def _resume_target(state: GoalState) -> str:
         and current is not None
         and current.status == "in_progress"
     ):
-        # An explicit user resume starts a new, bounded repair epoch. The old
-        # repair history remains audit evidence, but routing back into the
-        # exhausted repair checkpoint would pause immediately without ever
-        # verifying the current implementation.
-        state.repair_attempts = 0
-        state.repair_epoch += 1
-        state.no_progress_count = 0
-        state.consecutive_failures = 0
-        state.last_error = "Repair budget reset after explicit resume; verify the current Task."
-        candidate = GoalPhase.ACT.value
+        from harness.verification.snapshot import capture_code_snapshot
+
+        # A human or a recovery tool may have changed the implementation while
+        # the Goal was paused. Verify that concrete change before spending a
+        # fresh worker turn; otherwise a repaired Task can be sent back into
+        # the same exhausted loop without ever observing its new evidence.
+        current_snapshot = capture_code_snapshot(_execution_workspace(state))
+        if current.start_snapshot and current_snapshot and current_snapshot != current.start_snapshot:
+            state.repair_attempts = 0
+            state.repair_epoch += 1
+            state.no_progress_count = 0
+            state.consecutive_failures = 0
+            state.last_error = "Workspace changed after the repair pause; verify the current Task before another worker."
+            candidate = GoalPhase.VERIFY.value
+        else:
+            # An explicit user resume starts a new, bounded repair epoch. The old
+            # repair history remains audit evidence, but routing back into the
+            # exhausted repair checkpoint would pause immediately without ever
+            # verifying the current implementation.
+            state.repair_attempts = 0
+            state.repair_epoch += 1
+            state.no_progress_count = 0
+            state.consecutive_failures = 0
+            state.last_error = "Repair budget reset after explicit resume; verify the current Task."
+            candidate = GoalPhase.ACT.value
     # A recoverable pause can happen after verification/evaluation already
     # passed (for example, a stale scope snapshot). Do not spend another model
     # turn re-running the implementation worker; continue from the next
@@ -1507,13 +1522,34 @@ class GoalRunner(threading.Thread):
             response_example = json.dumps({
                 "test_selectors": [selector_example],
                 "case_selectors": {"AC1": [selector_example]},
+                "test_design": {
+                    "layer": "pure_logic",
+                    "target": "src/module.ts",
+                    "runner": "project-declared runner",
+                },
             })
+            pure_logic_required = self._requires_pure_logic_test(task)
+            test_architecture_guidance = (
+                "Classify the test before writing it. Use pure_logic for key bindings, cursor/text editing, "
+                "queues, reducers, parsing, formatting, and state transitions; use component only for rendered "
+                "component behavior; use terminal_integration only when native terminal rendering is itself the acceptance case. "
+                "For pure_logic, import the smallest existing production module in the approved scope. Never import "
+                "a complete application entry such as App.tsx, index.tsx, or a native renderer just to reach a helper. "
+                "Use the project's declared test runner; do not invent a Node loader. "
+                "Include test_design with layer, target, and runner in your final JSON."
+            )
+            if pure_logic_required:
+                test_architecture_guidance += (
+                    " This Task is a pure-logic Task. Its generated test must not import App.tsx, index.tsx, "
+                    "or another complete UI entry point."
+                )
             prompt = (
                 f"Create a NEW focused {adapter.id} test file for this Task before implementation. You may modify only test files; "
                 f"do not edit existing test files or production code. Use existing test conventions. {adapter_test_guidance}"
                 "The test file must be machine-collectable even though its pre-implementation baseline is expected "
                 "to fail on the missing behavior. An explanation or empty selector list is not a valid result. "
                 f"After writing tests, reply ONLY with JSON: {response_example}.\n\n"
+                f"Test architecture rules: {test_architecture_guidance}\n\n"
                 f"Task: {task.subject}\nBehavior: {task.description}\nAcceptance cases: {json.dumps(task.acceptance_cases)}"
             )
             prompt += (
@@ -1871,6 +1907,14 @@ class GoalRunner(threading.Thread):
                 self._restore_test_tree(root, before_tree, write_roots, expected_after=self._snapshot_test_tree(root, write_roots))
                 self._pause(state, "test_generation_reused_existing_selector", stop_reason=StopReason.test_generation_required.value)
                 return
+            files = tuple(dict.fromkeys(item.split("::", 1)[0] for item in selectors))
+            architecture_error = self._generated_test_architecture_error(root, task, files)
+            if architecture_error:
+                self._restore_test_tree(root, before_tree, write_roots, expected_after=self._snapshot_test_tree(root, write_roots))
+                self._pause(state, "test_generation_architecture_invalid", stop_reason=StopReason.test_generation_required.value)
+                state.last_error = f"Task {task.id} generated an invalid test architecture: {architecture_error}"
+                save_goal(state)
+                return
             # The writer is allowed to add a focused test, never alter any
             # pre-existing fixture/helper/conftest under a permitted test root.
             # Hashing only collected nodes misses these semantic escape hatches.
@@ -1989,6 +2033,41 @@ class GoalRunner(threading.Thread):
         if not isinstance(requested, list):
             return ()
         return tuple(str(item) for item in requested if item is not None)
+
+    @staticmethod
+    def _requires_pure_logic_test(task) -> bool:
+        """Identify Tasks whose proof should not load a full UI application."""
+        text = " ".join(
+            str(value or "")
+            for value in (getattr(task, "subject", ""), getattr(task, "description", ""), getattr(task, "test_strategy", ""))
+        ).casefold()
+        markers = (
+            "keybinding", "keyboard", "shortcut", "cursor", "kill-ring", "text editing",
+            "editing command", "queue", "reducer", "parser", "formatting", "state transition",
+            "快捷键", "键盘", "光标", "编辑", "队列", "状态转换",
+        )
+        return any(marker in text for marker in markers)
+
+    @classmethod
+    def _generated_test_architecture_error(cls, root: Path, task, files: tuple[str, ...]) -> str | None:
+        """Reject only a known-bad unit-test boundary for pure logic Tasks."""
+        if not cls._requires_pure_logic_test(task):
+            return None
+        blocked = re.compile(
+            r"(?:from\s+|import\s*(?:\([^)]*)?)[\"'][^\"']*(?:src-open/)?(?:App|index|main)\.(?:tsx?|jsx?)[\"']",
+            re.IGNORECASE,
+        )
+        for rel in files:
+            try:
+                content = (root / rel).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            if blocked.search(content):
+                return (
+                    f"pure-logic test {rel} imports a complete application entry. "
+                    "Test the smallest production logic module instead."
+                )
+        return None
 
     @staticmethod
     def _selectors_from_generation(raw: str, workspace: Path, *, catalog=None) -> tuple[str, ...]:

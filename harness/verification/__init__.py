@@ -155,9 +155,11 @@ def verify_task_command(
     cancel_check=None,
 ):
     """Run a Task's bound selector command and persist its machine verdict."""
-    from harness.tasks import load_task, set_task_verification_result
+    from harness.tasks import load_task, save_task, set_task_verification_result
 
     task = load_task(task_id)
+    if _migrate_task_runner_to_bun(task, workspace):
+        save_task(task)
     passed, evidence, error = _run_task_verification(task, workspace=workspace, timeout_s=timeout_s, cancel_check=cancel_check)
     return set_task_verification_result(task_id, passed=passed, evidence=evidence, error=error)
 
@@ -170,11 +172,40 @@ def reverify_task_command(
     cancel_check=None,
 ):
     """Re-run a completed Task's binding during the final Goal gate."""
-    from harness.tasks import load_task, record_task_reverification
+    from harness.tasks import load_task, record_task_reverification, save_task
 
     task = load_task(task_id)
+    if _migrate_task_runner_to_bun(task, workspace):
+        save_task(task, archived=task.status == "completed")
     passed, evidence, error = _run_task_verification(task, workspace=workspace, timeout_s=timeout_s, cancel_check=cancel_check)
     return record_task_reverification(task_id, passed=passed, evidence=evidence, error=error)
+
+
+def _migrate_task_runner_to_bun(task, workspace: str | Path | None) -> bool:
+    """Upgrade old Node+tsx bindings when this workspace vendors Bun.
+
+    Generated Task contracts are durable.  Updating adapter selection alone
+    would leave a paused Goal retrying an already-known incompatible command.
+    This narrowly replaces only the legacy Node test prefix, preserving the
+    exact frozen test files and selectors.
+    """
+    if workspace is None or not isinstance(task.verification_spec, dict):
+        return False
+    spec = task.verification_spec
+    if str(spec.get("adapter") or "").lower() != "node":
+        return False
+    command = str(spec.get("command") or "").strip()
+    prefix = "node --import tsx --test"
+    if command != prefix and not command.startswith(prefix + " "):
+        return False
+    root = Path(workspace).expanduser().resolve()
+    bun = root / "node_modules" / "@oven" / "bun-windows-x64" / "bin" / "bun.exe"
+    if not bun.is_file():
+        return False
+    suffix = command[len(prefix):].strip()
+    spec["command"] = "./node_modules/@oven/bun-windows-x64/bin/bun.exe test" + (f" {suffix}" if suffix else "")
+    task.verification_spec = spec
+    return True
 
 
 def _run_task_verification(

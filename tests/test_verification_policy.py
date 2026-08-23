@@ -1,7 +1,7 @@
 """Verification policy regressions for Goal's inferred pytest command."""
 
 from harness.verification.policy import check_verification_command
-from harness.verification.runner import _validate_script_path
+from harness.verification.runner import VerificationRunResult, _needs_isolated_bun_retry, _validate_script_path
 from harness.verification.catalog import build_pytest_command
 
 
@@ -21,6 +21,15 @@ def test_workspace_bun_runner_is_allowed_for_node_tests():
     command = "./node_modules/@oven/bun-windows-x64/bin/bun.exe test test/footer-state.test.ts"
 
     assert check_verification_command(command).allowed
+
+
+def test_bun_eperm_retry_is_limited_to_windows_file_sharing_failures(tmp_path):
+    command = "./node_modules/@oven/bun-windows-x64/bin/bun.exe test test/app.test.ts"
+    eperm = VerificationRunResult(command, 1, f'error: EPERM reading "{tmp_path}\\src-open\\App.tsx"', False, 1)
+    assertion_failure = VerificationRunResult(command, 1, "1 pass\n1 fail", False, 1)
+
+    assert _needs_isolated_bun_retry(command, eperm, tmp_path)
+    assert not _needs_isolated_bun_retry(command, assertion_failure, tmp_path)
 
 
 def test_task_pytest_command_uses_the_same_module_form_as_goal_default():
