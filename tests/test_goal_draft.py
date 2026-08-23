@@ -56,21 +56,106 @@ def test_draft_scopes_a_nested_node_project_before_collecting_tests(tmp_path):
     assert "test/input.test.ts::input works" in seen["prompt"]
 
 
-def test_draft_waits_for_clarification_before_planning(tmp_path):
+def test_draft_waits_for_clarification_before_planning(tmp_path, monkeypatch):
+    intake_responses = iter([
+        '{"questions":["Should limits be per user or per API key?"]}',
+        '{"questions":[]}',
+    ])
+
     draft = create_draft(
         "add rate limits",
         workspace=tmp_path,
-        intake_runner=lambda **_: '{"questions":["Should limits be per user or per API key?"]}',
+        verification="python -m pytest -q",
+        intake_runner=lambda **_: next(intake_responses),
     )
 
     assert draft.status == "clarifying"
     assert draft.task_plan == []
     assert load_draft(tmp_path).unanswered_question
 
-    ready = answer_draft("Per user.", workspace=tmp_path, planner_runner=lambda **_: _plan_json())
+    def mark_ready(draft, *_args, **_kwargs):
+        draft.task_plan = [{"verification_spec": {"source": "needs_generation"}}]
+        draft.status = "ready"
+
+    monkeypatch.setattr("harness.goal.draft._plan", mark_ready)
+    ready = answer_draft(
+        "Per user.", workspace=tmp_path,
+        intake_runner=lambda **_: next(intake_responses),
+        planner_runner=lambda **_: pytest.fail("the patched planner should handle this"),
+    )
 
     assert ready.status == "ready"
     assert ready.task_plan[0]["verification_spec"]["source"] == "needs_generation"
+
+
+def test_draft_followup_intake_can_ask_again_before_planning(tmp_path, monkeypatch):
+    intake_responses = iter([
+        '{"summary":"Need the limit subject.","questions":["Per user or API key?"]}',
+        '{"summary":"Need the enforcement behavior.","questions":["Reject immediately or queue requests?"]}',
+        '{"summary":"The requirement is clear.","questions":[]}',
+    ])
+    planner_targets = []
+
+    def intake(**_):
+        return next(intake_responses)
+
+    def mark_ready(draft, *_args, **_kwargs):
+        from harness.goal.draft import _planner_target
+
+        planner_targets.append(_planner_target(draft))
+        draft.task_plan = [{"verification_spec": {"source": "needs_generation"}}]
+        draft.status = "ready"
+
+    monkeypatch.setattr("harness.goal.draft._plan", mark_ready)
+
+    draft = create_draft(
+        "add rate limits", workspace=tmp_path, verification="python -m pytest -q",
+        intake_runner=intake, planner_runner=lambda **_: pytest.fail("the patched planner should handle this"),
+    )
+    second = answer_draft(
+        "Per user.", workspace=tmp_path, intake_runner=intake,
+        planner_runner=lambda **_: pytest.fail("the patched planner should handle this"),
+    )
+
+    assert second.status == "clarifying"
+    assert second.unanswered_question == "Reject immediately or queue requests?"
+    assert second.answers == ["Per user."]
+    assert not planner_targets
+
+    ready = answer_draft(
+        "Reject immediately.", workspace=tmp_path, intake_runner=intake,
+        planner_runner=lambda **_: pytest.fail("the patched planner should handle this"),
+    )
+
+    assert ready.status == "ready"
+    assert ready.answers == ["Per user.", "Reject immediately."]
+    assert "Q: Per user or API key?\nA: Per user." in planner_targets[0]
+    assert "Q: Reject immediately or queue requests?\nA: Reject immediately." in planner_targets[0]
+
+
+def test_draft_followup_intake_pauses_on_a_repeated_question(tmp_path):
+    intake_responses = iter([
+        '{"questions":["Per user or API key?"]}',
+        '{"questions":["Per user or API key?"]}',
+    ])
+
+    draft = create_draft(
+        "add rate limits", workspace=tmp_path, verification="python -m pytest -q",
+        intake_runner=lambda **_: next(intake_responses),
+        planner_runner=lambda **_: pytest.fail("planner must not run"),
+    )
+
+    with pytest.raises(ValueError, match="repeated a question"):
+        answer_draft(
+            "Per user.", workspace=tmp_path,
+            intake_runner=lambda **_: next(intake_responses),
+            planner_runner=lambda **_: pytest.fail("planner must not run"),
+        )
+
+    paused = load_draft(tmp_path)
+    assert paused is not None
+    assert paused.status == "paused"
+    assert paused.answers == ["Per user."]
 
 
 def test_draft_recognizes_questions_wrapped_by_agent_runner(tmp_path):
@@ -383,7 +468,7 @@ def test_answer_replans_through_discovery_and_resume_retries_paused_draft(tmp_pa
     )
     ready = answer_draft(
         "per user", workspace=tmp_path, planner_runner=planner,
-        discovery_runner=discovery,
+        discovery_runner=discovery, intake_runner=lambda **_: '{"questions":[]}',
     )
 
     assert ready.status == "ready"

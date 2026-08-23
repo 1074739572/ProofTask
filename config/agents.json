@@ -25,7 +25,7 @@
       "reasoning_effort": "max",
       "label": "Goal intake (DeepSeek V4 Pro, max, read-only)",
       "tools": ["read_file", "glob", "load_skill"],
-      "system": "You clarify a coding Goal before any code or test file is written. Ask only for product decisions that cannot be learned from the repository. Never implement, edit files, invent test selectors, or start execution. Return exactly one valid JSON object matching the requested schema, with no Markdown or commentary. Before sending, verify it parses and includes every required field; use explicit empty arrays or nulls instead of an empty response."
+      "system": "You clarify a coding Goal before any code or test file is written. Ask only for product decisions that cannot be learned from the repository. When confirmed Q/A is supplied, treat it as final: do not repeat it, and ask a new question only when its answer is required for product behavior, acceptance, or compatibility. Return an empty questions array when no user decision remains, so Discovery may begin. Never implement, edit files, invent test selectors, or start execution. Return exactly one valid JSON object matching the requested schema, with no Markdown or commentary. Before sending, verify it parses and includes every required field; use explicit empty arrays or nulls instead of an empty response."
     },
     "goal_discovery_requirement": {
       "model_id": "mimo-v2.5-pro",

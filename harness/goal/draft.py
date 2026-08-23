@@ -473,6 +473,32 @@ def _apply_intake_result(draft: GoalDraft, result: GoalIntakeResult) -> None:
     draft.intake_assumptions = result.assumptions
 
 
+def _question_key(question: str) -> str:
+    """Return a conservative identity key used to reject repeated intake loops."""
+    return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", "", question.casefold())).strip()
+
+
+def _append_followup_intake_result(draft: GoalDraft, result: GoalIntakeResult) -> None:
+    """Keep confirmed Q/A intact while adding only genuinely new questions."""
+    known = {_question_key(question) for question in draft.questions}
+    additions: list[str] = []
+    for question in result.questions:
+        key = _question_key(question)
+        if not key or key in known:
+            raise GoalDraftError(
+                "Goal intake repeated a question that was already asked. "
+                "The draft was paused so it cannot loop or discard your answer."
+            )
+        known.add(key)
+        additions.append(question)
+    draft.questions.extend(additions)
+    if result.summary:
+        draft.intake_summary = result.summary
+    for assumption in result.assumptions:
+        if assumption not in draft.intake_assumptions:
+            draft.intake_assumptions.append(assumption)
+
+
 def _collect_catalog(workspace: Path, verification: str):
     adapter = select_adapter(workspace, verification)
     return adapter, adapter.discover(VerificationContext(workspace, command=verification))
@@ -558,14 +584,24 @@ def _format_discovery_failures(failures: list[dict[str, Any]]) -> str:
     return "Goal discovery paused; no planner call was made. " + " | ".join(rows[:8])
 
 
-def _intake_prompt(target: str, verification: str, catalog) -> str:
+def _intake_prompt(target: str, verification: str, catalog, *, clarifications: list[tuple[str, str]] | None = None) -> str:
+    confirmed = ""
+    if clarifications:
+        pairs = "\n".join(f"Q: {question}\nA: {answer}" for question, answer in clarifications)
+        confirmed = (
+            "\nConfirmed clarifications below are decisions already made by the user. "
+            "Do not repeat or reopen them. Ask one new question only when its answer is still "
+            "necessary to define user-visible behavior, acceptance, or compatibility.\n"
+            f"{pairs}\n"
+        )
     return (
         "You are the read-only intake agent for a verified coding Goal.\n"
         "Read the repository only when needed. Identify only decisions the user must make; "
         "do not ask about facts discoverable from the repository.\n"
         f"Requested outcome: {target}\n"
         f"Proposed global verification: {verification or 'not inferred'}\n"
-        f"{catalog.prompt_text()}\n\n"
+        f"{catalog.prompt_text()}\n"
+        f"{confirmed}\n"
         "Reply ONLY as JSON: "
         '{"summary":"how you understand the requested outcome",'
         '"assumptions":["bounded assumption"],"questions":["short question"]}. '
@@ -573,6 +609,77 @@ def _intake_prompt(target: str, verification: str, catalog) -> str:
         "the requirement is sufficiently clear. Include only assumptions that materially constrain "
         "the result. Never propose implementation."
     )
+
+
+def _pause_intake(draft: GoalDraft, root: Path, error: str, message: str) -> None:
+    draft.status = "paused"
+    draft.last_error = error[:4_000]
+    _set_stage(draft, "paused")
+    save_draft(draft, root, event="failed", message=message)
+
+
+def _run_followup_intake(draft: GoalDraft, root: Path, catalog, *, intake_runner=None) -> None:
+    """Re-check intake after a completed clarification round.
+
+    A follow-up never replaces the previous Q/A history.  It either appends a
+    new unresolved decision or returns no questions, which is the only signal
+    that allows Discovery and planning to begin.
+    """
+    project_root = draft_project_root(draft, root)
+    operation_timeout = max(1, int(draft.limits.get("operation_timeout_seconds", 1800)))
+    clarifications = list(zip(draft.questions, draft.answers))
+    prompt = _intake_prompt(draft.target, draft.verification, catalog, clarifications=clarifications)
+    draft.status = "discovering"  # Prevent a second chat message being consumed while intake is running.
+    _set_stage(draft, "intake", deadline=time.time() + operation_timeout)
+    save_draft(draft, root, event="stage_started", message="Rechecking whether more clarification is needed")
+
+    runner = intake_runner
+    try:
+        if runner is None:
+            from harness.agents.runner import AgentTaskStats, run_agent_task
+
+            stats = AgentTaskStats()
+            with _draft_heartbeat(draft, root):
+                raw = run_agent_task(
+                    description="continue Goal clarification",
+                    prompt=prompt,
+                    agent_type="goal_intake",
+                    cwd=str(project_root),
+                    max_rounds=1,
+                    tools_override=(),
+                    stats=stats,
+                    deadline=time.monotonic() + operation_timeout,
+                )
+            unavailable = (
+                raw.startswith("[goal_intake] failed:")
+                or raw.startswith("[goal_intake] stopped:")
+                or stats.stop_reason in {"provider_error", "configuration_error", "empty_response"}
+            )
+            if unavailable:
+                raise GoalDraftError(f"Goal intake is unavailable: {raw}")
+        else:
+            try:
+                with _draft_heartbeat(draft, root):
+                    raw = runner(
+                        target=draft.target,
+                        verification=draft.verification,
+                        catalog=catalog,
+                        clarifications=clarifications,
+                        follow_up=True,
+                        deadline=time.monotonic() + operation_timeout,
+                    )
+            except TypeError as exc:
+                if not any(name in str(exc) for name in ("deadline", "clarifications", "follow_up")):
+                    raise
+                with _draft_heartbeat(draft, root):
+                    raw = runner(target=draft.target, verification=draft.verification, catalog=catalog)
+        result = _intake_from_raw(raw)
+        _append_followup_intake_result(draft, result)
+    except Exception as exc:
+        message = "Goal follow-up intake failed"
+        error = str(exc) if isinstance(exc, GoalDraftError) else f"Goal intake request failed: {type(exc).__name__}: {exc}"
+        _pause_intake(draft, root, error, message)
+        raise GoalDraftError(draft.last_error or error) from exc
 
 
 def _planner_target(draft: GoalDraft) -> str:
@@ -917,7 +1024,14 @@ def _run_plan_from_manifest(
         raise GoalDraftError(draft.last_error) from exc
 
 
-def answer_draft(answer: str, *, workspace: Path | None = None, planner_runner=None, discovery_runner=None) -> GoalDraft:
+def answer_draft(
+    answer: str,
+    *,
+    workspace: Path | None = None,
+    intake_runner: Callable[..., str] | None = None,
+    planner_runner=None,
+    discovery_runner=None,
+) -> GoalDraft:
     root = (workspace or get_workdir()).resolve()
     draft = load_draft(root)
     if draft is None or draft.status != "clarifying":
@@ -929,14 +1043,27 @@ def answer_draft(answer: str, *, workspace: Path | None = None, planner_runner=N
     if not draft.verification:
         draft.verification = text
         draft.verification_source = "user clarification"
-    # Persist the answer before catalog/discovery work. Otherwise a second
-    # composer message can still see the old unanswered question on disk and
-    # be consumed as another answer while this turn is busy.
+    # When the previous intake response already contains another question,
+    # show it immediately. Catalog collection and model preflight are not
+    # needed for a local Q/A transition and make the conversation feel stuck.
+    if draft.unanswered_question is not None:
+        draft.status = "clarifying"
+        _set_stage(draft, "clarifying")
+        save_draft(draft, root, event="completed", message="Waiting for the next clarification")
+        return draft
+
+    # Persist the final answer before the follow-up model call.  A second
+    # composer message must not be interpreted as an answer while that call is
+    # deciding whether another product decision is needed.
     draft.status = "discovering"
     _set_stage(draft, "catalog")
     save_draft(draft, root, event="stage_started", message="Clarification recorded; refreshing verification catalog")
     try:
-        _preflight_or_raise(draft, root, _required_resume_agents(planner_runner=planner_runner, discovery_runner=discovery_runner))
+        # A follow-up clarification only depends on the intake provider. Do
+        # not reject a still-useful user question because a later Discovery or
+        # Planner route is unavailable; those routes are preflighted when the
+        # user decision is actually complete.
+        _preflight_or_raise(draft, root, ("goal_intake",) if intake_runner is None else ())
         with _draft_heartbeat(draft, root):
             adapter, catalog = _collect_catalog(draft_project_root(draft, root), draft.verification)
     except GoalDraftError:
@@ -949,29 +1076,34 @@ def answer_draft(answer: str, *, workspace: Path | None = None, planner_runner=N
         raise GoalDraftError(draft.last_error) from exc
     draft.verification_adapter = getattr(adapter, "id", "pytest")
     draft.test_catalog_count = len(catalog.selectors)
+    _run_followup_intake(draft, root, catalog, intake_runner=intake_runner)
     if draft.unanswered_question is not None:
         draft.status = "clarifying"
         _set_stage(draft, "clarifying")
-        save_draft(draft, root, event="completed", message="Waiting for the next clarification")
+        save_draft(draft, root, event="completed", message="Waiting for follow-up clarification")
         return draft
-    if draft.unanswered_question is None:
-        # Test/provider injectors may supply only a planner. Production always
-        # takes the Discovery path; an injected discovery runner exercises the
-        # same route without a live model request.
-        if planner_runner is None or discovery_runner is not None:
-            _run_discovery_and_plan(draft, root, catalog, adapter, planner_runner=planner_runner, discovery_runner=discovery_runner)
-        else:
-            _set_stage(draft, "planning")
-            save_draft(draft, root, event="stage_started", message="Planning verifiable tasks")
-            try:
-                with _draft_heartbeat(draft, root):
-                    _plan(draft, draft_project_root(draft, root), catalog, planner_runner, verification_adapter=adapter)
-            except Exception as exc:
-                draft.status = "paused"
-                draft.last_error = f"Goal planning failed: {type(exc).__name__}: {exc}"
-                _set_stage(draft, "paused")
-                save_draft(draft, root, event="failed", message="Goal planning failed")
-                raise GoalDraftError(draft.last_error) from exc
+    # Test/provider injectors may supply only a planner. Production always
+    # takes the Discovery path; an injected discovery runner exercises the
+    # same route without a live model request.
+    if planner_runner is None or discovery_runner is not None:
+        _run_discovery_and_plan(draft, root, catalog, adapter, planner_runner=planner_runner, discovery_runner=discovery_runner)
+    else:
+        _preflight_or_raise(
+            draft,
+            root,
+            _required_resume_agents(planner_runner=planner_runner, include_discovery=False),
+        )
+        _set_stage(draft, "planning")
+        save_draft(draft, root, event="stage_started", message="Planning verifiable tasks")
+        try:
+            with _draft_heartbeat(draft, root):
+                _plan(draft, draft_project_root(draft, root), catalog, planner_runner, verification_adapter=adapter)
+        except Exception as exc:
+            draft.status = "paused"
+            draft.last_error = f"Goal planning failed: {type(exc).__name__}: {exc}"
+            _set_stage(draft, "paused")
+            save_draft(draft, root, event="failed", message="Goal planning failed")
+            raise GoalDraftError(draft.last_error) from exc
     save_draft(draft, root, event="completed" if draft.status == "ready" else "updated")
     return draft
 
@@ -1025,48 +1157,62 @@ def resume_draft(*, workspace: Path | None = None, planner_runner=None, discover
     # Discovery, leaving a Draft with no questions and skipping the failed
     # Pro intake stage entirely.
     if retry_intake:
-        from harness.agents.runner import AgentTaskStats, run_agent_task
+        # A follow-up failure happens after at least one confirmed answer.
+        # Re-run the same contextual check and append its result; replacing
+        # ``questions`` here would erase the completed conversation.
+        if draft.answers:
+            _preflight_or_raise(draft, root, ("goal_intake",))
+            _run_followup_intake(draft, root, catalog)
+            if draft.unanswered_question:
+                draft.status = "clarifying"
+                _set_stage(draft, "clarifying")
+                save_draft(draft, root, event="completed", message="Waiting for follow-up clarification")
+                return draft
+            draft.last_error = None
+            retry_intake = False
+        if retry_intake:
+            from harness.agents.runner import AgentTaskStats, run_agent_task
 
-        draft.status = "clarifying"
-        draft.last_error = None
-        _set_stage(draft, "intake")
-        save_draft(draft, root, event="stage_started", message="Retrying Goal intake")
-        stats = AgentTaskStats()
-        with _draft_heartbeat(draft, root):
-            raw = run_agent_task(
-                description="retry Goal intake as strict JSON",
-                prompt=(
-                    _intake_prompt(draft.target, draft.verification, catalog)
-                    + "\n\nReply with ONLY one JSON object "
-                    + '{"summary":"...","assumptions":[],"questions":["..."]}.'
-                ),
-                agent_type="goal_intake", cwd=str(draft_project_root(draft, root)), max_rounds=1,
-                tools_override=(), stats=stats,
-                deadline=time.monotonic() + max(1, int(draft.limits.get("operation_timeout_seconds", 1800))),
-            )
-        if (
-            raw.startswith("[goal_intake] failed:")
-            or raw.startswith("[goal_intake] stopped:")
-            or stats.stop_reason in {"provider_error", "configuration_error", "empty_response"}
-        ):
-            draft.status = "paused"
-            draft.last_error = f"Goal intake is unavailable: {raw}"
-            _set_stage(draft, "paused")
-            save_draft(draft, root, event="failed", message="Goal intake provider unavailable")
-            raise GoalDraftError(draft.last_error)
-        try:
-            _apply_intake_result(draft, _intake_from_raw(raw))
-        except GoalDraftError as exc:
-            draft.status = "paused"
-            draft.last_error = str(exc)
-            _set_stage(draft, "paused")
-            save_draft(draft, root, event="failed", message="Goal intake retry returned invalid JSON")
-            raise
-        if draft.questions:
-            _set_stage(draft, "clarifying")
-            save_draft(draft, root, event="completed", message="Waiting for clarification")
-            return draft
-        draft.last_error = None
+            draft.status = "clarifying"
+            draft.last_error = None
+            _set_stage(draft, "intake")
+            save_draft(draft, root, event="stage_started", message="Retrying Goal intake")
+            stats = AgentTaskStats()
+            with _draft_heartbeat(draft, root):
+                raw = run_agent_task(
+                    description="retry Goal intake as strict JSON",
+                    prompt=(
+                        _intake_prompt(draft.target, draft.verification, catalog)
+                        + "\n\nReply with ONLY one JSON object "
+                        + '{"summary":"...","assumptions":[],"questions":["..."]}.'
+                    ),
+                    agent_type="goal_intake", cwd=str(draft_project_root(draft, root)), max_rounds=1,
+                    tools_override=(), stats=stats,
+                    deadline=time.monotonic() + max(1, int(draft.limits.get("operation_timeout_seconds", 1800))),
+                )
+            if (
+                raw.startswith("[goal_intake] failed:")
+                or raw.startswith("[goal_intake] stopped:")
+                or stats.stop_reason in {"provider_error", "configuration_error", "empty_response"}
+            ):
+                draft.status = "paused"
+                draft.last_error = f"Goal intake is unavailable: {raw}"
+                _set_stage(draft, "paused")
+                save_draft(draft, root, event="failed", message="Goal intake provider unavailable")
+                raise GoalDraftError(draft.last_error)
+            try:
+                _apply_intake_result(draft, _intake_from_raw(raw))
+            except GoalDraftError as exc:
+                draft.status = "paused"
+                draft.last_error = str(exc)
+                _set_stage(draft, "paused")
+                save_draft(draft, root, event="failed", message="Goal intake retry returned invalid JSON")
+                raise
+            if draft.questions:
+                _set_stage(draft, "clarifying")
+                save_draft(draft, root, event="completed", message="Waiting for clarification")
+                return draft
+            draft.last_error = None
     if resume_from == "planning":
         from harness.goal.discovery_store import load_manifest
 
