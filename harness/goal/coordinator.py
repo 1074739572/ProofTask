@@ -20,11 +20,13 @@ from harness.agents.runner import AgentTaskStats, run_agent_task
 
 
 SUPERVISOR_AGENT = "goal_supervisor"
+SUPERVISOR_CORRECTION_TIMEOUT_SECONDS = 45
 SUPERVISOR_ACTIONS = frozenset({
     "continue",
     "watch",
     "redirect",
     "expand_scope",
+    "amend_scope",
     "replan",
     "retry",
     "pause_user",
@@ -132,13 +134,18 @@ def build_supervisor_prompt(observation: dict[str, Any]) -> str:
         "- continue: evidence shows the current direction is healthy.\n"
         "- watch: note a risk but do not interrupt work.\n"
         "- redirect: the current approach is making no useful progress; give a concrete corrected direction.\n"
-        "- expand_scope: a boundary request needs exact additional paths that remain inside the Goal contract.\n"
+        "- expand_scope: a boundary request needs exact additional paths that remain inside the planned Goal scope envelope.\n"
+        "- amend_scope: the Task plan omitted an existing source file directly imported by an unchanged, bound test; "
+        "use only for that exact requested source path inside the execution workspace, with high confidence.\n"
         "- replan: Task ownership or dependencies are wrong but the Goal contract remains valid.\n"
         "- retry: a transient or format failure should retry from its durable checkpoint.\n"
         "- pause_user: genuinely new authority is required, such as external paths, secrets, destructive actions, "
         "deployment, cost, or changing the Goal contract.\n\n"
         "For expand_scope, include only exact requested paths supported by the supplied Goal scope envelope. "
-        "Do not approve arbitrary shell commands. Explain the failure and the next action in the Goal language.\n\n"
+        "For amend_scope, include only an exact requested path that the supplied evidence proves is directly imported by "
+        "an unchanged, Task-bound test; do not use it for a guessed dependency, a test file, config, secrets, or any path "
+        "outside the execution workspace. Do not approve arbitrary shell commands. Explain the failure and the next action "
+        "in the Goal language.\n\n"
         f"Observation:\n{json.dumps(observation, ensure_ascii=False, sort_keys=True)[:24_000]}"
     )
 
@@ -200,7 +207,11 @@ def analyze_goal_observation(
                         cwd=cwd,
                         max_rounds=1,
                         cancel_check=cancel_check,
-                        deadline=deadline,
+                        # A correction is a fresh, minimal model operation.
+                        # Reusing the first call's deadline often gave it zero
+                        # remaining time, then misclassified the resulting
+                        # timeout as a permission problem.
+                        deadline=time.monotonic() + SUPERVISOR_CORRECTION_TIMEOUT_SECONDS,
                         stats=retry_stats,
                         tools_override=(),
                     )

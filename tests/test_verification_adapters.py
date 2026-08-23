@@ -22,6 +22,19 @@ def test_node_adapter_collects_real_files_and_builds_machine_command(tmp_path):
     assert isinstance(select_adapter(tmp_path, "node --import tsx --test"), NodeTestAdapter)
 
 
+def test_node_adapter_collects_jsx_test_files(tmp_path):
+    test_dir = tmp_path / "test"
+    test_dir.mkdir()
+    (test_dir / "app.test.tsx").write_text(
+        "import { test } from 'node:test';\ntest('renders JSX', () => {});\n", encoding="utf-8"
+    )
+
+    catalog = NodeTestAdapter().discover(VerificationContext(tmp_path, test_roots=("test",)))
+
+    assert catalog.selectors == ("test/app.test.tsx::renders JSX",)
+    assert NodeTestAdapter().build_command(catalog.selectors) == "node --import tsx --test test/app.test.tsx"
+
+
 def test_node_catalog_can_ground_a_planner_binding(tmp_path):
     test_dir = tmp_path / "test"
     test_dir.mkdir()

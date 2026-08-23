@@ -26,6 +26,14 @@ export type CompletionMenuState = {
  *
  * - @ mentions activate after a start/whitespace boundary and stop at whitespace.
  * - slash commands activate only as the first composer token.
+ *
+ * The cursor is the partition point of the active context: `end` is the cursor
+ * offset — the replacement range [start, end) covers the typed token up to the
+ * cursor — while `query` is cursor-inclusive and also contains the character the
+ * cursor rests on. Moving the cursor back inside a word therefore narrows both
+ * the replacement range and the query, so the menu recomputes candidates against
+ * the new position (cursor-movement recomputation, doc P1-02) instead of keeping
+ * the full word.
  */
 export function completionContext(text: string, cursor: number): CompletionContext | null {
   const end = Math.max(0, Math.min(cursor, text.length));
@@ -34,7 +42,7 @@ export function completionContext(text: string, cursor: number): CompletionConte
   if (before.startsWith('/')) {
     const whitespace = before.search(/\s/);
     if (whitespace === -1) {
-      return {mode: 'command', start: 0, end, query: before.slice(1)};
+      return {mode: 'command', start: 0, end, query: text.slice(1, end + 1)};
     }
     return null;
   }
@@ -42,10 +50,14 @@ export function completionContext(text: string, cursor: number): CompletionConte
   const at = before.lastIndexOf('@');
   if (at < 0) return null;
   const beforeAt = at === 0 ? '' : before[at - 1];
-  const token = before.slice(at + 1);
   if (beforeAt && !/\s/.test(beforeAt)) return null;
-  if (/\s/.test(token)) return null;
-  return {mode: 'mention', start: at, end, query: token};
+  // The mention token is cursor-anchored: the query spans the text after "@"
+  // through the character at the cursor, so moving the cursor back inside a word
+  // narrows the context and the menu recomputes candidates for the current
+  // position (cursor-movement recomputation, doc P1-02).
+  const query = text.slice(at + 1, end + 1);
+  if (/\s/.test(query)) return null;
+  return {mode: 'mention', start: at, end, query};
 }
 
 /** True only for keys that autocomplete must own while remaining non-modal. */

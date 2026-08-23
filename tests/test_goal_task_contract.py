@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 
 from harness.goal.planner import TaskPlan, discovery_readiness_error, parse_plan
@@ -881,6 +882,9 @@ def test_node_test_generation_prompt_uses_node_conventions(tmp_path, monkeypatch
 
     assert "test/example.test.ts::behavior name" in prompts[0]
     assert "test/**/*.test.ts" in prompts[0]
+    assert "test/**/*.test.tsx" in prompts[0]
+    assert "Do not put JSX in a .test.ts file" in prompts[0]
+    assert "excludes dependency trees such as node_modules" in prompts[0]
     assert "empty selector list is not a valid result" in prompts[0]
     assert ".py" not in prompts[0]
     assert load_task(task.id).verification_spec["adapter"] == "node"
@@ -2222,7 +2226,7 @@ def test_provider_error_pauses_without_consuming_repair_budget(tmp_path, monkeyp
     assert "APIConnectionError" in state.last_error
 
 
-def test_permission_request_pauses_goal_instead_of_failing(tmp_path, monkeypatch):
+def test_unavailable_permission_supervisor_pauses_as_provider_failure(tmp_path, monkeypatch):
     import harness.goal.runner as runner_mod
     import harness.tasks as tasks
 
@@ -2242,7 +2246,7 @@ def test_permission_request_pauses_goal_instead_of_failing(tmp_path, monkeypatch
 
     assert state.phase == GoalPhase.PAUSED.value
     assert state.status == "paused"
-    assert state.stop_reason == "permission_wait"
+    assert state.stop_reason == "provider_unavailable"
     assert "supervisor is unavailable" in state.last_error
 
 
@@ -2254,16 +2258,34 @@ def _run_supervised_permission_boundary(
     requested_path="src/shared.py",
     envelope=("src/current.py", "src/shared.py"),
     tool="edit_file",
+    bind_requested_source_test=False,
 ):
     import harness.goal.runner as runner_mod
     import harness.tasks as tasks
     from harness.goal.coordinator import SupervisorRun
 
     monkeypatch.setattr(tasks, "TASKS_DIR", tmp_path / ".tasks")
+    verification_spec = {}
+    if bind_requested_source_test:
+        source_path = tmp_path / requested_path
+        source_path.parent.mkdir(parents=True, exist_ok=True)
+        source_path.write_text("export const source = true;\n", encoding="utf-8")
+        test_path = tmp_path / "test" / "permission-boundary.test.ts"
+        test_path.parent.mkdir(parents=True, exist_ok=True)
+        test_path.write_text(
+            f"import {{source}} from '../{requested_path}';\nvoid source;\n",
+            encoding="utf-8",
+        )
+        verification_spec = {
+            "test_files": ["test/permission-boundary.test.ts"],
+            "test_hashes": {
+                "test/permission-boundary.test.ts": hashlib.sha256(test_path.read_bytes()).hexdigest(),
+            },
+        }
     task = tasks.create_task(
         "permission task",
         "keep working",
-        verification_spec={},
+        verification_spec=verification_spec,
         scope_paths=["src/current.py"],
     )
     tasks.claim_task(task.id)
@@ -2321,6 +2343,168 @@ def test_supervisor_can_expand_exact_task_scope_inside_goal_envelope(tmp_path, m
     assert state.permission_boundary_attempts[task.id] == 1
 
 
+def test_supervisor_can_amend_scope_for_an_unchanged_bound_test_import(tmp_path, monkeypatch):
+    from harness.goal.coordinator import SupervisorDecision
+
+    state, task = _run_supervised_permission_boundary(
+        tmp_path,
+        monkeypatch,
+        envelope=("src/current.py",),
+        bind_requested_source_test=True,
+        decision=SupervisorDecision(
+            "amend_scope",
+            "The frozen Task test directly imports the omitted source module.",
+            next_step="Edit the requested source module and rerun the Task.",
+            scope_paths=("src/shared.py",),
+            confidence="high",
+        ),
+    )
+
+    assert state.phase == GoalPhase.ACT.value
+    assert state.status == "running"
+    assert task.scope_paths == ["src/current.py", "src/shared.py"]
+    assert state.task_plan[0]["scope_paths"] == ["src/current.py", "src/shared.py"]
+
+
+def test_verification_failure_reconciles_a_test_proven_scope_omission(tmp_path, monkeypatch):
+    import harness.goal.runner as runner_mod
+    import harness.tasks as tasks
+    from harness.goal.coordinator import SupervisorDecision, SupervisorRun
+
+    monkeypatch.setattr(tasks, "TASKS_DIR", tmp_path / ".tasks")
+    source_path = tmp_path / "src" / "shared.py"
+    source_path.parent.mkdir(parents=True)
+    source_path.write_text("export const shared = true;\n", encoding="utf-8")
+    test_path = tmp_path / "test" / "scope.test.ts"
+    test_path.parent.mkdir(parents=True)
+    test_path.write_text("import {shared} from '../src/shared.py';\nvoid shared;\n", encoding="utf-8")
+    task = tasks.create_task(
+        "permission task",
+        "keep working",
+        scope_paths=["src/current.py"],
+        verification_spec={
+            "test_files": ["test/scope.test.ts"],
+            "test_hashes": {"test/scope.test.ts": hashlib.sha256(test_path.read_bytes()).hexdigest()},
+        },
+    )
+    tasks.claim_task(task.id)
+    task = tasks.load_task(task.id)
+    task.evidence = [{"exit_code": 1, "stdout_tail": "shared behavior failed"}]
+    tasks.save_task(task)
+    state = GoalState.new(target="permission task", verification="pytest -q", workspace=str(tmp_path))
+    state.current_task_id = task.id
+    state.task_ids = [task.id]
+    state.task_plan = [{"name": task.subject, "scope_paths": ["src/current.py"]}]
+    state.phase = GoalPhase.VERIFY.value
+    state.supervision = {"observation_revision": 1}
+    monkeypatch.setattr(runner_mod, "save_goal", lambda _state: None)
+    monkeypatch.setattr(runner_mod, "_emit_goal", lambda *args, **kwargs: None)
+    runner = GoalRunner(state=state, history=[], context={}, binding=None)
+    monkeypatch.setattr(
+        runner,
+        "_review_supervisor_boundary",
+        lambda *args, **kwargs: SupervisorRun(
+            "obs-1", 1,
+            SupervisorDecision(
+                "amend_scope",
+                "The frozen test imports the omitted source module.",
+                scope_paths=("src/shared.py",),
+                confidence="high",
+            ),
+        ),
+    )
+
+    assert runner._try_verification_scope_amendment(state, task)
+
+    updated = tasks.load_task(task.id)
+    assert state.phase == GoalPhase.ACT.value
+    assert updated.scope_paths == ["src/current.py", "src/shared.py"]
+    assert state.task_plan[0]["scope_paths"] == ["src/current.py", "src/shared.py"]
+
+
+def test_verification_scope_reconciliation_does_not_depend_on_supervisor_availability(tmp_path, monkeypatch):
+    import harness.goal.runner as runner_mod
+    import harness.tasks as tasks
+    from harness.goal.coordinator import SupervisorDecision, SupervisorRun
+
+    monkeypatch.setattr(tasks, "TASKS_DIR", tmp_path / ".tasks")
+    source_path = tmp_path / "src" / "shared.py"
+    source_path.parent.mkdir(parents=True)
+    source_path.write_text("export const shared = true;\n", encoding="utf-8")
+    test_path = tmp_path / "test" / "scope.test.ts"
+    test_path.parent.mkdir(parents=True)
+    test_path.write_text("import {shared} from '../src/shared.py';\nvoid shared;\n", encoding="utf-8")
+    task = tasks.create_task(
+        "permission task",
+        "keep working",
+        scope_paths=["src/current.py"],
+        verification_spec={
+            "test_files": ["test/scope.test.ts"],
+            "test_hashes": {"test/scope.test.ts": hashlib.sha256(test_path.read_bytes()).hexdigest()},
+        },
+    )
+    tasks.claim_task(task.id)
+    task = tasks.load_task(task.id)
+    task.evidence = [{"exit_code": 1, "stdout_tail": "shared behavior failed"}]
+    tasks.save_task(task)
+    state = GoalState.new(target="permission task", verification="pytest -q", workspace=str(tmp_path))
+    state.current_task_id = task.id
+    state.task_ids = [task.id]
+    state.task_plan = [{"name": task.subject, "scope_paths": ["src/current.py"]}]
+    state.phase = GoalPhase.VERIFY.value
+    state.supervision = {"observation_revision": 1}
+    monkeypatch.setattr(runner_mod, "save_goal", lambda _state: None)
+    monkeypatch.setattr(runner_mod, "_emit_goal", lambda *args, **kwargs: None)
+    runner = GoalRunner(state=state, history=[], context={}, binding=None)
+    monkeypatch.setattr(
+        runner,
+        "_review_supervisor_boundary",
+        lambda *args, **kwargs: SupervisorRun(
+            "obs-1", 1,
+            SupervisorDecision(
+                "watch",
+                "Supervisor is unavailable.",
+                unavailable=True,
+                error="provider_error",
+            ),
+        ),
+    )
+
+    assert runner._try_verification_scope_amendment(state, task)
+
+    updated = tasks.load_task(task.id)
+    assert state.phase == GoalPhase.ACT.value
+    assert updated.scope_paths == ["src/current.py", "src/shared.py"]
+    assert "deterministic test evidence" in updated.last_error
+
+
+def test_frozen_test_imports_include_multiline_named_imports(tmp_path, monkeypatch):
+    import harness.tasks as tasks
+
+    monkeypatch.setattr(tasks, "TASKS_DIR", tmp_path / ".tasks")
+    source_path = tmp_path / "src" / "shared.ts"
+    source_path.parent.mkdir(parents=True)
+    source_path.write_text("export const shared = true;\n", encoding="utf-8")
+    test_path = tmp_path / "test" / "scope.test.ts"
+    test_path.parent.mkdir(parents=True)
+    test_path.write_text(
+        "import {\n  shared,\n} from '../src/shared.js';\nvoid shared;\n",
+        encoding="utf-8",
+    )
+    task = tasks.create_task(
+        "import scan",
+        "keep working",
+        verification_spec={
+            "test_files": ["test/scope.test.ts"],
+            "test_hashes": {"test/scope.test.ts": hashlib.sha256(test_path.read_bytes()).hexdigest()},
+        },
+    )
+    state = GoalState.new(target="import scan", verification="pytest -q", workspace=str(tmp_path))
+    runner = GoalRunner(state=state, history=[], context={}, binding=None)
+
+    assert runner._frozen_test_imports(state, task) == {"src/shared.ts"}
+
+
 def test_supervisor_cannot_expand_scope_outside_goal_envelope(tmp_path, monkeypatch):
     from harness.goal.coordinator import SupervisorDecision
 
@@ -2358,6 +2542,27 @@ def test_supervisor_redirect_retries_act_with_durable_guidance(tmp_path, monkeyp
     assert state.phase == GoalPhase.ACT.value
     assert state.status == "running"
     assert "Use the existing adapter" in task.last_error
+
+
+def test_supervisor_continue_clears_stale_permission_request_and_verifies(tmp_path, monkeypatch):
+    import harness.goal.runner as runner_mod
+    from harness.goal.coordinator import SupervisorDecision
+
+    state, task = _run_supervised_permission_boundary(
+        tmp_path,
+        monkeypatch,
+        decision=SupervisorDecision(
+            "continue",
+            "The worker completed the scoped implementation without the requested file.",
+            next_step="Verify the in-scope implementation.",
+        ),
+    )
+
+    assert state.phase == GoalPhase.VERIFY.value
+    assert state.status == "running"
+    assert task.scope_paths == ["src/current.py"]
+    assert task.id not in state.permission_boundary_attempts
+    assert runner_mod.goal_permission_pending() is False
 
 
 def test_supervisor_permission_replan_routes_to_repair_plan(tmp_path, monkeypatch):

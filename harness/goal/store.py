@@ -84,9 +84,45 @@ def _pid_is_alive(pid: int) -> bool:
         return False
     except PermissionError:
         return True
-    except OSError:
+    except (OSError, SystemError) as exc:
+        # ``os.kill(pid, 0)`` is not a reliable liveness probe on Windows.
+        # Some Python/Windows combinations surface ERROR_INVALID_PARAMETER
+        # (87) as SystemError while another Goal process is alive. Use the
+        # native process handle instead so a status read cannot falsely
+        # normalize a live Goal and permit a second runner to acquire its
+        # lease.
+        if os.name == "nt":
+            return _windows_pid_is_alive(pid)
         return False
     return True
+
+
+def _windows_pid_is_alive(pid: int) -> bool:
+    """Check a Windows process without relying on ``kill(..., 0)``.
+
+    An access-denied handle is conservatively considered live: incorrectly
+    retaining a stale lease is recoverable, whereas running two Goal workers
+    against the same durable state is not.
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        process_query = 0x1000  # PROCESS_QUERY_LIMITED_INFORMATION
+        handle = ctypes.windll.kernel32.OpenProcess(process_query, False, pid)
+        if not handle:
+            return ctypes.get_last_error() == 5  # ERROR_ACCESS_DENIED
+        try:
+            exit_code = wintypes.DWORD()
+            if not ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                return True
+            return exit_code.value == 259  # STILL_ACTIVE
+        finally:
+            ctypes.windll.kernel32.CloseHandle(handle)
+    except (AttributeError, OSError, SystemError):
+        # Failure to inspect an active lease must not let another runner take
+        # ownership merely because this process lacks a platform capability.
+        return True
 
 
 def acquire_goal_lease(state: GoalState) -> str:
@@ -230,6 +266,46 @@ def load_goal(workspace: str | Path | None = None) -> GoalState | None:
         }
     ):
         state.stop_reason = StopReason.repair_plan_format_error.value
+
+    # Before in-scope permission resolution existed, a denied exploratory
+    # write could leave a Goal paused even when the supervisor had concluded
+    # that the worker had already corrected course and needed no new
+    # authority. Recover those durable checkpoints to verification, rather
+    # than spending another worker turn or asking the user to approve a file
+    # outside the Goal contract.
+    latest_supervision = (
+        state.supervision.get("latest")
+        if isinstance(state.supervision, dict)
+        else None
+    )
+    if (
+        state.status == GoalStatus.PAUSED.value
+        and state.stop_reason == StopReason.permission_wait.value
+        and isinstance(latest_supervision, dict)
+        and latest_supervision.get("trigger") == "permission_boundary"
+        and latest_supervision.get("unavailable")
+    ):
+        # Old runners reported a supervisor timeout as a permission wait.
+        # The user cannot grant their way out of a provider failure.
+        state.stop_reason = StopReason.provider_unavailable.value
+        attempts = dict(state.permission_boundary_attempts or {})
+        attempts.pop(state.current_task_id, None)
+        state.permission_boundary_attempts = attempts
+    if (
+        state.status == GoalStatus.PAUSED.value
+        and state.stop_reason == StopReason.permission_wait.value
+        and state.resume_phase == GoalPhase.ACT.value
+        and isinstance(latest_supervision, dict)
+        and latest_supervision.get("trigger") == "permission_boundary"
+        and latest_supervision.get("action") in {"continue", "watch"}
+        and not latest_supervision.get("unavailable")
+        and not latest_supervision.get("stale")
+    ):
+        state.resume_phase = GoalPhase.VERIFY.value
+        attempts = dict(state.permission_boundary_attempts or {})
+        attempts.pop(state.current_task_id, None)
+        state.permission_boundary_attempts = attempts
+        state.last_error = None
 
     # A durable cancellation request is final even if the process exited before
     # the worker reached its next checkpoint.

@@ -4,7 +4,7 @@ import json
 
 from harness.goal.commands import parse_goal_command, parse_goal_subcommand
 from harness.goal.engine import GoalEngine, GoalTransitionError
-from harness.goal.models import GOAL_SCHEMA_VERSION, GoalPhase, GoalState
+from harness.goal.models import GOAL_SCHEMA_VERSION, GoalPhase, GoalState, GoalStatus, StopReason
 import pytest
 
 from harness.goal.planner import GoalPlanningError, build_plan_prompt, parse_plan, plan_tasks
@@ -226,6 +226,59 @@ def test_load_goal_reclassifies_legacy_repair_json_error(tmp_path):
     assert loaded.stop_reason == "repair_plan_format_error"
 
 
+def test_load_goal_recovers_resolved_permission_boundary_to_verify(tmp_path):
+    state = GoalState.new(target="recover", verification="pytest -q", workspace=str(tmp_path))
+    state.status = GoalStatus.PAUSED.value
+    state.phase = GoalPhase.PAUSED.value
+    state.resume_phase = GoalPhase.ACT.value
+    state.stop_reason = StopReason.permission_wait.value
+    state.current_task_id = "task-current"
+    state.permission_boundary_attempts = {"task-current": 1}
+    state.last_error = "permission required"
+    state.supervision = {
+        "latest": {
+            "trigger": "permission_boundary",
+            "action": "continue",
+            "unavailable": False,
+            "stale": False,
+        }
+    }
+    save_goal(state)
+
+    loaded = load_goal(tmp_path)
+
+    assert loaded is not None
+    assert loaded.phase == GoalPhase.PAUSED.value
+    assert loaded.resume_phase == GoalPhase.VERIFY.value
+    assert loaded.stop_reason == StopReason.permission_wait.value
+    assert loaded.last_error is None
+    assert loaded.permission_boundary_attempts == {}
+
+
+def test_load_goal_reclassifies_legacy_unavailable_supervisor_permission_wait(tmp_path):
+    state = GoalState.new(target="recover", verification="pytest -q", workspace=str(tmp_path))
+    state.status = GoalStatus.PAUSED.value
+    state.phase = GoalPhase.PAUSED.value
+    state.resume_phase = GoalPhase.ACT.value
+    state.stop_reason = StopReason.permission_wait.value
+    state.current_task_id = "task-current"
+    state.permission_boundary_attempts = {"task-current": 1}
+    state.supervision = {
+        "latest": {
+            "trigger": "permission_boundary",
+            "action": "watch",
+            "unavailable": True,
+        }
+    }
+    save_goal(state)
+
+    loaded = load_goal(tmp_path)
+
+    assert loaded is not None
+    assert loaded.stop_reason == StopReason.provider_unavailable.value
+    assert loaded.permission_boundary_attempts == {}
+
+
 def test_goal_lease_allows_only_one_live_runner_per_workspace(tmp_path):
     state = GoalState.new(target="t", verification="v", workspace=str(tmp_path))
     token = acquire_goal_lease(state)
@@ -262,3 +315,12 @@ def test_goal_agents_use_the_configured_plan_run_eval_profiles():
         assert profile.model_id == model_id
         assert profile.reasoning_effort == reasoning_effort
         assert validate_agent_model(agent_type) is None
+def test_windows_pid_probe_uses_native_fallback_when_kill_zero_is_invalid(monkeypatch):
+    import harness.goal.store as store
+
+    monkeypatch.setattr(store.os, "name", "nt")
+    monkeypatch.setattr(store.os, "kill", lambda *_args: (_ for _ in ()).throw(SystemError("WinError 87")))
+    monkeypatch.setattr(store, "_windows_pid_is_alive", lambda pid: pid == 123)
+
+    assert store._pid_is_alive(123) is True
+    assert store._pid_is_alive(124) is False

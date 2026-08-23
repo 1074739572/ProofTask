@@ -148,6 +148,96 @@ export function createMessageQueue(send: (command: Record<string, unknown>) => b
   };
 }
 
+// ---------- 结构化滚动补全菜单（P1-02 / CM1-CM3） ----------
+
+/** 补全选项的接口形态：兼容后端返回的纯字符串与携带元数据的结构化对象。 */
+export type CompletionOption = {
+  label: string;
+  description?: string;
+  icon?: string;
+  type?: string;
+  isDirectory?: boolean;
+};
+
+export type CompletionOptionRow = {
+  label: string;
+  description: string;
+  icon: string;
+  directory: boolean;
+};
+
+/** 把任意补全选项（字符串或结构化对象）归一化为带安全默认值的行数据。 */
+export function completionOptionRow(option: CompletionOption | string): CompletionOptionRow {
+  const value: CompletionOption = typeof option === 'string' ? {label: option} : (option ?? {});
+  const label = String(value.label ?? '');
+  return {
+    label,
+    description: value.description ? String(value.description) : '',
+    icon: value.icon ? String(value.icon) : '',
+    directory: Boolean(value.isDirectory),
+  };
+}
+
+export type CompletionWindow = {
+  options: CompletionOption[];
+  start: number;
+  total: number;
+  selected: number;
+  selectedVisible: boolean;
+};
+
+/**
+ * 滚动窗口：最多展示 maxRows（默认 6）行。候选不足时展示全部而不截断；
+ * 超过时选中项始终落在可见区间内（跟随滚动），并返回连续切片。
+ */
+export function completionMenuWindow(
+  options: readonly CompletionOption[],
+  selected: number,
+  maxRows = 6,
+): CompletionWindow {
+  const total = options.length;
+  const rows = Math.max(1, Math.min(Math.max(1, maxRows), total));
+  const index = Math.max(0, Math.min(total - 1, selected));
+  const start = Math.max(0, Math.min(index - Math.floor(rows / 2), Math.max(0, total - rows)));
+  const visible = options.slice(start, start + rows);
+  return {
+    options: visible,
+    start,
+    total,
+    selected: index,
+    selectedVisible: rows > 0 && start <= index && index < start + visible.length,
+  };
+}
+
+export type DirectoryTraversal = {
+  text: string;
+  cursor: number;
+  path: string;
+};
+
+/**
+ * 接受目录补全选项：在 [start, end) 区间内用 "label/" 替换原 token（追加遍历
+ * 分隔符），并返回子目录请求路径；非目录选项返回 null，不触发目录遍历。
+ */
+export function enterCompletionDirectory(
+  option: CompletionOption | string,
+  text: string,
+  start: number,
+  end: number,
+): DirectoryTraversal | null {
+  const value: CompletionOption = typeof option === 'string' ? {label: option} : (option ?? {});
+  if (!value.isDirectory) return null;
+  const label = String(value.label ?? '');
+  const dir = label.endsWith('/') ? label : `${label}/`;
+  const from = Math.max(0, Math.min(start, text.length));
+  const to = Math.max(from, Math.min(end, text.length));
+  return {
+    text: text.slice(0, from) + dir + text.slice(to),
+    cursor: from + dir.length,
+    path: label.replace(/\/+$/, ''),
+  };
+}
+
 export function likelyPaste(previous: string, next: string, elapsedMs: number): boolean {
   const delta = next.length - previous.length;
   if (delta < PASTE_DETECTION_THRESHOLD) return false;

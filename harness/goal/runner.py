@@ -956,6 +956,207 @@ class GoalRunner(threading.Thread):
             approved.append(relative)
         return tuple(dict.fromkeys(approved)), None
 
+    def _scope_amendment_paths(
+        self,
+        state: GoalState,
+        task: Any,
+        run: SupervisorRun,
+        requests: tuple[dict[str, Any], ...],
+    ) -> tuple[tuple[str, ...], str | None]:
+        """Prove a missing Task source path is required by an unchanged bound test.
+
+        This is deliberately narrower than a normal scope expansion: it repairs
+        a planner omission without changing product intent, and only after the
+        supervisor has explicitly selected ``amend_scope`` with high confidence.
+        """
+        if run.decision.confidence != "high":
+            return (), "scope amendment requires high supervisor confidence"
+        requested: set[str] = set()
+        for request in requests:
+            if str(request.get("tool") or "") not in {"write_file", "edit_file", "patch_file"}:
+                return (), "only direct file writes can receive a scope amendment"
+            relative, _, error = self._scope_candidate(
+                _execution_workspace(state), str(request.get("path") or "")
+            )
+            if error:
+                return (), error
+            assert relative is not None
+            requested.add(relative)
+        if not requested:
+            return (), "scope amendment has no exact requested path"
+
+        proposed: set[str] = set()
+        for raw_path in run.decision.scope_paths:
+            relative, candidate, error = self._scope_candidate(_execution_workspace(state), raw_path)
+            if error:
+                return (), error
+            assert relative is not None and candidate is not None
+            if relative not in requested:
+                return (), f"supervisor proposed a path that was not actually requested: {relative}"
+            if not candidate.is_file() or candidate.suffix.lower() not in {".py", ".js", ".jsx", ".ts", ".tsx"}:
+                return (), f"scope amendment requires an existing source file: {relative}"
+            proposed.add(relative)
+        if not proposed:
+            return (), "scope amendment needs one exact source path"
+
+        imported = self._frozen_test_imports(state, task)
+        missing = sorted(proposed - imported)
+        if missing:
+            return (), "scope amendment path is not directly imported by an unchanged bound test: " + ", ".join(missing)
+        return tuple(sorted(proposed)), None
+
+    def _frozen_test_imports(self, state: GoalState, task: Any) -> set[str]:
+        """Return source modules directly imported by unchanged Task-bound tests."""
+        spec = task.verification_spec if isinstance(task.verification_spec, dict) else {}
+        hashes = spec.get("test_hashes") if isinstance(spec.get("test_hashes"), dict) else {}
+        root = Path(_execution_workspace(state)).resolve()
+        imported: set[str] = set()
+        for raw_test_path in spec.get("test_files") or []:
+            test_relative, test_path, error = self._scope_candidate(root, str(raw_test_path))
+            if error or test_relative is None or test_path is None or not test_path.is_file():
+                continue
+            expected_hash = str(hashes.get(test_relative) or "")
+            actual_hash = hashlib.sha256(test_path.read_bytes()).hexdigest()
+            if not expected_hash or actual_hash != expected_hash:
+                continue
+            try:
+                source = test_path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            # Match module specifiers independently of the imported bindings.
+            # Named imports are commonly formatted across several lines, so a
+            # one-line ``import {...} from`` pattern silently omitted exactly
+            # the production module that a frozen test was proving necessary.
+            for match in re.finditer(
+                r"\bfrom\s*[\"']([^\"']+)[\"']|\bimport\s*[\"']([^\"']+)[\"']|\brequire\s*\(\s*[\"']([^\"']+)[\"']",
+                source,
+            ):
+                raw_import = next((value for value in match.groups() if value), "")
+                if not raw_import.startswith("."):
+                    continue
+                base = (test_path.parent / raw_import).resolve()
+                candidates = [base]
+                if base.suffix.lower() in {".js", ".jsx", ".ts", ".tsx"}:
+                    candidates.extend(base.with_suffix(suffix) for suffix in (".ts", ".tsx", ".js", ".jsx"))
+                for candidate in candidates:
+                    try:
+                        if candidate.is_file() and candidate.is_relative_to(root):
+                            imported.add(candidate.relative_to(root).as_posix())
+                    except OSError:
+                        continue
+        return imported
+
+    def _verification_scope_omission_candidates(self, state: GoalState, task: Any) -> tuple[str, ...]:
+        scope: list[Path] = []
+        for raw_path in task.scope_paths or []:
+            _, candidate, error = self._scope_candidate(_execution_workspace(state), str(raw_path))
+            if error is None and candidate is not None:
+                scope.append(candidate)
+        root = Path(_execution_workspace(state)).resolve()
+        candidates: list[str] = []
+        for relative in self._frozen_test_imports(state, task):
+            candidate = (root / relative).resolve()
+            if any(candidate == allowed or candidate.is_relative_to(allowed) for allowed in scope):
+                continue
+            candidates.append(relative)
+        return tuple(sorted(dict.fromkeys(candidates)))
+
+    def _try_verification_scope_amendment(self, state: GoalState, task: Any) -> bool:
+        """Repair a test-proven Task scope omission before returning to ACT.
+
+        The supervisor still observes and explains this boundary, but it is not
+        an authority bottleneck.  An unchanged, Task-bound test directly
+        importing an existing source file is mechanical evidence that the Task
+        plan omitted that file.  Requiring a second model to restate that fact
+        turned a safe reconciliation into a provider/JSON single point of
+        failure and let stale no-progress counters win instead.
+        """
+        from harness.tasks import save_task
+
+        candidates = self._verification_scope_omission_candidates(state, task)
+        if not candidates:
+            return False
+        requests = tuple({
+            "tool": "patch_file",
+            "path": path,
+            "resource": path,
+            "reason": "frozen bound test imports an out-of-scope source module after verification failed",
+            "source": "verification_scope_reconciliation",
+        } for path in candidates)
+        run = self._review_supervisor_boundary(
+            "verification_scope_omission",
+            detail={
+                "requests": [dict(item) for item in requests],
+                "candidates": list(candidates),
+                "latest_verification": (task.evidence[-1] if task.evidence else {}),
+            },
+        )
+        paths: tuple[str, ...] = ()
+        error: str | None = None
+        source = "deterministic test evidence"
+        if run is not None and not run.decision.unavailable and run.decision.action == "amend_scope":
+            paths, error = self._scope_amendment_paths(state, task, run, requests)
+            source = "global supervisor plus deterministic test evidence"
+        else:
+            paths, error = self._test_proven_scope_amendment_paths(state, task, candidates)
+        if error:
+            return False
+        self._record_scope_amendment(state, task, paths)
+        task.last_error = f"Task scope reconciled from {source}."
+        save_task(task)
+        state.last_error = task.last_error
+        state.no_progress_count = 0
+        state.permission_boundary_attempts.pop(task.id, None)
+        save_goal(state)
+        _emit_goal("goal_status", state)
+        self._observe_supervisor(
+            "verification_scope_amended",
+            detail={"task_id": task.id, "paths": list(paths), "evidence": "unchanged bound test import"},
+        )
+        self._apply(state, GoalPhase.ACT, "verification_scope_amended")
+        return True
+
+    def _test_proven_scope_amendment_paths(
+        self,
+        state: GoalState,
+        task: Any,
+        candidates: tuple[str, ...],
+    ) -> tuple[tuple[str, ...], str | None]:
+        """Validate a narrow autonomous scope correction from frozen test imports.
+
+        This deliberately has no Goal-envelope exception: it can add only a
+        real source file that the unchanged bound test imports directly.  It
+        cannot grant tests, configuration, secret files, directories, or a
+        transitive/guessed dependency.
+        """
+        imported = self._frozen_test_imports(state, task)
+        approved: list[str] = []
+        for raw_path in candidates:
+            relative, candidate, error = self._scope_candidate(
+                _execution_workspace(state), raw_path
+            )
+            if error:
+                return (), error
+            assert relative is not None and candidate is not None
+            if relative not in imported:
+                return (), f"scope amendment path is not directly imported by an unchanged bound test: {relative}"
+            if not candidate.is_file() or candidate.suffix.lower() not in {".py", ".js", ".jsx", ".ts", ".tsx"}:
+                return (), f"scope amendment requires an existing source file: {relative}"
+            approved.append(relative)
+        if not approved:
+            return (), "scope amendment has no test-proven source path"
+        return tuple(sorted(dict.fromkeys(approved))), None
+
+    @staticmethod
+    def _record_scope_amendment(state: GoalState, task: Any, paths: tuple[str, ...]) -> None:
+        task.scope_paths = list(dict.fromkeys([*task.scope_paths, *paths]))
+        for plan in state.task_plan:
+            if not isinstance(plan, dict) or plan.get("name") != task.subject:
+                continue
+            scope_paths = plan.get("scope_paths") if isinstance(plan.get("scope_paths"), list) else []
+            plan["scope_paths"] = list(dict.fromkeys([*scope_paths, *paths]))
+            break
+
     def _handle_permission_boundary(
         self,
         state: GoalState,
@@ -1001,12 +1202,28 @@ class GoalRunner(threading.Thread):
             }
             save_goal(state)
 
+        def pause_supervisor_unavailable(message: str) -> None:
+            task.last_error = message
+            save_task(task)
+            state.last_error = message
+            # No user authority can resolve a model timeout. Keep the blocked
+            # write auditable, but surface the real provider condition so a
+            # resume retries supervision instead of asking for approval.
+            attempts.pop(task.id, None)
+            state.permission_boundary_attempts = attempts
+            self._pause(
+                state,
+                "goal_supervisor_unavailable",
+                stop_reason=StopReason.provider_unavailable.value,
+            )
+            save_goal(state)
+
         if run is None:
-            pause("Global supervisor is unavailable; the requested capability remains blocked.")
+            pause_supervisor_unavailable("Global supervisor is unavailable; the requested capability remains blocked.")
             return
         decision = run.decision
         if decision.unavailable:
-            pause(decision.error or "Global supervisor could not analyze the permission boundary.")
+            pause_supervisor_unavailable(decision.error or "Global supervisor could not analyze the permission boundary.")
             return
         supervision = state.supervision if isinstance(state.supervision, dict) else {}
         try:
@@ -1018,27 +1235,56 @@ class GoalRunner(threading.Thread):
             return
 
         guidance = decision.next_step or decision.reason or decision.summary
-        if decision.action == "expand_scope":
+        if decision.action in {"continue", "watch"}:
+            # The write hook may have blocked an exploratory edit even though
+            # the worker subsequently completed its scoped approach.  A
+            # supervisor ``continue``/``watch`` decision means no expanded
+            # authority is required, so do not leave that stale request
+            # holding the Goal in permission_wait.
+            attempts.pop(task.id, None)
+            state.permission_boundary_attempts = attempts
+            clear_goal_permission_flags()
+            state.no_progress_count = 0
+            save_goal(state)
+            self._observe_supervisor(
+                "permission_request_resolved_in_scope",
+                detail={
+                    "task_id": task.id,
+                    "action": decision.action,
+                    "attempt": attempt,
+                    "guidance": guidance,
+                },
+            )
+            self._apply(state, GoalPhase.VERIFY, "permission_request_resolved_in_scope")
+            return
+        if decision.action in {"expand_scope", "amend_scope"}:
             if attempt > MAX_PERMISSION_BOUNDARY_RETRIES:
                 pause(
                     f"Task reached {MAX_PERMISSION_BOUNDARY_RETRIES} automatic permission-boundary retries. "
                     f"Latest supervisor analysis: {decision.summary}"
                 )
                 return
-            paths, error = self._scope_expansion_paths(state, run, requests)
+            if decision.action == "amend_scope":
+                paths, error = self._scope_amendment_paths(state, task, run, requests)
+            else:
+                paths, error = self._scope_expansion_paths(state, run, requests)
             if error:
-                pause(f"Scope expansion was rejected by deterministic policy: {error}")
+                pause(f"Scope {decision.action} was rejected by deterministic policy: {error}")
                 return
-            task.scope_paths = list(dict.fromkeys([*task.scope_paths, *paths]))
-            task.last_error = f"Global supervisor expanded Task scope: {guidance}"
+            if decision.action == "amend_scope":
+                self._record_scope_amendment(state, task, paths)
+                task.last_error = f"Global supervisor corrected a Task scope omission: {guidance}"
+            else:
+                task.scope_paths = list(dict.fromkeys([*task.scope_paths, *paths]))
+                task.last_error = f"Global supervisor expanded Task scope: {guidance}"
             save_task(task)
             state.last_error = task.last_error
             state.no_progress_count = 0
             save_goal(state)
             _emit_goal("goal_status", state)
             self._observe_supervisor(
-                "permission_scope_expanded",
-                detail={"task_id": task.id, "paths": list(paths), "attempt": attempt},
+                "permission_scope_amended" if decision.action == "amend_scope" else "permission_scope_expanded",
+                detail={"task_id": task.id, "paths": list(paths), "attempt": attempt, "action": decision.action},
             )
             return
         if decision.action in {"redirect", "retry"}:
@@ -1093,6 +1339,9 @@ class GoalRunner(threading.Thread):
                     "acceptance_cases": list(task.acceptance_cases),
                     "last_error": task.last_error,
                     "verification_spec": dict(task.verification_spec),
+                    "latest_evidence": (
+                        dict(task.evidence[-1]) if task.evidence and isinstance(task.evidence[-1], dict) else None
+                    ),
                 }
             except (FileNotFoundError, OSError, TypeError, ValueError):
                 task_payload = {"id": state.current_task_id, "error": "Task state unavailable"}
@@ -1507,14 +1756,25 @@ class GoalRunner(threading.Thread):
             )
             write_roots = self._test_write_roots(before_catalog)
             before_tree = self._snapshot_test_tree(root, write_roots)
+            test_read_roots: list[str] = [*write_roots, "docs"]
+            test_read_paths = ["package.json", "tsconfig.json", "tsconfig.ink.json", "bunfig.toml"]
+            for raw_path in task.scope_paths or []:
+                relative, candidate, error = self._scope_candidate(root, str(raw_path))
+                if error is not None or relative is None or candidate is None or not candidate.exists():
+                    continue
+                (test_read_roots if candidate.is_dir() else test_read_paths).append(relative)
+            test_read_roots = list(dict.fromkeys(test_read_roots))
+            test_read_paths = list(dict.fromkeys(test_read_paths))
             impact_context = task.verification_spec.get("impact_context") or []
             if not isinstance(impact_context, list):
                 impact_context = []
             if adapter.id == "node":
                 selector_example = "test/example.test.ts::behavior name"
                 adapter_test_guidance = (
-                    "For Node, follow the existing test/**/*.test.ts conventions and return the exact "
-                    "discovered test name after the file path. "
+                    "For Node, use test/**/*.test.ts for non-JSX tests or test/**/*.test.tsx only when JSX is "
+                    "required; both extensions are machine-collected. Do not put JSX in a .test.ts file. "
+                    "Create the focused test first and let the project runner settle syntax/runtime questions instead "
+                    "of spending a slice debating TypeScript rules. Return the exact discovered test name after the file path. "
                 )
             else:
                 selector_example = "tests/test_x.py::test_name"
@@ -1555,6 +1815,8 @@ class GoalRunner(threading.Thread):
                 "async coordination, input routing, and rendering. Each group must state its layer, existing target module, "
                 "observed seam, and covered acceptance IDs in test_design. Do not invent a new production API or module just "
                 "to make a test fail; assert missing behavior through an existing observable boundary. "
+                "Your read boundary excludes dependency trees such as node_modules: use the Task source, existing tests, "
+                "docs, and project configuration as the evidence base. "
                 f"After writing tests, reply ONLY with JSON: {response_example}.\n\n"
                 f"Test architecture rules: {test_architecture_guidance}\n\n"
                 f"Task: {task.subject}\nBehavior: {task.description}\nAcceptance cases: {json.dumps(task.acceptance_cases)}"
@@ -1622,6 +1884,8 @@ class GoalRunner(threading.Thread):
                             deadline=writer_deadline,
                             stats=stats,
                             write_roots=write_roots,
+                            read_roots=tuple(test_read_roots),
+                            read_paths=tuple(test_read_paths),
                             conversation=writer_conversation,
                         )
                 finally:
@@ -1680,9 +1944,11 @@ class GoalRunner(threading.Thread):
                 if not writer_has_test_artifact:
                     return (
                         "The source-inspection and test-design slice is complete. Do not reopen the architecture decision "
-                        "or continue discussing alternatives. Use the existing conversation evidence and your selected "
+                        "or continue discussing alternatives, TypeScript syntax, or JSX extension choices. Use the existing conversation evidence and your selected "
                         "source-grounded test_design now. Your next tool call must create a NEW syntactically valid focused "
                         "test file under the approved test root, then collect it and return selector JSON with test_design. "
+                        "For Node, write a non-JSX .test.ts file unless JSX is genuinely required; in that case write .test.tsx. "
+                        "Do not wait for a theoretical answer about either extension: run the declared test command and use its output. "
                         "The test must exercise an existing observable boundary, not an invented production API. "
                         "Do not modify production code or existing test files. "
                         f"Supervisor evidence: {progress.summary}; idle slices: {idle_slices}."
@@ -2488,6 +2754,15 @@ class GoalRunner(threading.Thread):
             return
         state.consecutive_failures += 1
         state.last_error = task.last_error
+        self._observe_supervisor(
+            "task_verification_failed",
+            detail={
+                "task_id": task.id,
+                "latest_verification": task.evidence[-1] if task.evidence else {},
+            },
+        )
+        if self._try_verification_scope_amendment(state, task):
+            return
         if state.no_progress_count >= NO_PROGRESS_REPLAN_LIMIT:
             state.last_error = (
                 f"{state.no_progress_count} workers made no observable progress; "

@@ -15,6 +15,7 @@
   "dependencies": {
     "@opentui/core": "^0.4.5",
     "@opentui/solid": "^0.4.5",
+    "get-east-asian-width": "1.6.0",
     "ink": "^4.4.1",
     "ink-text-input": "^2.0.0",
     "react": "^18.3.1",

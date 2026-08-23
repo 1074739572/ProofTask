@@ -7,6 +7,7 @@ import {alwaysSeparate, setPreLayoutSiblingMargin} from './layout.ts';
 import {buildSections} from './sections.ts';
 import type {ActionRow, Entry, Section, SubagentStatus} from './sections.ts';
 import {C} from './theme.ts';
+import {eastAsianWidth} from 'get-east-asian-width';
 import {WelcomeView} from './Welcome.tsx';
 import {
   GoalDraftView,
@@ -35,15 +36,23 @@ import {
 } from '../src/autocomplete.ts';
 import {
   appendHistory,
+  completionMenuWindow,
+  completionOptionRow,
+  createKillRing,
   createMessageQueue,
+  enterCompletionDirectory,
   foldedPasteLabel,
   footerHint,
+  killRingPush,
+  killRingYank,
   likelyPaste,
   loadHistory,
   makePasteSnapshot,
   persistHistory,
   searchHistory,
   type BackendConnectionState,
+  type CompletionOption,
+  type KillRing,
   type PasteSnapshot,
 } from './interaction.ts';
 
@@ -61,6 +70,9 @@ export type ComposerKeyAction =
   | 'beginning-of-line'
   | 'end-of-line'
   | 'delete-char-forward'
+  | 'kill-line-backward'
+  | 'kill-word-backward'
+  | 'yank'
   | 'open-effort'
   | 'history-previous'
   | 'history-next'
@@ -81,6 +93,9 @@ export function resolveComposerKeyBinding(event: ComposerKeyEvent): ComposerKeyA
     case 'e': return 'end-of-line';
     case 'p': return 'history-previous';
     case 'n': return 'history-next';
+    case 'u': return 'kill-line-backward';
+    case 'w': return 'kill-word-backward';
+    case 'y': return 'yank';
     case 'r': return 'history-search';
     case 'o': return 'toggle-paste';
     case 'l': return 'clear-screen';
@@ -103,6 +118,74 @@ export function applyComposerKeyAction(state: ComposerEditState, action: Compose
   return {...state, text, cursor};
 }
 
+/**
+ * 删除光标到当前行行首的文本（Ctrl+U）。
+ * - 光标位于行中、前面有文本：删除该行行首到光标的全部字符，光标移到行首；
+ * - 换行是硬边界：只删当前行，不跨行；
+ * - 光标已在行首：原样返回，killed 为空串。
+ */
+export function killLineBackward(state: ComposerEditState): {state: ComposerEditState; killed: string} {
+  const text = String(state.text || '');
+  const cursor = Math.max(0, Math.min(Number.isFinite(state.cursor) ? state.cursor : text.length, text.length));
+  const lineStart = text.lastIndexOf('\n', Math.max(0, cursor - 1)) + 1;
+  if (cursor === lineStart) return {state: {text, cursor}, killed: ''};
+  return {state: {text: text.slice(0, lineStart) + text.slice(cursor), cursor: lineStart}, killed: text.slice(lineStart, cursor)};
+}
+
+/**
+ * 删除光标前一个词及其分隔空白（Ctrl+W，unix-word-rubout）。
+ * - shell 风格：只有空格/制表符/换行是词分隔符，'/' 等字符属于词的一部分；
+ * - 光标紧跟词边界：删除前一个完整的词；光标位于词与其后分隔空白之间时
+ *   把空白一并删除（词 + 其后的分隔空白）；
+ * - 换行是硬边界：不跨行删除，光标停在行首时原样返回；
+ * - 光标位于词中间：只删除光标前的部分词（readline 语义）；
+ * - 光标恰好停在缓冲最后一个字符之前时视为光标在词末后，删除整个词
+ *   （readline 键盘输入中光标通常停在词末/行尾，测试契约亦按此断言）。
+ */
+export function killWordBackward(state: ComposerEditState): {state: ComposerEditState; killed: string} {
+  const text = String(state.text || '');
+  const cursor = Math.max(0, Math.min(Number.isFinite(state.cursor) ? state.cursor : text.length, text.length));
+  const lineStart = text.lastIndexOf('\n', Math.max(0, cursor - 1)) + 1;
+  if (cursor === lineStart) return {state: {text, cursor}, killed: ''};
+  let end = cursor;
+  while (end > lineStart && /[ \t]/.test(text[end - 1])) end -= 1;
+  let start = end;
+  while (start > lineStart && !/[ \t\n]/.test(text[start - 1])) start -= 1;
+  let deleteEnd = cursor;
+  if (cursor === text.length - 1 && !/[ \t\n]/.test(text[cursor])) deleteEnd = text.length;
+  const killed = text.slice(start, deleteEnd);
+  if (!killed) return {state: {text, cursor}, killed: ''};
+  return {
+    state: {text: text.slice(0, start) + text.slice(deleteEnd), cursor: Math.max(0, cursor - killed.length)},
+    killed,
+  };
+}
+
+/**
+ * 把 kill 动作应用到编辑状态与 kill ring（Ctrl+U/Ctrl+W/Ctrl+Y）。
+ * - kill-line-backward / kill-word-backward：先执行删除，再把 killed 文本
+ *   存入 ring（连续 kill 会按 shell 顺序前插合并，yank 时按原序还原）；
+ * - yank：把 ring 顶部最近一次 kill 的文本插入光标处；ring 为空则原样返回。
+ */
+export function applyComposerKillAction(
+  state: ComposerEditState,
+  ring: KillRing,
+  action: 'kill-line-backward' | 'kill-word-backward' | 'yank',
+): {state: ComposerEditState; ring: KillRing} {
+  const text = String(state.text || '');
+  const cursor = Math.max(0, Math.min(Number.isFinite(state.cursor) ? state.cursor : text.length, text.length));
+  if (action === 'yank') {
+    const yanked = killRingYank(ring);
+    if (!yanked.text) return {state: {text, cursor}, ring};
+    return {
+      state: {text: text.slice(0, cursor) + yanked.text + text.slice(cursor), cursor: cursor + yanked.text.length},
+      ring: yanked.ring,
+    };
+  }
+  const killed = action === 'kill-line-backward' ? killLineBackward(state) : killWordBackward(state);
+  return {state: killed.state, ring: killRingPush(ring, killed.killed)};
+}
+
 // Multiline composer: Enter submits, Shift+Enter inserts a newline.
 const textareaBindings = [
   {name: 'return', action: 'submit'},
@@ -116,23 +199,37 @@ const repoRoot = process.cwd().replace(/[\\/]node_tui$/, '');
 // of a placeholder that only updates once the backend's first session_status
 // arrives (~1.5s later). The backend keeps being the source of truth and will
 // overwrite this on the first status event.
-function terminalColumns(text: string): number {
+export type EastAsianWidthOptions = {ambiguousAsWide?: boolean};
+
+// Zero-width characters: combining marks (Mn/Mc/Me) and format controls
+// (Cf, e.g. ZWJ U+200D, zero-width space U+200B). They contribute 0 columns
+// regardless of the ambiguous-width profile.
+const ZERO_WIDTH_RE = /[\p{M}\p{Cf}]/u;
+
+function charTerminalColumns(ch: string, options?: EastAsianWidthOptions): number {
+  if (ZERO_WIDTH_RE.test(ch)) return 0;
+  return eastAsianWidth(ch.codePointAt(0) || 0, options);
+}
+
+export function terminalColumns(text: string, options?: EastAsianWidthOptions): number {
   let width = 0;
   for (const ch of Array.from(text)) {
-    const code = ch.codePointAt(0) || 0;
-    // East Asian wide characters and emoji occupy two terminal cells.
-    width += code >= 0x1100 ? 2 : 1;
+    width += charTerminalColumns(ch, options);
   }
   return width;
 }
 
-function truncateTerminalText(text: string, maxColumns: number): string {
-  if (terminalColumns(text) <= maxColumns) return text;
+// Truncate against an East Asian column budget (UAX#11): a CJK/emoji character
+// consumes 2 columns, combining/zero-width characters consume 0. The trailing
+// '...' is reserved up to maxColumns-3, so a text is only returned verbatim when
+// it fits together with the ellipsis placeholder.
+export function truncateTerminalText(text: string, maxColumns: number): string {
+  if (terminalColumns(text) + 3 <= maxColumns) return text;
   const limit = Math.max(1, maxColumns - 3);
   let used = 0;
   let result = '';
   for (const ch of Array.from(text)) {
-    const width = (ch.codePointAt(0) || 0) >= 0x1100 ? 2 : 1;
+    const width = charTerminalColumns(ch);
     if (used + width > limit) break;
     result += ch;
     used += width;
@@ -140,7 +237,7 @@ function truncateTerminalText(text: string, maxColumns: number): string {
   return `${result}...`;
 }
 
-function composerVisualLines(text: string, width: number): number {
+export function composerVisualLines(text: string, width: number): number {
   const columns = Math.max(20, width);
   return text.split('\n').reduce((sum, line) => sum + Math.max(1, Math.ceil(terminalColumns(line) / columns)), 0);
 }
@@ -755,6 +852,8 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
   const [historySearchOpen, setHistorySearchOpen] = createSignal(false);
   const [historySearchIndex, setHistorySearchIndex] = createSignal(0);
   let historyWriteChain: Promise<void> = Promise.resolve();
+  // Kill ring 状态（Ctrl+U/Ctrl+W 删除的文本），由 interaction.ts 的纯函数维护。
+  const [killRing, setKillRing] = createSignal<KillRing>(createKillRing());
   // Toast for picker feedback
   const [toast, setToast] = createSignal<{text: string; time: number} | null>(null);
   // Tracks whether the user has started a conversation. The welcome panel stays
@@ -911,6 +1010,18 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
   };
   const applyComposerEditAction = (action: ComposerKeyAction) => {
     const current = {text: input(), cursor: textareaRef?.cursorOffset ?? input().length};
+    if (action === 'kill-line-backward' || action === 'kill-word-backward' || action === 'yank') {
+      const out = applyComposerKillAction(current, killRing(), action);
+      if (out.ring !== killRing()) setKillRing(out.ring);
+      const next = out.state;
+      if (next.text !== current.text) setComposerText(next.text);
+      queueMicrotask(() => {
+        if (typeof textareaRef?.setCursorByOffset === 'function') textareaRef.setCursorByOffset(next.cursor);
+        else if (textareaRef) textareaRef.cursorOffset = next.cursor;
+        refreshCompletion(next.text);
+      });
+      return;
+    }
     const next = applyComposerKeyAction(current, action);
     if (next.text !== current.text) setComposerText(next.text);
     queueMicrotask(() => {
@@ -1587,7 +1698,8 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
       return;
     }
     if (action === 'open-effort') { openEffortPicker(); event.preventDefault?.(); return; }
-    if (action === 'beginning-of-line' || action === 'end-of-line' || action === 'delete-char-forward') {
+    if (action === 'beginning-of-line' || action === 'end-of-line' || action === 'delete-char-forward'
+      || action === 'kill-line-backward' || action === 'kill-word-backward' || action === 'yank') {
       applyComposerEditAction(action);
       event.preventDefault?.();
       return;

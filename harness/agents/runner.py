@@ -312,13 +312,15 @@ def _tools_for_agent(
         roots = tuple((bound_cwd / root).resolve() for root in (read_roots or ()))
         paths = tuple((bound_cwd / path).resolve() for path in (read_paths or ()))
 
+        def permitted(candidate: Path) -> bool:
+            return candidate in paths or any(candidate.is_relative_to(root) for root in roots)
+
         def guarded_read(*, path: str, limit: int | None = None, offset: int | None = None) -> str:
             try:
                 candidate = (bound_cwd / path).resolve()
             except OSError as exc:
                 return f"Read blocked: invalid path {path!r}: {exc}"
-            allowed_path = candidate in paths or any(candidate.is_relative_to(root) for root in roots)
-            if not allowed_path:
+            if not permitted(candidate):
                 return "Read blocked: this agent may only read its assigned discovery paths."
             return run_read(path=path, limit=limit, offset=offset, cwd=bound_cwd)
 
@@ -334,8 +336,7 @@ def _tools_for_agent(
                     candidate = (bound_cwd / path).resolve()
                 except OSError as exc:
                     return f"Search blocked: invalid path {path!r}: {exc}"
-                allowed_path = candidate in paths or any(candidate.is_relative_to(root) for root in roots)
-                if not allowed_path:
+                if not permitted(candidate):
                     return "Search blocked: this agent may only search its assigned discovery paths."
                 return base_search(
                     pattern=pattern,
@@ -345,6 +346,28 @@ def _tools_for_agent(
                 )
 
             handlers["search_text"] = guarded_search
+        if "glob" in handlers:
+            base_glob = handlers["glob"]
+
+            def guarded_glob(*, pattern: str) -> str:
+                # The non-wildcard prefix is the directory a glob has to walk.
+                # Requiring that prefix to be readable prevents a constrained
+                # agent from turning ``**/*`` into a dependency-tree dump.
+                raw_pattern = str(pattern or "").replace("\\", "/").lstrip("./")
+                prefix: list[str] = []
+                for part in raw_pattern.split("/"):
+                    if not part or any(token in part for token in ("*", "?", "[")):
+                        break
+                    prefix.append(part)
+                try:
+                    candidate = (bound_cwd.joinpath(*prefix)).resolve()
+                except OSError as exc:
+                    return f"Glob blocked: invalid pattern {pattern!r}: {exc}"
+                if not permitted(candidate):
+                    return "Glob blocked: this agent may only glob its assigned discovery paths."
+                return base_glob(pattern=pattern)
+
+            handlers["glob"] = guarded_glob
     if "rag_search" in allowed:
         from harness.rag.tools import run_rag_search
 

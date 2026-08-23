@@ -82,8 +82,8 @@ class NodeTestAdapter:
             base = (root / folder).resolve()
             if not base.is_relative_to(root) or not base.exists():
                 continue
-            files.extend(path for path in base.rglob("*.test.ts") if path.is_file())
-            files.extend(path for path in base.rglob("*.test.js") if path.is_file())
+            for pattern in ("*.test.ts", "*.test.tsx", "*.test.js", "*.test.jsx"):
+                files.extend(path for path in base.rglob(pattern) if path.is_file())
         selectors: list[str] = []
         for path in sorted(set(files)):
             rel = path.relative_to(root).as_posix()

@@ -55,6 +55,27 @@ def test_supervisor_repairs_invalid_json_once():
     assert len(calls) == 2
 
 
+def test_supervisor_json_correction_gets_a_fresh_deadline():
+    deadlines: list[float | None] = []
+    responses = iter(("not json", '{"action":"watch","summary":"recovered"}'))
+
+    def fake_runner(**kwargs):
+        deadlines.append(kwargs["deadline"])
+        return next(responses)
+
+    run = analyze_goal_observation(
+        {"observation_id": "obs-1", "revision": 2, "event": "verify"},
+        cwd=".",
+        deadline=time.monotonic() - 1,
+        runner=fake_runner,
+    )
+
+    assert run.decision.summary == "recovered"
+    assert len(deadlines) == 2
+    assert deadlines[1] is not None
+    assert deadlines[1] > time.monotonic()
+
+
 def test_supervisor_provider_failure_degrades_to_watch():
     def unavailable(**kwargs):
         kwargs["stats"].stop_reason = "provider_error"
