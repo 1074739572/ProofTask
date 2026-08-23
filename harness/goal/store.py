@@ -354,6 +354,31 @@ def archive_goal(state: GoalState, workspace: str | Path | None = None) -> Path:
     return history_dir(ws) / f"{state.id}.json"
 
 
+def archive_unsupported_goal(workspace: str | Path | None = None) -> Path:
+    """Preserve, but never migrate, a Goal from an older schema.
+
+    A user starting a new Goal has explicitly chosen the current contract.  A
+    paused v3 Goal must therefore not block that action, but rewriting it into
+    v4 would create an unsafe half-migration.  Keep the raw document in
+    history and clear only the active slot after the archival write succeeds.
+    """
+    source = goal_path(workspace)
+    try:
+        payload = json.loads(source.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise GoalStoreError("goal_state_corrupt", f"cannot archive legacy Goal: {exc}") from exc
+    if not isinstance(payload, dict) or payload.get("schema_version") == GOAL_SCHEMA_VERSION:
+        raise GoalStoreError("unsupported_schema", "active Goal is not an older schema")
+    legacy_id = str(payload.get("id") or "unknown").replace("/", "_").replace("\\", "_")[:120]
+    destination = history_dir(workspace) / f"legacy-v{payload.get('schema_version')}-{legacy_id}.json"
+    _atomic_write(destination, payload)
+    try:
+        source.unlink()
+    except OSError as exc:
+        raise GoalStoreError("goal_state_corrupt", f"legacy Goal was archived but active slot could not be cleared: {exc}") from exc
+    return destination
+
+
 def clear_goal_for_test(workspace: str | Path | None = None) -> None:
     """Remove the goal slot + history for a workspace (test/eval cleanup)."""
     path = goal_path(workspace)

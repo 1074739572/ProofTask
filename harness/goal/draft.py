@@ -25,7 +25,7 @@ from harness.goal.planner import TaskPlan, discovery_readiness_error, plan_tasks
 from harness.settings import get_workdir
 from harness.verification import VerificationContext, select_adapter
 
-DRAFT_SCHEMA_VERSION = 4
+DRAFT_SCHEMA_VERSION = 5
 DRAFT_FILENAME = "goal-draft.json"
 _DRAFT_STATUSES = frozenset({"clarifying", "discovering", "planning", "paused", "cancelled", "ready", "approved", "failed", "consumed"})
 _ACTIVE_DRAFT_STAGES = frozenset({"preflight", "catalog", "intake", "discovering", "planning"})
@@ -65,6 +65,10 @@ class GoalDraft:
     answers: list[str] = field(default_factory=list)
     intake_summary: str = ""
     intake_assumptions: list[str] = field(default_factory=list)
+    # Frozen only after the planning reviewer accepts the plan.  This is the
+    # decision contract handed to /goal approve and then to every worker.
+    goal_contract: dict[str, Any] = field(default_factory=dict)
+    planning_review: dict[str, Any] = field(default_factory=dict)
     task_plan: list[dict[str, Any]] = field(default_factory=list)
     test_catalog_count: int = 0
     limits: dict[str, int] = field(default_factory=dict)
@@ -89,17 +93,9 @@ class GoalDraft:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "GoalDraft":
         version = data.get("schema_version")
-        if version not in {2, 3, DRAFT_SCHEMA_VERSION}:
+        if version != DRAFT_SCHEMA_VERSION:
             raise GoalDraftError("unsupported Goal draft schema")
         data = dict(data)
-        if version == 2:
-            # Version 2 stored only the visible paused stage.  Infer the
-            # checkpoint from its error for existing drafts, then persist v3
-            # on the next write.
-            data["resume_from"] = _legacy_resume_stage(data)
-        if version in {2, 3}:
-            data["language"] = detect_goal_language(str(data.get("target") or ""))
-            data["schema_version"] = DRAFT_SCHEMA_VERSION
         unknown = set(data) - set(cls.__dataclass_fields__)
         if unknown:
             raise GoalDraftError(f"unsupported Goal draft fields: {sorted(unknown)}")
@@ -195,7 +191,9 @@ def _draft_event_payload(draft: GoalDraft, *, event: str, message: str | None = 
         selectors = spec.get("selectors") if isinstance(spec.get("selectors"), list) else []
         cases = plan.get("acceptance_cases") if isinstance(plan.get("acceptance_cases"), list) else []
         dependencies = plan.get("depends_on") if isinstance(plan.get("depends_on"), list) else []
-        scope_paths = plan.get("scope_paths") if isinstance(plan.get("scope_paths"), list) else []
+        primary_write = plan.get("primary_write") if isinstance(plan.get("primary_write"), list) else []
+        planned_new = plan.get("planned_new") if isinstance(plan.get("planned_new"), list) else []
+        conditional_write = plan.get("conditional_write") if isinstance(plan.get("conditional_write"), list) else []
         evidence_refs = plan.get("evidence_refs") if isinstance(plan.get("evidence_refs"), list) else []
         task_summaries.append(
             {
@@ -205,7 +203,9 @@ def _draft_event_payload(draft: GoalDraft, *, event: str, message: str | None = 
                 "acceptance_count": len(cases),
                 "verification_source": str(spec.get("source") or "needs_generation")[:80],
                 "selectors": [str(item)[:500] for item in selectors[:8]],
-                "scope_paths": [str(item)[:500] for item in scope_paths[:12]],
+                "primary_write": [str(item)[:500] for item in primary_write[:12]],
+                "planned_new": [str(item)[:500] for item in planned_new[:12]],
+                "conditional_write": [str(item)[:500] for item in conditional_write[:12]],
                 "evidence_refs": [str(item)[:120] for item in evidence_refs[:12]],
                 "test_strategy": str(plan.get("test_strategy") or "")[:1_000],
             }
@@ -228,6 +228,8 @@ def _draft_event_payload(draft: GoalDraft, *, event: str, message: str | None = 
         "discovery_path": draft.discovery_path,
         "intake_summary": draft.intake_summary[:1_000],
         "intake_assumptions": [str(item)[:500] for item in draft.intake_assumptions[:8]],
+        "goal_contract": dict(draft.goal_contract or {}),
+        "planning_review": dict(draft.planning_review or {}),
         "clarifications": [
             {"question": str(question)[:500], "answer": str(answer)[:1_000]}
             for question, answer in list(zip(draft.questions, draft.answers))[:3]
@@ -580,21 +582,25 @@ def _planner_target(draft: GoalDraft) -> str:
     return f"{draft.target}\n\nConfirmed clarifications:\n{pairs}"
 
 
-def _plan(draft: GoalDraft, workspace: Path, catalog, planner_runner=None, discovery_manifest=None, verification_adapter=None) -> None:
+def _plan(draft: GoalDraft, workspace: Path, catalog, planner_runner=None, reviewer_runner=None, discovery_manifest=None, verification_adapter=None) -> None:
     readiness_error = discovery_readiness_error(discovery_manifest)
     if readiness_error:
         raise GoalDraftError(readiness_error)
-    plans = plan_tasks(
+    plan = plan_tasks(
         _planner_target(draft),
         draft.verification,
         workspace,
         planner_runner=planner_runner,
+        reviewer_runner=reviewer_runner,
         test_catalog=catalog,
         discovery_manifest=discovery_manifest,
         verification_adapter=verification_adapter,
         human_language=human_language_label(draft.language),
     )
-    draft.task_plan = [plan.to_dict() for plan in plans]
+    draft.goal_contract = dict(plan.contract)
+    draft.goal_contract["language"] = draft.language
+    draft.planning_review = dict(plan.review)
+    draft.task_plan = [task.to_dict() for task in plan.tasks]
     draft.status = "ready"
 
 
@@ -815,7 +821,7 @@ def create_draft(
         save_draft(draft, root, event="stage_started", message="Planning verifiable tasks")
         try:
             with _draft_heartbeat(draft, root):
-                _plan(draft, project_root, catalog, planner_runner, discovery_manifest, adapter)
+                _plan(draft, project_root, catalog, planner_runner=planner_runner, discovery_manifest=discovery_manifest, verification_adapter=adapter)
         except Exception as exc:
             draft.status = "paused"
             draft.last_error = f"Goal planning failed: {type(exc).__name__}: {exc}"
@@ -826,7 +832,7 @@ def create_draft(
     return draft
 
 
-def _run_discovery_and_plan(draft: GoalDraft, root: Path, catalog, adapter, *, planner_runner=None, discovery_runner=None) -> None:
+def _run_discovery_and_plan(draft: GoalDraft, root: Path, catalog, adapter, *, planner_runner=None, reviewer_runner=None, discovery_runner=None) -> None:
     operation_timeout = max(1, int(draft.limits.get("operation_timeout_seconds", 1800)))
     project_root = draft_project_root(draft, root)
     _preflight_or_raise(draft, root, _required_resume_agents(planner_runner=planner_runner, discovery_runner=discovery_runner))
@@ -870,7 +876,7 @@ def _run_discovery_and_plan(draft: GoalDraft, root: Path, catalog, adapter, *, p
     save_draft(draft, root, event="stage_started", message="Planning verifiable tasks")
     try:
         with _draft_heartbeat(draft, root):
-            _plan(draft, project_root, catalog, planner_runner, manifest, adapter)
+            _plan(draft, project_root, catalog, planner_runner=planner_runner, discovery_manifest=manifest, verification_adapter=adapter)
     except Exception as exc:
         draft.status = "paused"
         draft.last_error = f"Goal planning failed: {type(exc).__name__}: {exc}"
@@ -902,7 +908,7 @@ def _run_plan_from_manifest(
     save_draft(draft, root, event="stage_started", message="Resuming task planning from saved discovery evidence")
     try:
         with _draft_heartbeat(draft, root):
-            _plan(draft, project_root, catalog, planner_runner, manifest, adapter)
+            _plan(draft, project_root, catalog, planner_runner=planner_runner, reviewer_runner=reviewer_runner, discovery_manifest=manifest, verification_adapter=adapter)
     except Exception as exc:
         draft.status = "paused"
         draft.last_error = f"Goal planning failed: {type(exc).__name__}: {exc}"
@@ -1086,7 +1092,13 @@ def approve_draft(*, workspace: Path | None = None) -> GoalDraft:
     draft = load_draft(root)
     if draft is None:
         raise GoalDraftError("No Goal draft to approve.")
-    if draft.status not in {"ready", "approved"} or not draft.task_plan or not draft.verification:
+    if (
+        draft.status not in {"ready", "approved"}
+        or not draft.task_plan
+        or not draft.verification
+        or not draft.goal_contract
+        or draft.planning_review.get("approved") is not True
+    ):
         raise GoalDraftError("Goal draft is not ready. Answer the outstanding questions first.")
     draft.status = "approved"
     save_draft(draft, root)
@@ -1103,7 +1115,13 @@ def validate_ready_draft(*, workspace: Path | None = None) -> GoalDraft:
     draft = load_draft(root)
     if draft is None:
         raise GoalDraftError("No Goal draft to approve.")
-    if draft.status not in {"ready", "approved"} or not draft.task_plan or not draft.verification:
+    if (
+        draft.status not in {"ready", "approved"}
+        or not draft.task_plan
+        or not draft.verification
+        or not draft.goal_contract
+        or draft.planning_review.get("approved") is not True
+    ):
         raise GoalDraftError("Goal draft is not ready. Answer the outstanding questions first.")
     return draft
 

@@ -13,7 +13,7 @@ from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Any
 
-GOAL_SCHEMA_VERSION = 3
+GOAL_SCHEMA_VERSION = 5
 
 DEFAULT_WORKER_ROUND_LIMIT = 20
 DEFAULT_OPERATION_TIMEOUT_SECONDS = 1800  # one agent operation, not the Goal
@@ -24,6 +24,7 @@ class GoalPhase(str, Enum):
     INITIALIZE = "initialize"
     SELECT_TASK = "select_task"
     PREPARE_TESTS = "prepare_tests"
+    PREPARE_EXECUTION = "prepare_execution"
     CLAIM = "claim"
     ACT = "act"
     ROLLOVER = "rollover"
@@ -72,6 +73,8 @@ class StopReason(str, Enum):
     provider_unavailable = "provider_unavailable"
     autonomy_blocked = "autonomy_blocked"
     internal_error = "internal_error"
+    execution_preflight_failed = "execution_preflight_failed"
+    task_blocked = "task_blocked"
 
 
 _VALID_PHASES = frozenset(phase.value for phase in GoalPhase)
@@ -103,6 +106,14 @@ class GoalState:
     # The confirmed product boundary is immutable after `/goal run`; Task plans
     # may evolve inside it, but execution must not fall back to chat history.
     goal_contract: dict[str, Any] = field(default_factory=dict)
+    # Planning v2 keeps the independent review separate from the execution
+    # supervisor.  It records why a plan was accepted or sent back before any
+    # Task is created, so later workers do not have to rediscover the intent.
+    planning_review: dict[str, Any] = field(default_factory=dict)
+    # Execution v2 records deterministic checkpoints rather than asking the
+    # UI to infer progress from model prose. Entries are bounded by the runner.
+    execution_preflight: dict[str, Any] = field(default_factory=dict)
+    execution_trace: list[dict[str, Any]] = field(default_factory=list)
     # Origin Draft id links the two durable files for crash reconciliation.
     draft_id: str = ""
     initialization_complete: bool = False

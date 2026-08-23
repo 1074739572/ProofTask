@@ -62,7 +62,11 @@ export type GoalTaskSnapshot = {
   verification_state: string;
   blocked_by?: string[];
   acceptance_cases?: GoalAcceptanceCase[];
-  scope_paths?: string[];
+  primary_write?: string[];
+  planned_new?: string[];
+  conditional_write?: string[];
+  read_envelope?: string[];
+  forbidden?: string[];
   evidence_refs?: string[];
   test_strategy?: string;
   verification_spec?: GoalVerificationSpec;
@@ -91,6 +95,10 @@ export type GoalSnapshot = {
   paused_at?: number | null;
   stop_reason?: string | null;
   final_verification?: GoalFinalVerification | null;
+  goal_contract?: Record<string, unknown>;
+  planning_review?: {approved?: boolean; summary?: string; findings?: unknown[]};
+  execution_preflight?: Record<string, unknown>;
+  execution_trace?: {at?: number; event?: string; task_id?: string; route?: string; summary?: string; detail?: Record<string, unknown>}[];
   supervision?: GoalSupervisionSnapshot;
   tasks: GoalTaskSnapshot[];
   last_error?: string | null;
@@ -105,7 +113,9 @@ export type GoalDraftTaskSummary = {
   acceptance_count?: number;
   verification_source?: string;
   selectors?: string[];
-  scope_paths?: string[];
+  primary_write?: string[];
+  planned_new?: string[];
+  conditional_write?: string[];
   evidence_refs?: string[];
   test_strategy?: string;
 };
@@ -178,6 +188,8 @@ export type GoalDraftSnapshot = {
   discovery_path?: string;
   intake_summary?: string;
   intake_assumptions: string[];
+  goal_contract?: Record<string, unknown>;
+  planning_review?: {approved?: boolean; summary?: string; findings?: unknown[]};
   clarifications: GoalClarification[];
   question?: string;
   question_index: number;
@@ -317,6 +329,18 @@ export function goalSnapshotFromEvent(event: any, current: GoalSnapshot | null =
     final_verification: has(event, 'final_verification')
       ? (event.final_verification && typeof event.final_verification === 'object' ? event.final_verification : null)
       : base?.final_verification,
+    goal_contract: has(event, 'goal_contract')
+      ? (event.goal_contract && typeof event.goal_contract === 'object' ? event.goal_contract : undefined)
+      : base?.goal_contract,
+    planning_review: has(event, 'planning_review')
+      ? (event.planning_review && typeof event.planning_review === 'object' ? event.planning_review : undefined)
+      : base?.planning_review,
+    execution_preflight: has(event, 'execution_preflight')
+      ? (event.execution_preflight && typeof event.execution_preflight === 'object' ? event.execution_preflight : undefined)
+      : base?.execution_preflight,
+    execution_trace: has(event, 'execution_trace')
+      ? (Array.isArray(event.execution_trace) ? event.execution_trace : [])
+      : base?.execution_trace,
     supervision: has(event, 'supervision')
       ? (event.supervision && typeof event.supervision === 'object' ? event.supervision : undefined)
       : base?.supervision,

@@ -64,6 +64,12 @@
       "tools": ["read_file", "glob", "search_text", "load_skill"],
       "system": "You plan a Goal into independently verifiable Tasks. Search first, then inspect only relevant evidence with the provided read-only tools. Every Task needs concrete acceptance cases and an explicit dependency list. You may bind only test selectors supplied by the system Test Catalog; never invent a path or command. If no listed selector proves the Task, request test generation in the requested structured plan. Return exactly one valid JSON object matching the requested schema, with no Markdown; self-check required fields before sending. Never modify files or spawn subagents."
     },
+    "goal_plan_reviewer": {
+      "model_id": "mimo-v2.5-pro",
+      "label": "Goal planning reviewer (Xiaomi MiMo, read-only)",
+      "tools": [],
+      "system": "You independently review one already-validated GoalPlan before execution. Find only concrete planning defects: unresolved decisions, impossible dependencies, scope that is too broad or too narrow, missing runtime prerequisites, untestable acceptance cases, or conflicts with the frozen Goal contract. Do not write code, call tools, replace the plan, grant permissions, or weaken tests. Return exactly one valid JSON object matching the requested schema, with no Markdown or empty response."
+    },
     "goal_test_writer": {
       "model_id": "deepseek-v4-pro",
       "reasoning_effort": "max",

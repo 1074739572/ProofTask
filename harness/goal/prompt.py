@@ -74,9 +74,18 @@ def build_goal_act_prompt(
         f"Human-facing summaries and status explanations must be written in {language}. "
         "Keep code, paths, commands, selectors, JSON keys, and tool names unchanged.",
     ]
-    scope_paths = [str(path) for path in (getattr(task, "scope_paths", None) or []) if str(path)]
-    if scope_paths:
-        lines += ["Approved write scope:", *[f"  - {path}" for path in scope_paths]]
+    primary_write = [str(path) for path in (getattr(task, "primary_write", None) or []) if str(path)]
+    planned_new = [str(path) for path in (getattr(task, "planned_new", None) or []) if str(path)]
+    conditional_write = [str(path) for path in (getattr(task, "conditional_write", None) or []) if str(path)]
+    if primary_write:
+        lines += ["Approved existing files to edit:", *[f"  - {path}" for path in primary_write]]
+    if planned_new:
+        lines += ["Approved new paths to create:", *[f"  - {path}" for path in planned_new]]
+    if conditional_write:
+        lines += ["Conditional paths (not writable unless runner-approved):", *[f"  - {path}" for path in conditional_write]]
+    read_envelope = [str(path) for path in (getattr(task, "read_envelope", None) or []) if str(path)]
+    if read_envelope:
+        lines += ["Approved repository context to inspect:", *[f"  - {path}" for path in read_envelope]]
     test_strategy = str(getattr(task, "test_strategy", "") or "").strip()
     if test_strategy:
         lines += ["Planned test strategy:", test_strategy]

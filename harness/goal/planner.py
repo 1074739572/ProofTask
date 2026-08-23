@@ -18,6 +18,7 @@ from harness.settings import get_workdir
 from harness.verification.catalog import TestCatalog, build_pytest_command, collect_pytest_catalog
 
 PLANNER_AGENT = "goal_planner"
+PLAN_REVIEWER_AGENT = "goal_plan_reviewer"
 # Planning turns a confirmed requirement plus a machine-collected test catalog
 # into a contract. Deep repository inspection belongs to the test writer and
 # implementation worker; keeping planning tool-free prevents an invisible,
@@ -25,6 +26,7 @@ PLANNER_AGENT = "goal_planner"
 PLANNER_MAX_ROUNDS = 1
 PLANNER_MAX_OUTPUT_TOKENS = 32_000
 PLANNER_FORMAT_RETRY_MAX_ROUNDS = 1
+PLAN_REVIEW_MAX_ROUNDS = 1
 PLANNER_REPAIR_INPUT_LIMIT = 24_000
 MAX_BEHAVIOR_CHARS = 600
 MAX_ACCEPTANCE_CASES = 8
@@ -178,7 +180,11 @@ class TaskPlan:
     acceptance_cases: tuple[AcceptanceCase, ...] = ()
     skill_names: tuple[str, ...] = ()
     verification_spec: VerificationSpec = field(default_factory=VerificationSpec)
-    scope_paths: tuple[str, ...] = ()
+    primary_write: tuple[str, ...] = ()
+    planned_new: tuple[str, ...] = ()
+    conditional_write: tuple[str, ...] = ()
+    read_envelope: tuple[str, ...] = ()
+    forbidden: tuple[str, ...] = ()
     evidence_refs: tuple[str, ...] = ()
     test_strategy: str = ""
     discovery_revision: int = 0
@@ -191,7 +197,11 @@ class TaskPlan:
             "acceptance_cases": [case.to_dict() for case in self.acceptance_cases],
             "skills": list(self.skill_names),
             "verification_spec": self.verification_spec.to_dict(),
-            "scope_paths": list(self.scope_paths),
+            "primary_write": list(self.primary_write),
+            "planned_new": list(self.planned_new),
+            "conditional_write": list(self.conditional_write),
+            "read_envelope": list(self.read_envelope),
+            "forbidden": list(self.forbidden),
             "evidence_refs": list(self.evidence_refs),
             "test_strategy": self.test_strategy,
             "discovery_revision": self.discovery_revision,
@@ -208,11 +218,24 @@ class TaskPlan:
             acceptance_cases=cases,
             skill_names=_normalise_skill_names(data.get("skills")),
             verification_spec=VerificationSpec.from_dict(spec_raw),
-            scope_paths=_normalise_strings(data.get("scope_paths")),
+            primary_write=_normalise_strings(data.get("primary_write")),
+            planned_new=_normalise_strings(data.get("planned_new")),
+            conditional_write=_normalise_strings(data.get("conditional_write")),
+            read_envelope=_normalise_strings(data.get("read_envelope")),
+            forbidden=_normalise_strings(data.get("forbidden")),
             evidence_refs=_normalise_strings(data.get("evidence_refs")),
             test_strategy=str(data.get("test_strategy") or "")[:1000],
             discovery_revision=max(0, int(data.get("discovery_revision") or 0)),
         )
+
+
+@dataclass(frozen=True)
+class GoalPlan:
+    """Planning v2 output: a decision contract plus executable Task contracts."""
+
+    contract: dict[str, Any]
+    tasks: tuple[TaskPlan, ...]
+    review: dict[str, Any] = field(default_factory=dict)
 
 
 def _parse_acceptance_cases(raw: Any) -> tuple[AcceptanceCase, ...]:
@@ -384,20 +407,33 @@ def build_plan_prompt(
     discovery_manifest: dict[str, Any] | None = None,
     *,
     human_language: str = "English",
+    frozen_contract: dict[str, Any] | None = None,
+    completed_task_names: tuple[str, ...] = (),
 ) -> str:
-    """Prompt for the read-only planner. Output is a JSON Task array only."""
+    """Prompt for the read-only planner. Output is a GoalPlan v2 object."""
     catalog_text = (test_catalog or TestCatalog(error="not collected")).prompt_text(limit=PLANNER_CATALOG_LIMIT)
-    manifest_text = "No Discovery Manifest supplied. Use empty evidence_refs and scope_paths."
+    manifest_text = "No Discovery Manifest supplied. Do not guess repository paths."
     if isinstance(discovery_manifest, dict):
         manifest_text = (
             "Discovery evidence view (machine-collected; cite evidence IDs exactly). "
             "The full repository map remains available only for local validation:\n"
             + json.dumps(_planner_manifest_view(discovery_manifest), ensure_ascii=False)
         )
+    replan_context = ""
+    if frozen_contract is not None:
+        replan_context = (
+            "\nThis is execution-time replanning, not a new product-planning pass. "
+            "The frozen goal_contract below is authoritative: reproduce its six fields exactly and do not "
+            "broaden its outcome, constraints, assumptions, or verification preconditions. Return only replacement "
+            "Tasks for unfinished work. Completed Tasks are historical facts and must not be emitted again. "
+            "A replacement Task may depend on one of these already completed Task names: "
+            f"{json.dumps(list(completed_task_names), ensure_ascii=False)}.\n"
+            f"Frozen goal_contract:\n{json.dumps(_contract_projection(frozen_contract), ensure_ascii=False)}\n\n"
+        )
     return (
-        "You plan one Goal into independently verifiable Tasks.\n"
-        "The confirmed Goal and system test catalog below are your complete planning evidence. "
-        "Return the Task contract directly; do not ask questions, inspect files, or call tools.\n\n"
+        "You are the Goal planning compiler. Convert repository evidence and a confirmed request into "
+        "one decision contract plus independently executable Task contracts.\n"
+        "Do not ask questions, inspect files, or call tools. Do not solve uncertainty by making a worker guess later.\n\n"
         f"Goal target: {target}\n"
         f"Goal-level full verification command: {full_verification}\n\n"
         "Test binding rules:\n"
@@ -406,16 +442,28 @@ def build_plan_prompt(
         "- Never emit a verification command. The system builds it from test_selectors.\n"
         "- Use existing test_selectors only when every acceptance case has an exact case_selectors mapping. "
         "Otherwise use an empty test_selectors array; the system will generate focused tests later.\n"
-        "- Do not invent files, paths, commands, or selectors.\n\n"
+        "- Do not invent existing files, paths, commands, or selectors. A planned_new path may be a new "
+        "file or new directory only when its parent is evidenced by the repository.\n\n"
         f"{catalog_text}\n\n"
         f"{manifest_text}\n\n"
+        f"{replan_context}"
+        "First compile goal_contract, then split it into Tasks:\n"
+        "- goal_contract.summary states the intended outcome in one precise sentence.\n"
+        "- constraints are non-negotiable product, safety, compatibility, and user decisions.\n"
+        "- assumptions are bounded decisions inferred from evidence; never hide an unresolved product choice here.\n"
+        "- unresolved must be an empty array before execution. If the request genuinely needs a user decision, return it here and no tasks.\n"
+        "- verification_preconditions state external/runtime facts that must hold before a real integration test.\n"
+        "- decision_ledger records important architecture choices as objects with id, decision, rationale, and evidence_refs.\n"
+        "- Task scope has five explicit classes: primary_write (existing files to edit), planned_new (new files/directories), conditional_write (existing files that may be added only after proof), read_envelope (existing paths needed to understand the task), forbidden (paths that must not change).\n"
+        "- Never put a whole project root or a broad parent directory in primary_write. Use the smallest exact existing files.\n"
+        "- primary_write, conditional_write, and read_envelope must be discovered paths. planned_new must not already exist.\n\n"
         "Split the Goal into as many Tasks as its independently verifiable deliverables require:\n"
         "- First compare every requested behavior against Discovery evidence and classify it internally as implemented, partial, missing, or unknown. Create Tasks only for partial or missing behavior; implemented behavior may need regression coverage but is not implementation work.\n"
         "- There is no target Task count. Cover every distinct deliverable; never merge work merely to reduce the count.\n"
         "- Each Task is independently implementable and machine-verifiable.\n"
         "- Each Task must include 1-8 concrete acceptance_cases using given/when/then; split a Task that needs more.\n"
         "- depends_on lists names of earlier Tasks only.\n"
-        "- scope_paths must be selected from scope_candidates or evidence.path. The system derives evidence_refs from that scope; include extra evidence IDs only when they add requirement context.\n"
+        "- Every Task needs a non-empty primary_write or planned_new list. The system derives evidence_refs from these paths.\n"
         "- test_strategy must explain how each acceptance case will be verified.\n"
         "- case_selectors maps each acceptance case id to exact catalog selectors; never claim coverage without a mapping.\n"
         "- Keep related implementation details together, but preserve independently testable deliverables as separate Tasks.\n"
@@ -427,26 +475,27 @@ def build_plan_prompt(
         "- Do not use code-review here; the independent evaluator handles review.\n\n"
         f"Write all human-readable Task names, behavior, acceptance-case text, and test_strategy in {human_language}. "
         "Keep JSON keys, evidence IDs, paths, commands, and selectors exactly as supplied.\n\n"
-        "Reply with ONLY a JSON array in this schema:\n"
-        '[{"name":"paginate list","behavior":"list returns every page",'
+        "Reply with ONLY one JSON object in this schema:\n"
+        '{"goal_contract":{"summary":"...","constraints":["..."],"assumptions":["..."],"unresolved":[],"verification_preconditions":["..."],"decision_ledger":[{"id":"D1","decision":"...","rationale":"...","evidence_refs":["E1"]}]},"tasks":['
+        '{"name":"paginate list","behavior":"list returns every page",'
         '"acceptance_cases":[{"id":"AC1","given":"more than one page",'
         '"when":"the caller requests pages","then":"no row is skipped"}],'
         '"test_selectors":["tests/test_pagination.py::test_all_pages"],'
-        '"depends_on":[],"scope_paths":["src/list.py"],"evidence_refs":["E1"],'
+        '"depends_on":[],"primary_write":["src/list.py"],"planned_new":[],"conditional_write":[],"read_envelope":["src/list.py"],"forbidden":[".env"],"evidence_refs":["E1"],'
         '"test_strategy":"one selector per acceptance case", "case_selectors":{"AC1":["tests/test_pagination.py::test_all_pages"]},'
-        '"skills":["test-driven-development"]}]\n'
+        '"skills":["test-driven-development"]}]}\n'
         "No prose and no code fence."
     )
 
 
-def _extract_json_array(text: str) -> str | None:
+def _extract_json_object(text: str) -> str | None:
     if not text or not text.strip():
         return None
     for candidate in _FENCE_RE.findall(text):
         candidate = candidate.strip()
-        if candidate.startswith("["):
+        if candidate.startswith("{"):
             return candidate
-    start = text.find("[")
+    start = text.find("{")
     if start == -1:
         return None
     depth = 0
@@ -464,9 +513,9 @@ def _extract_json_array(text: str) -> str | None:
             continue
         if char == '"':
             in_string = True
-        elif char == "[":
+        elif char == "{":
             depth += 1
-        elif char == "]":
+        elif char == "}":
             depth -= 1
             if depth == 0:
                 return text[start : index + 1]
@@ -551,25 +600,112 @@ def _contract_error_text(errors: list[str]) -> str:
     return "Plan contract errors:\n" + "\n".join(f"- {error}" for error in unique)
 
 
+def _path_is_existing(path: str, files: set[str]) -> bool:
+    return path in files
+
+
+def _path_is_existing_envelope(path: str, files: set[str]) -> bool:
+    return any(item == path or item.startswith(path.rstrip("/") + "/") for item in files)
+
+
+def _path_can_be_planned_new(path: str, files: set[str]) -> bool:
+    if not _valid_scope_path(path) or _path_is_existing_envelope(path, files):
+        return False
+    parent = Path(path).parent.as_posix()
+    return parent in {"", "."} or _path_is_existing_envelope(parent, files)
+
+
+def _parse_goal_contract(raw: Any, evidence_ids: set[str]) -> tuple[dict[str, Any] | None, list[str]]:
+    errors: list[str] = []
+    if not isinstance(raw, dict):
+        return None, ["goal_contract must be a JSON object"]
+    contract = {
+        "summary": str(raw.get("summary") or "").strip()[:1000],
+        "constraints": list(_normalise_strings(raw.get("constraints"), limit=24)),
+        "assumptions": list(_normalise_strings(raw.get("assumptions"), limit=24)),
+        "unresolved": list(_normalise_strings(raw.get("unresolved"), limit=12)),
+        "verification_preconditions": list(_normalise_strings(raw.get("verification_preconditions"), limit=24)),
+        "decision_ledger": [],
+    }
+    if not contract["summary"]:
+        errors.append("goal_contract is missing summary")
+    if contract["unresolved"]:
+        errors.append("goal_contract has unresolved decisions: " + "; ".join(contract["unresolved"][:4]))
+    ledger = raw.get("decision_ledger")
+    if not isinstance(ledger, list) or not ledger:
+        errors.append("goal_contract needs a non-empty decision_ledger")
+    else:
+        ids: set[str] = set()
+        for index, item in enumerate(ledger, start=1):
+            if not isinstance(item, dict):
+                errors.append(f"decision_ledger entry {index} must be an object")
+                continue
+            decision_id = str(item.get("id") or "").strip()[:40]
+            decision = str(item.get("decision") or "").strip()[:800]
+            rationale = str(item.get("rationale") or "").strip()[:1000]
+            refs = tuple(ref for ref in _normalise_strings(item.get("evidence_refs")) if ref in evidence_ids)
+            if not decision_id or decision_id in ids or not decision or not rationale:
+                errors.append(f"decision_ledger entry {index} needs unique id, decision, and rationale")
+                continue
+            ids.add(decision_id)
+            contract["decision_ledger"].append({
+                "id": decision_id, "decision": decision, "rationale": rationale, "evidence_refs": list(refs),
+            })
+    return contract, errors
+
+
+_CONTRACT_FIELDS = (
+    "summary",
+    "constraints",
+    "assumptions",
+    "unresolved",
+    "verification_preconditions",
+    "decision_ledger",
+)
+
+
+def _contract_projection(raw: dict[str, Any] | None) -> dict[str, Any]:
+    """Compare only the validated contract fields, never runner metadata."""
+    source = raw if isinstance(raw, dict) else {}
+    return {field: source.get(field, [] if field != "summary" else "") for field in _CONTRACT_FIELDS}
+
+
+def _frozen_contract_error(plan: GoalPlan | None, frozen_contract: dict[str, Any] | None) -> str | None:
+    if plan is None or frozen_contract is None:
+        return None
+    if _contract_projection(plan.contract) != _contract_projection(frozen_contract):
+        return "execution-time replan attempted to change the frozen goal_contract"
+    return None
+
+
 def _parse_plan_result(
     raw: str, *, test_catalog=None, discovery_manifest: dict[str, Any] | None = None, verification_adapter=None,
-) -> tuple[list[TaskPlan] | None, str | None]:
+    external_dependency_names: tuple[str, ...] = (),
+) -> tuple[GoalPlan | None, str | None]:
     """Parse planner output and collect all repairable contract errors."""
-    block = _extract_json_array(_strip_agent_header(raw or ""))
+    block = _extract_json_object(_strip_agent_header(raw or ""))
     if block is None:
-        return None, "response does not contain a complete JSON array"
+        return None, "response does not contain a complete JSON object"
     try:
         data = json.loads(block)
     except json.JSONDecodeError:
         return None, "response contains malformed JSON"
-    if not isinstance(data, list) or not data:
-        return None, "plan must be a non-empty JSON array"
+    if not isinstance(data, dict) or not isinstance(data.get("tasks"), list) or not data["tasks"]:
+        return None, "plan must be an object with a non-empty tasks array"
     if discovery_readiness_error(discovery_manifest):
         return None, discovery_readiness_error(discovery_manifest)
     plans: list[TaskPlan] = []
     errors: list[str] = []
+    evidence_ids = {
+        str(item.get("id")) for item in (discovery_manifest or {}).get("evidence", []) if isinstance(item, dict)
+    }
+    contract, contract_errors = _parse_goal_contract(data.get("goal_contract"), evidence_ids)
+    errors.extend(contract_errors)
+    if "scope_paths" in data:
+        errors.append("planning v2 does not support root-level scope_paths")
     names: set[str] = set()
-    for index, entry in enumerate(data, start=1):
+    external_names = set(external_dependency_names)
+    for index, entry in enumerate(data["tasks"], start=1):
         label = f"Task {index}"
         if not isinstance(entry, dict):
             errors.append(f"{label} must be a JSON object")
@@ -585,35 +721,47 @@ def _parse_plan_result(
             errors.append(f"{label} needs 1-{MAX_ACCEPTANCE_CASES} valid acceptance_cases")
             continue
         dependencies = _normalise_strings(entry.get("depends_on"))
-        if any(dependency not in names for dependency in dependencies):
-            errors.append(f"{label} depends_on must list only earlier Task names")
+        if any(dependency not in names and dependency not in external_names for dependency in dependencies):
+            errors.append(f"{label} depends_on must list an earlier or completed Task name")
             continue
         spec = _spec_from_entry(entry, test_catalog, cases, verification_adapter)
-        scopes = _normalise_strings(entry.get("scope_paths"))
+        primary_write = _normalise_strings(entry.get("primary_write"))
+        planned_new = _normalise_strings(entry.get("planned_new"))
+        conditional_write = _normalise_strings(entry.get("conditional_write"))
+        read_envelope = _normalise_strings(entry.get("read_envelope"))
+        forbidden = _normalise_strings(entry.get("forbidden"))
         requested_refs = _normalise_strings(entry.get("evidence_refs"))
         strategy = str(entry.get("test_strategy") or "")[:1000]
+        if "scope_paths" in entry:
+            errors.append(f"{label} uses removed scope_paths; use planning v2 scope classes")
+        if not primary_write and not planned_new:
+            errors.append(f"{label} needs primary_write or planned_new")
+        if not strategy:
+            errors.append(f"{label} is missing test_strategy")
         if discovery_manifest is not None:
-            evidence_ids = {str(item.get("id")) for item in discovery_manifest.get("evidence", []) if isinstance(item, dict)}
             file_paths = {str(item) for item in discovery_manifest.get("repo_files", [])}
-            # A scope may be an existing file or a directory that contains a
-            # discovered file. The latter is required for planned new files.
-            scopes_valid = all(
-                _valid_scope_path(scope)
-                and any(path == scope or path.startswith(scope.rstrip("/") + "/") for path in file_paths)
-                for scope in scopes
-            )
+            primary_valid = all(_valid_scope_path(path) and _path_is_existing(path, file_paths) for path in primary_write)
+            planned_new_valid = all(_path_can_be_planned_new(path, file_paths) for path in planned_new)
+            conditional_valid = all(_valid_scope_path(path) and _path_is_existing(path, file_paths) for path in conditional_write)
+            read_valid = all(_valid_scope_path(path) and _path_is_existing_envelope(path, file_paths) for path in read_envelope)
+            forbidden_valid = all(_valid_scope_path(path) for path in forbidden)
+            evidence_scope = tuple(dict.fromkeys([*primary_write, *conditional_write, *read_envelope]))
             refs = tuple(dict.fromkeys(
                 [ref for ref in requested_refs if ref in evidence_ids]
-                + list(_inferred_evidence_refs(scopes, discovery_manifest))
+                + list(_inferred_evidence_refs(evidence_scope, discovery_manifest))
             ))
-            if not scopes:
-                errors.append(f"{label} is missing scope_paths")
-            if not strategy:
-                errors.append(f"{label} is missing test_strategy")
-            if scopes and not scopes_valid:
-                errors.append(f"{label} scope_paths must be discovered workspace files or directories")
-            if scopes and scopes_valid and not _task_has_source_evidence(scopes, refs, discovery_manifest):
-                errors.append(f"{label} has no source-code evidence for its code scope")
+            if primary_write and not primary_valid:
+                errors.append(f"{label} primary_write must contain exact discovered files")
+            if planned_new and not planned_new_valid:
+                errors.append(f"{label} planned_new must be absent and have an evidenced parent directory")
+            if conditional_write and not conditional_valid:
+                errors.append(f"{label} conditional_write must contain exact discovered files")
+            if read_envelope and not read_valid:
+                errors.append(f"{label} read_envelope must contain discovered files or directories")
+            if forbidden and not forbidden_valid:
+                errors.append(f"{label} forbidden has an invalid workspace path")
+            if primary_write and primary_valid and not _task_has_source_evidence(primary_write, refs, discovery_manifest):
+                errors.append(f"{label} has no source-code evidence for primary_write")
         else:
             refs = requested_refs
         selected_skills = _normalise_skill_names(entry.get("skills"))
@@ -627,7 +775,11 @@ def _parse_plan_result(
                 acceptance_cases=cases,
                 skill_names=selected_skills,
                 verification_spec=spec,
-                scope_paths=scopes,
+                primary_write=primary_write,
+                planned_new=planned_new,
+                conditional_write=conditional_write,
+                read_envelope=read_envelope,
+                forbidden=forbidden,
                 evidence_refs=refs,
                 test_strategy=strategy,
                 discovery_revision=max(0, int(entry.get("discovery_revision") or 0)),
@@ -636,18 +788,18 @@ def _parse_plan_result(
         names.add(name)
     if errors:
         return None, _contract_error_text(errors)
-    return plans, None
+    return GoalPlan(contract=contract or {}, tasks=tuple(plans)), None
 
 
-def parse_plan(raw: str, *, test_catalog=None, discovery_manifest: dict[str, Any] | None = None, verification_adapter=None) -> list[TaskPlan] | None:
-    """Parse planner output into validated TaskPlans without raising."""
-    plans, _ = _parse_plan_result(
+def parse_plan(raw: str, *, test_catalog=None, discovery_manifest: dict[str, Any] | None = None, verification_adapter=None) -> GoalPlan | None:
+    """Parse a v2 Goal plan without raising."""
+    plan, _ = _parse_plan_result(
         raw,
         test_catalog=test_catalog,
         discovery_manifest=discovery_manifest,
         verification_adapter=verification_adapter,
     )
-    return plans
+    return plan
 
 
 def _format_repair_prompt(original_prompt: str, raw: str, error: str) -> str:
@@ -657,11 +809,65 @@ def _format_repair_prompt(original_prompt: str, raw: str, error: str) -> str:
         f"{original_prompt}\n\n"
         "Your previous response was rejected before any execution began. "
         f"Contract error: {error}.\n"
-        "Return a corrected COMPLETE JSON array now. Preserve valid planning intent, "
+        "Return a corrected COMPLETE GoalPlan JSON object now. Preserve valid planning intent, "
         "but fix the contract error. Do not explain the correction, do not call tools, "
         "and do not omit required fields.\n"
         f"Previous response (may be truncated):\n{previous}"
     )
+
+
+def build_plan_review_prompt(
+    plan: GoalPlan,
+    *,
+    human_language: str = "English",
+    completed_task_names: tuple[str, ...] = (),
+) -> str:
+    """Ask an independent model whether a validated plan is executable."""
+    return (
+        "You are the independent reviewer for a Goal plan. You do not redesign it and you never grant "
+        "permissions. Find only execution-blocking ambiguity, invalid task dependency, scope that is too broad "
+        "or too narrow, missing prerequisite, untestable acceptance case, or conflict with the Goal contract.\n\n"
+        "A plan is approvable only when a worker can begin each task without deciding product architecture, "
+        "and primary_write is narrow exact existing-file scope. conditional_write is not initially writable.\n"
+        f"Already completed Task names, when present, are valid dependency anchors: {json.dumps(list(completed_task_names), ensure_ascii=False)}.\n\n"
+        f"Plan to review:\n{json.dumps({'goal_contract': plan.contract, 'tasks': [task.to_dict() for task in plan.tasks]}, ensure_ascii=False)}\n\n"
+        f"Write all human-readable text in {human_language}. Reply ONLY with JSON:\n"
+        '{"approved":true,"summary":"...","findings":[]}\n'
+        "or\n"
+        '{"approved":false,"summary":"...","findings":[{"severity":"high|medium|low","task":"task name or goal_contract","issue":"specific execution problem","repair":"specific contract correction"}]}\n'
+        "No Markdown or prose."
+    )
+
+
+def _review_result(raw: str) -> tuple[bool | None, dict[str, Any] | None, str | None]:
+    block = _extract_json_object(_strip_agent_header(raw or ""))
+    if block is None:
+        return None, None, "reviewer response does not contain a complete JSON object"
+    try:
+        data = json.loads(block)
+    except json.JSONDecodeError:
+        return None, None, "reviewer response contains malformed JSON"
+    if not isinstance(data, dict) or not isinstance(data.get("approved"), bool):
+        return None, None, "reviewer response needs boolean approved"
+    findings = data.get("findings")
+    if not isinstance(findings, list):
+        return None, None, "reviewer response needs findings array"
+    normalized: list[dict[str, str]] = []
+    for index, finding in enumerate(findings, start=1):
+        if not isinstance(finding, dict):
+            return None, None, f"reviewer finding {index} must be an object"
+        severity = str(finding.get("severity") or "").lower()
+        issue = str(finding.get("issue") or "").strip()
+        repair = str(finding.get("repair") or "").strip()
+        task = str(finding.get("task") or "goal_contract").strip()
+        if severity not in {"high", "medium", "low"} or not issue or not repair:
+            return None, None, f"reviewer finding {index} needs severity, issue, and repair"
+        normalized.append({"severity": severity, "task": task[:120], "issue": issue[:1000], "repair": repair[:1000]})
+    if data["approved"] and normalized:
+        return None, None, "reviewer cannot approve while findings are present"
+    if not data["approved"] and not normalized:
+        return None, None, "reviewer rejection needs at least one finding"
+    return bool(data["approved"]), {"approved": bool(data["approved"]), "summary": str(data.get("summary") or "")[:1000], "findings": normalized}, None
 
 
 def plan_tasks(
@@ -670,6 +876,7 @@ def plan_tasks(
     workspace: Path | None = None,
     *,
     planner_runner=None,
+    reviewer_runner=None,
     cancel_check: Callable[[], bool] | None = None,
     deadline: float | None = None,
     stats=None,
@@ -677,8 +884,10 @@ def plan_tasks(
     discovery_manifest: dict[str, Any] | None = None,
     verification_adapter=None,
     human_language: str = "English",
-) -> list[TaskPlan]:
-    """Decompose a Goal and bind only selectors the system collected."""
+    frozen_contract: dict[str, Any] | None = None,
+    completed_task_names: tuple[str, ...] = (),
+) -> GoalPlan:
+    """Compile, validate, and independently review a GoalPlan v2."""
     from harness.agents.runner import AgentTaskStats, run_agent_task as default_runner
 
     root = (workspace or get_workdir()).resolve()
@@ -688,10 +897,13 @@ def plan_tasks(
         verification_adapter = select_adapter(root, full_verification)
     catalog = test_catalog if test_catalog is not None else verification_adapter.discover(VerificationContext(root, command=full_verification))
     runner = planner_runner or default_runner
+    reviewer = reviewer_runner or default_runner
     planner_stats = stats if stats is not None else AgentTaskStats()
     prompt = build_plan_prompt(
         target, full_verification, catalog, discovery_manifest,
         human_language=human_language,
+        frozen_contract=frozen_contract,
+        completed_task_names=completed_task_names,
     )
     planner_call = {
         "description": "decompose goal into verifiable tasks",
@@ -711,44 +923,95 @@ def plan_tasks(
         raise GoalPlanningError(f"Goal planner request failed: {type(exc).__name__}: {exc}") from exc
     if raw.startswith(f"[{PLANNER_AGENT}] failed:") or raw.startswith(f"[{PLANNER_AGENT}] stopped:"):
         raise GoalPlanningError(f"Goal planner is unavailable: {raw}")
-    plans, contract_error = _parse_plan_result(
+    plan, contract_error = _parse_plan_result(
         raw,
         test_catalog=catalog,
         discovery_manifest=discovery_manifest,
         verification_adapter=verification_adapter,
+        external_dependency_names=completed_task_names,
     )
-    if plans:
-        return plans
-    if planner_stats.stop_reason == "max_tokens":
-        raise GoalPlanningError(
-            f"Goal planner exhausted its {PLANNER_MAX_OUTPUT_TOKENS}-token output budget before returning "
-            "a complete Task contract; no execution was started."
+    contract_error = contract_error or _frozen_contract_error(plan, frozen_contract)
+    if contract_error:
+        plan = None
+    used_repair = False
+    if plan is None:
+        if planner_stats.stop_reason == "max_tokens":
+            raise GoalPlanningError(
+                f"Goal planner exhausted its {PLANNER_MAX_OUTPUT_TOKENS}-token output budget before returning "
+                "a complete GoalPlan contract; no execution was started."
+            )
+        repair_call = dict(planner_call)
+        repair_call["description"] = "repair GoalPlan v2 JSON"
+        repair_call["prompt"] = _format_repair_prompt(prompt, raw, contract_error or "unknown contract error")
+        repair_call["max_rounds"] = PLANNER_FORMAT_RETRY_MAX_ROUNDS
+        try:
+            raw = runner(**repair_call)
+        except Exception as exc:
+            raise GoalPlanningError(f"Goal planner contract repair failed: {type(exc).__name__}: {exc}") from exc
+        used_repair = True
+        if raw.startswith(f"[{PLANNER_AGENT}] failed:") or raw.startswith(f"[{PLANNER_AGENT}] stopped:"):
+            raise GoalPlanningError(f"Goal planner contract repair is unavailable: {raw}")
+        plan, repair_error = _parse_plan_result(
+            raw, test_catalog=catalog, discovery_manifest=discovery_manifest,
+            verification_adapter=verification_adapter, external_dependency_names=completed_task_names,
         )
+        repair_error = repair_error or _frozen_contract_error(plan, frozen_contract)
+        if repair_error:
+            plan = None
+        if plan is None:
+            detail = raw.strip().replace("\n", " ")[:500] or "empty response"
+            raise GoalPlanningError(
+                "Goal planner returned no valid GoalPlan after one repair attempt; "
+                f"first error: {contract_error or 'unknown'}; repair error: {repair_error or 'unknown'}. Response: {detail}"
+            )
+
+    def review_plan(current: GoalPlan) -> tuple[bool, dict[str, Any], str | None]:
+        review_call = {
+            "description": "review GoalPlan v2 for execution readiness",
+            "prompt": build_plan_review_prompt(
+                current,
+                human_language=human_language,
+                completed_task_names=completed_task_names,
+            ),
+            "agent_type": PLAN_REVIEWER_AGENT,
+            "cwd": str(root), "max_rounds": PLAN_REVIEW_MAX_ROUNDS,
+            "max_tokens": PLANNER_MAX_OUTPUT_TOKENS, "tools_override": (),
+            "cancel_check": cancel_check, "deadline": deadline, "stats": planner_stats,
+        }
+        try:
+            review_raw = reviewer(**review_call)
+        except Exception as exc:
+            raise GoalPlanningError(f"Goal plan reviewer request failed: {type(exc).__name__}: {exc}") from exc
+        if review_raw.startswith(f"[{PLAN_REVIEWER_AGENT}] failed:") or review_raw.startswith(f"[{PLAN_REVIEWER_AGENT}] stopped:"):
+            raise GoalPlanningError(f"Goal plan reviewer is unavailable: {review_raw}")
+        approved, result, error = _review_result(review_raw)
+        if approved is None or result is None:
+            raise GoalPlanningError(f"Goal plan reviewer returned invalid JSON: {error}")
+        return approved, result, None
+
+    approved, review, _ = review_plan(plan)
+    if approved:
+        return GoalPlan(contract=plan.contract, tasks=plan.tasks, review=review)
+    if used_repair:
+        raise GoalPlanningError("GoalPlan was rejected after its one permitted correction: " + str(review.get("summary") or review.get("findings")))
     repair_call = dict(planner_call)
-    repair_call["description"] = "repair Goal Task contract JSON"
-    repair_call["prompt"] = _format_repair_prompt(prompt, raw, contract_error or "unknown contract error")
+    repair_call["description"] = "repair GoalPlan v2 after independent review"
+    repair_call["prompt"] = _format_repair_prompt(prompt, raw, "Independent review rejected the plan: " + json.dumps(review, ensure_ascii=False))
     repair_call["max_rounds"] = PLANNER_FORMAT_RETRY_MAX_ROUNDS
     try:
         repaired_raw = runner(**repair_call)
     except Exception as exc:
-        raise GoalPlanningError(f"Goal planner contract repair failed: {type(exc).__name__}: {exc}") from exc
-    if repaired_raw.startswith(f"[{PLANNER_AGENT}] failed:") or repaired_raw.startswith(f"[{PLANNER_AGENT}] stopped:"):
-        raise GoalPlanningError(f"Goal planner contract repair is unavailable: {repaired_raw}")
-    plans, repair_error = _parse_plan_result(
-        repaired_raw,
-        test_catalog=catalog,
-        discovery_manifest=discovery_manifest,
-        verification_adapter=verification_adapter,
+        raise GoalPlanningError(f"Goal planner review repair failed: {type(exc).__name__}: {exc}") from exc
+    repaired, repair_error = _parse_plan_result(
+        repaired_raw, test_catalog=catalog, discovery_manifest=discovery_manifest,
+        verification_adapter=verification_adapter, external_dependency_names=completed_task_names,
     )
-    if plans:
-        return plans
-    if planner_stats.stop_reason == "max_tokens":
-        raise GoalPlanningError(
-            f"Goal planner contract repair exhausted its {PLANNER_MAX_OUTPUT_TOKENS}-token output budget before "
-            "returning a complete Task contract; no execution was started."
-        )
-    detail = repaired_raw.strip().replace("\n", " ")[:500] or "empty response"
-    raise GoalPlanningError(
-        "Goal planner returned no valid Task contract after one repair attempt; "
-        f"first error: {contract_error or 'unknown'}; repair error: {repair_error or 'unknown'}. Response: {detail}"
-    )
+    repair_error = repair_error or _frozen_contract_error(repaired, frozen_contract)
+    if repair_error:
+        repaired = None
+    if repaired is None:
+        raise GoalPlanningError("Goal planner did not repair the reviewed GoalPlan: " + (repair_error or "unknown error"))
+    approved, final_review, _ = review_plan(repaired)
+    if not approved:
+        raise GoalPlanningError("GoalPlan remains rejected after one correction: " + str(final_review.get("summary") or final_review.get("findings")))
+    return GoalPlan(contract=repaired.contract, tasks=repaired.tasks, review=final_review)

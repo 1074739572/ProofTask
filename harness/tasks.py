@@ -70,6 +70,14 @@ class Task:
     # Planner-declared production scope. Machine gates compare worker diffs
     # against this list before any verification result can advance the Task.
     scope_paths: list[str] = field(default_factory=list)
+    # Goal v2 compiles these three scope classes into ``scope_paths`` only at
+    # the execution boundary.  Keeping the original classes on the Task makes
+    # it possible to show and enforce why a path is writable.
+    primary_write: list[str] = field(default_factory=list)
+    planned_new: list[str] = field(default_factory=list)
+    conditional_write: list[str] = field(default_factory=list)
+    read_envelope: list[str] = field(default_factory=list)
+    forbidden: list[str] = field(default_factory=list)
     evidence_refs: list[str] = field(default_factory=list)
     # Planner rationale for turning acceptance cases into focused proof. It
     # must reach test preparation instead of disappearing at Task projection.
@@ -126,6 +134,11 @@ def create_task(
     verification_spec: dict | None = None,
     evaluation_required: bool = False,
     scope_paths: list[str] | None = None,
+    primary_write: list[str] | None = None,
+    planned_new: list[str] | None = None,
+    conditional_write: list[str] | None = None,
+    read_envelope: list[str] | None = None,
+    forbidden: list[str] | None = None,
     evidence_refs: list[str] | None = None,
     test_strategy: str = "",
     discovery_revision: int = 0,
@@ -145,7 +158,12 @@ def create_task(
         verification_spec=spec,
         verification_state=("needs_generation" if spec.get("source") == "needs_generation" else "not_started"),
         evaluation_required=evaluation_required,
-        scope_paths=list(scope_paths or []),
+        scope_paths=list(scope_paths or [*(primary_write or []), *(planned_new or [])]),
+        primary_write=list(primary_write or []),
+        planned_new=list(planned_new or []),
+        conditional_write=list(conditional_write or []),
+        read_envelope=list(read_envelope or []),
+        forbidden=list(forbidden or []),
         evidence_refs=list(evidence_refs or []),
         test_strategy=str(test_strategy or "")[:1000],
         discovery_revision=max(0, int(discovery_revision or 0)),
@@ -383,6 +401,19 @@ def request_task_test_repair(task_id: str) -> Task:
     task.verification_spec = spec
     task.verification_state = "needs_generation"
     task.last_error = "evaluator requested additional focused coverage"
+    save_task(task)
+    return task
+
+
+def block_task(task_id: str, *, error: str) -> Task:
+    """Leave an explicit Task terminal checkpoint without fabricating success."""
+    path = _active_path(task_id)
+    if not path.exists():
+        raise FileNotFoundError(task_id)
+    task = _load_task_from_path(path)
+    task.status = "blocked"
+    task.owner = None
+    task.last_error = str(error or "Task is blocked")[:4_000]
     save_task(task)
     return task
 

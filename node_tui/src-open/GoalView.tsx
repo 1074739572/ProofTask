@@ -63,6 +63,7 @@ export type GoalDecisionPresentation = GoalPresentation & {title: string; owner:
 const TERMINAL_STATUSES = new Set(['done', 'failed', 'cancelled']);
 
 const PHASE_LABELS: Record<string, string> = {
+  prepare_execution: '核对任务合同',
   initialize: '生成任务契约',
   prepare_tests: '准备验收测试',
   select_task: '选择下一任务',
@@ -168,6 +169,7 @@ function taskPresentation(task: GoalTaskSnapshot, current: boolean, tasks: GoalT
   if (current && goal.status === 'paused' && goal.stop_reason === 'permission_wait') return {tone: 'warning', icon: '!', text: '等待工具权限'};
   if (task.status === 'missing') return {tone: 'error', icon: '!', text: '状态缺失'};
   if (task.status === 'completed') return {tone: 'success', icon: '✓', text: '已完成'};
+  if (task.status === 'blocked') return {tone: 'error', icon: '×', text: '已阻塞'};
   if (current && task.verification_state === 'failing') return {tone: 'error', icon: '×', text: '测试失败，修复中'};
   if (current) return {tone: 'warning', icon: '●', text: '当前任务'};
   const incomplete = (task.blocked_by || []).filter(id => tasks.find(item => item.id === id)?.status !== 'completed');
@@ -176,6 +178,9 @@ function taskPresentation(task: GoalTaskSnapshot, current: boolean, tasks: GoalT
 }
 
 export function gatePresentation(goal: GoalSnapshot, task?: GoalTaskSnapshot): GoalPresentation {
+  if (goal.status === 'running' && goal.phase === 'prepare_execution') {
+    return {tone: 'info', icon: '●', text: '正在核对任务范围、依赖和可验证前提'};
+  }
   if (goal.status === 'paused' && goal.stop_reason === 'permission_wait') return {tone: 'warning', icon: '!', text: '等待工具权限（approval）后才能继续当前 Task'};
   if (goal.status === 'paused' && goal.stop_reason === 'impact_review_format_error') return {tone: 'warning', icon: '!', text: '影响审查输出无效，自动重试后已暂停'};
   if (goal.status === 'done') return {tone: 'success', icon: '✓', text: '全部 Task 证据与最终回归均已通过，可以交付'};
@@ -605,12 +610,17 @@ export function GoalDraftView(props: {draft: GoalDraftSnapshot; now?: number; wi
       <Show when={props.draft.tasks.length || props.draft.status === 'planning'}>
         <box border borderStyle="rounded" borderColor={C.secondary} paddingX={1} flexDirection="column" minWidth={0}>
           <text fg={C.secondary}>阶段产物 · Task 草案 · {props.draft.tasks.length || props.draft.task_count}</text>
+          <Show when={props.draft.planning_review?.summary}>
+            <text fg={props.draft.planning_review?.approved ? C.info : C.warning} wrapMode="word">  规划审查 · {props.draft.planning_review?.summary}</text>
+          </Show>
           <Show when={!props.draft.tasks.length}><text fg={C.textMuted}>规划模型正在把证据整理成可验证 Task…</text></Show>
           <For each={props.draft.tasks}>{(item, index) => <box flexDirection="column" minWidth={0}>
             <text fg={C.text} wrapMode="word">{String(index() + 1).padStart(2, '0')} · {item.name}</text>
             <text fg={C.textMuted} wrapMode="word">  {item.behavior || '未提供行为摘要'}</text>
             <text fg={C.textMuted} wrapMode="word">  验收 {item.acceptance_count || 0} 条 · {item.verification_source || 'needs_generation'}{item.selectors?.length ? ` · ${item.selectors.join(', ')}` : ''}</text>
-            <Show when={item.scope_paths?.length}><text fg={C.textMuted} wrapMode="word">  修改范围 · {item.scope_paths?.join(', ')}</text></Show>
+            <Show when={item.primary_write?.length}><text fg={C.textMuted} wrapMode="word">  可修改现有文件 · {item.primary_write?.join(', ')}</text></Show>
+            <Show when={item.planned_new?.length}><text fg={C.textMuted} wrapMode="word">  计划新建 · {item.planned_new?.join(', ')}</text></Show>
+            <Show when={item.conditional_write?.length}><text fg={C.warning} wrapMode="word">  需证据后扩展 · {item.conditional_write?.join(', ')}</text></Show>
             <Show when={item.evidence_refs?.length}><text fg={C.textMuted} wrapMode="word">  探索证据 · {item.evidence_refs?.join(', ')}</text></Show>
             <Show when={item.test_strategy}><text fg={C.textMuted} wrapMode="word">  测试策略 · {item.test_strategy}</text></Show>
           </box>}</For>
@@ -624,7 +634,7 @@ export function GoalDraftView(props: {draft: GoalDraftSnapshot; now?: number; wi
 }
 
 const EXECUTION_STAGES = [
-  {id: 'contract', label: '任务合同', phases: ['initialize', 'select_task', 'claim']},
+  {id: 'contract', label: '任务合同', phases: ['initialize', 'select_task', 'prepare_execution', 'claim']},
   {id: 'tests', label: '测试准备', phases: ['prepare_tests']},
   {id: 'act', label: '实现', phases: ['act', 'rollover']},
   {id: 'verify', label: '验证', phases: ['verify']},
@@ -812,6 +822,17 @@ export function GoalView(props: {goal: GoalSnapshot; decisions?: GoalDecision[];
         }}</For>
       </box>
 
+      <Show when={(props.goal.execution_trace || []).length}>
+        <box border borderStyle="rounded" borderColor={C.textMuted} paddingX={1} flexDirection="column" minWidth={0}>
+          <text fg={C.secondary}>执行决策记录</text>
+          <For each={(props.goal.execution_trace || []).slice(-6)}>{item =>
+            <text fg={item.route === 'blocked' ? C.error : (item.route === 'replan' || item.route === 'failure_analysis' ? C.warning : C.textMuted)} wrapMode="word">
+              {item.event || 'checkpoint'} · {item.route || 'observe'} · {item.summary || '-'}
+            </text>
+          }</For>
+        </box>
+      </Show>
+
       <Show when={current()}>
         {task => <>
           <box flexDirection={compact() ? 'column' : 'row'} minWidth={0} gap={1}>
@@ -824,9 +845,11 @@ export function GoalView(props: {goal: GoalSnapshot; decisions?: GoalDecision[];
                   <text fg={C.text} wrapMode="word">  {item.id || `AC${index() + 1}`} · 给定 {item.given || '-'} · 当 {item.when || '-'} · 则 {item.then || '-'}</text>
                 }</For>
               </Show>
-              <Show when={(task().scope_paths || []).length}>
-                <text fg={C.secondary}>批准的修改范围</text>
-                <For each={task().scope_paths || []}>{path => <text fg={C.textMuted} wrapMode="word">  {path}</text>}</For>
+              <Show when={(task().primary_write || []).length || (task().planned_new || []).length || (task().conditional_write || []).length}>
+                <text fg={C.secondary}>执行权限</text>
+                <For each={task().primary_write || []}>{path => <text fg={C.textMuted} wrapMode="word">  现有文件 · {path}</text>}</For>
+                <For each={task().planned_new || []}>{path => <text fg={C.info} wrapMode="word">  计划新建 · {path}</text>}</For>
+                <For each={task().conditional_write || []}>{path => <text fg={C.warning} wrapMode="word">  等待证据 · {path}</text>}</For>
               </Show>
               <Show when={(task().evidence_refs || []).length}>
                 <text fg={C.secondary}>探索证据</text>

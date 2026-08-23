@@ -20,7 +20,7 @@ DISCOVERY_AGENT_TYPES = tuple(
     for role in ("requirement", "architecture", "implementation", "tests", "history")
 )
 
-DRAFT_AGENT_TYPES = ("goal_intake", "goal_planner", *DISCOVERY_AGENT_TYPES)
+DRAFT_AGENT_TYPES = ("goal_intake", "goal_planner", "goal_plan_reviewer", *DISCOVERY_AGENT_TYPES)
 EXECUTION_AGENT_TYPES = (
     "goal_test_writer",
     "goal_worker",
