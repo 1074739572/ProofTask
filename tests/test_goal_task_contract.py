@@ -789,6 +789,20 @@ def test_test_generation_expands_a_parameterized_test_function(tmp_path):
     assert selectors == catalog.selectors
 
 
+def test_test_generation_keeps_multiple_source_grounded_test_designs():
+    raw = json.dumps({
+        "test_design": [
+            {"layer": "pure_logic", "target": "src/completion.ts", "seam": "requestVersion", "cases": ["CM1", "CM2"], "runner": "bun test"},
+            {"layer": "terminal_integration", "target": "src-open/App.tsx", "seam": "completion menu", "cases": ["CM3"], "runner": "bun test"},
+        ],
+    })
+
+    design = GoalRunner._test_design_from_generation(raw)
+
+    assert [item["layer"] for item in design] == ["pure_logic", "terminal_integration"]
+    assert design[0]["cases"] == ["CM1", "CM2"]
+
+
 def test_legacy_verification_command_is_not_a_task_binding():
     plans = parse_plan('[{"name":"x","behavior":"b","acceptance_cases":[{"id":"AC1","given":"input","when":"called","then":"result"}],"verification":"pytest -q","depends_on":[]}]')
     assert plans is not None
@@ -1127,6 +1141,7 @@ def test_test_generation_uses_multiple_rounds_for_inspect_write_and_final_json(t
 
     assert seen[0]["max_rounds"] == runner_mod.TEST_WRITER_MAX_ROUNDS
     assert runner_mod.TEST_WRITER_MAX_ROUNDS > 1
+    assert "Test-design protocol" in seen[0]["prompt"]
 
 
 def test_test_generation_continues_after_a_round_slice(tmp_path, monkeypatch):

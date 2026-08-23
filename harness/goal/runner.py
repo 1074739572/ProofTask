@@ -1522,11 +1522,13 @@ class GoalRunner(threading.Thread):
             response_example = json.dumps({
                 "test_selectors": [selector_example],
                 "case_selectors": {"AC1": [selector_example]},
-                "test_design": {
+                "test_design": [{
                     "layer": "pure_logic",
                     "target": "src/module.ts",
+                    "seam": "named observable behavior",
+                    "cases": ["AC1"],
                     "runner": "project-declared runner",
-                },
+                }],
             })
             pure_logic_required = self._requires_pure_logic_test(task)
             test_architecture_guidance = (
@@ -1536,7 +1538,7 @@ class GoalRunner(threading.Thread):
                 "For pure_logic, import the smallest existing production module in the approved scope. Never import "
                 "a complete application entry such as App.tsx, index.tsx, or a native renderer just to reach a helper. "
                 "Use the project's declared test runner; do not invent a Node loader. "
-                "Include test_design with layer, target, and runner in your final JSON."
+                "Include a test_design array with layer, target, seam, cases, and runner in your final JSON."
             )
             if pure_logic_required:
                 test_architecture_guidance += (
@@ -1548,6 +1550,11 @@ class GoalRunner(threading.Thread):
                 f"do not edit existing test files or production code. Use existing test conventions. {adapter_test_guidance}"
                 "The test file must be machine-collectable even though its pre-implementation baseline is expected "
                 "to fail on the missing behavior. An explanation or empty selector list is not a valid result. "
+                "Test-design protocol: inspect the relevant source and existing tests before choosing a boundary. "
+                "For a broad Task, make multiple focused test groups when its acceptance cases cross pure state/data, "
+                "async coordination, input routing, and rendering. Each group must state its layer, existing target module, "
+                "observed seam, and covered acceptance IDs in test_design. Do not invent a new production API or module just "
+                "to make a test fail; assert missing behavior through an existing observable boundary. "
                 f"After writing tests, reply ONLY with JSON: {response_example}.\n\n"
                 f"Test architecture rules: {test_architecture_guidance}\n\n"
                 f"Task: {task.subject}\nBehavior: {task.description}\nAcceptance cases: {json.dumps(task.acceptance_cases)}"
@@ -1679,10 +1686,11 @@ class GoalRunner(threading.Thread):
                 initial_description=f"generate tests for task {task.id}",
                 continuation_prompt=lambda _slice, progress, _idle: (
                     "Continue the same test-writing conversation. All prior assistant messages, source contents, "
-                    "and tool results remain available above. Use that retained evidence to create an accurate "
-                    "machine-collectable focused test and submit non-empty selector JSON. The missing product "
-                    "behavior should make the baseline fail; it is not a reason to return an empty result. "
-                    "Re-read source when useful. "
+                    "and tool results remain available above. Use that retained evidence to finish the focused "
+                    "machine-collectable test and submit non-empty selector JSON with test_design. Do not invent a "
+                    "production API merely to finish the test: choose an existing observable boundary, or split the "
+                    "tests into focused groups by layer. The missing product behavior should make the baseline fail; "
+                    "it is not a reason to return an empty result. Re-read source when useful. "
                     f"Supervisor evidence: {progress.summary}. Do not modify existing test files."
                 ),
                 continuation_description=lambda slice_number: f"continue generating tests for task {task.id} (slice {slice_number})",
@@ -1758,6 +1766,7 @@ class GoalRunner(threading.Thread):
             }
             selectors = self._selectors_from_generation(raw, root, catalog=after_catalog)
             case_selectors = self._case_selectors_from_generation(raw, selectors, task.acceptance_cases)
+            test_design = self._test_design_from_generation(raw)
             requested_selectors = self._requested_selectors_from_generation(raw)
 
             def contract_mismatches(*, response_empty: bool, response_stalled: bool) -> list[str]:
@@ -1987,6 +1996,8 @@ class GoalRunner(threading.Thread):
             # cross-Task reason that caused this additive test generation.
             if impact_context:
                 bound_spec["impact_context"] = impact_context
+            if test_design:
+                bound_spec["test_design"] = list(test_design)
             bound_spec["generated_files"] = [
                 {
                     "path": path,
@@ -2033,6 +2044,29 @@ class GoalRunner(threading.Thread):
         if not isinstance(requested, list):
             return ()
         return tuple(str(item) for item in requested if item is not None)
+
+    @staticmethod
+    def _test_design_from_generation(raw: str) -> tuple[dict[str, Any], ...]:
+        """Keep the writer's source-grounded test design with its bound evidence."""
+        try:
+            text = str(raw or "")
+            data = json.loads(text[text.find("{") : text.rfind("}") + 1])
+        except (ValueError, TypeError, json.JSONDecodeError):
+            return ()
+        design = data.get("test_design") if isinstance(data, dict) else None
+        entries = [design] if isinstance(design, dict) else design if isinstance(design, list) else []
+        result: list[dict[str, Any]] = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            layer = str(entry.get("layer") or "").strip()
+            target = str(entry.get("target") or "").replace("\\", "/").strip()
+            seam = str(entry.get("seam") or "").strip()
+            cases = [str(case) for case in entry.get("cases", []) if str(case)] if isinstance(entry.get("cases"), list) else []
+            runner = str(entry.get("runner") or "").strip()
+            if layer and target and seam and cases:
+                result.append({"layer": layer, "target": target, "seam": seam, "cases": cases, "runner": runner})
+        return tuple(result)
 
     @staticmethod
     def _requires_pure_logic_test(task) -> bool:
