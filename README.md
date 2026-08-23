@@ -1,51 +1,52 @@
 # ProofTask
 
-**可验证的自主编码执行器：让 AI 不只会反复改代码，而是能用测试结果证明：这次改动真的可以交付。**
+**面向大型抽象需求的 Goal 执行系统。**
 
-[![Python](https://img.shields.io/badge/Python-3.11+-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
-[![Tests](https://img.shields.io/badge/tests-81%20passed-2ea44f?style=flat-square)](https://github.com/1074739572/claude-code_exchange)
-[![GitHub stars](https://img.shields.io/github/stars/1074739572/claude-code_exchange.svg?style=flat-square&color=3b8686)](https://github.com/1074739572/claude-code_exchange)
-
-ProofTask 是一个面向真实代码仓库的 Agent Harness。它把复杂需求拆成可交付的 `Task`，并要求每个 Task 都有验收标准、真实测试绑定和机器验证证据。
+ProofTask 不把“模型输出了很多内容”当作完成。它先探索仓库、形成证据和任务合同，再让
+受限 worker 定向实现，并用机器验证决定每一步能否继续。整个过程可暂停、恢复、审计，
+失败也会留下下一步该怎么做。
 
 ```text
-Goal -> Task -> Acceptance Cases -> Test Binding -> Evidence -> Delivery
+用户需求
+  -> Discovery 证据
+  -> Goal 合同与 Task 图
+  -> 聚焦测试和失败基线
+  -> 定向实现与机器验证
+  -> 修复/重规划
+  -> 全量回归与交付
 ```
 
-<p align="center">
-  <img src="docs/assets/goal-cli-preview.png" alt="ProofTask Goal CLI: Task graph, test binding, and machine delivery gate" width="100%">
-</p>
+## 项目重点
 
-<p align="center"><sub>Goal 执行时，模型的工作过程与机器是否允许推进会被明确分开。</sub></p>
+ProofTask 围绕四件事设计：
 
-## 为什么需要 ProofTask
+1. **先规划清楚再执行**：把大范围探索放在 Discovery，把架构决定写进 Goal 合同，避免每个 worker 从头理解仓库。
+2. **把大目标拆成可交付 Task**：每个 Task 有验收条件、依赖、可读/可写范围、测试策略和证据归属。
+3. **让执行过程看得见**：页面展示当前阶段、每个 Agent 的动作、执行前检查、验证结果、修复路线和阻塞原因。
+4. **让失败有去处**：系统区分实现问题、测试缺口、范围遗漏、需要重规划和外部阻塞；不再只是报错后停止。
 
-普通 Agent 擅长持续修改代码，却容易把“做过很多操作”误认为“需求已经交付”。ProofTask 把完成定义收敛为可审计的事实：绑定测试实际通过，证据已经保存，依赖关系可以继续推进。
+## 运行阶段
 
-核心原则很简单：
+| 阶段 | 系统在做什么 | 阶段产物 |
+| --- | --- | --- |
+| 1. 需求预检 | 确认需求、项目环境、测试入口和必要澄清 | 可执行需求或待回答问题 |
+| 2. Discovery | 并行只读探索相关代码、测试、历史和配置 | 证据清单与相关路径 |
+| 3. 规划 | 编译 Goal 合同、Task 图、范围、依赖和验收条件 | 已审查的任务合同 |
+| 4. 测试准备 | 绑定已有测试或生成聚焦测试并确认失败基线 | selector、AC 映射、测试证据 |
+| 5. 执行前检查 | 检查依赖、范围、文件状态和验证前提 | 可执行结论或精确阻塞原因 |
+| 6. 定向实现 | 当前 worker 只在 Task 合同允许范围内工作 | 代码变更与执行切片记录 |
+| 7. 验证与修复 | 机器验证，必要时补实现、补测试、修正范围或重规划 | 失败分类和下一步决策 |
+| 8. 最终交付 | 重验全部 Task 并跑全局回归 | 可审计的交付证据 |
 
-- 模型说“完成了”不算完成。
-- Todo 全部完成不算完成。
-- 只有绑定测试实际通过，Task 才能完成并解锁下一步。
-
-## 核心工作流
-
-1. **Goal 拆分 Task**：每个 Task 有行为描述、Given / When / Then 验收条件和依赖关系。
-2. **测试先绑定**：selector 必须来自 pytest 实际收集结果，模型不能编造路径或命令。
-3. **缺测试先生成**：`goal_test_writer` 只为当前 Task 写聚焦测试；新测试必须在实现前先失败。
-4. **机器证据验收**：保存命令、退出码、selector、收集数量、输出摘要和代码快照。
-5. **严格完成门槛**：没有零退出码证据或 clean check 失败，Task 不能完成。
-6. **最终全量复核**：Goal 交付前重跑所有 Task 的绑定测试，再执行全局回归命令。
-
-## 与普通 Agent 的区别
+## 为什么不是普通 Agent Loop
 
 | 普通循环式 Agent | ProofTask |
 | --- | --- |
-| 关注下一轮继续尝试 | 关注下一步是否有足够证据 |
-| 测试命令可能由模型临时猜测 | selector 必须来自真实测试目录 |
-| Todo 容易被误认为交付完成 | Todo 不影响 Task 验证状态 |
-| 失败可能混入后续工作 | 失败固定回到当前 Task |
-| 恢复依赖对话上下文 | Goal / Task 图和状态可持久化恢复 |
+| 继续尝试直到模型认为完成 | 验证证据决定是否能推进 |
+| 每轮可能重新探索整个仓库 | Discovery 先沉淀证据，执行按合同定向读取 |
+| Todo 或模型总结容易被当作完成 | 只有绑定测试、clean check 和最终回归能交付 |
+| 失败后重新问同一个模型 | 失败先分类，再选择修复、补测、范围修正或重规划 |
+| 长任务靠无限上下文 | Goal/Task/证据落盘，可跨会话恢复 |
 
 ## 快速开始
 
@@ -54,47 +55,60 @@ pip install -r requirements.txt
 python main.py
 ```
 
-创建一个 Goal 草案：
+在界面中创建一个 Goal：
 
 ```text
-/goal 修复分页接口并补齐边界测试
+/goal 为订单列表增加分页、边界测试和回归验证
 ```
 
-系统会读取 `HARNESS.md`、测试配置和实际 pytest 收集结果，先提出无法从仓库判断的问题，再预览 Task、验收条件、测试方案和全局回归命令。它不会在此阶段写代码。
-
-确认与控制：
+常用命令：
 
 ```text
 /goal preview
-/goal answer 空页也必须返回统一结构
-/goal approve   # 只允许生成测试并验证失败基线
-/goal run       # 审阅测试后，允许进入业务实现
+/goal answer <回答>
+/goal approve
 /goal status
 /goal pause
 /goal resume
 /goal cancel
 ```
 
-`/goal --verify "<command>" -- <需求>` 仍可手动覆盖推断出的全局回归命令。
+`/goal approve` 在合同通过后启动受控执行。也可以用
+`/goal --verify "<command>" -- <需求>` 指定最终全局回归命令。
 
-## 验证
+## 交付标准
 
-```bash
-python -m pytest -q tests/test_goal_module.py tests/test_goal_task_contract.py tests/test_goal_clean_scope.py
-python -m evals
+一个 Task 必须满足：验收条件有绑定测试、测试真实收集且以 `exit_code = 0` 通过、证据已
+保存、clean check 通过。一个 Goal 还必须重跑所有已完成 Task 的绑定测试，并通过全局
+回归命令。
+
+模型不能通过删除、跳过或弱化测试来获得“通过”。
+
+## 技术结构
+
+```text
+harness/goal/          Goal 草案、规划、执行、修复、持久化
+harness/tasks.py       Task 合同、依赖、验证证据
+harness/verification/  测试目录、执行适配器、机器证据
+config/agents.json     各阶段 Agent 的角色与工具
+node_tui/              实时 Goal 页面和执行决策记录
 ```
 
-当前结果：`11 passed`；完整评估 `81 passed, 0 failed, 2 skipped`。
+## 验证与贡献
+
+Goal 相关改动至少运行：
+
+```bash
+python -m pytest -q tests/test_goal_planning_v2.py tests/test_goal_execution_v2.py tests/test_agent_read_scope.py
+cd node_tui && npm run typecheck
+```
+
+贡献时优先维护 Goal 合同、状态机、恢复、可观察性和测试之间的一致性。新的能力应回答：
+它在生命周期哪个阶段发生，留下什么可验证产物，失败时如何恢复或阻塞。
 
 ## 文档
 
-- [ProofTask 工作手册](HARNESS.md)
-- [ProofTask 设计说明：问题、原则与机器判定](docs/proof-task-design.md)
-- [Goal / Task / 测试验证设计](docs/goal-task-verification-plan.md)
-- [面向使用者的完整介绍](readme.txt)
-
-## 项目定位
-
-ProofTask 不是另一个只会延长上下文的 Agent Loop。它把“目标 -> 任务 -> 测试 -> 证据 -> 交付”连成闭环，让复杂任务中的每一次推进都值得信任。
-
-本项目基于 [learn-claude-code](https://github.com/shareAI-lab/learn-claude-code) 的 Agent Harness 思路持续演进。
+- [项目规则与阶段约束](HARNESS.md)
+- [Goal 系统总览：范围、重规划与失败路线](docs/goal-system-guide.md)
+- [设计原则与机器交付判定](docs/proof-task-design.md)
+- [文档索引](docs/README.md)

@@ -1,102 +1,77 @@
-# ProofTask
+# ProofTask 项目规则
 
-可验证的自主编码执行器。ProofTask 让 AI 不只会反复改代码，而是能用测试结果证明：这次改动真的可以交付。
+## 项目目标
 
-复杂需求会被拆成独立的 Task；每个 Task 都有验收标准、真实测试绑定和机器验证证据。
-
-```text
-Goal -> Task -> Acceptance Cases -> Test Binding -> Evidence -> Delivery
-```
-
-## Commands
-
-- 安装依赖：`pip install -r requirements.txt`
-- 启动命令行：`python main.py`
-- 运行 Goal 定向测试：`python -m pytest -q tests/test_goal_module.py tests/test_goal_task_contract.py tests/test_goal_clean_scope.py`
-- 运行完整可靠性评估：`python -m evals`
-- 创建 Goal 草案：`/goal 修复分页接口并补齐边界测试`
-- 确认 Goal：`/goal preview`、`/goal answer <回答>`、`/goal approve`、`/goal run`
-- 控制 Goal：`/goal status`、`/goal pause`、`/goal resume`、`/goal cancel`
-
-`--verify` 是可选的全局回归覆盖命令；默认由 `HARNESS.md`、测试配置和实际收集结果推断。`/goal approve` 只会写测试并确认失败基线，`/goal run` 才允许业务实现。每个 Task 另有自己绑定的聚焦测试。
-
-## Hard Constraints
-
-- Goal 只使用 `Task`，不再混入旧的 Feature 状态或兼容字段。
-- Task 必须有 Given / When / Then 验收条件、依赖关系及真实的测试 selector。
-- selector 必须来自 pytest 实际收集的测试目录，模型不能编造文件、测试名或验证命令。
-- 缺少合适测试时，`goal_test_writer` 只能为当前 Task 写聚焦回归测试。
-- 新生成的测试必须在实现前先失败；基线通过、超时或出错时，Goal 暂停而不是绑定弱测试。
-- Todo 是 Agent 的临时工作笔记，不能替代 Task 的验收和验证。
-- Task 只有在绑定测试成功、证据已保存且 clean check 通过后才能完成。
-- Goal 完成前会强制以 `enforce` 模式执行 clean check，并重跑全部已绑定的 Task 测试。
-- 不得删除、跳过或弱化测试来制造通过结果。
-
-## Task Routing
-
-- Goal 的规划和状态机：`harness/goal/`。
-- Task 生命周期、验收条件、依赖和证据记录：`harness/tasks.py`。
-- 测试收集、执行、重验和证据规范：`harness/verification/`。
-- 测试生成代理配置：`config/agents.json` 中的 `goal_test_writer`。
-- 设计与迁移说明：`docs/goal-task-verification-plan.md`。
-
-Goal 执行顺序：
+ProofTask 的核心不是“让模型多做几轮”，而是把大型、抽象的需求变成可审计、可恢复、
+可验证的 Goal 交付过程。
 
 ```text
-PLAN -> TEST CATALOG -> PREPARE TESTS -> SELECT TASK -> ACT -> VERIFY
-     -> EVALUATE -> CLEAN CHECK -> IMPACT REVIEW -> next Task
-                     |                |
-                     v                v
-                REPAIR PLAN      cross-Task tests
-                     |
-                     v
-             additive test prep or a fresh ACT worker
-     -> FULL VERIFY (all Task bindings + global regression)
+Goal -> 证据 -> 任务合同 -> 实现 -> 验证 -> 交付
 ```
 
-Goal lifetime is unbounded by default. `worker_round_limit` ends only the
-current disposable worker and creates a durable handoff; the next ACT starts
-with a fresh worker. `operation_timeout_seconds` limits one model, test, or
-verification operation. Accumulated elapsed time, worker count, repair cycles,
-and failed attempts are progress data, not failure conditions.
+模型负责理解、提出方案和实现；系统负责保存事实、限制权限、运行验证并裁定能否推进。
 
-任务依赖未完成时，后续 Task 不会开始。任何失败都回到同一个 Task 继续修复，不会跳到下一项。
+## Goal 生命周期
 
-## Definition Of Done
+| 阶段 | 重点 | 必须产出 |
+| --- | --- | --- |
+| 需求与预检 | 识别目标、运行环境、测试入口和真正需要澄清的产品选择 | 可执行请求或明确问题 |
+| Discovery | 只读探索相关仓库区域，不让后续 worker 重复全仓搜索 | 证据清单、相关路径、测试目录、风险/冲突 |
+| 规划与审查 | 将证据编译为冻结 Goal 合同和 Task 图，并由独立模型审查 | Goal 合同、Task 依赖、验收条件、范围、测试策略 |
+| 测试准备 | 复用真实 selector 或为当前 Task 生成聚焦测试 | 测试绑定、失败基线、AC 到 selector 的映射 |
+| 执行前检查 | 检查依赖、范围、文件存在性和验证前提 | 可执行/不可执行的明确结论 |
+| 定向实现 | worker 只在当前 Task 的允许范围内读取和修改 | 受限代码变更、切片交接记录 |
+| 验证与修复 | 先由机器验证，再按证据选择修复、补测、修正范围或重规划 | 验证证据、失败分类、修复决策 |
+| 最终交付 | 重跑所有 Task 绑定测试和全局回归 | 完整证据链与最终结果 |
 
-一个 Task 完成，必须同时满足：
+## 不可违反的规则
 
-1. 验收条件已明确，依赖已满足。
-2. 绑定的 selector 能被真实收集。
-3. 运行结果为 `exit_code = 0`，且已记录命令、输出摘要、收集数量和代码快照。
-4. 严格 clean check 通过；启用 evaluator 时必须明确返回 `passed: true`，失败会进入 Repair Plan，不能放行。
+1. **Discovery 在规划前。** 执行 worker 只能读取当前 Task 的 `read_envelope`、目标源码和绑定测试，不能用大范围探索重新猜项目结构。
+2. **合同先于实现。** 每个 Task 必须有行为、Given/When/Then 验收条件、依赖、测试策略和精确范围。
+3. **范围是权限边界。** `primary_write` 是直接可改的已有文件；`planned_new` 是允许新建的路径；`conditional_write` 必须有后续证据；`forbidden` 永远不可改。
+4. **测试不能编造。** selector 来自系统收集；新测试要在实现前证明缺失行为，不能用弱测试制造通过。
+5. **模型自报不算完成。** Task 需要零退出码验证证据和 clean check；Goal 还需要全部 Task 重验和全局回归。
+6. **失败不丢失。** 每次失败必须留下原因、证据和下一条路线，不允许静默回到空白 worker。
+7. **长任务可延长，但不能盲飞。** worker 达到单次轮数或 token 边界且有进展时，先验证当前结果，再决定是否创建下一切片。
+8. **重规划只改未完成部分。** 保留已完成 Task 和冻结 Goal 合同；新的剩余任务图必须重新通过合同校验和独立审查。
+9. **敏感边界必须停下。** 工作区外、密钥、部署、不可逆操作、缺失外部环境或 provider 不可用，必须保留阻塞原因，不能自行放权。
 
-一个 Goal 完成，必须同时满足：
+## 范围判断
 
-1. 所有 Task 均已完成。
-2. 最终阶段重新运行每个 Task 的绑定测试，全部通过。
-3. 配置的全局回归命令通过。
-4. 每次修复、跨 Task 补测和最终回归失败都保留在 Goal 的决策账本与 TestMap 中；恢复或切换内部 worker 后继续加载。
+- **过宽**：将整个目录或无关模块放进 `primary_write`；一个 Task 同时决定架构、实现多项独立能力、修改配置并补多层测试；worker 必须自行判断产品边界。
+- **过窄**：绑定测试或确定调用链证明需要的源码不在范围内；计划新建文件缺少必要的已有注册/导出点；合同路径已失效。
+- **合适**：新 worker 不需要猜架构，能说明改哪些精确文件、为何修改、用哪些测试证明；能独立验收的交付物应拆开。
 
-## Working Model
+## 失败路线
 
-| 普通循环式 Agent | ProofTask |
+| 路线 | 适用情况 |
 | --- | --- |
-| 关注下一轮继续尝试 | 关注下一步是否有足够验证证据 |
-| 测试命令可由模型临时猜测 | selector 必须来自系统收集的测试目录 |
-| Todo 容易被误认为完成 | Todo 不影响 Task 验证状态 |
-| 失败可能混进后续任务 | 失败固定回到当前 Task |
-| 重启依赖对话上下文 | Goal / Task 图和状态可持久化恢复 |
+| `implementation_fix` | 验证给出了明确的实现缺口 |
+| `test_gap` | 验收行为缺少有效的聚焦测试 |
+| `scope_omission` | 未变更的绑定测试证明遗漏了必要源码路径 |
+| `replan` | 多次无进展，或任务边界、依赖、测试接缝本身错误 |
+| `blocked` | 需要外部授权、环境、凭据或无法安全判断的事实 |
 
-循环负责推进；验证负责决定能否推进。
+`replan` 不是“重新写测试”。它依据原始 Discovery 证据，在冻结 Goal 合同内重新编译
+未完成的 Task，并由独立审查器确认后才替换旧任务。
 
-## Development
+## 代码地图
 
-提交任何行为变更前，运行：
+- `harness/goal/draft.py`：需求预检、Discovery、规划草案。
+- `harness/goal/planner.py`：Goal 合同、Task 合同和独立规划审查。
+- `harness/goal/runner.py`：执行状态机、执行前检查、worker、验证、修复和恢复。
+- `harness/tasks.py`：Task、依赖、证据和完成状态。
+- `harness/goal/repair.py`：修复路线选择。
+- `harness/verification/`：测试收集、运行和证据规范。
+- `node_tui/src-open/GoalView.tsx`：阶段、Task 合同和执行决策记录。
+
+## 变更要求
+
+改动 Goal 行为时，同时更新对应状态机/恢复逻辑、页面可观察性和回归测试。优先运行：
 
 ```bash
-python -m pytest -q tests/test_goal_module.py tests/test_goal_task_contract.py tests/test_goal_clean_scope.py
-python -m evals
+python -m pytest -q tests/test_goal_planning_v2.py tests/test_goal_execution_v2.py tests/test_agent_read_scope.py
+cd node_tui && npm run typecheck
 ```
 
-为行为变化补充相应测试。独立的 Feature 工具仍可用于自身工作流，但 Goal 模式不创建或依赖 `.features/` 作为执行状态。
+更完整的设计和故障处理见 [docs/goal-system-guide.md](docs/goal-system-guide.md)。
