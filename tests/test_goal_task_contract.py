@@ -1214,7 +1214,8 @@ def test_test_generation_continues_after_max_tokens_with_retained_context(tmp_pa
 
     assert len(calls) == 2
     assert calls[0]["conversation"] is calls[1]["conversation"]
-    assert "Continue the same test-writing conversation" in calls[1]["prompt"]
+    assert "source-inspection and test-design slice is complete" in calls[1]["prompt"]
+    assert "next tool call must create" in calls[1]["prompt"]
     assert state.phase == GoalPhase.SELECT_TASK.value
 
 
@@ -1251,7 +1252,8 @@ def test_test_generation_rejects_final_json_until_a_new_test_artifact_exists(tmp
 
     assert len(calls) == 2
     assert calls[0]["conversation"] is calls[1]["conversation"]
-    assert "All prior assistant messages" in calls[1]["prompt"]
+    assert "source-inspection and test-design slice is complete" in calls[1]["prompt"]
+    assert "next tool call must create" in calls[1]["prompt"]
     assert load_task(task.id).verification_spec["source"] == "generated"
 
 

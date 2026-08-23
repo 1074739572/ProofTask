@@ -40,9 +40,10 @@ manufacture a red baseline.
 
 ## Guardrails
 
-- Test generation has a source-and-test inspection phase before test code is
-  written; complex tasks are not forced into an arbitrary four-round artifact
-  deadline.
+- Test generation gets one complete source-and-test-design slice before test
+  code is required. If it has not created an artifact after that slice, its
+  next turn is a delivery turn: it must write the already designed test instead
+  of reopening the architecture discussion.
 - `test_design` is saved with the bound verification evidence so later repair,
   evaluation, and users can see which module and boundary each generated test
   used.

@@ -1676,6 +1676,27 @@ class GoalRunner(threading.Thread):
                     ),
                 )
 
+            def test_writer_continuation(_slice: int, progress: StageProgress, idle_slices: int) -> str:
+                if not writer_has_test_artifact:
+                    return (
+                        "The source-inspection and test-design slice is complete. Do not reopen the architecture decision "
+                        "or continue discussing alternatives. Use the existing conversation evidence and your selected "
+                        "source-grounded test_design now. Your next tool call must create a NEW syntactically valid focused "
+                        "test file under the approved test root, then collect it and return selector JSON with test_design. "
+                        "The test must exercise an existing observable boundary, not an invented production API. "
+                        "Do not modify production code or existing test files. "
+                        f"Supervisor evidence: {progress.summary}; idle slices: {idle_slices}."
+                    )
+                return (
+                    "Continue the same test-writing conversation. All prior assistant messages, source contents, "
+                    "and tool results remain available above. Use that retained evidence to finish the focused "
+                    "machine-collectable test and submit non-empty selector JSON with test_design. Do not invent a "
+                    "production API merely to finish the test: choose an existing observable boundary, or split the "
+                    "tests into focused groups by layer. The missing product behavior should make the baseline fail; "
+                    "it is not a reason to return an empty result. Re-read source when useful. "
+                    f"Supervisor evidence: {progress.summary}. Do not modify existing test files."
+                )
+
             supervised = StageSupervisor(StagePolicy(
                 name="test_generation",
                 slice_rounds=TEST_WRITER_MAX_ROUNDS,
@@ -1684,15 +1705,7 @@ class GoalRunner(threading.Thread):
                 invoke=invoke_writer,
                 initial_prompt=prompt,
                 initial_description=f"generate tests for task {task.id}",
-                continuation_prompt=lambda _slice, progress, _idle: (
-                    "Continue the same test-writing conversation. All prior assistant messages, source contents, "
-                    "and tool results remain available above. Use that retained evidence to finish the focused "
-                    "machine-collectable test and submit non-empty selector JSON with test_design. Do not invent a "
-                    "production API merely to finish the test: choose an existing observable boundary, or split the "
-                    "tests into focused groups by layer. The missing product behavior should make the baseline fail; "
-                    "it is not a reason to return an empty result. Re-read source when useful. "
-                    f"Supervisor evidence: {progress.summary}. Do not modify existing test files."
-                ),
+                continuation_prompt=test_writer_continuation,
                 continuation_description=lambda slice_number: f"continue generating tests for task {task.id} (slice {slice_number})",
                 snapshot=lambda: self._snapshot_test_tree(root, write_roots),
                 assess_progress=test_progress,
