@@ -276,12 +276,28 @@ def _tools_for_agent(
     if write_roots:
         roots = tuple((bound_cwd / root).resolve() for root in write_roots)
 
+        def write_is_permitted(tool_name: str, path: str, candidate: Path) -> bool:
+            """Use the active Goal authority as the sole Goal write boundary.
+
+            Goal permission_hook already evaluates this authority.  Rechecking
+            a separately reconstructed ``write_roots`` tuple here allowed the
+            two guards to disagree on the same path.
+            """
+            try:
+                from harness.goal.authority import current_goal_authority, evaluate_goal_authority
+
+                if current_goal_authority() is not None:
+                    return evaluate_goal_authority(tool_name, {"path": path}).allowed
+            except ImportError:
+                pass
+            return any(candidate.is_relative_to(root) for root in roots)
+
         def guarded_write(*, path: str, content: str) -> str:
             try:
                 candidate = (bound_cwd / path).resolve()
             except OSError as exc:
                 return f"Write blocked: invalid path {path!r}: {exc}"
-            if not any(candidate.is_relative_to(root) for root in roots):
+            if not write_is_permitted("write_file", path, candidate):
                 _record_goal_scope_request("write_file", path, candidate, bound_cwd)
                 return "Write blocked: path is outside the current agent write scope."
             return run_write(path=path, content=content, cwd=bound_cwd)
@@ -291,7 +307,7 @@ def _tools_for_agent(
                 candidate = (bound_cwd / path).resolve()
             except OSError as exc:
                 return f"Edit blocked: invalid path {path!r}: {exc}"
-            if not any(candidate.is_relative_to(root) for root in roots):
+            if not write_is_permitted("edit_file", path, candidate):
                 _record_goal_scope_request("edit_file", path, candidate, bound_cwd)
                 return "Edit blocked: path is outside the current agent write scope."
             return run_edit(path=path, old_text=old_text, new_text=new_text, occurrence=occurrence, cwd=bound_cwd)
@@ -308,7 +324,7 @@ def _tools_for_agent(
                     candidate = (bound_cwd / path).resolve()
                 except OSError as exc:
                     return f"Patch blocked: invalid path {path!r}: {exc}"
-                if not any(candidate.is_relative_to(root) for root in roots):
+                if not write_is_permitted("patch_file", path, candidate):
                     _record_goal_scope_request("patch_file", path, candidate, bound_cwd)
                     return "Patch blocked: path is outside the current agent write scope."
                 return base_patch(path=path, hunks=hunks, expected_sha256=expected_sha256)

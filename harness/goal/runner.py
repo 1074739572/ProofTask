@@ -2794,7 +2794,7 @@ class GoalRunner(threading.Thread):
                 phase=GoalPhase.ACT.value,
                 workspace=_execution_workspace(state),
                 write_roots=tuple(task.scope_paths),
-            ):
+            ) as authority:
                 set_goal_noninteractive(True)
                 clear_cancel()
                 summary = run_agent_task(
@@ -2806,7 +2806,9 @@ class GoalRunner(threading.Thread):
                     cancel_check=self._interrupted,
                     deadline=self._deadline(state),
                     stats=stats,
-                    write_roots=tuple(task.scope_paths) or None,
+                    # Pass the same resolved roots used by permission_hook;
+                    # never rebuild an independent path scope in the tool layer.
+                    write_roots=tuple(str(path) for path in authority.write_roots) or None,
                     read_roots=tuple(read_roots),
                     read_paths=tuple(read_paths),
                 )

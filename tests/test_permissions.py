@@ -231,6 +231,34 @@ def test_goal_write_inside_task_scope_is_auto_approved(tmp_path):
     ask.assert_not_called()
 
 
+def test_goal_authority_is_the_shared_boundary_for_the_write_tool(tmp_path):
+    from harness.agents.runner import _tools_for_agent
+    from harness.goal.authority import goal_authority
+
+    (tmp_path / "src").mkdir()
+    with goal_authority(
+        goal_id="goal-1",
+        task_id="task-1",
+        phase="act",
+        workspace=tmp_path,
+        write_roots=("src/app.py",),
+    ):
+        _tools, handlers = _tools_for_agent(
+            ["write_file"],
+            cwd=tmp_path,
+            # Deliberately different from GoalAuthority. The Goal path must
+            # be evaluated by the shared authority, not this stale projection.
+            write_roots=("other",),
+        )
+        result = handlers["write_file"](path="src/app.py", content="value = 1\n")
+        blocked = handlers["write_file"](path="outside.py", content="blocked\n")
+
+    assert result == "Wrote 10 bytes to src/app.py"
+    assert (tmp_path / "src" / "app.py").read_text(encoding="utf-8") == "value = 1\n"
+    assert blocked == "Write blocked: path is outside the current agent write scope."
+    assert not (tmp_path / "outside.py").exists()
+
+
 def test_goal_write_outside_task_scope_becomes_supervisor_boundary(tmp_path):
     from harness.goal.authority import goal_authority
 
