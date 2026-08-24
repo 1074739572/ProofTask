@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 
 from harness.goal.language import human_language_label
@@ -42,7 +43,7 @@ def build_goal_act_prompt(
 ) -> str:
     # A Goal worker is deliberately a fresh session. Rehydrate only the small,
     # durable facts that can affect this Task; never rehydrate user chat.
-    from harness.goal.memory import load_test_map, recent_decisions
+    from harness.goal.memory import load_handoff, load_test_map, recent_decisions
 
     cases = task.acceptance_cases or []
     case_lines = [
@@ -83,6 +84,15 @@ def build_goal_act_prompt(
         lines += ["Approved new paths to create:", *[f"  - {path}" for path in planned_new]]
     if conditional_write:
         lines += ["Conditional paths (not writable unless runner-approved):", *[f"  - {path}" for path in conditional_write]]
+    active_write_paths = [*primary_write, *planned_new]
+    if active_write_paths:
+        root = Path(getattr(state, "execution_workspace", "") or state.workspace).expanduser().resolve()
+        lines += [
+            f"Execution workspace root (tool cwd): {root}",
+            "These write permissions are already active in this worker slice. Do not request them again.",
+            "Use only the canonical relative paths below; do not prefix the workspace name, ./, or ../:",
+            *[f"  - {path} -> {(root / path).resolve()}" for path in active_write_paths],
+        ]
     read_envelope = [str(path) for path in (getattr(task, "read_envelope", None) or []) if str(path)]
     if read_envelope:
         lines += ["Approved repository context to inspect:", *[f"  - {path}" for path in read_envelope]]
@@ -113,6 +123,20 @@ def build_goal_act_prompt(
     decisions = recent_decisions(state, limit=12)
     if decisions:
         lines += ["Durable decisions from earlier Goal work:", str(decisions)[-5000:]]
+    handoff = load_handoff(state)
+    execution = handoff.get("execution") if isinstance(handoff.get("execution"), dict) else {}
+    if execution.get("task_id") == task.id:
+        prior_paths = execution.get("write_paths") if isinstance(execution.get("write_paths"), list) else []
+        prior_outcomes = execution.get("write_outcomes") if isinstance(execution.get("write_outcomes"), list) else []
+        prior_errors = execution.get("tool_errors") if isinstance(execution.get("tool_errors"), list) else []
+        if prior_paths or prior_outcomes or prior_errors:
+            lines += [
+                "Previous worker execution checkpoint. Continue from these facts; do not repeat broad path discovery:",
+                f"  - stop_reason: {execution.get('stop_reason') or 'unknown'}",
+                *[f"  - attempted write: {item}" for item in prior_paths[-8:]],
+                *[f"  - write result: {item}" for item in prior_outcomes[-8:]],
+                *[f"  - tool error: {item}" for item in prior_errors[-6:]],
+            ]
     relevant_bindings = [
         entry for entry in load_test_map(state)
         if isinstance(entry, dict) and task.id in (entry.get("task_ids") or [])

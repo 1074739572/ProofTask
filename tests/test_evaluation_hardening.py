@@ -8,6 +8,7 @@ from harness.evaluation.inputs import EvaluationInputs
 from harness.evaluation.parser import parse_findings
 from harness.evaluation.runner import build_evaluation_prompt
 from harness.goal.models import GoalState
+from harness.goal.memory import write_handoff
 from harness.goal.prompt import build_goal_act_prompt
 
 
@@ -84,6 +85,38 @@ def test_chinese_goal_worker_prompt_requests_chinese_human_summaries(tmp_path):
     prompt = build_goal_act_prompt(state, task)
 
     assert "Simplified Chinese" in prompt
+
+
+def test_goal_worker_prompt_rehydrates_active_write_scope_and_tool_checkpoint(tmp_path):
+    task = SimpleNamespace(
+        id="task_checkpoint", subject="policy", description="write the policy", acceptance_cases=[],
+        verification_state="not_started", verification_spec={}, evidence=[], last_error=None,
+        repair_history=[], primary_write=["config/permissions.json"],
+        planned_new=["harness/permission_policy.py"], conditional_write=[], read_envelope=[],
+        behavior="write the policy",
+    )
+    state = GoalState.new(target="policy", verification="pytest -q", workspace=str(tmp_path))
+    state.execution_workspace = str(tmp_path)
+    write_handoff(
+        state,
+        task,
+        phase="verify",
+        execution={
+            "task_id": task.id,
+            "stop_reason": "max_rounds",
+            "write_paths": ["config/permissions.json"],
+            "write_outcomes": [],
+            "tool_errors": ["write_file: Error: simulated write failure"],
+        },
+    )
+
+    prompt = build_goal_act_prompt(state, task)
+
+    assert f"Execution workspace root (tool cwd): {tmp_path.resolve()}" in prompt
+    assert "config/permissions.json ->" in prompt
+    assert "Do not request them again" in prompt
+    assert "Previous worker execution checkpoint" in prompt
+    assert "simulated write failure" in prompt
 
 
 def test_task_scoped_diff_excludes_unchanged_preexisting_dirty_files(monkeypatch, tmp_path):

@@ -893,6 +893,7 @@ class GoalRunner(threading.Thread):
             "tool_names": list(dict.fromkeys(str(item) for item in stats.tool_names))[-12:],
             "read_paths": list(dict.fromkeys(str(item) for item in stats.read_paths))[-12:],
             "write_paths": list(dict.fromkeys(str(item) for item in stats.write_paths))[-12:],
+            "write_outcomes": list(dict.fromkeys(str(item) for item in stats.write_outcomes))[-12:],
             "write_audits": list(dict.fromkeys(str(item) for item in stats.write_audits))[-12:],
             "tool_errors": [str(item)[:500] for item in stats.tool_errors[-6:]],
             **dict(extra or {}),
@@ -2858,7 +2859,15 @@ class GoalRunner(threading.Thread):
                 else ("Worker slice ended with observable progress; running verification." if worker_progressed
                       else "Worker made no observable progress; verification will classify the blocker.")
             ),
-            detail={"stop_reason": stats.stop_reason, "rounds": stats.llm_rounds, "tools": stats.tool_count, "idle_slices": state.no_progress_count},
+            detail={
+                "stop_reason": stats.stop_reason,
+                "rounds": stats.llm_rounds,
+                "tools": stats.tool_count,
+                "idle_slices": state.no_progress_count,
+                "write_paths": agent_detail["write_paths"],
+                "write_outcomes": agent_detail["write_outcomes"],
+                "tool_errors": agent_detail["tool_errors"],
+            },
         )
         emit_stage_supervision(
             "slice_finished",
@@ -2875,7 +2884,13 @@ class GoalRunner(threading.Thread):
             idle_slices=state.no_progress_count,
             checkpoint={"task_id": task.id, "worker_rollovers": state.worker_rollovers},
         )
-        write_handoff(state, task, phase=GoalPhase.VERIFY.value, summary=summary)
+        write_handoff(
+            state,
+            task,
+            phase=GoalPhase.VERIFY.value,
+            summary=summary,
+            execution=agent_detail,
+        )
         if self._cancel_event.is_set():
             self._cancel(state, "user requested cancel")
         elif permission_pending:

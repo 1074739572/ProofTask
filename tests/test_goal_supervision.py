@@ -146,9 +146,11 @@ def test_agent_task_stats_records_paths_and_tool_failures():
     stats = AgentTaskStats()
 
     stats.record_tool("read_file", {"path": "src\\app.py"}, "contents")
+    stats.record_tool("write_file", {"path": "src\\new.py"}, "Wrote 12 bytes to src/new.py")
     stats.record_tool("edit_file", {"path": "tests/test_app.py"}, "Write blocked: test-only")
 
-    assert stats.tool_count == 2
+    assert stats.tool_count == 3
     assert stats.read_paths == ["src/app.py"]
-    assert stats.write_paths == ["tests/test_app.py"]
+    assert stats.write_paths == ["src/new.py", "tests/test_app.py"]
+    assert stats.write_outcomes == ["write_file src/new.py: Wrote 12 bytes to src/new.py"]
     assert stats.tool_errors == ["edit_file: Write blocked: test-only"]

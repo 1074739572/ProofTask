@@ -192,6 +192,10 @@ class AgentTaskStats:
     tool_names: list[str] = field(default_factory=list)
     read_paths: list[str] = field(default_factory=list)
     write_paths: list[str] = field(default_factory=list)
+    # Short, content-free acknowledgements from successful write tools.  Goal
+    # handoffs need these to distinguish an approved request from a write that
+    # actually reached the filesystem.
+    write_outcomes: list[str] = field(default_factory=list)
     tool_errors: list[str] = field(default_factory=list)
     write_audits: list[str] = field(default_factory=list)
     elapsed_seconds: float = 0.0
@@ -210,6 +214,8 @@ class AgentTaskStats:
             audit = re.search(r"sha256\s+([0-9a-f]{12,64})\s*->\s*([0-9a-f]{12,64})", detail, re.IGNORECASE)
             if audit:
                 self.write_audits.append(audit.group(0))
+            if detail.startswith(("Wrote ", "Edited ", "Patched ")):
+                self.write_outcomes.append(f"{name} {path}: {detail[:300]}")
         if detail.lower().startswith((
             "error",
             "write blocked",

@@ -72,8 +72,22 @@ def recent_decisions(state, *, limit: int = 12) -> list[dict[str, Any]]:
     return [row for row in rows if isinstance(row, dict)][-limit:]
 
 
-def write_handoff(state, task, *, phase: str, summary: str = "") -> None:
+def load_handoff(state) -> dict[str, Any]:
+    data = _read_json(_root(state) / "handoff.json", {})
+    return data if isinstance(data, dict) else {}
+
+
+def write_handoff(
+    state,
+    task,
+    *,
+    phase: str,
+    summary: str = "",
+    execution: dict[str, Any] | None = None,
+) -> None:
     """Snapshot the exact facts a fresh internal worker needs, never chat logs."""
+    previous = load_handoff(state)
+    previous_execution = previous.get("execution") if isinstance(previous.get("execution"), dict) else {}
     payload = {
         "goal_id": state.id,
         "phase": phase,
@@ -90,6 +104,10 @@ def write_handoff(state, task, *, phase: str, summary: str = "") -> None:
         },
         "decisions": recent_decisions(state),
         "summary": summary[:4_000],
+        # An ACT slice starts as a fresh model conversation. Preserve the
+        # last bounded tool facts so it can resume from an execution checkpoint
+        # instead of rediscovering the same path or tool failure.
+        "execution": dict(execution) if isinstance(execution, dict) else previous_execution,
         "updated_at": time.time(),
     }
     _atomic_json(_root(state) / "handoff.json", payload)
