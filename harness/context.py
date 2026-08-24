@@ -8,12 +8,14 @@ from harness.teams.bus import active_teammates
 
 
 def update_context(context: dict, messages: list) -> dict:
-    memories = ""
-    memory_index = get_workspace_paths().memory_index
-    if memory_index.exists():
-        # MEMORY.md may be hand-edited or written by older releases in a
-        # non-UTF-8 encoding; never let a decode error break the turn.
-        memories = memory_index.read_text(encoding="utf-8", errors="replace")[:2000]
+    memories = context.get("memories")
+    if memories is None:
+        memories = ""
+        memory_index = get_workspace_paths().memory_index
+        if memory_index.exists():
+            # Snapshot memory at session/open time. Re-reading it on every tool
+            # round unnecessarily changes prompt input and defeats caching.
+            memories = memory_index.read_text(encoding="utf-8", errors="replace")[:2000]
     return {
         **context,
         "memories": memories,

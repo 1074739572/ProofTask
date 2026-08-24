@@ -227,6 +227,14 @@ class TestCompactHistoryTail(unittest.TestCase):
         ]
         self.assertEqual(find_latest_user_text(messages), "real ask")
 
+    def test_find_latest_user_skips_reminder_and_harness_injections(self) -> None:
+        messages = [
+            {"role": "user", "content": "real ask"},
+            {"role": "user", "content": "<reminder>\nupdate todos\n</reminder>"},
+            {"role": "user", "content": "[Harness] continue the current goal"},
+        ]
+        self.assertEqual(find_latest_user_text(messages), "real ask")
+
 
 class TestMicroCompactPersist(unittest.TestCase):
     def test_micro_compact_persists_instead_of_hard_delete(self) -> None:

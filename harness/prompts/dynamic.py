@@ -170,3 +170,22 @@ def build_session_context(
         )
 
     return "\n\n".join(sections)
+
+
+def build_stable_session_context(context: dict) -> str:
+    """Session/task-scoped instructions suitable for the provider system prompt.
+
+    Omit volatile operational data. Time comes from a tool when needed; tool
+    schemas already describe MCP availability; todo updates and background
+    results are durable conversation events. This shape changes only when a
+    user intentionally changes task/mode-level state.
+    """
+    return build_session_context(
+        context,
+        include_time=False,
+        include_model=False,
+        include_mcp=False,
+        include_teammates=False,
+        include_todos=False,
+        include_project_instructions=False,
+    )

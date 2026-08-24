@@ -31,6 +31,7 @@ from harness.hooks import trigger_hooks
 from harness.llm import create_message
 from harness.mcp.pool import ensure_mcp_ready, take_mcp_bootstrap_warnings
 from harness.messages.blocks import block_field, block_text, has_displayable_text, is_text, is_tool_use
+from harness.messages.injections import is_harness_injection_text
 from harness.messages.repair import finalize_cancelled_tool_round, repair_tool_pairing
 from harness.models import get_model
 from harness.modes import mode_auto_route, mode_enables_task, mode_lead_model_hint
@@ -75,8 +76,10 @@ def _latest_plain_user(messages: list) -> str:
         if msg.get("role") != "user":
             continue
         content = msg.get("content")
-        if isinstance(content, str) and content.strip() and not content.startswith("["):
-            return content.strip()
+        if isinstance(content, str) and content.strip():
+            text = content.strip()
+            if not is_harness_injection_text(text):
+                return text
     return ""
 
 
@@ -114,8 +117,9 @@ def call_llm(
         context,
         base_system=context.get("system_override"),
     )
-    # Session state belongs to the provider system prompt. Do not prefix or
-    # duplicate the user's first message with internal runtime instructions.
+    # The provider sees only the durable conversation history. Session/task
+    # instructions live in ``system``; volatile state arrives through tools or
+    # event messages when it actually changes.
     api_messages = list(messages)
     # Subagent-enabled modes may bind a coordinator model independently from
     # the user's direct model selection. Recovery fallback remains highest priority.

@@ -7,12 +7,8 @@ import json
 from dataclasses import dataclass, field
 from typing import Callable, Literal
 
+from harness.prompts import assemble_system_prompt
 from harness.prompts.dynamic import build_session_context
-from harness.prompts.ephemeral import (
-    EPHEMERAL_MARKER,
-    build_ephemeral_user_message,
-    messages_with_ephemeral_context,
-)
 from harness.prompts.static import assemble_static_system_prompt
 
 StrategyName = Literal[
@@ -113,25 +109,18 @@ def _session_context_options(strategy: StrategyName) -> dict:
     return {}
 
 
-def _build_legacy_system(context: dict, strategy: StrategyName) -> str:
+def _build_legacy_system(
+    context: dict,
+    strategy: StrategyName,
+    *,
+    runtime_tick: int | None = None,
+) -> str:
     static = assemble_static_system_prompt()
     opts = _session_context_options(strategy)
     dynamic = build_session_context(context, **opts)
+    if runtime_tick is not None and opts.get("include_time", True):
+        dynamic += f"\n\nCurrent time (simulated): 2026-01-01T10:{runtime_tick:02d}:00"
     return f"{static}\n\n{dynamic}" if dynamic.strip() else static
-
-
-def _ephemeral_body(context: dict, strategy: StrategyName) -> str:
-    opts = _session_context_options(strategy)
-    return build_session_context(context, **opts).strip()
-
-
-def _wrap_ephemeral(body: str) -> str:
-    return (
-        f"{EPHEMERAL_MARKER}\n"
-        "The following is current harness session state (not a new user request). "
-        "Use it together with the conversation above.\n\n"
-        f"{body}"
-    )
 
 
 def build_request_payload(
@@ -141,22 +130,21 @@ def build_request_payload(
     context: dict,
     tools_blob: str,
     last_ephemeral_body: str | None = None,
+    runtime_tick: int | None = None,
 ) -> tuple[str, list[dict], str | None]:
     """Return (system, api_messages, ephemeral_body_used)."""
     if strategy == "legacy_system":
-        return _build_legacy_system(context, strategy), list(messages), None
+        return (
+            _build_legacy_system(context, strategy, runtime_tick=runtime_tick),
+            list(messages),
+            None,
+        )
 
-    system = assemble_static_system_prompt()
-    body = _ephemeral_body(context, strategy)
-
-    if strategy == "ephemeral_if_unchanged" and body and body == last_ephemeral_body:
-        return system, list(messages), None
-
-    if not body:
-        return system, list(messages), None
-
-    ephemeral = _wrap_ephemeral(body)
-    return system, [*messages, {"role": "user", "content": ephemeral}], body
+    # ``current`` mirrors the live generic agent: all request-level input is
+    # durable history, while only session/task-scoped guidance appears in the
+    # system prompt. The legacy strategy above is intentionally the old bug.
+    _ = last_ephemeral_body, runtime_tick
+    return assemble_system_prompt(context), list(messages), None
 
 
 def canonical_request_string(system: str, tools_blob: str, messages: list[dict]) -> str:
@@ -240,6 +228,10 @@ def simulate_tool_loop(
             context=context,
             tools_blob=tools_blob,
             last_ephemeral_body=last_ephemeral_body,
+            # A tool loop can cross minute boundaries. This synthetic clock
+            # catches exactly the regression where dynamic system assembly
+            # invalidates the request prefix after the cache's first block.
+            runtime_tick=index,
         )
         if ephemeral_body is not None:
             last_ephemeral_body = ephemeral_body
@@ -247,19 +239,13 @@ def simulate_tool_loop(
         current = canonical_request_string(system, tools_blob, api_messages)
         hit, miss = split_hit_miss(previous, current)
 
-        ephemeral_text = ""
-        if api_messages and api_messages[-1].get("role") == "user":
-            content = api_messages[-1].get("content", "")
-            if isinstance(content, str) and content.startswith(EPHEMERAL_MARKER):
-                ephemeral_text = content
-
         result.rounds.append(
             RoundMetrics(
                 round_index=index + 1,
                 hit_tokens=hit,
                 miss_tokens=miss,
                 input_tokens=hit + miss,
-                ephemeral_tokens=estimate_tokens(ephemeral_text),
+                ephemeral_tokens=0,
                 history_tokens=estimate_tokens(
                     json.dumps(messages, ensure_ascii=False)
                 ),
@@ -321,10 +307,6 @@ def run_all_simulations(
     names: list[StrategyName] = strategies or [
         "legacy_system",
         "current",
-        "ephemeral_if_unchanged",
-        "time_minute",
-        "time_none",
-        "slim_context",
     ]
     return [simulate_tool_loop(name, rounds=rounds) for name in names]
 

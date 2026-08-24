@@ -1,7 +1,8 @@
 """Load user-project instructions (HARNESS.md / AGENTS.md) at session start.
 
 Product path (not Cursor/Claude IDE rules): walk up from WORKDIR, prefer
-HARNESS.md over AGENTS.md, nearest file wins, inject via ephemeral context.
+HARNESS.md over AGENTS.md, nearest file wins, inject into the stable session
+prompt prefix.
 """
 
 from __future__ import annotations
@@ -155,7 +156,7 @@ def apply_project_instructions(
     start: Path | None = None,
     max_chars: int | None = None,
 ) -> ProjectMdLoad:
-    """Load once and store on ``context`` for ephemeral injection."""
+    """Load once and store on ``context`` for stable prompt assembly."""
     result = find_project_md(start, max_chars=max_chars)
     context[CTX_TEXT] = result.text
     context[CTX_SOURCE] = result.source_name
@@ -166,7 +167,7 @@ def apply_project_instructions(
 
 
 def format_project_instructions_block(context: dict) -> str:
-    """Markdown/XML block for ephemeral session context (empty if none)."""
+    """Markdown/XML block for the stable session prompt (empty if none)."""
     text = (context.get(CTX_TEXT) or "").strip()
     if not text:
         return ""

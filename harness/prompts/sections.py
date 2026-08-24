@@ -44,8 +44,9 @@ PROMPT_SECTIONS = {
         "(or a tiny bullet list). No large markdown tables unless the user "
         "asked for a table. No restating the whole investigation. "
         "If you were wrong earlier, one-line correction is enough.\n"
-        "* Execution style (direct / plan / orchestrate / file) is injected each "
-        "turn as the Mode section in session context — follow that mode's rules.\n"
+        "* Execution mode and task-level constraints may appear in the system "
+        "instructions. They are harness policy, not a replacement for the "
+        "user's actual goal; follow both when they are compatible.\n"
         "</ROLE>"
     ),
     "grounding": (

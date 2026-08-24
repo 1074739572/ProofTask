@@ -3,21 +3,9 @@
 from __future__ import annotations
 
 from harness.messages.repair import repair_tool_pairing, strip_trailing_incomplete_tool_turns
+from harness.messages.injections import is_harness_injection_text
 from harness.project.session_registry import SessionBinding
 from harness.project.session_store import replace_session
-
-# User-role messages that are harness injections, not CLI turns.
-_SKIP_PREFIXES = (
-    "[Scheduled]",
-    "[Inbox]",
-    "<reminder>",
-    "[Compacted]",
-    "[Reactive compact]",
-    "[Session resumed]",
-    "[Resume context]",
-    "[Skill loaded:",
-    "[Compacted. Continue",
-)
 
 
 def is_user_turn(message: dict) -> bool:
@@ -30,7 +18,7 @@ def is_user_turn(message: dict) -> bool:
     text = content.strip()
     if not text:
         return False
-    return not any(text.startswith(prefix) for prefix in _SKIP_PREFIXES)
+    return not is_harness_injection_text(text)
 
 
 def find_last_turn_index(messages: list) -> int | None:

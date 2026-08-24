@@ -3,20 +3,9 @@
 from __future__ import annotations
 
 from harness.messages.blocks import block_type
+from harness.messages.injections import is_harness_injection_text
 
 LATEST_USER_FOCUS_MARKER = "[Current user request]"
-
-_SKIP_USER_PREFIXES = (
-    "[Compacted]",
-    "[Reactive compact]",
-    "[Current user request]",
-    "[Scheduled]",
-    "[Inbox]",
-    "[snipped ",
-    "<session-context>",
-    "<persisted-output",
-)
-
 
 def message_has_tool_use(message: dict) -> bool:
     if message.get("role") != "assistant":
@@ -73,7 +62,7 @@ def _user_text_content(message: dict) -> str | None:
 
 
 def _is_harness_system_user_text(text: str) -> bool:
-    return any(text.startswith(prefix) for prefix in _SKIP_USER_PREFIXES)
+    return text.startswith(LATEST_USER_FOCUS_MARKER) or is_harness_injection_text(text)
 
 
 def find_latest_user_text(messages: list) -> str | None:

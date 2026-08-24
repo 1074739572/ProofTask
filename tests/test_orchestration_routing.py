@@ -77,6 +77,7 @@ def test_call_llm_keeps_the_literal_user_message_clean() -> None:
         assert call_llm(messages, {}, [], RecoveryState(), 1000) is response
 
     assert create.call_args.kwargs["system"] == "runtime system"
+    assert messages == [{"role": "user", "content": "Explain this error in plain Chinese."}]
     assert create.call_args.kwargs["messages"] == messages
     assemble.assert_called_once_with({}, base_system=None)
 

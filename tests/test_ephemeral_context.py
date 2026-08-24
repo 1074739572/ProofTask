@@ -1,4 +1,4 @@
-"""Regression tests for stateless per-request dynamic context."""
+"""Regression tests for legacy cache-experiment context helpers."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ def test_runtime_ephemeral_policy_is_always_for_stateless_requests() -> None:
     assert ephemeral_policy() == "always"
 
 
-def test_ephemeral_context_is_present_on_every_api_request() -> None:
+def test_ephemeral_context_is_present_on_every_experiment_request() -> None:
     messages = [{"role": "user", "content": "implement this"}]
     with patch("harness.prompts.ephemeral.build_session_context", return_value="Mode: plan"):
         first = messages_with_ephemeral_context(messages, {})

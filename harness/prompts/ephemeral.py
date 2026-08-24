@@ -1,8 +1,4 @@
-"""Legacy user-message context helpers for prompt-cache experiments.
-
-The live agent sends runtime state through the provider system prompt. These
-helpers remain for the cache experiment module and session-history filtering.
-"""
+"""Legacy user-message context helpers for cache experiments and migration."""
 
 from __future__ import annotations
 
