@@ -22,5 +22,11 @@
     "type": "openai",
     "base_url": "https://api.deepseek.com",
     "api_key_env": "DEEPSEEK_API_KEY"
+  },
+  "kapibala": {
+    "label": "kapibala",
+    "type": "openai",
+    "base_url": "https://kapibala.asia/v1",
+    "api_key_env": "kapibala_API_KEY"
   }
 }

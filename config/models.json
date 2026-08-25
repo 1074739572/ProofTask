@@ -10,6 +10,14 @@
       "effort_options": ["low", "high", "max"]
     },
     {
+      "id": "ox-alpha-free",
+      "provider": "opencode",
+      "label": "Ox Alpha Free",
+      "api_model": "ox-alpha-free",
+      "context_window": 1000000,
+      "effort_options": ["max"]
+    },
+    {
       "id": "deepseek-v4-pro",
       "provider": "deepseek",
       "label": "DeepSeek V4 Pro",
@@ -19,22 +27,14 @@
       "effort_options": ["low", "high", "max"]
     },
     {
-      "id": "mimo-v2.5-pro",
+      "id": "mimo-v2.5",
       "provider": "xiaomi-mimo",
-      "label": "Xiaomi MiMo V2.5 Pro (long-context explorer)",
-      "api_model": "mimo-v2.5-pro",
+      "label": "Xiaomi MiMo V2.5 (long-context explorer)",
+      "api_model": "mimo-v2.5",
       "context_window": 1000000
     },
     {
-      "id": "gpt-5.6",
-      "provider": "anzhiyu",
-      "label": "GPT-5.6",
-      "api_model": "gpt-5.6",
-      "context_window": 1000000,
-      "effort_options": ["medium", "high", "xhigh", "max"]
-    },
-    {
-      "id": "gpt-5.6-terra",
+      "id": "gpt-5.6-terra(jiaweisi)",
       "provider": "anzhiyu",
       "label": "GPT-5.6 Terra",
       "api_model": "gpt-5.6-terra",
@@ -43,11 +43,19 @@
     },
     {
       "id": "gpt-5.6-sol",
-      "provider": "anzhiyu",
-      "label": "GPT-5.6 Sol (高规格)",
+      "provider": "kapibala",
+      "label": "GPT-5.6 sol",
       "api_model": "gpt-5.6-sol",
       "context_window": 1000000,
       "reasoning_effort": "high",
+      "effort_options": ["medium", "high", "xhigh", "max"]
+    },
+    {
+      "id": "gpt-5.6-terra",
+      "provider": "kapibala",
+      "label": "GPT-5.6 Terra",
+      "api_model": "gpt-5.6-terra",
+      "context_window": 1000000,
       "effort_options": ["medium", "high", "xhigh", "max"]
     }
   ]
