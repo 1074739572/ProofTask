@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from harness.agent.cancel import clear_cancel, request_cancel
+from harness.change_session import ChangeSession, ChangeSessionError
 from harness.agents.runner import AgentTaskConversation, AgentTaskStats, run_agent_task
 from harness.evaluation import run_task_evaluation
 from harness.goal.engine import GoalEngine
@@ -316,6 +317,27 @@ def get_goal_status() -> str:
     return format_goal_status(state) if state else "No goal in this workspace."
 
 
+def _create_goal_change_session(workspace_root: Path, execution_workspace: Path, goal_id: str) -> tuple[ChangeSession | None, Path]:
+    """Create an isolated Goal checkout and map a nested project into it."""
+    try:
+        session = ChangeSession.create(workspace_root, session_id=goal_id)
+    except ChangeSessionError as exc:
+        message = str(exc).lower()
+        if "not a git repository" in message or "no head commit" in message:
+            return None, execution_workspace
+        raise ValueError(f"Goal isolation unavailable: {exc}") from exc
+    try:
+        relative = execution_workspace.relative_to(workspace_root)
+    except ValueError:
+        session.remove()
+        raise ValueError("Goal execution workspace must be inside the workspace root")
+    mapped = (session.execution_worktree / relative).resolve()
+    if not mapped.is_dir():
+        session.remove()
+        raise ValueError(f"Goal execution project is missing in isolated worktree: {relative}")
+    return session, mapped
+
+
 def start_goal(request: GoalRequest, *, history: list, context: dict, binding: Any) -> GoalState:
     global _runner
     _reap_runner()
@@ -344,14 +366,22 @@ def start_goal(request: GoalRequest, *, history: list, context: dict, binding: A
             raise ValueError(f"invalid Goal execution workspace: {exc}") from exc
         if not execution_workspace.is_dir() or not execution_workspace.is_relative_to(workspace_root):
             raise ValueError("Goal execution workspace must be an existing directory inside the current workspace")
+        goal_id = f"goal_{time.time_ns()}_{hashlib.sha1(request.target.encode('utf-8')).hexdigest()[:4]}"
+        change_session, isolated_execution_workspace = _create_goal_change_session(
+            workspace_root, execution_workspace, goal_id
+        )
         state = GoalState.new(
             target=request.target, verification=request.verification, workspace=str(workspace_root),
-            execution_workspace=str(execution_workspace),
+            execution_workspace=str(isolated_execution_workspace),
             workspace_generation=workspace_generation(), evaluation_required=request.evaluation_required,
             worker_round_limit=request.worker_round_limit,
             operation_timeout_seconds=request.operation_timeout_seconds,
             draft_id=request.draft_id,
         )
+        if change_session is not None:
+            state.change_session_id = change_session.session_id
+            state.change_worktree = str(change_session.execution_worktree)
+            state.change_base_commit = change_session.base_commit
         if request.task_plan:
             state.task_plan = [dict(item) for item in request.task_plan]
         state.goal_contract = dict(request.goal_contract or {
@@ -383,6 +413,11 @@ def start_goal(request: GoalRequest, *, history: list, context: dict, binding: A
         except BaseException:
             _runner = None
             release_goal_lease(state, lease_token)
+            if change_session is not None:
+                try:
+                    change_session.remove()
+                except ChangeSessionError:
+                    pass
             raise
 
 
@@ -3494,6 +3529,37 @@ class GoalRunner(threading.Thread):
 
         self._record_final_verification(state, status="passed" if result.passed else "failed", result=result)
         if result.passed:
+            if state.change_worktree:
+                try:
+                    session = ChangeSession.attach(
+                        state.workspace,
+                        state.change_worktree,
+                        base_commit=state.change_base_commit,
+                        session_id=state.change_session_id or state.id,
+                    )
+                    merge_status = session.merge_to_main()
+                except ChangeSessionError as exc:
+                    merge_status = "conflict"
+                    state.last_error = f"change session merge unavailable: {exc}"
+                state.supervision = {
+                    **(state.supervision if isinstance(state.supervision, dict) else {}),
+                    "merge_status": merge_status,
+                    "merge_session": state.change_session_id,
+                    "merge_updated_at": time.time(),
+                }
+                save_goal(state)
+                if merge_status != "merged":
+                    state.last_error = state.last_error or "Worker changes conflict with the main workspace."
+                    self._pause(state, "merge_conflict", stop_reason=StopReason.merge_conflict.value)
+                    return
+                try:
+                    session.remove()
+                except ChangeSessionError:
+                    # The merged worktree may already be gone or unremovable;
+                    # it must never block a completed Goal.
+                    pass
+                state.change_worktree = ""
+                state.change_session_id = ""
             self._apply(state, GoalPhase.DONE, "goal_verification_passed")
         elif getattr(result, "error", None) or getattr(result, "timed_out", False):
             detail = getattr(result, "error", None) or "full verification timed out"

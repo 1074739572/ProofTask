@@ -75,6 +75,7 @@ class StopReason(str, Enum):
     internal_error = "internal_error"
     execution_preflight_failed = "execution_preflight_failed"
     task_blocked = "task_blocked"
+    merge_conflict = "merge_conflict"
 
 
 _VALID_PHASES = frozenset(phase.value for phase in GoalPhase)
@@ -95,6 +96,10 @@ class GoalState:
     # Code, tests, and workers may operate in a nested project while Goal
     # state continues to live in the workspace-level .project directory.
     execution_workspace: str = ""
+    # Durable attribution metadata for isolated Goal execution.
+    change_session_id: str = ""
+    change_worktree: str = ""
+    change_base_commit: str = ""
     # The plan is persisted before task creation.  Each item maps to exactly
     # one durable Task; there is no Feature projection in Goal mode.
     task_ids: list[str] = field(default_factory=list)
