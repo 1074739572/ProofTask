@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from harness.settings import get_workdir
+from harness.verification import VerificationContext, select_adapter
 from harness.verification.catalog import TestCatalog, build_pytest_command, collect_pytest_catalog
 
 PLANNER_AGENT = "goal_planner"
@@ -409,6 +410,7 @@ def build_plan_prompt(
     human_language: str = "English",
     frozen_contract: dict[str, Any] | None = None,
     completed_task_names: tuple[str, ...] = (),
+    replan_reason: str = "",
 ) -> str:
     """Prompt for the read-only planner. Output is a GoalPlan v2 object."""
     catalog_text = (test_catalog or TestCatalog(error="not collected")).prompt_text(limit=PLANNER_CATALOG_LIMIT)
@@ -428,6 +430,11 @@ def build_plan_prompt(
             "Tasks for unfinished work. Completed Tasks are historical facts and must not be emitted again. "
             "A replacement Task may depend on one of these already completed Task names: "
             f"{json.dumps(list(completed_task_names), ensure_ascii=False)}.\n"
+            "Use the replan trigger below to correct task boundaries. Every acceptance case assigned "
+            "to a Task must be satisfiable by that Task and its completed dependencies; do not assign "
+            "a runtime integration acceptance case to an earlier Task when its execution route is a "
+            "separate pending Task.\n"
+            f"Replan trigger evidence:\n{replan_reason[:12_000] or '(none supplied)'}\n"
             f"Frozen goal_contract:\n{json.dumps(_contract_projection(frozen_contract), ensure_ascii=False)}\n\n"
         )
     return (
@@ -886,14 +893,13 @@ def plan_tasks(
     human_language: str = "English",
     frozen_contract: dict[str, Any] | None = None,
     completed_task_names: tuple[str, ...] = (),
+    replan_reason: str = "",
 ) -> GoalPlan:
     """Compile, validate, and independently review a GoalPlan v2."""
     from harness.agents.runner import AgentTaskStats, run_agent_task as default_runner
 
     root = (workspace or get_workdir()).resolve()
     if verification_adapter is None:
-        from harness.verification import VerificationContext, select_adapter
-
         verification_adapter = select_adapter(root, full_verification)
     catalog = test_catalog if test_catalog is not None else verification_adapter.discover(VerificationContext(root, command=full_verification))
     runner = planner_runner or default_runner
@@ -904,6 +910,7 @@ def plan_tasks(
         human_language=human_language,
         frozen_contract=frozen_contract,
         completed_task_names=completed_task_names,
+        replan_reason=replan_reason,
     )
     planner_call = {
         "description": "decompose goal into verifiable tasks",

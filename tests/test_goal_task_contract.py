@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from types import SimpleNamespace
 
 from harness.goal.planner import TaskPlan, discovery_readiness_error, parse_plan
 from harness.goal.models import GoalPhase, GoalState
@@ -2128,6 +2129,112 @@ def test_repair_plan_json_format_failure_resumes_current_task(tmp_path, monkeypa
     repaired = tasks.load_task(task.id)
     assert repaired.repair_history[-1]["event"] == "repair_planner_format_fallback"
     assert repaired.repair_history[-1]["format_fallback"] is True
+
+
+def test_repair_plan_json_format_failure_replans_after_repair_threshold(tmp_path, monkeypatch):
+    import harness.goal.repair as repair_mod
+    import harness.goal.runner as runner_mod
+    import harness.tasks as tasks
+    from harness.goal.repair import RepairDecision
+
+    monkeypatch.setattr(tasks, "TASKS_DIR", tmp_path / ".tasks")
+    task = tasks.create_task("repair", "behavior", verification_spec={})
+    tasks.claim_task(task.id)
+    tasks.record_task_evaluation(task.id, {"passed": False, "route": "implementation_fix"})
+    for _ in range(4):
+        tasks.record_task_repair(task.id, {"repair_epoch": 0, "action": "implementation_fix"})
+    state = GoalState.new(target="repair", verification="pytest -q", workspace=str(tmp_path))
+    state.current_task_id = task.id
+    state.task_ids = [task.id]
+    state.phase = GoalPhase.REPAIR_PLAN.value
+    monkeypatch.setattr(runner_mod, "save_goal", lambda state: None)
+    monkeypatch.setattr(
+        repair_mod,
+        "plan_task_repair",
+        lambda *args, **kwargs: RepairDecision("blocked", "", error="repair planner returned no JSON", unavailable=True),
+    )
+    captured = {}
+    monkeypatch.setattr(
+        GoalRunner,
+        "_replan_remaining_tasks",
+        lambda self, state, *, task, evaluation, reason: captured.update(
+            task=task.id, route=evaluation["route"], reason=reason
+        ),
+    )
+
+    GoalRunner(state=state, history=[], context={}, binding=None)._repair_plan(state)
+
+    repaired = tasks.load_task(task.id)
+    assert captured["task"] == task.id
+    assert captured["route"] == "replan"
+    assert repaired.repair_history[-1]["action"] == "replan"
+    assert repaired.repair_history[-1]["format_fallback"] is True
+
+
+def test_malformed_repair_output_preserves_route_and_records_bounded_audit():
+    from harness.goal.repair import plan_task_repair
+
+    state = GoalState.new(target="repair", verification="pytest -q", workspace=".")
+    task = SimpleNamespace(
+        id="task_demo",
+        subject="repair",
+        description="repair behavior",
+        primary_write=[],
+        planned_new=[],
+        conditional_write=[],
+        read_envelope=[],
+        acceptance_cases=[],
+        verification_spec={},
+        last_error="",
+        start_snapshot="",
+        start_diff="",
+    )
+    replies = iter((
+        "first malformed C:/Users/example/workspace token=private-value",
+        "second malformed /home/example/project password: private-value",
+    ))
+
+    decision = plan_task_repair(
+        state,
+        task,
+        {"passed": False, "route": "replan", "summary": "task boundaries conflict"},
+        cwd=".",
+        runner=lambda **kwargs: next(replies),
+    )
+
+    assert decision.action == "replan"
+    assert decision.format_fallback is True
+    assert "C:/Users" not in decision.raw_output_tail
+    assert "/home/example" not in decision.correction_output_tail
+    assert "private-value" not in decision.raw_output_tail
+    assert "private-value" not in decision.correction_output_tail
+    assert "[redacted-host-path]" in decision.raw_output_tail
+    assert "token=[redacted]" in decision.raw_output_tail
+    assert len(decision.raw_output_sha256) == 64
+    assert len(decision.correction_output_sha256) == 64
+
+
+def test_repair_planner_runs_tool_free():
+    from harness.goal.repair import plan_task_repair
+
+    state = GoalState.new(target="repair", verification="pytest -q", workspace=".")
+    task = SimpleNamespace(
+        id="task_demo", subject="repair", description="repair behavior",
+        primary_write=[], planned_new=[], conditional_write=[], read_envelope=[],
+        acceptance_cases=[], verification_spec={}, last_error="", start_snapshot="", start_diff="",
+    )
+    calls = []
+
+    decision = plan_task_repair(
+        state,
+        task,
+        {"passed": False, "route": "implementation_fix"},
+        cwd=".",
+        runner=lambda **kwargs: calls.append(kwargs) or '{"action":"implementation_fix","instructions":"apply fix"}',
+    )
+
+    assert decision.action == "implementation_fix"
+    assert calls[0]["tools_override"] == ()
 
 
 def test_goal_worker_context_excludes_stale_cli_state():

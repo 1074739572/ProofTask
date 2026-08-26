@@ -3320,6 +3320,17 @@ class GoalRunner(threading.Thread):
                 human_language=human_language_label((state.goal_contract or {}).get("language")),
                 frozen_contract=dict(state.goal_contract or {}),
                 completed_task_names=completed_names,
+                replan_reason=json.dumps(
+                    {
+                        "summary": reason,
+                        "evaluation": {
+                            "summary": evaluation.get("summary"),
+                            "route": evaluation.get("route"),
+                            "findings": evaluation.get("findings", []),
+                        },
+                    },
+                    ensure_ascii=False,
+                )[:12_000],
             )
         except Exception as exc:
             state.total_llm_rounds += stats.llm_rounds
@@ -3491,7 +3502,10 @@ class GoalRunner(threading.Thread):
             # A malformed model response is recoverable: use a bounded local
             # direction and let the normal repair-attempt/no-progress limits
             # prevent an endless loop.
-            decision = fallback_repair_decision(state.last_error)
+            decision = fallback_repair_decision(
+                state.last_error,
+                route=str(evaluation.get("route") or "implementation_fix"),
+            )
         self._observe_supervisor(
             "agent_finished",
             detail=self._agent_stats_detail(

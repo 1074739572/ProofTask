@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import re
+import hashlib
+from dataclasses import replace
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -13,7 +15,15 @@ from harness.goal.planner import PLANNER_MAX_ROUNDS
 REPAIR_AGENT = "goal_repair_planner"
 REPAIR_ACTIONS = frozenset({"implementation_fix", "test_gap", "replan", "blocked"})
 GOAL_REGRESSION_ACTIONS = frozenset({"reopen_existing", "create_repair_task", "pause"})
+MAX_REPAIR_RAW_OUTPUT_TAIL = 2_000
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL | re.IGNORECASE)
+_HOST_PATH_RE = re.compile(
+    r"(?<![\w])(?:[A-Za-z]:[\\/]|/(?:Users|home|tmp|var|private)/)[^\s\"']*",
+    re.IGNORECASE,
+)
+_SECRET_ASSIGNMENT_RE = re.compile(
+    r"(?i)\b(api[_-]?key|token|password|secret)\s*[:=]\s*[^\s,;\]}]+"
+)
 
 
 @dataclass(frozen=True)
@@ -25,6 +35,10 @@ class RepairDecision:
     error: str | None = None
     unavailable: bool = False
     format_fallback: bool = False
+    raw_output_tail: str = ""
+    raw_output_sha256: str = ""
+    correction_output_tail: str = ""
+    correction_output_sha256: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -35,6 +49,10 @@ class RepairDecision:
             "error": self.error,
             "unavailable": self.unavailable,
             "format_fallback": self.format_fallback,
+            "raw_output_tail": self.raw_output_tail,
+            "raw_output_sha256": self.raw_output_sha256,
+            "correction_output_tail": self.correction_output_tail,
+            "correction_output_sha256": self.correction_output_sha256,
         }
 
 
@@ -120,23 +138,68 @@ def parse_repair_decision(raw: str) -> RepairDecision:
     )
 
 
-def fallback_repair_decision(error: str | None) -> RepairDecision:
-    """Keep the current Task moving when the planner's structured output is unusable."""
+def _repair_output_audit(raw: str | None) -> tuple[str, str]:
+    text = str(raw or "")
+    tail = text[-MAX_REPAIR_RAW_OUTPUT_TAIL:]
+    redacted = _HOST_PATH_RE.sub("[redacted-host-path]", tail)
+    redacted = _SECRET_ASSIGNMENT_RE.sub(r"\1=[redacted]", redacted)
+    return redacted, hashlib.sha256(
+        text.encode("utf-8", errors="replace")
+    ).hexdigest()
+
+
+def _with_repair_output_audit(
+    decision: RepairDecision,
+    *,
+    raw: str | None,
+    corrected: str | None = None,
+) -> RepairDecision:
+    raw_tail, raw_hash = _repair_output_audit(raw)
+    corrected_tail, corrected_hash = _repair_output_audit(corrected)
+    return replace(
+        decision,
+        raw_output_tail=raw_tail,
+        raw_output_sha256=raw_hash,
+        correction_output_tail=corrected_tail,
+        correction_output_sha256=corrected_hash if corrected is not None else "",
+    )
+
+
+def fallback_repair_decision(
+    error: str | None,
+    *,
+    route: str = "implementation_fix",
+) -> RepairDecision:
+    """Preserve the deterministic repair route when planner JSON is unusable."""
     detail = str(error or "repair planner returned unusable JSON").strip()
-    return RepairDecision(
-        action="implementation_fix",
-        instructions=(
+    action = route if route in REPAIR_ACTIONS else "implementation_fix"
+    instructions_by_action = {
+        "implementation_fix": (
             "Resume the current Task and implement the smallest code fix supported by the "
             "existing verification evidence and frozen Goal Contract. Do not regenerate, "
             "remove, or weaken tests. Run the bound verification before reporting completion."
         ),
+        "test_gap": (
+            "Prepare focused bound tests for the uncovered acceptance behavior identified by "
+            "the existing evidence. Do not weaken or replace existing tests."
+        ),
+        "replan": (
+            "Recompile the unfinished Task contracts from the frozen Goal Contract and current "
+            "evaluation evidence. Split cross-task integration behavior into ordered, independently "
+            "verifiable Tasks before resuming implementation."
+        ),
+        "blocked": "",
+    }
+    return RepairDecision(
+        action=action,
+        instructions=instructions_by_action[action],
         assumptions=(
             {
-                "decision": "Continue the current implementation repair without a model-generated plan.",
+                "decision": f"Continue with the deterministic {action} route without a model-generated plan.",
                 "basis": "The repair planner returned unusable structured output; Task evidence and test bindings remain available.",
             },
         ),
-        summary="Repair planner returned invalid JSON; deterministic fallback continued the current Task.",
+        summary=f"Repair planner returned invalid JSON; deterministic fallback selected {action}.",
         error=f"repair planner format fallback: {detail}",
         unavailable=False,
         format_fallback=True,
@@ -213,6 +276,7 @@ def plan_task_repair(
             agent_type=REPAIR_AGENT,
             cwd=cwd,
             max_rounds=PLANNER_MAX_ROUNDS,
+            tools_override=(),
             cancel_check=cancel_check,
             deadline=deadline,
             stats=stats,
@@ -235,7 +299,7 @@ def plan_task_repair(
         "unsupported repair action:",
         "repair action needs instructions",
     )):
-        return decision
+        return _with_repair_output_audit(decision, raw=raw)
 
     # A completed model turn with malformed structured output is not a repair
     # attempt. Give it one bounded correction turn before the runner pauses;
@@ -254,6 +318,7 @@ def plan_task_repair(
             agent_type=REPAIR_AGENT,
             cwd=cwd,
             max_rounds=PLANNER_MAX_ROUNDS,
+            tools_override=(),
             cancel_check=cancel_check,
             deadline=deadline,
             stats=correction_stats,
@@ -274,8 +339,15 @@ def plan_task_repair(
         )
     corrected_decision = parse_repair_decision(corrected)
     if corrected_decision.unavailable:
-        return fallback_repair_decision(f"{corrected_decision.error} after JSON correction")
-    return corrected_decision
+        return _with_repair_output_audit(
+            fallback_repair_decision(
+                f"{corrected_decision.error} after JSON correction",
+                route=str(evaluation.get("route") or "implementation_fix"),
+            ),
+            raw=raw,
+            corrected=corrected,
+        )
+    return _with_repair_output_audit(corrected_decision, raw=raw, corrected=corrected)
 
 
 def plan_goal_regression_repair(

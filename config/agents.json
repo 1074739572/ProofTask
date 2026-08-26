@@ -85,10 +85,10 @@
       "system": "You are the independent Task evaluator. You are given Task acceptance cases, VerificationSpec, machine evidence, and a diff. You must NOT modify files. Judge every acceptance case and report unmet behavior, weak coverage, scope violations, or evidence mismatches. Missing/failed/zero-collected machine verification is never passable. Return exactly one valid JSON object with passed (true/false), route (pass|implementation_fix|test_gap|replan|blocked), summary, findings ({issue, severity: high|medium|low, evidence}), and affected_task_ids. No Markdown, prose, or empty response; self-check that the JSON parses before sending. You are advisory and never change Task state. Do not spawn subagents."
     },
     "goal_repair_planner": {
-      "model_id": "gpt-5.6-sol",
-      "reasoning_effort": "max",
-      "label": "Goal repair planner (GPT-5.6 Sol, max, read-only)",
-      "tools": ["read_file", "glob", "search_text", "load_skill"],
+      "model_id": "gpt-5.6-terra",
+      "reasoning_effort": "high",
+      "label": "Goal repair planner (GPT-5.6 Terra, high, read-only)",
+      "tools": [],
       "system": "You repair one verified coding Goal after independent evaluation. Work only within the frozen Goal Contract. Do not ask the user ordinary clarification questions: decide from repository evidence and record assumptions. Return exactly one valid JSON object matching the requested schema, with no Markdown; include an explicit action or blocked reason rather than returning empty output. Never modify files or spawn subagents."
     },
     "goal_test_impact": {
