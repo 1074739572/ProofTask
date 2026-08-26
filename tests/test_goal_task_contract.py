@@ -2574,6 +2574,33 @@ def test_frozen_test_imports_include_multiline_named_imports(tmp_path, monkeypat
     assert runner._frozen_test_imports(state, task) == {"src/shared.ts"}
 
 
+def test_frozen_test_imports_include_workspace_python_module_imports(tmp_path, monkeypatch):
+    import harness.tasks as tasks
+
+    monkeypatch.setattr(tasks, "TASKS_DIR", tmp_path / ".tasks")
+    source_path = tmp_path / "harness" / "goal" / "runner.py"
+    source_path.parent.mkdir(parents=True)
+    source_path.write_text("class GoalRunner: pass\n", encoding="utf-8")
+    test_path = tmp_path / "tests" / "test_scope.py"
+    test_path.parent.mkdir(parents=True)
+    test_path.write_text(
+        "from harness.goal.runner import GoalRunner\n\nassert GoalRunner\n",
+        encoding="utf-8",
+    )
+    task = tasks.create_task(
+        "import scan",
+        "keep working",
+        verification_spec={
+            "test_files": ["tests/test_scope.py"],
+            "test_hashes": {"tests/test_scope.py": hashlib.sha256(test_path.read_bytes()).hexdigest()},
+        },
+    )
+    state = GoalState.new(target="import scan", verification="pytest -q", workspace=str(tmp_path))
+    runner = GoalRunner(state=state, history=[], context={}, binding=None)
+
+    assert runner._frozen_test_imports(state, task) == {"harness/goal/runner.py"}
+
+
 def test_supervisor_cannot_expand_scope_outside_goal_envelope(tmp_path, monkeypatch):
     from harness.goal.coordinator import SupervisorDecision
 

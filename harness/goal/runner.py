@@ -1206,6 +1206,24 @@ class GoalRunner(threading.Thread):
                             imported.add(candidate.relative_to(root).as_posix())
                     except OSError:
                         continue
+            # Python tests generally name the production module with an
+            # absolute dotted import (``from harness.goal.runner import ...``).
+            # Resolve only a matching workspace module; standard-library and
+            # third-party imports cannot expand a Task's write scope.
+            for match in re.finditer(
+                r"(?m)^\s*(?:from\s+([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)\s+import\b|"
+                r"import\s+([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*))",
+                source,
+            ):
+                module = next((value for value in match.groups() if value), "")
+                if not module:
+                    continue
+                candidate = root.joinpath(*module.split(".")).with_suffix(".py")
+                try:
+                    if candidate.is_file() and candidate.is_relative_to(root):
+                        imported.add(candidate.relative_to(root).as_posix())
+                except OSError:
+                    continue
         return imported
 
     def _verification_scope_omission_candidates(self, state: GoalState, task: Any) -> tuple[str, ...]:
@@ -1321,6 +1339,8 @@ class GoalRunner(threading.Thread):
             conditional = plan.get("conditional_write") if isinstance(plan.get("conditional_write"), list) else []
             plan["primary_write"] = list(dict.fromkeys([*primary, *paths]))
             plan["conditional_write"] = [path for path in conditional if path not in paths]
+            if isinstance(plan.get("scope_paths"), list):
+                plan["scope_paths"] = list(dict.fromkeys([*plan["scope_paths"], *paths]))
             break
 
     def _handle_permission_boundary(
