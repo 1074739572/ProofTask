@@ -36,6 +36,9 @@ class Findings:
     error: str | None = None
     route: str = "blocked"
     affected_task_ids: list[str] = field(default_factory=list)
+    # A replan is valid only when the evaluator names the concrete production
+    # paths that fall outside the frozen Task contract.
+    required_write_paths: list[str] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -49,6 +52,7 @@ class Findings:
             "error": self.error,
             "route": self.route,
             "affected_task_ids": list(self.affected_task_ids),
+            "required_write_paths": list(self.required_write_paths),
         }
 
 
@@ -85,6 +89,29 @@ def _extract_json_block(text: str) -> str | None:
             if depth == 0:
                 return text[start : i + 1]
     return None
+
+
+def _required_write_paths(value: Any) -> list[str]:
+    """Normalize explicit evaluator scope requests without reading prose."""
+    if not isinstance(value, list):
+        return []
+    paths: list[str] = []
+    for item in value:
+        path = str(item or "").strip().replace("\\", "/")
+        while path.startswith("./"):
+            path = path[2:]
+        if (
+            not path
+            or path.startswith("/")
+            or re.match(r"^[A-Za-z]:/", path)
+            or ".." in path.split("/")
+            or path in paths
+        ):
+            continue
+        paths.append(path[:300])
+        if len(paths) == 16:
+            break
+    return paths
 
 
 def parse_findings(raw: str) -> Findings:
@@ -135,4 +162,11 @@ def parse_findings(raw: str) -> Findings:
         return Findings(passed=None, error="inconsistent evaluator verdict: failed result cannot use route='pass'")
     raw_affected = data.get("affected_task_ids")
     affected = [str(value)[:80] for value in raw_affected if str(value).strip()][:8] if isinstance(raw_affected, list) else []
-    return Findings(passed=passed, summary=summary, items=items, route=route, affected_task_ids=affected)
+    return Findings(
+        passed=passed,
+        summary=summary,
+        items=items,
+        route=route,
+        affected_task_ids=affected,
+        required_write_paths=_required_write_paths(data.get("required_write_paths")),
+    )

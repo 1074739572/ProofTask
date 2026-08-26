@@ -303,7 +303,7 @@ def test_evaluator_input_renders_all_bound_selectors_and_write_scope():
     assert selectors[-1] in rendered
 
 
-def test_scope_replan_is_required_when_evaluator_names_unapproved_source_file():
+def test_scope_replan_is_required_when_evaluator_declares_unapproved_write_path():
     from harness.evaluation.runner import _requires_scope_replan
 
     task = SimpleNamespace(
@@ -312,16 +312,28 @@ def test_scope_replan_is_required_when_evaluator_names_unapproved_source_file():
         conditional_write=[],
     )
     payload = {
-        "findings": [{
-            "issue": "runner integration remains mutable",
-            "evidence": "harness/goal/runner.py stores a mutable dict",
-        }],
+        "required_write_paths": ["harness/goal/runner.py"],
     }
 
     assert _requires_scope_replan(task, payload) is True
 
 
-def test_scope_replan_ignores_test_paths_named_in_evaluator_evidence():
+def test_scope_replan_ignores_test_only_explicit_write_paths():
+    from harness.evaluation.runner import _requires_scope_replan
+
+    task = SimpleNamespace(
+        primary_write=["harness/goal/sandbox.py"],
+        planned_new=[],
+        conditional_write=[],
+    )
+    payload = {
+        "required_write_paths": ["tests/test_goal_sandbox_config_snapshot.py"],
+    }
+
+    assert _requires_scope_replan(task, payload) is False
+
+
+def test_scope_replan_does_not_infer_required_paths_from_evaluator_prose():
     from harness.evaluation.runner import _requires_scope_replan
 
     task = SimpleNamespace(
@@ -331,9 +343,50 @@ def test_scope_replan_ignores_test_paths_named_in_evaluator_evidence():
     )
     payload = {
         "findings": [{
-            "issue": "coverage is incomplete",
-            "evidence": "tests/test_goal_sandbox_config_snapshot.py omits a fractional-limit case",
+            "issue": "runner integration needs review",
+            "evidence": "harness/goal/runner.py is relevant historical context",
         }],
     }
 
     assert _requires_scope_replan(task, payload) is False
+
+
+def test_evaluator_parser_preserves_explicit_required_write_paths():
+    parsed = parse_findings(
+        '{"passed":false,"route":"replan","summary":"scope",'
+        '"findings":[],"required_write_paths":["harness/goal/runner.py", "../ignored.py"]}'
+    )
+
+    assert parsed.required_write_paths == ["harness/goal/runner.py"]
+
+
+def test_task_evaluation_downgrades_unqualified_replan_to_task_repair(monkeypatch, tmp_path):
+    import harness.evaluation.runner as evaluation_runner
+    import harness.tasks as tasks
+    from harness.evaluation.parser import Findings
+
+    monkeypatch.setattr(tasks, "TASKS_DIR", tmp_path / ".tasks")
+    task = tasks.create_task(
+        "repair sandbox config",
+        goal_id="goal_demo",
+        primary_write=["harness/goal/sandbox.py"],
+    )
+    tasks.claim_task(task.id)
+    monkeypatch.setattr(evaluation_runner, "validate_agent_model", lambda _agent: None)
+    monkeypatch.setattr(evaluation_runner, "get_agent_profile", lambda _agent: SimpleNamespace(model_id="evaluator"))
+    monkeypatch.setattr(evaluation_runner, "collect_task_inputs", lambda *_args: SimpleNamespace())
+    monkeypatch.setattr(evaluation_runner, "build_evaluation_prompt", lambda _inputs: "prompt")
+    monkeypatch.setattr(
+        evaluation_runner,
+        "_run_evaluator",
+        lambda **_kwargs: (
+            Findings(passed=False, route="replan", summary="historical runner reference"),
+            {},
+        ),
+    )
+    monkeypatch.setattr(evaluation_runner, "capture_code_snapshot", lambda _workspace: "snapshot")
+
+    updated = evaluation_runner.run_task_evaluation(task.id, tmp_path)
+
+    assert updated.evaluation["route"] == "implementation_fix"
+    assert "lacked an explicit" in updated.evaluation["findings"][-1]["issue"]
