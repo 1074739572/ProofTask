@@ -2601,6 +2601,20 @@ def test_frozen_test_imports_include_workspace_python_module_imports(tmp_path, m
     assert runner._frozen_test_imports(state, task) == {"harness/goal/runner.py"}
 
 
+def test_routine_goal_events_do_not_start_parallel_supervisor_requests(tmp_path, monkeypatch):
+    import harness.goal.runner as runner_mod
+
+    state = GoalState.new(target="supervision", verification="pytest -q", workspace=str(tmp_path))
+    runner = GoalRunner(state=state, history=[], context={}, binding=None)
+    observed = []
+    runner._supervisor = type("Supervisor", (), {"observe": lambda _self, observation: observed.append(observation) or "obs-1"})()
+    monkeypatch.setattr(runner_mod, "save_goal", lambda _state: None)
+
+    runner._observe_supervisor("agent_finished", detail={"agent_type": "goal_worker"})
+
+    assert observed == []
+
+
 def test_supervisor_cannot_expand_scope_outside_goal_envelope(tmp_path, monkeypatch):
     from harness.goal.coordinator import SupervisorDecision
 

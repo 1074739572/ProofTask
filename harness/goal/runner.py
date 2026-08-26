@@ -55,6 +55,12 @@ class GoalBusyError(Exception):
 TEST_WRITER_MAX_ROUNDS = 8
 TEST_WRITER_MAX_IDLE_CHUNKS = 3
 MAX_PERMISSION_BOUNDARY_RETRIES = 3
+# Routine progress reports used to start an independent Sol request after
+# nearly every worker slice and phase transition.  They competed with the
+# implementation worker for the same provider connection while carrying a
+# large Goal snapshot.  Supervision remains synchronous at authority and
+# failure boundaries, where its decision can actually change execution.
+ROUTINE_SUPERVISION_EVENTS: frozenset[str] = frozenset()
 
 
 def _execution_workspace(state: GoalState) -> str:
@@ -1567,7 +1573,7 @@ class GoalRunner(threading.Thread):
         }
 
     def _observe_supervisor(self, event: str, *, detail: dict[str, Any] | None = None) -> None:
-        if self._supervisor is None:
+        if self._supervisor is None or event not in ROUTINE_SUPERVISION_EVENTS:
             return
         observation = self._supervisor_observation(event, detail=detail)
         observation_id = self._supervisor.observe(observation)
@@ -1716,7 +1722,6 @@ class GoalRunner(threading.Thread):
     def run(self) -> None:
         self._start_supervisor()
         try:
-            self._observe_supervisor("goal_runner_started")
             self._drive()
         except Exception as exc:
             self._fail(self._state, StopReason.internal_error, f"{type(exc).__name__}: {exc}")

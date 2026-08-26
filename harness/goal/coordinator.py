@@ -20,6 +20,9 @@ from harness.agents.runner import AgentTaskStats, run_agent_task
 
 
 SUPERVISOR_AGENT = "goal_supervisor"
+SUPERVISOR_MAX_OUTPUT_TOKENS = 1_500
+SUPERVISOR_MAX_OBSERVATION_CHARS = 12_000
+SUPERVISOR_TIMEOUT_SECONDS = 120
 SUPERVISOR_CORRECTION_TIMEOUT_SECONDS = 45
 SUPERVISOR_ACTIONS = frozenset({
     "continue",
@@ -146,7 +149,7 @@ def build_supervisor_prompt(observation: dict[str, Any]) -> str:
         "an unchanged, Task-bound test; do not use it for a guessed dependency, a test file, config, secrets, or any path "
         "outside the execution workspace. Do not approve arbitrary shell commands. Explain the failure and the next action "
         "in the Goal language.\n\n"
-        f"Observation:\n{json.dumps(observation, ensure_ascii=False, sort_keys=True)[:24_000]}"
+        f"Observation:\n{json.dumps(observation, ensure_ascii=False, sort_keys=True)[:SUPERVISOR_MAX_OBSERVATION_CHARS]}"
     )
 
 
@@ -174,6 +177,9 @@ def analyze_goal_observation(
             deadline=deadline,
             stats=stats,
             tools_override=(),
+            max_tokens=SUPERVISOR_MAX_OUTPUT_TOKENS,
+            stream_response=True,
+            max_request_attempts=1,
         )
     except Exception as exc:
         decision = SupervisorDecision(
@@ -214,6 +220,9 @@ def analyze_goal_observation(
                         deadline=time.monotonic() + SUPERVISOR_CORRECTION_TIMEOUT_SECONDS,
                         stats=retry_stats,
                         tools_override=(),
+                        max_tokens=SUPERVISOR_MAX_OUTPUT_TOKENS,
+                        stream_response=True,
+                        max_request_attempts=1,
                     )
                 except Exception as exc:
                     decision = SupervisorDecision(
@@ -255,7 +264,7 @@ class ParallelGoalSupervisor:
         analyzer=analyze_goal_observation,
     ):
         self.cwd = str(Path(cwd).resolve())
-        self.timeout_seconds = max(1, min(int(operation_timeout_seconds), 180))
+        self.timeout_seconds = max(1, min(int(operation_timeout_seconds), SUPERVISOR_TIMEOUT_SECONDS))
         self._cancel_check = cancel_check
         self._analyzer = analyzer
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="goal-supervisor")

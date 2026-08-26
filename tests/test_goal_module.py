@@ -306,6 +306,7 @@ def test_goal_agents_use_the_configured_plan_run_eval_profiles():
         "goal_repair_planner": ("gpt-5.6-sol", "max"),
         "goal_test_impact": ("mimo-v2.5", None),
         "goal_test_writer": ("gpt-5.6-terra", "high"),
+        "goal_supervisor": ("gpt-5.6-sol", "high"),
         "goal_worker": ("gpt-5.6-terra", "high"),
         "evaluator": ("gpt-5.6-terra", "high"),
     }

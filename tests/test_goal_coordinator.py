@@ -93,6 +93,26 @@ def test_supervisor_provider_failure_degrades_to_watch():
     assert "provider_error" in run.decision.error
 
 
+def test_supervisor_requests_are_short_streaming_and_not_retried():
+    calls = []
+
+    def fake_runner(**kwargs):
+        calls.append(kwargs)
+        return '{"action":"watch","summary":"healthy"}'
+
+    run = analyze_goal_observation(
+        {"observation_id": "obs-1", "revision": 1, "event": "act"},
+        cwd=".",
+        deadline=time.monotonic() + 10,
+        runner=fake_runner,
+    )
+
+    assert run.decision.action == "watch"
+    assert calls[0]["max_tokens"] == 1_500
+    assert calls[0]["stream_response"] is True
+    assert calls[0]["max_request_attempts"] == 1
+
+
 def test_parallel_supervisor_coalesces_pending_observations_to_latest():
     first_started = threading.Event()
     release_first = threading.Event()
