@@ -153,6 +153,7 @@ def verify_task_command(
     workspace: str | Path | None = None,
     timeout_s: float | None = None,
     cancel_check=None,
+    controller_authorized: bool = False,
 ):
     """Run a Task's bound selector command and persist its machine verdict."""
     from harness.tasks import load_task, save_task, set_task_verification_result
@@ -160,7 +161,10 @@ def verify_task_command(
     task = load_task(task_id)
     if _migrate_task_runner_to_bun(task, workspace):
         save_task(task)
-    passed, evidence, error = _run_task_verification(task, workspace=workspace, timeout_s=timeout_s, cancel_check=cancel_check)
+    passed, evidence, error = _run_task_verification(
+        task, workspace=workspace, timeout_s=timeout_s, cancel_check=cancel_check,
+        controller_authorized=controller_authorized,
+    )
     return set_task_verification_result(task_id, passed=passed, evidence=evidence, error=error)
 
 
@@ -170,6 +174,7 @@ def reverify_task_command(
     workspace: str | Path | None = None,
     timeout_s: float | None = None,
     cancel_check=None,
+    controller_authorized: bool = False,
 ):
     """Re-run a completed Task's binding during the final Goal gate."""
     from harness.tasks import load_task, record_task_reverification, save_task
@@ -177,7 +182,10 @@ def reverify_task_command(
     task = load_task(task_id)
     if _migrate_task_runner_to_bun(task, workspace):
         save_task(task, archived=task.status == "completed")
-    passed, evidence, error = _run_task_verification(task, workspace=workspace, timeout_s=timeout_s, cancel_check=cancel_check)
+    passed, evidence, error = _run_task_verification(
+        task, workspace=workspace, timeout_s=timeout_s, cancel_check=cancel_check,
+        controller_authorized=controller_authorized,
+    )
     return record_task_reverification(task_id, passed=passed, evidence=evidence, error=error)
 
 
@@ -214,6 +222,7 @@ def _run_task_verification(
     workspace: str | Path | None = None,
     timeout_s: float | None = None,
     cancel_check=None,
+    controller_authorized: bool = False,
 ) -> tuple[bool, dict | None, str | None]:
     """Execute one Task binding without assuming the Task is active."""
     spec = task.verification_spec
@@ -232,7 +241,10 @@ def _run_task_verification(
                 return False, None, f"bound test file is unavailable: {rel}: {exc}"
             if current != str(expected):
                 return False, None, f"bound test file changed after it was approved: {rel}"
-    result = run_verification(command, workspace=root, timeout_s=timeout_s, cancel_check=cancel_check)
+    result = run_verification(
+        command, workspace=root, timeout_s=timeout_s, cancel_check=cancel_check,
+        controller_authorized=controller_authorized,
+    )
     error = result.error or (None if result.passed else f"verification failed with exit code {result.exit_code}")
     executed = result.error is None or result.timed_out
     evidence = (

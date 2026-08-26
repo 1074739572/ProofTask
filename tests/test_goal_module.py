@@ -296,18 +296,18 @@ def test_goal_agents_use_the_configured_plan_run_eval_profiles():
     from harness.agents.registry import get_agent_profile, validate_agent_model
 
     expected = {
-        "goal_intake": ("deepseek-v4-pro", "max"),
-        "goal_discovery_requirement": ("mimo-v2.5-pro", None),
-        "goal_discovery_architecture": ("mimo-v2.5-pro", None),
-        "goal_discovery_implementation": ("mimo-v2.5-pro", None),
-        "goal_discovery_tests": ("mimo-v2.5-pro", None),
-        "goal_discovery_history": ("mimo-v2.5-pro", None),
-        "goal_planner": ("deepseek-v4-pro", "max"),
-        "goal_repair_planner": ("deepseek-v4-pro", "max"),
-        "goal_test_impact": ("mimo-v2.5-pro", None),
-        "goal_test_writer": ("deepseek-v4-pro", "max"),
-        "goal_worker": ("deepseek-v4-flash", "max"),
-        "evaluator": ("mimo-v2.5-pro", None),
+        "goal_intake": ("gpt-5.6-terra", "high"),
+        "goal_discovery_requirement": ("mimo-v2.5", None),
+        "goal_discovery_architecture": ("mimo-v2.5", None),
+        "goal_discovery_implementation": ("mimo-v2.5", None),
+        "goal_discovery_tests": ("mimo-v2.5", None),
+        "goal_discovery_history": ("mimo-v2.5", None),
+        "goal_planner": ("gpt-5.6-sol", "high"),
+        "goal_repair_planner": ("gpt-5.6-sol", "max"),
+        "goal_test_impact": ("mimo-v2.5", None),
+        "goal_test_writer": ("gpt-5.6-terra", "high"),
+        "goal_worker": ("gpt-5.6-terra", "high"),
+        "evaluator": ("gpt-5.6-terra", "high"),
     }
     for agent_type, (model_id, reasoning_effort) in expected.items():
         profile = get_agent_profile(agent_type)

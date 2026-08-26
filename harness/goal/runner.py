@@ -29,6 +29,7 @@ from harness.goal.store import (
     GoalStoreError,
     acquire_goal_lease,
     archive_goal,
+    archive_goal_change_patch,
     archive_unsupported_goal,
     load_goal,
     release_goal_lease,
@@ -62,7 +63,18 @@ def _execution_workspace(state: GoalState) -> str:
     try:
         candidate = Path(state.execution_workspace or root).expanduser().resolve()
     except OSError:
+        if state.change_mode == "worktree":
+            raise ChangeSessionError("isolated Goal execution workspace is invalid")
         return str(root)
+    if state.change_mode == "worktree":
+        try:
+            worktree = Path(state.change_worktree).expanduser().resolve()
+            expected = (worktree / (state.change_execution_relpath or ".")).resolve()
+        except OSError as exc:
+            raise ChangeSessionError("isolated Goal worktree is invalid") from exc
+        if not worktree.is_dir() or not candidate.is_dir() or candidate != expected:
+            raise ChangeSessionError("isolated Goal worktree is missing")
+        return str(candidate)
     return str(candidate) if candidate.is_dir() and candidate.is_relative_to(root) else str(root)
 
 
@@ -206,6 +218,9 @@ def goal_event_payload(state: GoalState) -> dict[str, Any]:
         "updated_at": state.updated_at,
         "paused_at": state.paused_at,
         "stop_reason": state.stop_reason,
+        "change_mode": state.change_mode,
+        "change_merge_state": state.change_merge_state,
+        "change_archive_path": state.change_archive_path,
         "final_verification": dict(state.final_verification) if isinstance(state.final_verification, dict) else None,
         "goal_contract": dict(state.goal_contract) if isinstance(state.goal_contract, dict) else {},
         "planning_review": dict(state.planning_review) if isinstance(state.planning_review, dict) else {},
@@ -232,6 +247,14 @@ def emit_current_goal_status(*, include_terminal: bool = True, hydrated: bool = 
         return None
     if state is None:
         return None
+    if (
+        state.status in {GoalStatus.FAILED.value, GoalStatus.CANCELLED.value}
+        and state.change_mode == "worktree"
+        and state.change_worktree
+    ):
+        # A process can die after the terminal transition reaches goal.json
+        # but before the runner's finally block reclaims the checkout.
+        _finalize_terminal_change_session(state)
     terminal = {GoalStatus.DONE.value, GoalStatus.FAILED.value, GoalStatus.CANCELLED.value}
     if include_terminal or state.status not in terminal:
         if hydrated:
@@ -259,6 +282,11 @@ def format_goal_status(state: GoalState) -> str:
         lines.append(f"  Completed: {completed}/{len(state.task_ids)}")
     if state.phase == GoalPhase.PREPARE_TESTS.value:
         lines.append("  Waiting for Task test generation and test collection.")
+    if state.change_mode == "worktree":
+        merge_state = state.change_merge_state or "executing"
+        lines.append(f"  Isolation: worktree ({merge_state})")
+        if state.change_archive_path:
+            lines.append(f"  Change archive: {state.change_archive_path}")
     lines += [
         f"  Task cycles: {state.attempts}",
         f"  Workers: {state.worker_generation} ({state.worker_rollovers} rollover(s), limit {state.worker_round_limit} rounds each)",
@@ -320,22 +348,72 @@ def get_goal_status() -> str:
 def _create_goal_change_session(workspace_root: Path, execution_workspace: Path, goal_id: str) -> tuple[ChangeSession | None, Path]:
     """Create an isolated Goal checkout and map a nested project into it."""
     try:
-        session = ChangeSession.create(workspace_root, session_id=goal_id)
+        session = ChangeSession.create(
+            workspace_root,
+            execution_workspace=execution_workspace,
+            session_id=goal_id,
+        )
     except ChangeSessionError as exc:
         message = str(exc).lower()
         if "not a git repository" in message or "no head commit" in message:
             return None, execution_workspace
         raise ValueError(f"Goal isolation unavailable: {exc}") from exc
+    return session, session.execution_path()
+
+
+def _finalize_terminal_change_session(state: GoalState) -> None:
+    """Archive failed/cancelled isolated work before reclaiming its worktree.
+
+    A paused Goal keeps its checkout so `/goal resume` has the exact worker
+    state. Terminal outcomes cannot resume, so retaining a binary patch is
+    the durable recovery artifact before freeing the checkout.
+    """
+    if state.change_mode != "worktree" or not state.change_worktree:
+        return
     try:
-        relative = execution_workspace.relative_to(workspace_root)
-    except ValueError:
+        session = ChangeSession.attach(
+            state.change_repository_root or state.workspace,
+            state.change_worktree,
+            base_commit=state.change_base_commit,
+            worker_base_commit=state.change_baseline_commit,
+            execution_relative=state.change_execution_relpath or ".",
+            session_id=state.change_session_id or state.id,
+        )
+        archive_path = archive_goal_change_patch(state, session.export_goal_patch())
+    except (ChangeSessionError, OSError) as exc:
+        supervision = state.supervision if isinstance(state.supervision, dict) else {}
+        state.supervision = {
+            **supervision,
+            "change_cleanup": "retained",
+            "change_cleanup_error": str(exc),
+            "change_cleanup_updated_at": time.time(),
+        }
+        save_goal(state)
+        return
+
+    state.change_archive_path = str(archive_path)
+    state.supervision = {
+        **(state.supervision if isinstance(state.supervision, dict) else {}),
+        "change_cleanup": "archived",
+        "change_cleanup_updated_at": time.time(),
+    }
+    save_goal(state)
+    try:
         session.remove()
-        raise ValueError("Goal execution workspace must be inside the workspace root")
-    mapped = (session.execution_worktree / relative).resolve()
-    if not mapped.is_dir():
-        session.remove()
-        raise ValueError(f"Goal execution project is missing in isolated worktree: {relative}")
-    return session, mapped
+    except ChangeSessionError as exc:
+        supervision = state.supervision if isinstance(state.supervision, dict) else {}
+        state.supervision = {
+            **supervision,
+            "change_cleanup": "retained",
+            "change_cleanup_error": str(exc),
+            "change_cleanup_updated_at": time.time(),
+        }
+        save_goal(state)
+        return
+    state.change_worktree = ""
+    state.change_session_id = ""
+    state.change_merge_state = "archived"
+    save_goal(state)
 
 
 def start_goal(request: GoalRequest, *, history: list, context: dict, binding: Any) -> GoalState:
@@ -358,6 +436,8 @@ def start_goal(request: GoalRequest, *, history: list, context: dict, binding: A
         if existing and existing.status not in {GoalStatus.DONE.value, GoalStatus.FAILED.value, GoalStatus.CANCELLED.value}:
             raise GoalBusyError(f"Goal {existing.id} is {existing.status}. Resume, cancel, or finish it first.")
         if existing:
+            if existing.status in {GoalStatus.FAILED.value, GoalStatus.CANCELLED.value}:
+                _finalize_terminal_change_session(existing)
             archive_goal(existing)
         workspace_root = get_workdir().resolve()
         try:
@@ -379,9 +459,13 @@ def start_goal(request: GoalRequest, *, history: list, context: dict, binding: A
             draft_id=request.draft_id,
         )
         if change_session is not None:
+            state.change_mode = "worktree"
             state.change_session_id = change_session.session_id
             state.change_worktree = str(change_session.execution_worktree)
             state.change_base_commit = change_session.base_commit
+            state.change_baseline_commit = change_session.worker_base_commit
+            state.change_repository_root = str(change_session.repository_root)
+            state.change_execution_relpath = change_session.execution_relative
         if request.task_plan:
             state.task_plan = [dict(item) for item in request.task_plan]
         state.goal_contract = dict(request.goal_contract or {
@@ -393,10 +477,20 @@ def start_goal(request: GoalRequest, *, history: list, context: dict, binding: A
         state.execution_approved = not request.await_execution_approval
         problems = validate_limits(state)
         if problems:
+            if change_session is not None:
+                try:
+                    change_session.remove()
+                except ChangeSessionError:
+                    pass
             raise ValueError("invalid goal limits: " + "; ".join(problems))
         try:
             lease_token = acquire_goal_lease(state)
         except GoalLeaseError as exc:
+            if change_session is not None:
+                try:
+                    change_session.remove()
+                except ChangeSessionError:
+                    pass
             raise GoalBusyError(str(exc)) from exc
         try:
             save_goal(state)
@@ -436,6 +530,13 @@ def resume_goal(*, history: list, context: dict, binding: Any, approve_execution
             raise GoalNotRunningError(
                 "Paused Goal belongs to a different workspace. Switch back to its workspace before resuming."
             )
+        try:
+            _execution_workspace(state)
+        except ChangeSessionError as exc:
+            state.last_error = str(exc)
+            state.stop_reason = StopReason.change_session_unavailable.value
+            save_goal(state)
+            raise GoalNotRunningError(f"Goal isolation is unavailable: {exc}") from exc
         try:
             lease_token = acquire_goal_lease(state)
         except GoalLeaseError as exc:
@@ -796,6 +897,7 @@ def cancel_goal() -> GoalState:
                 stop_reason=StopReason.cancelled_by_user.value,
             )
             save_goal(state)
+            _finalize_terminal_change_session(state)
             archive_goal(state)
             _emit_goal("goal_stopped", state)
             return state
@@ -1606,6 +1708,8 @@ class GoalRunner(threading.Thread):
                 self._close_supervisor()
                 try:
                     if self._state.status in {GoalStatus.DONE.value, GoalStatus.FAILED.value, GoalStatus.CANCELLED.value}:
+                        if self._state.status in {GoalStatus.FAILED.value, GoalStatus.CANCELLED.value}:
+                            _finalize_terminal_change_session(self._state)
                         archive_goal(self._state)
                 finally:
                     release_goal_lease(self._state, self._lease_token)
@@ -1623,6 +1727,16 @@ class GoalRunner(threading.Thread):
                 return
             if self._pause_event.is_set() and not self._phase_in_flight:
                 self._pause(state, "user_pause")
+                return
+            try:
+                _execution_workspace(state)
+            except ChangeSessionError as exc:
+                state.last_error = str(exc)
+                self._pause(
+                    state,
+                    "change_session_unavailable",
+                    stop_reason=StopReason.change_session_unavailable.value,
+                )
                 return
             self._step_once(state)
 
@@ -2307,11 +2421,16 @@ class GoalRunner(threading.Thread):
                 workspace=root,
                 timeout_s=state.operation_timeout_seconds,
                 cancel_check=self._interrupted,
+                controller_authorized=True,
             )
             if self._honor_control_request(state):
                 return
-            output = str(getattr(baseline, "stdout", "") or "").lower()
-            infrastructure_failure = "error collecting" in output or "importerror" in output or "fixture" in output and "error" in output
+            output = str(getattr(baseline, "stdout", "") or "")
+            infrastructure_failure = (
+                "error collecting" in output.lower()
+                or "importerror" in output.lower()
+                or "fixture" in output.lower() and "error" in output.lower()
+            ) and not self._is_expected_planned_new_module_import_failure(task, output)
             posthoc = bool(task.verification_spec.get("allow_posthoc_test"))
             if baseline.error or baseline.timed_out or (baseline.passed and not posthoc) or infrastructure_failure:
                 detail = baseline.error or (
@@ -2319,6 +2438,9 @@ class GoalRunner(threading.Thread):
                     if baseline.passed
                     else "generated test baseline failed outside the requested behavior"
                 )
+                output_tail = output[-1_200:].strip()
+                if output_tail:
+                    detail = f"{detail}. Verification output tail: {output_tail}"
                 self._restore_test_tree(root, before_tree, write_roots, expected_after=self._snapshot_test_tree(root, write_roots))
                 self._pause(state, "test_generation_baseline_failed", stop_reason=StopReason.test_generation_required.value)
                 state.last_error = f"Task {task.id} test baseline is invalid: {detail}"
@@ -2376,6 +2498,9 @@ class GoalRunner(threading.Thread):
                 bound.verification_spec,
                 kind="integration" if len(bound.verification_spec.get("owners") or []) > 1 else "task",
             )
+            # A successful retry must not leave the prior baseline diagnostic
+            # visible while the Goal proceeds to implementation.
+            state.last_error = None
             # Test preparation is deliberately lazy. The next Task is chosen
             # only after this one has been implemented and reviewed.
             break
@@ -2407,6 +2532,36 @@ class GoalRunner(threading.Thread):
         if not isinstance(requested, list):
             return ()
         return tuple(str(item) for item in requested if item is not None)
+
+    @staticmethod
+    def _is_expected_planned_new_module_import_failure(task, output: str) -> bool:
+        """Accept the red baseline for a test importing this Task's new module.
+
+        Pytest reports this as a collection error before the module exists, but
+        it is exactly the behavior a test-first Task with ``planned_new`` must
+        demonstrate.  Other collection, fixture, and import failures remain
+        invalid baselines.
+        """
+        text = str(output or "").replace("\\", "/").casefold()
+        import_markers = (
+            "importerror",
+            "modulenotfounderror",
+            "no module named",
+            "cannot import name",
+        )
+        if not any(marker in text for marker in import_markers):
+            return False
+        for raw_path in getattr(task, "planned_new", ()) or ():
+            path = str(raw_path).replace("\\", "/").lstrip("./")
+            if not path.endswith(".py"):
+                continue
+            module = path[:-3].replace("/", ".").strip(".").casefold()
+            if not module:
+                continue
+            modules = (module[:-9], module) if module.endswith(".__init__") else (module,)
+            if any(candidate and candidate in text for candidate in modules):
+                return True
+        return False
 
     @staticmethod
     def _test_design_from_generation(raw: str) -> tuple[dict[str, Any], ...]:
@@ -2997,6 +3152,7 @@ class GoalRunner(threading.Thread):
             workspace=_execution_workspace(state),
             timeout_s=state.operation_timeout_seconds,
             cancel_check=self._interrupted,
+            controller_authorized=True,
         )
         if self._honor_control_request(state):
             return
@@ -3483,6 +3639,7 @@ class GoalRunner(threading.Thread):
                 workspace=_execution_workspace(state),
                 timeout_s=state.operation_timeout_seconds,
                 cancel_check=self._interrupted,
+                controller_authorized=True,
             )
             if self._honor_control_request(state):
                 return
@@ -3512,6 +3669,7 @@ class GoalRunner(threading.Thread):
             workspace=Path(_execution_workspace(state)),
             timeout_s=state.operation_timeout_seconds,
             cancel_check=self._interrupted,
+            controller_authorized=True,
         )
         if self._honor_control_request(state):
             return
@@ -3527,39 +3685,122 @@ class GoalRunner(threading.Thread):
             )
             return
 
-        self._record_final_verification(state, status="passed" if result.passed else "failed", result=result)
-        if result.passed:
-            if state.change_worktree:
-                try:
-                    session = ChangeSession.attach(
-                        state.workspace,
-                        state.change_worktree,
-                        base_commit=state.change_base_commit,
-                        session_id=state.change_session_id or state.id,
+        if result.passed and state.change_mode == "worktree":
+            try:
+                session = ChangeSession.attach(
+                    state.change_repository_root or state.workspace,
+                    state.change_worktree,
+                    base_commit=state.change_base_commit,
+                    worker_base_commit=state.change_baseline_commit,
+                    execution_relative=state.change_execution_relpath or ".",
+                    session_id=state.change_session_id or state.id,
+                )
+                source_execution = (
+                    Path(state.change_repository_root or state.workspace)
+                    / (state.change_execution_relpath or ".")
+                ).resolve()
+                integration = session.prepare_integration(source_execution_workspace=source_execution)
+            except ChangeSessionError as exc:
+                detail = f"change session merge unavailable: {exc}"
+                self._record_final_verification(state, status="blocked", error=detail)
+                state.last_error = detail
+                state.change_merge_state = "conflict"
+                self._pause(state, "merge_conflict", stop_reason=StopReason.merge_conflict.value)
+                return
+
+            try:
+                integrated = run_verification(
+                    state.verification,
+                    workspace=integration.execution_workspace,
+                    timeout_s=state.operation_timeout_seconds,
+                    cancel_check=self._interrupted,
+                    controller_authorized=True,
+                )
+                if self._honor_control_request(state):
+                    return
+                self._record_final_verification(
+                    state,
+                    status="passed" if integrated.passed else "failed",
+                    result=integrated,
+                )
+                if not integrated.passed:
+                    detail = integrated.error or f"integrated verification failed with exit code {integrated.exit_code}"
+                    state.last_error = detail
+                    state.change_merge_state = "verification_failed"
+                    self._pause(
+                        state,
+                        "merge_verification_failed",
+                        stop_reason=StopReason.merge_verification_failed.value,
                     )
-                    merge_status = session.merge_to_main()
-                except ChangeSessionError as exc:
-                    merge_status = "conflict"
-                    state.last_error = f"change session merge unavailable: {exc}"
+                    return
+                state.change_merge_state = "publishing"
                 state.supervision = {
                     **(state.supervision if isinstance(state.supervision, dict) else {}),
-                    "merge_status": merge_status,
+                    "merge_status": "verified",
                     "merge_session": state.change_session_id,
                     "merge_updated_at": time.time(),
                 }
                 save_goal(state)
-                if merge_status != "merged":
-                    state.last_error = state.last_error or "Worker changes conflict with the main workspace."
-                    self._pause(state, "merge_conflict", stop_reason=StopReason.merge_conflict.value)
-                    return
                 try:
-                    session.remove()
+                    merge_status = integration.publish()
+                except ChangeSessionError as exc:
+                    detail = f"verified Goal merge could not be published: {exc}"
+                    state.last_error = detail
+                    state.change_merge_state = "publish_unavailable"
+                    state.supervision = {
+                        **(state.supervision if isinstance(state.supervision, dict) else {}),
+                        "merge_status": "publish_unavailable",
+                        "merge_error": str(exc),
+                        "merge_session": state.change_session_id,
+                        "merge_updated_at": time.time(),
+                    }
+                    self._pause(state, "merge_publish_unavailable", stop_reason=StopReason.merge_conflict.value)
+                    return
+            finally:
+                try:
+                    integration.remove()
                 except ChangeSessionError:
-                    # The merged worktree may already be gone or unremovable;
-                    # it must never block a completed Goal.
                     pass
+
+            state.supervision = {
+                **(state.supervision if isinstance(state.supervision, dict) else {}),
+                "merge_status": merge_status,
+                "merge_session": state.change_session_id,
+                "merge_updated_at": time.time(),
+            }
+            if merge_status != "published":
+                state.last_error = (
+                    "Main workspace changed while the verified Goal merge was being published."
+                    if merge_status == "main_changed"
+                    else (
+                        "Main workspace is busy with another harness writer; verified Goal changes were not applied."
+                        if merge_status == "main_locked"
+                        else "Verified Goal changes could not be applied to the main workspace."
+                    )
+                )
+                state.change_merge_state = (
+                    "main_changed_after_publish" if merge_status == "main_changed" else (
+                        "main_locked" if merge_status == "main_locked" else "publish_conflict"
+                    )
+                )
+                save_goal(state)
+                self._pause(state, "merge_conflict", stop_reason=StopReason.merge_conflict.value)
+                return
+            state.change_merge_state = "published"
+            self._apply(state, GoalPhase.DONE, "goal_verification_passed")
+            try:
+                session.remove()
+            except ChangeSessionError:
+                # Cleanup is best effort after the durable DONE transition.
+                pass
+            else:
                 state.change_worktree = ""
                 state.change_session_id = ""
+                save_goal(state)
+            return
+
+        self._record_final_verification(state, status="passed" if result.passed else "failed", result=result)
+        if result.passed:
             self._apply(state, GoalPhase.DONE, "goal_verification_passed")
         elif getattr(result, "error", None) or getattr(result, "timed_out", False):
             detail = getattr(result, "error", None) or "full verification timed out"

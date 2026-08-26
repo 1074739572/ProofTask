@@ -1033,6 +1033,75 @@ def test_test_generation_uses_writer_and_requires_failing_baseline(tmp_path, mon
     assert bound.verification_spec["baseline_result"] == "failing"
 
 
+def test_test_generation_accepts_import_error_for_its_planned_new_module(tmp_path, monkeypatch):
+    import harness.goal.runner as runner_mod
+    import harness.tasks as tasks
+
+    task, state = _needs_generation_task(tmp_path, monkeypatch)
+    task.planned_new = ["harness/goal/sandbox.py"]
+    state.last_error = "prior baseline failed"
+    tasks.save_task(task)
+    monkeypatch.setattr(runner_mod, "save_goal", lambda state: None)
+    monkeypatch.setattr(
+        runner_mod,
+        "run_agent_task",
+        lambda **kwargs: '{"test_selectors":["tests/test_new.py::test_new"],"case_selectors":{"AC1":["tests/test_new.py::test_new"]}}',
+    )
+    catalogs = iter((
+        TestCatalog(),
+        TestCatalog(selectors=("tests/test_new.py::test_new",), test_files=("tests/test_new.py",)),
+    ))
+    monkeypatch.setattr(runner_mod, "collect_pytest_catalog", lambda workspace: next(catalogs))
+    monkeypatch.setattr(
+        runner_mod,
+        "run_verification",
+        lambda *args, **kwargs: type("Result", (), {
+            "passed": False, "error": None, "timed_out": False,
+            "stdout": "ERROR collecting tests/test_new.py\nModuleNotFoundError: No module named 'harness.goal.sandbox'",
+            "exit_code": 2, "duration_ms": 5, "command": "pytest -q tests/test_new.py::test_new",
+        })(),
+    )
+
+    GoalRunner(state=state, history=[], context={}, binding=None)._prepare_tests(state)
+
+    assert state.phase == GoalPhase.SELECT_TASK.value
+    assert state.last_error is None
+    assert tasks.load_task(task.id).verification_spec["baseline_result"] == "failing"
+
+
+def test_test_generation_rejects_unrelated_import_error_baseline(tmp_path, monkeypatch):
+    import harness.goal.runner as runner_mod
+
+    task, state = _needs_generation_task(tmp_path, monkeypatch)
+    task.planned_new = ["harness/goal/sandbox.py"]
+    monkeypatch.setattr(runner_mod, "save_goal", lambda state: None)
+    monkeypatch.setattr(
+        runner_mod,
+        "run_agent_task",
+        lambda **kwargs: '{"test_selectors":["tests/test_new.py::test_new"],"case_selectors":{"AC1":["tests/test_new.py::test_new"]}}',
+    )
+    catalogs = iter((
+        TestCatalog(),
+        TestCatalog(selectors=("tests/test_new.py::test_new",), test_files=("tests/test_new.py",)),
+    ))
+    monkeypatch.setattr(runner_mod, "collect_pytest_catalog", lambda workspace: next(catalogs))
+    monkeypatch.setattr(
+        runner_mod,
+        "run_verification",
+        lambda *args, **kwargs: type("Result", (), {
+            "passed": False, "error": None, "timed_out": False,
+            "stdout": "ERROR collecting tests/test_new.py\nModuleNotFoundError: No module named 'unrelated.module'",
+            "exit_code": 2, "duration_ms": 5, "command": "pytest -q tests/test_new.py::test_new",
+        })(),
+    )
+
+    GoalRunner(state=state, history=[], context={}, binding=None)._prepare_tests(state)
+
+    assert state.phase == GoalPhase.PAUSED.value
+    assert state.stop_reason == "test_generation_required"
+    assert "unrelated.module" in state.last_error
+
+
 def test_test_generation_binds_only_the_current_runnable_task(tmp_path, monkeypatch):
     import harness.goal.runner as runner_mod
     import harness.tasks as tasks

@@ -144,6 +144,7 @@ def run_verification(
     workspace: str | Path | None = None,
     timeout_s: float | None = None,
     cancel_check: Callable[[], bool] | None = None,
+    controller_authorized: bool = False,
     _allow_isolated_bun_retry: bool = True,
 ) -> VerificationRunResult:
     """Validate + run one verification command under controlled execution.
@@ -167,9 +168,10 @@ def run_verification(
     if not policy.allowed:
         return _reject(f"policy rejected: {policy.reason}")
 
-    denied = _permission_allows(command)
-    if denied is not None:
-        return _reject(denied)
+    if not controller_authorized:
+        denied = _permission_allows(command)
+        if denied is not None:
+            return _reject(denied)
 
     cwd = Path(workspace).expanduser().resolve() if workspace else get_workdir()
     try:
