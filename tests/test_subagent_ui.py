@@ -242,6 +242,33 @@ def test_goal_subagent_passes_its_configured_reasoning_effort():
     assert create.call_args.kwargs["reasoning_effort"] == "max"
 
 
+def test_goal_subagent_can_force_transport_streaming():
+    from harness.agents.runner import run_agent_task
+
+    with mock.patch(
+        "harness.agents.runner.create_message",
+        return_value=_response([{"type": "text", "text": "{}"}]),
+    ) as create:
+        run_agent_task("plan goal", "return JSON", "goal_planner", stream_response=True)
+
+    assert create.call_args.kwargs["force_stream"] is True
+
+
+def test_goal_subagent_can_override_request_timeouts_and_attempts():
+    from harness.agents.runner import run_agent_task
+
+    with mock.patch(
+        "harness.agents.runner.create_message",
+        return_value=_response([{"type": "text", "text": "{}"}]),
+    ) as create:
+        run_agent_task(
+            "plan goal", "return JSON", "goal_planner",
+            request_read_timeout_seconds=300, max_request_attempts=1,
+        )
+
+    assert create.call_args.kwargs["read_timeout_seconds"] == 300
+
+
 def test_subagent_uses_a_call_specific_output_budget_and_records_exhaustion():
     from harness.agents.runner import AgentTaskStats, run_agent_task
 

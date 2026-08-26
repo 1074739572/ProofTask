@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from difflib import unified_diff
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -54,6 +55,7 @@ class EvaluationInputs:
     diff: str
     bound_test_sources: list[tuple[str, str]] = field(default_factory=list)
     rubric: list[str] = field(default_factory=lambda: list(RUBRIC))
+    effective_evidence: list[dict[str, Any]] | None = None
 
     def to_text(self) -> str:
         """Render the inputs as the prompt body for the evaluator agent."""
@@ -78,6 +80,16 @@ class EvaluationInputs:
                 )
         else:
             lines.append("(legacy Task: no explicit acceptance cases)")
+        approved_writes = [
+            *getattr(self.feature, "primary_write", []),
+            *getattr(self.feature, "planned_new", []),
+            *getattr(self.feature, "conditional_write", []),
+        ]
+        lines += [
+            "",
+            "# Approved implementation scope",
+            json.dumps(list(dict.fromkeys(str(path) for path in approved_writes if str(path).strip())), ensure_ascii=False),
+        ]
         lines += [
             "",
             "# 验证绑定 (VerificationSpec)",
@@ -88,6 +100,11 @@ class EvaluationInputs:
             "",
             "# 机器验证证据 (evidence)",
         ]
+        evidence = (
+            self.effective_evidence
+            if self.effective_evidence is not None
+            else self.feature.evidence
+        )
         spec = self.feature.verification_spec if isinstance(self.feature.verification_spec, dict) else {}
         impact_context = spec.get("impact_context") or []
         if isinstance(impact_context, list):
@@ -100,8 +117,12 @@ class EvaluationInputs:
                 "# Cross-Task impact context",
                 json.dumps(impact_context, ensure_ascii=False, sort_keys=True)[:5000],
             ]
-        if self.feature.evidence:
-            for ev in self.feature.evidence:
+        if evidence:
+            if self.effective_evidence is not None and len(self.feature.evidence) > len(evidence):
+                lines.append(
+                    "Earlier verification runs are retained for audit but are not evidence of the current code state."
+                )
+            for ev in evidence:
                 lines.append(
                     f"- command: {ev.get('command', '')} | "
                     f"exit_code: {ev.get('exit_code')} | "
@@ -110,7 +131,7 @@ class EvaluationInputs:
                 )
                 selectors = ev.get("selectors") or []
                 if selectors:
-                    lines.append(f"  selectors: {', '.join(str(item) for item in selectors[:8])}")
+                    lines.append(f"  selectors: {', '.join(str(item) for item in selectors[:32])}")
                 tail = (ev.get("stdout_tail") or "").strip()
                 if tail:
                     lines.append(f"  stdout_tail: {tail[:500]}")
@@ -133,16 +154,38 @@ class EvaluationInputs:
             "Judge scope violations only from unrelated files actually present in this Task diff.",
         ]
         start_snapshot = getattr(self.feature, "start_snapshot", None)
-        start_diff = getattr(self.feature, "start_diff", None)
-        if start_snapshot or start_diff:
+        start_dirty_hashes = getattr(self.feature, "start_dirty_hashes", None)
+        if start_snapshot or start_dirty_hashes:
             lines.extend(
                 [
                     "# Task start baseline",
                     f"snapshot: {start_snapshot or '(not recorded)'}",
-                    (start_diff or "(workspace was clean at Task start)")[:8000],
+                    "Pre-existing dirty files are an attribution baseline, not current Task changes: "
+                    + json.dumps(sorted(start_dirty_hashes) if isinstance(start_dirty_hashes, dict) else []),
+                    "Their historical diff is intentionally omitted. Judge scope and behavior from the Task-local diff above.",
                 ]
             )
         return "\n".join(lines)
+
+
+def _current_task_evidence(task: Any) -> list[dict[str, Any]]:
+    """Select the proof that represents the Task's current verification state.
+
+    A red baseline remains durable audit history, but it must not make a later
+    matching green verification permanently fail the evaluator. The Task state
+    machine likewise uses the latest verification result, so evaluator input
+    follows that same current-state rule.
+    """
+    evidence = [item for item in (getattr(task, "evidence", None) or []) if isinstance(item, dict)]
+    if not evidence:
+        return []
+    spec = getattr(task, "verification_spec", None)
+    command = str(spec.get("command") or "") if isinstance(spec, dict) else ""
+    if command:
+        matching = [item for item in evidence if str(item.get("command") or "") == command]
+        if matching:
+            return [matching[-1]]
+    return [evidence[-1]]
 
 
 def _git_diff(workspace: Path, paths: set[str] | None = None) -> str:
@@ -229,7 +272,7 @@ def _git_diff(workspace: Path, paths: set[str] | None = None) -> str:
 
 
 def _task_scoped_diff(task, workspace: Path) -> str:
-    """Exclude files that were already dirty and unchanged for this Task."""
+    """Render only changes attributable to this Task from its claim baseline."""
     from harness.verification.snapshot import capture_dirty_file_hashes
 
     baseline = getattr(task, "start_dirty_hashes", None)
@@ -252,10 +295,36 @@ def _task_scoped_diff(task, workspace: Path) -> str:
             for path in changed
             if any(path == scope or path.startswith(f"{scope}/") for scope in scope_paths)
         }
-    # A pre-existing dirty file that became clean was touched too, but has no
-    # current patch to render. The machine verification/evidence still records
-    # that outcome; never leak unrelated unchanged baseline files into review.
-    return _git_diff(workspace, changed)
+    # A recovery may restore a multi-file Goal patch before a replacement Task
+    # is claimed.  For a pre-existing dirty file edited again by this Task,
+    # render a content-to-content delta.  Passing it through ``git diff`` would
+    # show the whole restored file and falsely attribute earlier Task work.
+    prior_contents = getattr(task, "start_dirty_contents", None)
+    prior_contents = prior_contents if isinstance(prior_contents, dict) else {}
+    current_contents: dict[str, str] = {}
+    inherited_changed: set[str] = set()
+    for path in changed:
+        before = prior_contents.get(path)
+        candidate = workspace / path
+        if not isinstance(before, str) or not candidate.is_file():
+            continue
+        try:
+            after = candidate.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        current_contents[path] = "".join(
+            unified_diff(
+                before.splitlines(keepends=True),
+                after.splitlines(keepends=True),
+                fromfile=f"a/{path} (Task start)",
+                tofile=f"b/{path} (current)",
+                n=0,
+            )
+        )
+        inherited_changed.add(path)
+    rendered = _git_diff(workspace, changed - inherited_changed)
+    task_deltas = "\n".join(delta for delta in current_contents.values() if delta)
+    return "\n".join(part for part in (rendered, task_deltas) if part)[:MAX_DIFF_CHARS]
 
 
 def _bound_test_sources(feature: Feature, workspace: Path) -> list[tuple[str, str]]:
@@ -299,4 +368,5 @@ def collect_task_inputs(task_id: str, workspace: str | Path) -> EvaluationInputs
         feature=task,
         diff=_task_scoped_diff(task, root),
         bound_test_sources=_bound_test_sources(task, root),
+        effective_evidence=_current_task_evidence(task),
     )

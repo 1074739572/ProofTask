@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from harness.evaluation.inputs import EvaluationInputs
+from harness.evaluation.inputs import EvaluationInputs, _current_task_evidence
 from harness.evaluation.parser import parse_findings
 from harness.evaluation.runner import build_evaluation_prompt
 from harness.goal.models import GoalState
@@ -165,6 +165,29 @@ def test_task_scoped_diff_honors_declared_scope_paths(monkeypatch, tmp_path):
     assert requested == [{"node_tui/src-open/App.tsx", "node_tui/src-open/interaction.ts"}]
 
 
+def test_task_scoped_diff_renders_only_later_changes_to_restored_dirty_file(monkeypatch, tmp_path):
+    import harness.evaluation.inputs as inputs_mod
+
+    source = tmp_path / "harness" / "goal" / "sandbox.py"
+    source.parent.mkdir(parents=True)
+    source.write_text("restored = True\ncurrent = True\n", encoding="utf-8")
+    task = SimpleNamespace(
+        start_dirty_hashes={"harness/goal/sandbox.py": "before"},
+        start_dirty_contents={"harness/goal/sandbox.py": "restored = True\n"},
+        scope_paths=["harness/goal/sandbox.py"],
+    )
+    monkeypatch.setattr(
+        "harness.verification.snapshot.capture_dirty_file_hashes",
+        lambda _workspace: {"harness/goal/sandbox.py": "after"},
+    )
+    monkeypatch.setattr(inputs_mod, "_git_diff", lambda *_args, **_kwargs: "")
+
+    rendered = inputs_mod._task_scoped_diff(task, tmp_path)
+
+    assert "restored = True" not in rendered
+    assert "+current = True" in rendered
+
+
 def test_untracked_credential_backups_are_not_rendered(monkeypatch, tmp_path):
     import harness.evaluation.inputs as inputs_mod
 
@@ -199,3 +222,118 @@ def test_evaluator_input_explains_that_a_clean_diff_is_not_a_scope_failure():
 
     assert "clean diff can mean the Task work was committed" in rendered
     assert "Do not fail scope merely" in rendered
+
+
+def test_evaluator_input_does_not_expose_full_pre_task_diff_as_current_work():
+    feature = SimpleNamespace(
+        behavior="parse configuration only",
+        acceptance_cases=[],
+        verification_spec={},
+        verification="pytest -q",
+        evidence=[],
+        start_snapshot="abc:123",
+        start_diff="diff --git a/harness/goal/runner.py b/harness/goal/runner.py\n+Docker integration",
+        start_dirty_hashes={"harness/goal/runner.py": "before"},
+    )
+
+    rendered = EvaluationInputs(feature=feature, diff="sandbox-only delta").to_text()
+
+    assert "harness/goal/runner.py" in rendered
+    assert "Docker integration" not in rendered
+    assert "historical diff is intentionally omitted" in rendered
+
+
+def test_task_evaluator_uses_latest_matching_bound_verification_only():
+    task = SimpleNamespace(
+        verification_spec={"command": "python -m pytest -q tests/test_bound.py"},
+        evidence=[
+            {
+                "command": "python -m pytest -q tests/test_bound.py",
+                "exit_code": 1,
+                "stdout_tail": "old failure",
+            },
+            {
+                "command": "python -m pytest -q tests/test_bound.py",
+                "exit_code": 0,
+                "stdout_tail": "1 passed",
+            },
+        ],
+    )
+
+    effective = _current_task_evidence(task)
+    rendered = EvaluationInputs(
+        feature=SimpleNamespace(
+            behavior="behavior",
+            acceptance_cases=[],
+            verification_spec=task.verification_spec,
+            verification="pytest -q",
+            evidence=task.evidence,
+            start_snapshot=None,
+            start_diff=None,
+        ),
+        diff="",
+        effective_evidence=effective,
+    ).to_text()
+
+    assert effective == [task.evidence[-1]]
+    assert "1 passed" in rendered
+    assert "old failure" not in rendered
+    assert "retained for audit" in rendered
+
+
+def test_evaluator_input_renders_all_bound_selectors_and_write_scope():
+    selectors = [f"tests/test_bound.py::test_case_{index}" for index in range(10)]
+    task = SimpleNamespace(
+        behavior="behavior",
+        acceptance_cases=[],
+        verification_spec={},
+        verification="pytest -q",
+        evidence=[{"selectors": selectors, "exit_code": 0}],
+        primary_write=["harness/goal/sandbox.py"],
+        planned_new=[],
+        conditional_write=[],
+        start_snapshot=None,
+        start_diff=None,
+    )
+
+    rendered = EvaluationInputs(feature=task, diff="").to_text()
+
+    assert "Approved implementation scope" in rendered
+    assert "harness/goal/sandbox.py" in rendered
+    assert selectors[-1] in rendered
+
+
+def test_scope_replan_is_required_when_evaluator_names_unapproved_source_file():
+    from harness.evaluation.runner import _requires_scope_replan
+
+    task = SimpleNamespace(
+        primary_write=["harness/goal/sandbox.py"],
+        planned_new=[],
+        conditional_write=[],
+    )
+    payload = {
+        "findings": [{
+            "issue": "runner integration remains mutable",
+            "evidence": "harness/goal/runner.py stores a mutable dict",
+        }],
+    }
+
+    assert _requires_scope_replan(task, payload) is True
+
+
+def test_scope_replan_ignores_test_paths_named_in_evaluator_evidence():
+    from harness.evaluation.runner import _requires_scope_replan
+
+    task = SimpleNamespace(
+        primary_write=["harness/goal/sandbox.py"],
+        planned_new=[],
+        conditional_write=[],
+    )
+    payload = {
+        "findings": [{
+            "issue": "coverage is incomplete",
+            "evidence": "tests/test_goal_sandbox_config_snapshot.py omits a fractional-limit case",
+        }],
+    }
+
+    assert _requires_scope_replan(task, payload) is False

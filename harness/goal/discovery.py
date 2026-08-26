@@ -38,7 +38,7 @@ DEFAULT_DISCOVERY_CONCURRENCY = 2
 DISCOVERY_FACT_LIMIT = 8
 DISCOVERY_GAP_LIMIT = 8
 _TARGET_PATH_RE = re.compile(
-    r"(?<![A-Za-z0-9_.-])(?:(?:\.\.?)[/\\]|[A-Za-z0-9_@.+-]+[/\\])(?:[A-Za-z0-9_@.+-]+[/\\])*[A-Za-z0-9_@.+-]+"
+    r"(?<![A-Za-z0-9_.-])(?:(?:[A-Za-z]:)?[/\\]|(?:\.\.?)[/\\]|[A-Za-z0-9_@.+-]+[/\\])(?:[A-Za-z0-9_@.+-]+[/\\])*[A-Za-z0-9_@.+-]+"
 )
 _JS_IMPORT_RE = re.compile(
     r"(?:\b(?:import|export)\s+(?:type\s+)?(?:[^'\"\n]+?\s+from\s+)?|\brequire\s*\()"

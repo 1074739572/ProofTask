@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import os
 import re
 import subprocess
 import threading
@@ -82,6 +83,60 @@ def _execution_workspace(state: GoalState) -> str:
             raise ChangeSessionError("isolated Goal worktree is missing")
         return str(candidate)
     return str(candidate) if candidate.is_dir() and candidate.is_relative_to(root) else str(root)
+
+
+_EXECUTION_REPLAN_IGNORED_DIRS = frozenset({
+    ".git", ".mypy_cache", ".project", ".pytest_cache", ".ruff_cache", ".venv", "__pycache__", "node_modules",
+})
+_EXECUTION_REPLAN_SOURCE_SUFFIXES = frozenset({
+    ".py", ".pyi", ".js", ".jsx", ".ts", ".tsx", ".java", ".go", ".rs", ".rb", ".php", ".cs",
+})
+
+
+def _execution_replan_manifest(
+    manifest: dict[str, Any], root: Path, *, scope_paths: tuple[str, ...] = (),
+) -> tuple[dict[str, Any], tuple[str, ...]]:
+    """Overlay initial Discovery with the files that actually exist in the Goal worktree."""
+    workspace = root.resolve()
+    files: list[str] = []
+    for directory, child_dirs, child_files in os.walk(workspace):
+        child_dirs[:] = [name for name in child_dirs if name not in _EXECUTION_REPLAN_IGNORED_DIRS]
+        current = Path(directory)
+        for name in child_files:
+            try:
+                files.append((current / name).resolve().relative_to(workspace).as_posix())
+            except (OSError, ValueError):
+                continue
+    snapshot = tuple(sorted(dict.fromkeys(files)))
+    snapshot_set = set(snapshot)
+    result = dict(manifest)
+    result["repo_files"] = list(snapshot)
+    evidence = [dict(item) for item in manifest.get("evidence", []) if isinstance(item, dict)]
+    evidenced_paths = {
+        str(item.get("path") or "").replace("\\", "/").strip()
+        for item in evidence
+    }
+    evidence_ids = {str(item.get("id") or "").strip() for item in evidence}
+    serial = 1
+    for raw_path in scope_paths:
+        path = str(raw_path or "").replace("\\", "/").strip().lstrip("./")
+        if path not in snapshot_set or path in evidenced_paths or Path(path).suffix.lower() not in _EXECUTION_REPLAN_SOURCE_SUFFIXES:
+            continue
+        evidence_id = f"EXECUTION_SNAPSHOT_{serial}"
+        while evidence_id in evidence_ids:
+            serial += 1
+            evidence_id = f"EXECUTION_SNAPSHOT_{serial}"
+        evidence.append({
+            "id": evidence_id,
+            "path": path,
+            "claim": "Existing source file in the current Goal execution worktree.",
+            "source_job": "execution_workspace_snapshot",
+        })
+        evidenced_paths.add(path)
+        evidence_ids.add(evidence_id)
+        serial += 1
+    result["evidence"] = evidence
+    return result, tuple(path for path in scope_paths if path in snapshot_set)
 
 
 @dataclass(frozen=True)
@@ -2286,7 +2341,7 @@ class GoalRunner(threading.Thread):
                     mismatches.append(
                         "returned selectors were existing or non-generated: " + ", ".join(unexpected)
                     )
-                missing_cases = sorted(required_cases - set(case_selectors))
+                missing_cases = self._missing_case_selectors(required_cases, case_selectors)
                 if missing_cases:
                     mismatches.append("case_selectors did not cover: " + ", ".join(missing_cases))
                 return mismatches
@@ -2353,6 +2408,78 @@ class GoalRunner(threading.Thread):
                 case_selectors = self._case_selectors_from_generation(raw, selectors, task.acceptance_cases)
                 requested_selectors = self._requested_selectors_from_generation(raw)
 
+            # A selector-only correction cannot recover a writer that created
+            # coverage for just one part of a broad Task. Continue the same
+            # constrained test-writing conversation once so it can add tests
+            # for the remaining acceptance cases rather than falsely mapping
+            # an unrelated selector to them.
+            missing_cases = self._missing_case_selectors(required_cases, case_selectors)
+            coverage_repair_attempted = bool(missing_cases and generated_selectors)
+            if coverage_repair_attempted:
+                prior_selectors = selectors
+                prior_case_selectors = case_selectors
+                prior_test_design = test_design
+                coverage_stats = AgentTaskStats()
+                coverage_prompt = (
+                    "The current generated tests cover only some acceptance cases. Continue with tools and create "
+                    "NEW focused test files for every missing case below. Do not modify an existing test file or "
+                    "production code. A configuration-only test must not be claimed as coverage for runtime execution, "
+                    "timeouts, cancellation, or routing. After collecting the added tests, return ONLY one complete "
+                    "JSON object that maps every acceptance case, including the already covered cases, to the exact "
+                    "machine-collectable selectors that exercise it.\n\n"
+                    f"Task: {task.subject}\n"
+                    f"Missing acceptance cases: {json.dumps(missing_cases, ensure_ascii=False)}\n"
+                    f"All acceptance cases: {json.dumps(task.acceptance_cases, ensure_ascii=False)}\n"
+                    f"Existing selectors from this generation: {json.dumps(generated_selectors, ensure_ascii=False)}"
+                )
+                raw = invoke_writer(
+                    coverage_prompt,
+                    f"add missing acceptance-case tests for task {task.id}",
+                    1,
+                    coverage_stats,
+                )
+                state.total_llm_rounds += coverage_stats.llm_rounds
+                if self._honor_control_request(state):
+                    return
+                self._observe_supervisor(
+                    "agent_finished",
+                    detail=self._agent_stats_detail(
+                        "goal_test_writer",
+                        coverage_stats,
+                        summary=str(raw)[-2_000:],
+                        extra={"task_id": task.id, "source": "acceptance_case_coverage_repair"},
+                    ),
+                )
+                if coverage_stats.stop_reason in {"provider_error", "configuration_error"} or str(raw).startswith((
+                    "Error:", "[goal_test_writer] failed:", "[goal_test_writer] stopped:",
+                )):
+                    self._restore_test_tree(
+                        root, before_tree, write_roots, expected_after=self._snapshot_test_tree(root, write_roots),
+                    )
+                    state.last_error = f"Goal test writer unavailable while adding missing acceptance-case coverage: {str(raw)[:3_000]}"
+                    self._pause(
+                        state,
+                        "goal_test_writer_unavailable",
+                        stop_reason=StopReason.provider_unavailable.value,
+                    )
+                    save_goal(state)
+                    return
+                after_catalog = (
+                    collect_pytest_catalog(root)
+                    if adapter.id == "pytest"
+                    else adapter.discover(verification_context)
+                )
+                generated_selectors = tuple(
+                    selector for selector in after_catalog.selectors
+                    if selector not in before_catalog.selectors
+                )
+                added_selectors = self._selectors_from_generation(raw, root, catalog=after_catalog)
+                selectors = tuple(dict.fromkeys((*prior_selectors, *added_selectors)))
+                added_case_selectors = self._case_selectors_from_generation(raw, selectors, task.acceptance_cases)
+                case_selectors = {**prior_case_selectors, **added_case_selectors}
+                test_design = (*prior_test_design, *self._test_design_from_generation(raw))
+                requested_selectors = self._requested_selectors_from_generation(raw)
+
             final_mismatches = contract_mismatches(
                 response_empty=empty_response,
                 response_stalled=False,
@@ -2369,6 +2496,8 @@ class GoalRunner(threading.Thread):
                 if repair_attempted:
                     details["initial_mismatch"] = "; ".join(initial_mismatches)
                     details["initial_requested_selectors"] = list(initial_requested_selectors)
+                if coverage_repair_attempted:
+                    details["coverage_repair_attempted"] = True
                 return json.dumps(details, ensure_ascii=False)
 
             if not generated_selectors and (original_empty_response or original_writer_stalled):
@@ -2701,6 +2830,14 @@ class GoalRunner(threading.Thread):
         return result
 
     @staticmethod
+    def _missing_case_selectors(required_cases: set[str], case_selectors: dict[str, list[str]]) -> list[str]:
+        """Return acceptance cases without an explicit non-empty test binding."""
+        return sorted(
+            case_id for case_id in required_cases
+            if not isinstance(case_selectors.get(case_id), list) or not case_selectors[case_id]
+        )
+
+    @staticmethod
     def _test_file_hashes(root: Path, paths) -> dict[str, str]:
         hashes: dict[str, str] = {}
         for raw in paths:
@@ -2931,7 +3068,11 @@ class GoalRunner(threading.Thread):
 
     def _claim(self, state: GoalState) -> None:
         from harness.tasks import claim_task, load_task, record_task_start, save_task
-        from harness.verification.snapshot import capture_code_snapshot, capture_dirty_file_hashes
+        from harness.verification.snapshot import (
+            capture_code_snapshot,
+            capture_dirty_file_contents,
+            capture_dirty_file_hashes,
+        )
 
         task = load_task(state.current_task_id)
         spec = task.verification_spec if isinstance(task.verification_spec, dict) else {}
@@ -2951,6 +3092,7 @@ class GoalRunner(threading.Thread):
             snapshot=capture_code_snapshot(_execution_workspace(state)),
             diff=self._workspace_diff(_execution_workspace(state)),
             dirty_hashes=capture_dirty_file_hashes(_execution_workspace(state)),
+            dirty_contents=capture_dirty_file_contents(_execution_workspace(state)),
         )
         self._apply(state, GoalPhase.ACT, "task_claimed")
 
@@ -3266,6 +3408,14 @@ class GoalRunner(threading.Thread):
             self._apply(state, GoalPhase.CLEAN_CHECK, "evaluation_passed")
             return
         state.last_error = str(evaluation.get("error") or evaluation.get("summary") or "evaluator rejected Task")
+        if evaluation.get("route") == "replan":
+            self._replan_remaining_tasks(
+                state,
+                task=task,
+                evaluation=evaluation,
+                reason=state.last_error,
+            )
+            return
         self._apply(state, GoalPhase.REPAIR_PLAN, "evaluation_requires_repair", error=state.last_error)
 
     def _replan_remaining_tasks(
@@ -3304,6 +3454,22 @@ class GoalRunner(threading.Thread):
             return
 
         root = Path(_execution_workspace(state))
+        replan_scope_paths = tuple(dict.fromkeys(
+            str(path)
+            for candidate in unfinished
+            for path in (
+                *getattr(candidate, "primary_write", []),
+                *getattr(candidate, "planned_new", []),
+                *getattr(candidate, "conditional_write", []),
+                *getattr(candidate, "read_envelope", []),
+            )
+            if str(path).strip()
+        ))
+        manifest, execution_workspace_paths = _execution_replan_manifest(
+            manifest,
+            root,
+            scope_paths=replan_scope_paths,
+        )
         adapter = select_adapter(root, state.verification)
         stats = AgentTaskStats()
         self._phase_in_flight = True
@@ -3320,6 +3486,7 @@ class GoalRunner(threading.Thread):
                 human_language=human_language_label((state.goal_contract or {}).get("language")),
                 frozen_contract=dict(state.goal_contract or {}),
                 completed_task_names=completed_names,
+                execution_workspace_paths=execution_workspace_paths,
                 replan_reason=json.dumps(
                     {
                         "summary": reason,
@@ -3427,6 +3594,12 @@ class GoalRunner(threading.Thread):
             },
         )
         save_goal(state)
+        self._enter_replanned_task_selection(state)
+
+    def _enter_replanned_task_selection(self, state: GoalState) -> None:
+        """Advance through the legal state-machine edge after an evaluation replan."""
+        if state.phase == GoalPhase.EVALUATE.value:
+            self._apply(state, GoalPhase.REPAIR_PLAN, "evaluation_replan_ready")
         self._apply(state, GoalPhase.SELECT_TASK, "execution_replan_accepted")
 
     def _repair_plan(self, state: GoalState) -> None:
@@ -3436,6 +3609,14 @@ class GoalRunner(threading.Thread):
 
         task = load_task(state.current_task_id)
         evaluation = task.evaluation or {"passed": False, "summary": state.last_error or "Goal verification failed", "route": "implementation_fix"}
+        if evaluation.get("route") == "replan":
+            self._replan_remaining_tasks(
+                state,
+                task=task,
+                evaluation=evaluation,
+                reason=str(evaluation.get("summary") or state.last_error or "Task boundaries require replanning."),
+            )
+            return
         if state.repair_epoch > 0:
             repair_count = sum(
                 1

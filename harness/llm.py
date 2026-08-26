@@ -57,6 +57,8 @@ def create_message(
     reasoning_effort: str | None = None,
     inherit_interactive_effort: bool = True,
     usage_context: dict[str, str] | None = None,
+    force_stream: bool = False,
+    read_timeout_seconds: float | None = None,
 ):
     from harness.ui.events import emit as _emit, is_enabled as _is_enabled
 
@@ -69,7 +71,11 @@ def create_message(
     def _delta_callback(text: str, _event_type: str) -> None:
         _emit("assistant_delta", text=text, model=profile.api_model)
 
-    on_delta = _delta_callback if _is_enabled() else None
+    # Headless structured jobs still benefit from transport streaming: relays
+    # can keep a long reasoning response alive by sending chunks, while a
+    # non-streaming request must finish its whole response before the read
+    # timeout expires. Keep that traffic out of the user-facing event stream.
+    on_delta = _delta_callback if _is_enabled() else (lambda _text, _kind: None) if force_stream else None
 
     with renderer.llm_busy(_format_llm_tag(profile)):
         response = create_provider_message(
@@ -79,6 +85,7 @@ def create_message(
             system=system,
             tools=tools,
             on_delta=on_delta,
+            read_timeout_seconds=read_timeout_seconds,
         )
 
     _log_cache_usage(response, model_id=profile.id, usage_context=usage_context)

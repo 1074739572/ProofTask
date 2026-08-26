@@ -17,6 +17,7 @@ def create_provider_message(
     system: str | None = None,
     tools: list | None = None,
     on_delta: callable = None,
+    read_timeout_seconds: float | None = None,
 ):
     provider = get_provider(profile.provider)
     # Session blocks may include provider-specific shapes; sanitize before API.
@@ -50,6 +51,7 @@ def create_provider_message(
             reasoning_effort=api_reasoning_effort(profile),
             extra_body=profile.extra_body,
             on_delta=on_delta,
+            read_timeout_seconds=read_timeout_seconds,
         )
 
     raise RuntimeError(f"Unsupported provider type '{provider.type}' for '{provider.id}'")

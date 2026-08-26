@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from harness.goal.language import detect_goal_language, human_language_label
-from harness.goal.planner import TaskPlan, discovery_readiness_error, plan_tasks
+from harness.goal.planner import GoalPlanningError, TaskPlan, discovery_readiness_error, plan_tasks, planning_error_requires_discovery
 from harness.settings import get_workdir
 from harness.verification import VerificationContext, select_adapter
 
@@ -34,6 +34,8 @@ _DRAFT_IO_LOCK = threading.RLock()
 _AGENT_RESULT_HEADER_RE = re.compile(r"^\[[^\]]+\][^\n]*\n+")
 _PROJECT_MARKERS = frozenset({"package.json", "pyproject.toml", "pytest.ini", "setup.cfg", "setup.py"})
 _PROJECT_EXCLUDED_DIRS = frozenset({".git", ".project", ".venv", "venv", "node_modules", "dist", "build", "coverage", ".worktrees"})
+_INTAKE_FORMAT_RETRY_TOKENS = 2_000
+_INTAKE_FORMAT_RETRY_EFFORT = "low"
 
 
 class GoalDraftError(ValueError):
@@ -427,6 +429,8 @@ def _intake_from_raw(raw: str) -> GoalIntakeResult:
     # still returns JSON underneath it, so parse the model payload rather than
     # treating a successful clarification as an empty answer.
     raw = _AGENT_RESULT_HEADER_RE.sub("", (raw or "").lstrip(), count=1).strip()
+    if not raw:
+        raise GoalDraftError("Goal intake returned invalid JSON: no visible JSON payload")
     # Accept a fenced or lightly narrated JSON object. Reasoning providers
     # sometimes wrap the required object in a short sentence even when the
     # prompt asks for JSON-only output.
@@ -465,6 +469,37 @@ def _intake_from_raw(raw: str) -> GoalIntakeResult:
             else "The requirement is clear enough to continue without clarification."
         )
     return GoalIntakeResult(questions=questions, summary=summary, assumptions=assumptions)
+
+
+def _run_strict_intake_retry(*, prompt: str, cwd: Path, deadline: float):
+    """Ask a reasoning provider for a small visible JSON correction response."""
+    from harness.agents.runner import AgentTaskStats, run_agent_task
+
+    stats = AgentTaskStats()
+    raw = run_agent_task(
+        description="retry Goal intake as strict JSON",
+        prompt=(
+            prompt
+            + "\n\nYour previous response was not parseable. Reply with ONLY one JSON object "
+            + '{"summary":"...","assumptions":[],"questions":["..."]}. '
+            + "No markdown, explanation, or hidden reasoning-only answer."
+        ),
+        agent_type="goal_intake",
+        cwd=str(cwd),
+        max_rounds=1,
+        tools_override=(),
+        reasoning_effort_override=_INTAKE_FORMAT_RETRY_EFFORT,
+        max_tokens=_INTAKE_FORMAT_RETRY_TOKENS,
+        stats=stats,
+        deadline=deadline,
+    )
+    if (
+        raw.startswith("[goal_intake] failed:")
+        or raw.startswith("[goal_intake] stopped:")
+        or stats.stop_reason in {"provider_error", "configuration_error", "empty_response"}
+    ):
+        raise GoalDraftError(f"Goal intake is unavailable: {raw}")
+    return raw
 
 
 def _apply_intake_result(draft: GoalDraft, result: GoalIntakeResult) -> None:
@@ -673,7 +708,18 @@ def _run_followup_intake(draft: GoalDraft, root: Path, catalog, *, intake_runner
                     raise
                 with _draft_heartbeat(draft, root):
                     raw = runner(target=draft.target, verification=draft.verification, catalog=catalog)
-        result = _intake_from_raw(raw)
+        try:
+            result = _intake_from_raw(raw)
+        except GoalDraftError:
+            if runner is not None:
+                raise
+            with _draft_heartbeat(draft, root):
+                retry_raw = _run_strict_intake_retry(
+                    prompt=prompt,
+                    cwd=project_root,
+                    deadline=time.monotonic() + operation_timeout,
+                )
+            result = _intake_from_raw(retry_raw)
         _append_followup_intake_result(draft, result)
     except Exception as exc:
         message = "Goal follow-up intake failed"
@@ -709,6 +755,13 @@ def _plan(draft: GoalDraft, workspace: Path, catalog, planner_runner=None, revie
     draft.planning_review = dict(plan.review)
     draft.task_plan = [task.to_dict() for task in plan.tasks]
     draft.status = "ready"
+    _set_stage(draft, "ready")
+
+
+def _planning_resume_stage(exc: Exception) -> str:
+    if isinstance(exc, GoalPlanningError) and exc.requires_discovery_refresh:
+        return "discovering"
+    return "planning"
 
 
 def create_draft(
@@ -837,32 +890,19 @@ def create_draft(
             # message while the provider request itself succeeded. Give it one
             # bounded correction turn before pausing the Draft.
             if runner is None:
-                retry_stats = AgentTaskStats()
-                retry_prompt = (
-                    intake_prompt
-                    + "\n\nYour previous response was not parseable. Reply with ONLY one JSON object "
-                    + '{"summary":"...","assumptions":[],"questions":["..."]}. '
-                    + "No markdown, explanation, or hidden reasoning-only answer."
-                )
                 with _draft_heartbeat(draft, root):
-                    retry_raw = run_agent_task(
-                        description="retry Goal intake as strict JSON",
-                        prompt=retry_prompt,
-                        agent_type="goal_intake",
-                        cwd=str(root), max_rounds=1, tools_override=(),
-                        stats=retry_stats,
-                        deadline=time.monotonic() + operation_timeout,
-                    )
-                if (
-                    retry_raw.startswith("[goal_intake] failed:")
-                    or retry_raw.startswith("[goal_intake] stopped:")
-                    or retry_stats.stop_reason in {"provider_error", "configuration_error", "empty_response"}
-                ):
-                    draft.status = "paused"
-                    draft.last_error = f"Goal intake is unavailable: {retry_raw}"
-                    _set_stage(draft, "paused")
-                    save_draft(draft, root, event="failed", message="Goal intake provider unavailable")
-                    raise GoalDraftError(draft.last_error)
+                    try:
+                        retry_raw = _run_strict_intake_retry(
+                            prompt=intake_prompt,
+                            cwd=project_root,
+                            deadline=time.monotonic() + operation_timeout,
+                        )
+                    except GoalDraftError as exc:
+                        draft.status = "paused"
+                        draft.last_error = str(exc)
+                        _set_stage(draft, "paused")
+                        save_draft(draft, root, event="failed", message="Goal intake provider unavailable")
+                        raise GoalDraftError(draft.last_error)
                 try:
                     intake_result = _intake_from_raw(retry_raw)
                 except GoalDraftError as retry_error:
@@ -931,6 +971,7 @@ def create_draft(
                 _plan(draft, project_root, catalog, planner_runner=planner_runner, discovery_manifest=discovery_manifest, verification_adapter=adapter)
         except Exception as exc:
             draft.status = "paused"
+            draft.resume_from = _planning_resume_stage(exc)
             draft.last_error = f"Goal planning failed: {type(exc).__name__}: {exc}"
             _set_stage(draft, "paused")
             save_draft(draft, root, event="failed", message="Goal planning failed")
@@ -986,6 +1027,7 @@ def _run_discovery_and_plan(draft: GoalDraft, root: Path, catalog, adapter, *, p
             _plan(draft, project_root, catalog, planner_runner=planner_runner, discovery_manifest=manifest, verification_adapter=adapter)
     except Exception as exc:
         draft.status = "paused"
+        draft.resume_from = _planning_resume_stage(exc)
         draft.last_error = f"Goal planning failed: {type(exc).__name__}: {exc}"
         _set_stage(draft, "paused")
         save_draft(draft, root, event="failed", message="Goal planning failed")
@@ -1015,9 +1057,17 @@ def _run_plan_from_manifest(
     save_draft(draft, root, event="stage_started", message="Resuming task planning from saved discovery evidence")
     try:
         with _draft_heartbeat(draft, root):
-            _plan(draft, project_root, catalog, planner_runner=planner_runner, reviewer_runner=reviewer_runner, discovery_manifest=manifest, verification_adapter=adapter)
+            _plan(
+                draft,
+                project_root,
+                catalog,
+                planner_runner=planner_runner,
+                discovery_manifest=manifest,
+                verification_adapter=adapter,
+            )
     except Exception as exc:
         draft.status = "paused"
+        draft.resume_from = _planning_resume_stage(exc)
         draft.last_error = f"Goal planning failed: {type(exc).__name__}: {exc}"
         _set_stage(draft, "paused")
         save_draft(draft, root, event="failed", message="Goal planning failed")
@@ -1100,6 +1150,7 @@ def answer_draft(
                 _plan(draft, draft_project_root(draft, root), catalog, planner_runner, verification_adapter=adapter)
         except Exception as exc:
             draft.status = "paused"
+            draft.resume_from = _planning_resume_stage(exc)
             draft.last_error = f"Goal planning failed: {type(exc).__name__}: {exc}"
             _set_stage(draft, "paused")
             save_draft(draft, root, event="failed", message="Goal planning failed")
@@ -1127,6 +1178,8 @@ def resume_draft(*, workspace: Path | None = None, planner_runner=None, discover
 
     clear_cancel()
     resume_from = draft.resume_from or _legacy_resume_stage(draft.to_dict())
+    if resume_from == "planning" and planning_error_requires_discovery(draft.last_error):
+        resume_from = "discovering"
     retry_intake = resume_from == "intake" or (draft.last_error or "").lower().startswith("goal intake")
     if draft.unanswered_question:
         draft.status = "clarifying"
@@ -1171,35 +1224,23 @@ def resume_draft(*, workspace: Path | None = None, planner_runner=None, discover
             draft.last_error = None
             retry_intake = False
         if retry_intake:
-            from harness.agents.runner import AgentTaskStats, run_agent_task
-
             draft.status = "clarifying"
             draft.last_error = None
             _set_stage(draft, "intake")
             save_draft(draft, root, event="stage_started", message="Retrying Goal intake")
-            stats = AgentTaskStats()
             with _draft_heartbeat(draft, root):
-                raw = run_agent_task(
-                    description="retry Goal intake as strict JSON",
-                    prompt=(
-                        _intake_prompt(draft.target, draft.verification, catalog)
-                        + "\n\nReply with ONLY one JSON object "
-                        + '{"summary":"...","assumptions":[],"questions":["..."]}.'
-                    ),
-                    agent_type="goal_intake", cwd=str(draft_project_root(draft, root)), max_rounds=1,
-                    tools_override=(), stats=stats,
-                    deadline=time.monotonic() + max(1, int(draft.limits.get("operation_timeout_seconds", 1800))),
-                )
-            if (
-                raw.startswith("[goal_intake] failed:")
-                or raw.startswith("[goal_intake] stopped:")
-                or stats.stop_reason in {"provider_error", "configuration_error", "empty_response"}
-            ):
-                draft.status = "paused"
-                draft.last_error = f"Goal intake is unavailable: {raw}"
-                _set_stage(draft, "paused")
-                save_draft(draft, root, event="failed", message="Goal intake provider unavailable")
-                raise GoalDraftError(draft.last_error)
+                try:
+                    raw = _run_strict_intake_retry(
+                        prompt=_intake_prompt(draft.target, draft.verification, catalog),
+                        cwd=draft_project_root(draft, root),
+                        deadline=time.monotonic() + max(1, int(draft.limits.get("operation_timeout_seconds", 1800))),
+                    )
+                except GoalDraftError as exc:
+                    draft.status = "paused"
+                    draft.last_error = str(exc)
+                    _set_stage(draft, "paused")
+                    save_draft(draft, root, event="failed", message="Goal intake provider unavailable")
+                    raise GoalDraftError(draft.last_error)
             try:
                 _apply_intake_result(draft, _intake_from_raw(raw))
             except GoalDraftError as exc:

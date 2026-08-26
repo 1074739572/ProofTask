@@ -65,9 +65,11 @@ def _is_transient(exc: Exception) -> bool:
     )
 
 
-def with_retry(fn, state: RecoveryState):
+def with_retry(fn, state: RecoveryState, *, max_attempts: int = MAX_RETRIES):
+    """Run a request with a bounded number of attempts."""
+    attempts = max(1, int(max_attempts))
     last_error: Exception | None = None
-    for attempt in range(MAX_RETRIES):
+    for attempt in range(attempts):
         try:
             result = fn()
             state.consecutive_529 = 0
@@ -101,7 +103,7 @@ def with_retry(fn, state: RecoveryState):
                 continue
             raise
     detail = f"{type(last_error).__name__}: {last_error}" if last_error is not None else "unknown error"
-    raise RuntimeError(f"Max retries ({MAX_RETRIES}) exceeded; last error: {detail}") from last_error
+    raise RuntimeError(f"Max retries ({attempts}) exceeded; last error: {detail}") from last_error
 
 
 def is_model_recoverable_error(exc: Exception) -> bool:

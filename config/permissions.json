@@ -1,3 +1,86 @@
 {
-  "permission": "sandbox"
+  "version": 1,
+  "description": "静态默认权限策略与风险分级模型（仓库内只读默认值；会话运行时模式不写回本文件）",
+  "modes": {
+    "default": {
+      "label": "默认权限",
+      "auto_approve": ["low"]
+    },
+    "auto-review": {
+      "label": "自动审查",
+      "auto_approve": ["low", "medium"]
+    },
+    "full-access": {
+      "label": "完全访问权限",
+      "auto_approve": ["low", "medium", "high"]
+    }
+  },
+  "tools": {
+    "read_file": "low",
+    "inspect_file": "low",
+    "glob": "low",
+    "search_text": "low",
+    "rag_search": "low",
+    "rag_status": "low",
+    "git_status": "low",
+    "git_diff": "low",
+    "list_tasks": "low",
+    "get_task": "low",
+    "list_features": "low",
+    "project_status": "low",
+    "load_skill": "low",
+    "todo_write": "low",
+    "web_search": "low",
+    "write_file": "medium",
+    "edit_file": "medium",
+    "patch_file": "medium",
+    "mcp__fetch__*": "low",
+    "mcp__*": "high",
+    "bash": "high",
+    "subagent": "high",
+    "task": "high",
+    "spawn_teammate": "high"
+  },
+  "bash": {
+    "default_risk": "high",
+    "patterns": {
+      "blocked": [
+        "rm\\s+(-[a-z]*[rR][a-z]*\\s+)*/?\\s*$",
+        "\\srm\\s+(-[a-z]*[rR][a-z]*\\s+)*/?\\s*$",
+        "shutdown",
+        "reboot",
+        "mkfs",
+        "dd\\s+if=",
+        "sudo"
+      ],
+      "high": [
+        "rm\\s+(-[a-z]*[rR]\\s*)?-?[a-z]*f",
+        "\\brm\\b"
+      ],
+      "low": [
+        "\\bls\\b",
+        "\\bcat\\b",
+        "\\bless\\b",
+        "\\bmore\\b",
+        "\\bhead\\b",
+        "\\btail\\b",
+        "\\bgrep\\b",
+        "\\bfind\\b",
+        "\\bwc\\b",
+        "\\bgit\\s+status\\b",
+        "\\bgit\\s+diff\\b",
+        "\\bgit\\s+log\\b",
+        "\\bgit\\s+show\\b",
+        "\\bgit\\s+ls-files\\b",
+        "\\bpwd\\b",
+        "\\bwhoami\\b",
+        "\\bdate\\b",
+        "\\benv\\b",
+        "\\bcp\\b",
+        "\\bmv\\b",
+        "\\bmkdir\\b",
+        "\\btouch\\b"
+      ]
+    }
+  }
 }

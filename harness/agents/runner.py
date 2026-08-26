@@ -19,7 +19,7 @@ from harness.hooks import trigger_hooks
 from harness.llm import create_message
 from harness.messages.blocks import block_field, is_tool_use
 from harness.project.session import serialize_messages
-from harness.settings import get_workdir
+from harness.settings import MAX_RETRIES, get_workdir
 from harness.skills_loader import load_skill
 from harness.tools.dispatch import call_tool_handler, extract_text, has_tool_use
 from harness.tools.filesystem import (
@@ -447,6 +447,9 @@ def run_agent_task(
     read_paths: tuple[str, ...] | None = None,
     reasoning_effort_override: str | None = None,
     max_tokens: int = 8_000,
+    stream_response: bool = False,
+    request_read_timeout_seconds: float | None = None,
+    max_request_attempts: int | None = None,
     conversation: AgentTaskConversation | None = None,
 ) -> str:
     error = validate_agent_model(agent_type, reasoning_effort=reasoning_effort_override)
@@ -551,8 +554,15 @@ def run_agent_task(
                                 tools=tools,
                                 max_tokens=max(1, int(max_tokens)),
                                 usage_context=usage_context,
+                                force_stream=stream_response,
+                                read_timeout_seconds=request_read_timeout_seconds,
                             ),
                             recovery,
+                            max_attempts=(
+                                max_request_attempts
+                                if max_request_attempts is not None
+                                else MAX_RETRIES
+                            ),
                         ),
                     )
                 )

@@ -15,12 +15,16 @@ if TYPE_CHECKING:
     from openai import OpenAI
 
 _lock = threading.Lock()
-_clients: dict[str, "OpenAI"] = {}
+_clients: dict[tuple[str, float, float, float, float], "OpenAI"] = {}
 
 
-def get_openai_client(provider: ProviderConfig) -> "OpenAI":
+def get_openai_client(provider: ProviderConfig, *, read_timeout_seconds: float | None = None) -> "OpenAI":
     with _lock:
-        cached = _clients.get(provider.id)
+        connect, read, write, pool = provider_timeout()
+        if read_timeout_seconds is not None:
+            read = max(0.1, float(read_timeout_seconds))
+        client_key = (provider.id, connect, read, write, pool)
+        cached = _clients.get(client_key)
         if cached is not None:
             return cached
         # Lazy import: the OpenAI SDK is ~5s to import on Windows; only pay
@@ -34,7 +38,6 @@ def get_openai_client(provider: ProviderConfig) -> "OpenAI":
                 f"Missing API key for provider '{provider.label}'. "
                 f"Set {provider.api_key_env} in .env"
             )
-        connect, read, write, pool = provider_timeout()
         client = OpenAI(
             api_key=api_key,
             base_url=provider.base_url,
@@ -43,7 +46,7 @@ def get_openai_client(provider: ProviderConfig) -> "OpenAI":
             # turn one 90s stalled request into several silent minutes.
             max_retries=0,
         )
-        _clients[provider.id] = client
+        _clients[client_key] = client
         return client
 
 
@@ -223,8 +226,9 @@ def create_openai_message(
     reasoning_effort: str | None = None,
     extra_body: dict | None = None,
     on_delta: callable = None,
+    read_timeout_seconds: float | None = None,
 ) -> MessageResponse:
-    client = get_openai_client(provider)
+    client = get_openai_client(provider, read_timeout_seconds=read_timeout_seconds)
     openai_messages = anthropic_messages_to_openai(messages)
     if system:
         openai_messages = [{"role": "system", "content": system}, *openai_messages]

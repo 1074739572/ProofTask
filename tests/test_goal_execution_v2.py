@@ -103,3 +103,34 @@ def test_execution_replan_replaces_only_unfinished_tasks(tmp_path, monkeypatch):
     assert state.task_ids == [completed.id, replacement_id]
     assert load_task(active.id).status == "cancelled"
     assert replacement.blockedBy == [completed.id]
+
+
+def test_execution_replan_manifest_uses_current_worktree_files(tmp_path):
+    from harness.goal.runner import _execution_replan_manifest
+
+    sandbox = tmp_path / "harness" / "goal" / "sandbox.py"
+    sandbox.parent.mkdir(parents=True)
+    sandbox.write_text("class Sandbox: pass\n", encoding="utf-8")
+    manifest, paths = _execution_replan_manifest(
+        {
+            "repo_files": ["docs/goal-shell-sandbox-requirements.md"],
+            "evidence": [{"id": "E1", "path": "docs/goal-shell-sandbox-requirements.md", "claim": "old input"}],
+        },
+        tmp_path,
+        scope_paths=("harness/goal/sandbox.py", "docs/goal-shell-sandbox-requirements.md"),
+    )
+
+    assert manifest["repo_files"] == ["harness/goal/sandbox.py"]
+    assert paths == ("harness/goal/sandbox.py",)
+    assert any(item["path"] == "harness/goal/sandbox.py" for item in manifest["evidence"])
+
+
+def test_missing_case_selectors_requires_nonempty_machine_bindings():
+    from harness.goal.runner import GoalRunner
+
+    missing = GoalRunner._missing_case_selectors(
+        {"AC1", "AC2", "AC3"},
+        {"AC1": ["tests/test_example.py::test_one"], "AC2": []},
+    )
+
+    assert missing == ["AC2", "AC3"]

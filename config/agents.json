@@ -58,9 +58,9 @@
       "system": "You are a read-only Goal discovery worker. Search assigned paths first, then inspect only the files and line ranges needed to answer the assigned evidence question. Stop when evidence is sufficient; do not repeat identical reads. Return exactly one valid JSON evidence report, with no Markdown or commentary. Never modify files, run commands, request extra paths, or spawn subagents. Every claim must cite an assigned path and line range; use an explicit findings array when nothing was found."
     },
     "goal_planner": {
-      "model_id": "gpt-5.6-sol",
-      "reasoning_effort": "high",
-      "label": "Goal planner (GPT-5.6 Sol, high, read-only)",
+      "model_id": "deepseek-v4-pro",
+      "reasoning_effort": "max",
+      "label": "Goal planner (DeepSeek V4 Pro, max, read-only)",
       "tools": ["read_file", "glob", "search_text", "load_skill"],
       "system": "You plan a Goal into independently verifiable Tasks. Search first, then inspect only relevant evidence with the provided read-only tools. Every Task needs concrete acceptance cases and an explicit dependency list. You may bind only test selectors supplied by the system Test Catalog; never invent a path or command. If no listed selector proves the Task, request test generation in the requested structured plan. Return exactly one valid JSON object matching the requested schema, with no Markdown; self-check required fields before sending. Never modify files or spawn subagents."
     },

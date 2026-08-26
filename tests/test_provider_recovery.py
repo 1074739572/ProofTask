@@ -37,3 +37,21 @@ def test_connection_error_retries_then_succeeds(monkeypatch):
 
     assert with_retry(request, RecoveryState()) == "ok"
     assert calls == 3
+
+
+def test_connection_error_honors_single_attempt_limit(monkeypatch):
+    monkeypatch.setattr(recovery, "retry_delay", lambda attempt: 0)
+    calls = 0
+
+    def request():
+        nonlocal calls
+        calls += 1
+        raise ConnectionError("temporary connection failure")
+
+    try:
+        with_retry(request, RecoveryState(), max_attempts=1)
+    except RuntimeError as exc:
+        assert "Max retries (1) exceeded" in str(exc)
+    else:
+        raise AssertionError("expected the single request to fail")
+    assert calls == 1

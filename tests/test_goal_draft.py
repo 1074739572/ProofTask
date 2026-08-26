@@ -302,6 +302,31 @@ def test_invalid_intake_json_pauses_draft_instead_of_planning(tmp_path):
     assert "invalid JSON" in (draft.last_error or "")
 
 
+def test_builtin_intake_retries_invalid_json_with_low_reasoning(tmp_path, monkeypatch):
+    import harness.goal.draft as draft_module
+
+    calls = []
+
+    def intake_call(**kwargs):
+        calls.append(kwargs)
+        return "not JSON" if len(calls) == 1 else '{"questions":[]}'
+
+    def mark_ready(draft, *_args, **_kwargs):
+        draft.status = "ready"
+
+    monkeypatch.setattr("harness.agents.runner.run_agent_task", intake_call)
+    monkeypatch.setattr(draft_module, "_plan", mark_ready)
+
+    draft = draft_module.create_draft(
+        "add rate limits", workspace=tmp_path, verification="python -m pytest -q",
+        planner_runner=lambda **_: pytest.fail("the patched planner should handle this"),
+    )
+
+    assert draft.status == "ready"
+    assert calls[1]["reasoning_effort_override"] == "low"
+    assert calls[1]["max_tokens"] == 2_000
+
+
 def test_resume_retries_intake_failure_before_discovery(tmp_path):
     with pytest.raises(ValueError, match="invalid JSON"):
         create_draft(
@@ -526,6 +551,72 @@ def test_resume_planner_failure_reuses_saved_discovery_manifest(tmp_path, monkey
     assert resumed.status == "ready"
     assert discovery_calls == [paused.id]
     assert planner_calls == [paused.id, paused.id]
+
+
+def test_resume_path_grounding_failure_refreshes_discovery(tmp_path, monkeypatch):
+    import harness.goal.draft as draft_module
+    from harness.goal.planner import GoalPlanningError
+
+    discovery_calls = []
+    plan_calls = []
+    manifest = {
+        "repo_files": ["src/rate.py"],
+        "evidence": [{"id": "E1", "path": "src/rate.py"}],
+        "jobs": [{"id": "implementation-1", "status": "done"}],
+        "revision": 1,
+    }
+
+    def discovery(**kwargs):
+        discovery_calls.append(kwargs["draft"].id)
+        return manifest
+
+    def planner(draft, *_args, **_kwargs):
+        plan_calls.append(draft.id)
+        if len(plan_calls) == 1:
+            raise GoalPlanningError(
+                "planner referenced an undiscovered read_envelope path",
+                requires_discovery_refresh=True,
+            )
+        draft.status = "ready"
+
+    monkeypatch.setattr(draft_module, "_plan", planner)
+    with pytest.raises(ValueError, match="Goal planning failed"):
+        draft_module.create_draft(
+            "add rate limits",
+            workspace=tmp_path,
+            verification="python -m pytest -q",
+            intake_runner=lambda **_: '{"questions":[]}',
+            discovery_runner=discovery,
+        )
+
+    paused = draft_module.load_draft(tmp_path)
+    assert paused is not None
+    assert paused.resume_from == "discovering"
+
+    resumed = draft_module.resume_draft(workspace=tmp_path, discovery_runner=discovery)
+
+    assert resumed.status == "ready"
+    assert discovery_calls == [paused.id, paused.id]
+
+
+def test_completed_planning_sets_ready_stage(tmp_path, monkeypatch):
+    import harness.goal.draft as draft_module
+
+    draft = draft_module.GoalDraft(
+        id="ready-stage",
+        target="add rate limits",
+        verification="python -m pytest -q",
+        verification_source="test",
+        status="planning",
+        stage="planning",
+    )
+    plan = type("Plan", (), {"contract": {}, "review": {"approved": True}, "tasks": []})()
+    monkeypatch.setattr(draft_module, "plan_tasks", lambda *_args, **_kwargs: plan)
+
+    draft_module._plan(draft, tmp_path, object())
+
+    assert draft.status == "ready"
+    assert draft.stage == "ready"
 
 
 def test_resume_discovery_failure_runs_discovery_again(tmp_path, monkeypatch):

@@ -16,6 +16,7 @@ import time
 from pathlib import Path
 
 from harness.settings import WORKDIR, get_workdir
+from harness.workspace_lock import WorkspaceMutationLock
 
 if sys.platform == "win32":
     import ctypes
@@ -269,7 +270,7 @@ def _timeout_diagnosis(
     )
 
 
-def run_bash(
+def _run_bash_unlocked(
     command: str,
     cwd: Path | None = None,
     run_in_background: bool = False,
@@ -338,7 +339,7 @@ def run_bash(
     return f"[exit_code={info['exit_code']}]\n{result}"
 
 
-def run_bash_streaming(
+def _run_bash_streaming_unlocked(
     command: str,
     cwd: Path | None = None,
     timeout: int | None = None,
@@ -519,7 +520,7 @@ def run_read(
         return f"Error: {exc}"
 
 
-def run_write(path: str, content: str, cwd: Path | None = None) -> str:
+def _run_write_unlocked(path: str, content: str, cwd: Path | None = None) -> str:
     try:
         if len(content) > MAX_WRITE_CHARS:
             return (
@@ -556,7 +557,7 @@ def _closest_line_hint(old_text: str, text: str) -> str | None:
     return f"Closest match: line {line_no}: {lines[line_no - 1].strip()[:80]}"
 
 
-def run_edit(
+def _run_edit_unlocked(
     path: str,
     old_text: str,
     new_text: str,
@@ -740,7 +741,7 @@ def run_git_diff(
     return _run_git_read(command, cwd, max(1_000, min(int(max_chars or 50_000), 100_000)))
 
 
-def run_patch_file(
+def _run_patch_file_unlocked(
     path: str,
     hunks: list[dict],
     *,
@@ -798,3 +799,78 @@ def run_patch_file(
         return f"Patched {path} ({len(hunks)} hunks) sha256 {before_hash[:12]} -> {after_hash[:12]}"
     except Exception as exc:
         return f"Error: {exc}"
+
+
+def _run_with_workspace_lock(cwd: Path | None, purpose: str, operation) -> str:
+    try:
+        lock = WorkspaceMutationLock(cwd or get_workdir(), purpose=purpose)
+        if not lock.acquire(timeout_s=3.0):
+            return "Error: workspace is busy publishing or applying another agent change; retry shortly."
+    except OSError as exc:
+        return f"Error: cannot acquire workspace mutation lock: {exc}"
+    try:
+        return operation()
+    finally:
+        lock.release()
+
+
+def run_bash(
+    command: str,
+    cwd: Path | None = None,
+    run_in_background: bool = False,
+    timeout: int | None = None,
+) -> str:
+    return _run_with_workspace_lock(
+        cwd,
+        "bash",
+        lambda: _run_bash_unlocked(command, cwd, run_in_background, timeout),
+    )
+
+
+def run_bash_streaming(
+    command: str,
+    cwd: Path | None = None,
+    timeout: int | None = None,
+    tool_use_id: str = "",
+) -> str:
+    return _run_with_workspace_lock(
+        cwd,
+        "bash_streaming",
+        lambda: _run_bash_streaming_unlocked(command, cwd, timeout, tool_use_id),
+    )
+
+
+def run_write(path: str, content: str, cwd: Path | None = None) -> str:
+    return _run_with_workspace_lock(
+        cwd,
+        "write_file",
+        lambda: _run_write_unlocked(path, content, cwd),
+    )
+
+
+def run_edit(
+    path: str,
+    old_text: str,
+    new_text: str,
+    occurrence: int = 1,
+    cwd: Path | None = None,
+) -> str:
+    return _run_with_workspace_lock(
+        cwd,
+        "edit_file",
+        lambda: _run_edit_unlocked(path, old_text, new_text, occurrence, cwd),
+    )
+
+
+def run_patch_file(
+    path: str,
+    hunks: list[dict],
+    *,
+    expected_sha256: str = "",
+    cwd: Path | None = None,
+) -> str:
+    return _run_with_workspace_lock(
+        cwd,
+        "patch_file",
+        lambda: _run_patch_file_unlocked(path, hunks, expected_sha256=expected_sha256, cwd=cwd),
+    )

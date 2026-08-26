@@ -66,6 +66,22 @@ def test_execution_replan_prompt_includes_boundary_failure_evidence():
     assert "Every acceptance case assigned" in prompt
 
 
+def test_execution_replan_prompt_marks_current_paths_as_existing():
+    from harness.goal.planner import build_plan_prompt
+
+    prompt = build_plan_prompt(
+        "add a shell sandbox",
+        "pytest -q",
+        TestCatalog(),
+        MANIFEST,
+        frozen_contract=_plan()["goal_contract"],
+        execution_workspace_paths=("harness/goal/sandbox.py",),
+    )
+
+    assert "Current execution-workspace paths" in prompt
+    assert "harness/goal/sandbox.py" in prompt
+
+
 def test_plan_tasks_accepts_an_explicit_adapter_without_importing_it_locally(tmp_path):
     result = plan_tasks(
         "add a rate limit",

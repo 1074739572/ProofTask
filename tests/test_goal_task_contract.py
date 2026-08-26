@@ -2878,6 +2878,86 @@ def test_invalid_evaluator_output_pauses_for_a_retry(tmp_path, monkeypatch):
     assert "no JSON object" in state.last_error
 
 
+def test_evaluator_replan_bypasses_repair_worker_loop(tmp_path, monkeypatch):
+    import harness.goal.runner as runner_mod
+    import harness.tasks as tasks
+
+    monkeypatch.setattr(tasks, "TASKS_DIR", tmp_path / ".tasks")
+    task = tasks.create_task("review task", "keep working", verification_spec={})
+    tasks.claim_task(task.id)
+    state = GoalState.new(target="review task", verification="pytest -q", workspace=str(tmp_path))
+    state.current_task_id = task.id
+    state.task_ids = [task.id]
+    state.phase = GoalPhase.EVALUATE.value
+    task.evaluation = {"passed": False, "route": "replan", "summary": "Task scope is too narrow"}
+    monkeypatch.setattr(runner_mod, "save_goal", lambda _state: None)
+    monkeypatch.setattr(runner_mod, "_emit_goal", lambda *args: None)
+    monkeypatch.setattr(
+        runner_mod,
+        "run_task_evaluation",
+        lambda *args, **kwargs: task,
+    )
+    runner = GoalRunner(state=state, history=[], context={}, binding=None)
+    replans = []
+    monkeypatch.setattr(
+        runner,
+        "_replan_remaining_tasks",
+        lambda *args, **kwargs: replans.append(kwargs),
+    )
+
+    runner._evaluate(state)
+
+    assert len(replans) == 1
+    assert replans[0]["task"].id == task.id
+    assert replans[0]["reason"] == "Task scope is too narrow"
+
+
+def test_persisted_evaluator_replan_bypasses_repair_planner_on_resume(tmp_path, monkeypatch):
+    import harness.goal.runner as runner_mod
+    import harness.tasks as tasks
+
+    monkeypatch.setattr(tasks, "TASKS_DIR", tmp_path / ".tasks")
+    task = tasks.create_task("review task", "keep working", verification_spec={})
+    tasks.claim_task(task.id)
+    task.evaluation = {"passed": False, "route": "replan", "summary": "Task scope is too narrow"}
+    tasks.save_task(task)
+    state = GoalState.new(target="review task", verification="pytest -q", workspace=str(tmp_path))
+    state.current_task_id = task.id
+    state.task_ids = [task.id]
+    state.phase = GoalPhase.REPAIR_PLAN.value
+    monkeypatch.setattr(runner_mod, "save_goal", lambda _state: None)
+    monkeypatch.setattr(runner_mod, "_emit_goal", lambda *args: None)
+    runner = GoalRunner(state=state, history=[], context={}, binding=None)
+    replans = []
+    monkeypatch.setattr(
+        runner,
+        "_replan_remaining_tasks",
+        lambda *args, **kwargs: replans.append(kwargs),
+    )
+
+    runner._repair_plan(state)
+
+    assert len(replans) == 1
+    assert replans[0]["task"].id == task.id
+    assert replans[0]["reason"] == "Task scope is too narrow"
+
+
+def test_evaluation_replan_enters_repair_plan_before_task_selection(tmp_path, monkeypatch):
+    import harness.goal.runner as runner_mod
+
+    state = GoalState.new(target="review task", verification="pytest -q", workspace=str(tmp_path))
+    state.phase = GoalPhase.EVALUATE.value
+    monkeypatch.setattr(runner_mod, "save_goal", lambda _state: None)
+    monkeypatch.setattr(runner_mod, "_emit_goal", lambda *args: None)
+    runner = GoalRunner(state=state, history=[], context={}, binding=None)
+
+    runner._enter_replanned_task_selection(state)
+
+    assert state.phase == GoalPhase.SELECT_TASK.value
+    assert state.transition_log[-2]["reason"] == "evaluation_replan_ready"
+    assert state.transition_log[-1]["reason"] == "execution_replan_accepted"
+
+
 def test_act_uses_isolated_goal_worker_with_task_prompt(tmp_path, monkeypatch):
     import harness.agents.registry as registry_mod
     import harness.goal.runner as runner_mod

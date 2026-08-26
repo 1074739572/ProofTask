@@ -156,7 +156,7 @@ def agent_loop(
     """Run until the agent finishes or cancel is requested. Returns True if interrupted.
 
     max_rounds: optional cap on LLM turns (used by evals). When None the cap is
-    read from HARNESS_MAX_LLM_ROUNDS (default 40) so an agent looping on tools
+    read from HARNESS_MAX_LLM_ROUNDS (default 200) so an agent looping on tools
     cannot spin forever; pass max_rounds=0 to disable the cap entirely.
     binding: optional SessionBinding for persisting compact boundaries.
     disabled_tools: optional tool-name set hidden from the model this run
@@ -173,11 +173,11 @@ def agent_loop(
         renderer.warn(line)
 
     if max_rounds is None:
-        raw = os.getenv("HARNESS_MAX_LLM_ROUNDS", "40").strip()
+        raw = os.getenv("HARNESS_MAX_LLM_ROUNDS", "200").strip()
         try:
             max_rounds = int(raw)
         except ValueError:
-            max_rounds = 40
+            max_rounds = 200
         if max_rounds <= 0:
             max_rounds = None  # 0 disables the cap (explicit opt-out)
 

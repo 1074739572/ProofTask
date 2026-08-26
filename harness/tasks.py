@@ -64,6 +64,9 @@ class Task:
     # Hashes of files already dirty when the Task was claimed. They let an
     # evaluator exclude unrelated workspace changes from this Task's diff.
     start_dirty_hashes: dict[str, str] = field(default_factory=dict)
+    # Text snapshots of already-dirty files let evaluation attribute a later
+    # edit to the current Task instead of treating restored Goal work as new.
+    start_dirty_contents: dict[str, str] = field(default_factory=dict)
     # Feature links are durable Task metadata, used to keep Goal/Feature
     # history attributable after a session is restarted.
     feature_ids: list[str] = field(default_factory=list)
@@ -308,6 +311,7 @@ def record_task_start(
     snapshot: str | None,
     diff: str | None,
     dirty_hashes: dict[str, str] | None = None,
+    dirty_contents: dict[str, str] | None = None,
 ) -> Task:
     """Persist the Task-local workspace baseline at claim time."""
     path = _active_path(task_id)
@@ -317,6 +321,7 @@ def record_task_start(
     task.start_snapshot = snapshot
     task.start_diff = diff
     task.start_dirty_hashes = dict(dirty_hashes or {})
+    task.start_dirty_contents = dict(dirty_contents or {})
     save_task(task)
     return task
 

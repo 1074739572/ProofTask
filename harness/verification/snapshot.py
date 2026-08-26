@@ -182,6 +182,46 @@ def capture_dirty_file_hashes(workspace: str | Path | None = None) -> dict[str, 
     return result
 
 
+def capture_dirty_file_contents(workspace: str | Path | None = None) -> dict[str, str]:
+    """Capture pre-Task dirty file text for task-local diff attribution.
+
+    Hashes tell us *which* files were already dirty, but cannot distinguish an
+    earlier recovered change from a later Task edit to the same file.  Keep a
+    bounded text baseline so an evaluator can review only the latter.  Binary,
+    unreadable, and harness-metadata files are intentionally omitted.
+    """
+    ws = Path(workspace).expanduser().resolve() if workspace else None
+    if ws is None:
+        from harness.settings import get_workdir
+
+        ws = get_workdir()
+    changed = _git_bytes("diff", "--name-only", "-z", "HEAD", cwd=ws)
+    untracked = _git_bytes("ls-files", "--others", "--exclude-standard", "-z", cwd=ws)
+    if changed is None or untracked is None:
+        return {}
+    root = _git("rev-parse", "--show-toplevel", cwd=ws)
+    repository = Path(root.strip()).resolve() if root else ws
+    result: dict[str, str] = {}
+    for raw_path in (*changed.split(b"\0"), *untracked.split(b"\0")):
+        if not raw_path:
+            continue
+        resolved = _workspace_git_path(raw_path, ws, repository)
+        if resolved is None:
+            continue
+        path, key = resolved
+        if _is_harness_metadata(Path(key)) or not path.is_file():
+            continue
+        try:
+            content = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        # Task records are durable metadata.  A bounded baseline prevents a
+        # large pre-existing generated file from bloating every Goal checkpoint.
+        if len(content) <= 200_000:
+            result[key] = content
+    return result
+
+
 def workspace_has_changes_since(workspace: str | Path | None, snapshot: str) -> bool:
     """True when the workspace is a git repo, the snapshot is a git snapshot,
     and the current state differs from it. Non-git -> False (cannot check)."""

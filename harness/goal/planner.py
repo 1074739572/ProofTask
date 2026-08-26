@@ -25,7 +25,13 @@ PLAN_REVIEWER_AGENT = "goal_plan_reviewer"
 # implementation worker; keeping planning tool-free prevents an invisible,
 # unbounded explore loop before a draft can be saved.
 PLANNER_MAX_ROUNDS = 1
-PLANNER_MAX_OUTPUT_TOKENS = 32_000
+PLANNER_MAX_OUTPUT_TOKENS = 12_000
+PLANNER_ESCALATED_OUTPUT_TOKENS = 24_000
+# The configured Sol relay buffers the initial response, so the shared 90s
+# read timeout is too short for a high-reasoning Goal contract. One longer
+# attempt is more predictable than three full 90s retries.
+PLANNER_READ_TIMEOUT_SECONDS = 300.0
+PLANNER_MAX_REQUEST_ATTEMPTS = 1
 PLANNER_FORMAT_RETRY_MAX_ROUNDS = 1
 PLAN_REVIEW_MAX_ROUNDS = 1
 PLANNER_REPAIR_INPUT_LIMIT = 24_000
@@ -40,6 +46,10 @@ _AGENT_HEADER = re.compile(r"^\[[^\]]+\] [^\n]*\n*")
 
 class GoalPlanningError(ValueError):
     """Raised when a Goal cannot be decomposed into valid Task contracts."""
+
+    def __init__(self, message: str, *, requires_discovery_refresh: bool = False):
+        super().__init__(message)
+        self.requires_discovery_refresh = requires_discovery_refresh
 
 
 def _strip_agent_header(text: str) -> str:
@@ -341,6 +351,7 @@ def _planner_manifest_view(discovery_manifest: dict[str, Any]) -> dict[str, Any]
         "revision": discovery_manifest.get("revision", 0),
         "evidence": evidence,
         "scope_candidates": scope_candidates,
+        "implementation_candidates": list(_implementation_candidates(discovery_manifest)),
         "gaps": [str(item)[:500] for item in discovery_manifest.get("gaps", []) if str(item).strip()],
         "conflicts": [str(item)[:500] for item in discovery_manifest.get("conflicts", []) if str(item).strip()],
         "jobs": jobs,
@@ -348,6 +359,60 @@ def _planner_manifest_view(discovery_manifest: dict[str, Any]) -> dict[str, Any]
 
 
 _SOURCE_SUFFIXES = frozenset({".py", ".pyi", ".js", ".jsx", ".ts", ".tsx", ".java", ".go", ".rs", ".rb", ".php", ".cs"})
+_EVIDENCE_PATH_RE = re.compile(r"(?<![\w./-])(?:[\w.-]+/)*[\w.-]+\.(?:py|pyi|js|jsx|ts|tsx|java|go|rs|rb|php|cs)(?![\w/-])", re.IGNORECASE)
+_PYTHON_MODULE_RE = re.compile(r"(?<![\w.])[A-Za-z_]\w*(?:\.[A-Za-z_]\w*){1,}(?!\w)")
+
+
+def _implementation_candidates(discovery_manifest: dict[str, Any]) -> tuple[str, ...]:
+    """Resolve source entry points named by Discovery reports to exact repo files.
+
+    A Discovery report often documents an extension point as ``hooks.py`` or
+    ``cli.py`` while the machine-collected repository map owns the full path.
+    Preserve that link for planning instead of forcing a second Discovery pass
+    merely to turn a known basename into an exact file scope.
+    """
+    source_paths = tuple(
+        str(path or "").replace("\\", "/").strip()
+        for path in discovery_manifest.get("repo_files", [])
+        if Path(str(path or "")).suffix.lower() in _SOURCE_SUFFIXES
+    )
+    by_name: dict[str, list[str]] = {}
+    for path in source_paths:
+        by_name.setdefault(Path(path).name.lower(), []).append(path)
+
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    def add(path: str) -> None:
+        if path and path not in seen:
+            seen.add(path)
+            candidates.append(path)
+
+    for item in discovery_manifest.get("evidence", []):
+        if not isinstance(item, dict):
+            continue
+        evidence_path = str(item.get("path") or "").replace("\\", "/").strip()
+        if Path(evidence_path).suffix.lower() in _SOURCE_SUFFIXES and evidence_path in source_paths:
+            add(evidence_path)
+        claim = str(item.get("claim") or "")
+        for mention in _EVIDENCE_PATH_RE.findall(claim):
+            normalized = mention.replace("\\", "/")
+            if normalized in source_paths:
+                add(normalized)
+                continue
+            matches = by_name.get(Path(normalized).name.lower(), [])
+            if len(matches) == 1:
+                add(matches[0])
+        # Requirement documents commonly name Python extension points in
+        # dotted-module form (for example ``harness.agents.runner``). Resolve
+        # them only when that exact module maps to an indexed source file.
+        for module in _PYTHON_MODULE_RE.findall(claim):
+            candidate = module.replace(".", "/") + ".py"
+            if candidate in source_paths:
+                add(candidate)
+    return tuple(candidates[:80])
+
+
 def discovery_readiness_error(discovery_manifest: dict[str, Any] | None) -> str | None:
     """Reject planning only when system-validated evidence is insufficient.
 
@@ -370,7 +435,7 @@ def discovery_readiness_error(discovery_manifest: dict[str, Any] | None) -> str 
         for item in evidence
         if Path(str(item.get("path") or "")).suffix.lower() in _SOURCE_SUFFIXES
     }
-    if repo_source_paths and not source_evidence_paths:
+    if repo_source_paths and not source_evidence_paths and not _implementation_candidates(discovery_manifest):
         return "Discovery produced no validated source-code evidence. Continue discovery before planning."
     return None
 
@@ -398,7 +463,11 @@ def _task_has_source_evidence(
             continue
         if any(path == scope or path.startswith(scope.rstrip("/") + "/") for scope in code_scopes):
             return True
-    return False
+    # The repository inventory is machine-collected.  A report that names a
+    # unique entry-point basename can therefore safely authorize that exact
+    # indexed file for planning, without silently rerunning Discovery.
+    candidates = set(_implementation_candidates(discovery_manifest))
+    return bool(candidates) and all(scope in candidates for scope in code_scopes)
 
 
 def build_plan_prompt(
@@ -411,6 +480,7 @@ def build_plan_prompt(
     frozen_contract: dict[str, Any] | None = None,
     completed_task_names: tuple[str, ...] = (),
     replan_reason: str = "",
+    execution_workspace_paths: tuple[str, ...] = (),
 ) -> str:
     """Prompt for the read-only planner. Output is a GoalPlan v2 object."""
     catalog_text = (test_catalog or TestCatalog(error="not collected")).prompt_text(limit=PLANNER_CATALOG_LIMIT)
@@ -434,6 +504,10 @@ def build_plan_prompt(
             "to a Task must be satisfiable by that Task and its completed dependencies; do not assign "
             "a runtime integration acceptance case to an earlier Task when its execution route is a "
             "separate pending Task.\n"
+            "The execution-workspace paths below are authoritative current facts, even when they differ "
+            "from the original Discovery evidence. An existing listed path may be primary_write or read_envelope, "
+            "but must never be planned_new. Do not emit a missing original path as a Task scope.\n"
+            f"Current execution-workspace paths: {json.dumps(list(execution_workspace_paths), ensure_ascii=False)}\n"
             f"Replan trigger evidence:\n{replan_reason[:12_000] or '(none supplied)'}\n"
             f"Frozen goal_contract:\n{json.dumps(_contract_projection(frozen_contract), ensure_ascii=False)}\n\n"
         )
@@ -464,6 +538,15 @@ def build_plan_prompt(
         "- Task scope has five explicit classes: primary_write (existing files to edit), planned_new (new files/directories), conditional_write (existing files that may be added only after proof), read_envelope (existing paths needed to understand the task), forbidden (paths that must not change).\n"
         "- Never put a whole project root or a broad parent directory in primary_write. Use the smallest exact existing files.\n"
         "- primary_write, conditional_write, and read_envelope must be discovered paths. planned_new must not already exist.\n\n"
+        "State-lifetime rule:\n"
+        "- Separate persistent implementation artifacts from runtime user selections. Source files and checked-in configuration may be primary_write when the Task explicitly implements a schema, shipped default policy, or parser for them.\n"
+        "- A current-session, temporary, or non-persistent user selection belongs in session/runtime state. It must not be written back to a user/default configuration file on each command invocation.\n"
+        "- When a Task writes a configuration file and the Goal has session-scoped behavior, its behavior and acceptance cases must explicitly say that the write creates static schema/default support while the runtime selection remains session-scoped. If it only reads the configuration, list it only in read_envelope.\n\n"
+        "Integration-closure rule:\n"
+        "- implementation_candidates are exact source files from the machine-collected repository map whose extension-point names were cited by Discovery. They are valid existing-file scope candidates; do not replace them with guessed paths.\n"
+        "- For a feature that changes how a command affects later tool calls, the Tasks together must explicitly cover: command/input registration, current-session state ownership, and the centralized enforcement hook. A static configuration/schema task is separate from, and cannot substitute for, the runtime enforcement task.\n"
+        "- Put every required integration boundary in primary_write or read_envelope. Do not hide command routing, session state, hook registration, or an explicitly requested client/event bridge only in broad behavior prose. Add a dependency when one boundary needs another.\n"
+        "- Do not invent a UI or event-stream task when the confirmed Goal limits the feature to the ordinary CLI; include such a boundary only when the Goal or Discovery evidence requires it.\n\n"
         "Split the Goal into as many Tasks as its independently verifiable deliverables require:\n"
         "- First compare every requested behavior against Discovery evidence and classify it internally as implemented, partial, missing, or unknown. Create Tasks only for partial or missing behavior; implemented behavior may need regression coverage but is not implementation work.\n"
         "- There is no target Task count. Cover every distinct deliverable; never merge work merely to reduce the count.\n"
@@ -622,6 +705,19 @@ def _path_can_be_planned_new(path: str, files: set[str]) -> bool:
     return parent in {"", "."} or _path_is_existing_envelope(parent, files)
 
 
+def planning_error_requires_discovery(error: str | None) -> bool:
+    """Whether a rejected plan relies on paths the current manifest cannot prove."""
+    text = str(error or "")
+    return any(
+        marker in text
+        for marker in (
+            "primary_write must contain exact discovered files",
+            "conditional_write must contain exact discovered files",
+            "read_envelope must contain discovered files or directories",
+        )
+    )
+
+
 def _parse_goal_contract(raw: Any, evidence_ids: set[str]) -> tuple[dict[str, Any] | None, list[str]]:
     errors: list[str] = []
     if not isinstance(raw, dict):
@@ -712,6 +808,7 @@ def _parse_plan_result(
         errors.append("planning v2 does not support root-level scope_paths")
     names: set[str] = set()
     external_names = set(external_dependency_names)
+    generated_paths_by_task: dict[str, frozenset[str]] = {}
     for index, entry in enumerate(data["tasks"], start=1):
         label = f"Task {index}"
         if not isinstance(entry, dict):
@@ -731,11 +828,21 @@ def _parse_plan_result(
         if any(dependency not in names and dependency not in external_names for dependency in dependencies):
             errors.append(f"{label} depends_on must list an earlier or completed Task name")
             continue
+        dependency_generated_paths = frozenset().union(
+            *(generated_paths_by_task.get(dependency, frozenset()) for dependency in dependencies)
+        )
         spec = _spec_from_entry(entry, test_catalog, cases, verification_adapter)
         primary_write = _normalise_strings(entry.get("primary_write"))
         planned_new = _normalise_strings(entry.get("planned_new"))
         conditional_write = _normalise_strings(entry.get("conditional_write"))
-        read_envelope = _normalise_strings(entry.get("read_envelope"))
+        # A file declared as planned_new cannot be read yet. Some planners
+        # redundantly include it in read_envelope; omit only that impossible
+        # overlap, while preserving discovery refreshes for every other
+        # unknown path.
+        read_envelope = tuple(
+            path for path in _normalise_strings(entry.get("read_envelope"))
+            if path not in planned_new
+        )
         forbidden = _normalise_strings(entry.get("forbidden"))
         requested_refs = _normalise_strings(entry.get("evidence_refs"))
         strategy = str(entry.get("test_strategy") or "")[:1000]
@@ -750,7 +857,14 @@ def _parse_plan_result(
             primary_valid = all(_valid_scope_path(path) and _path_is_existing(path, file_paths) for path in primary_write)
             planned_new_valid = all(_path_can_be_planned_new(path, file_paths) for path in planned_new)
             conditional_valid = all(_valid_scope_path(path) and _path_is_existing(path, file_paths) for path in conditional_write)
-            read_valid = all(_valid_scope_path(path) and _path_is_existing_envelope(path, file_paths) for path in read_envelope)
+            read_valid = all(
+                _valid_scope_path(path)
+                and (
+                    _path_is_existing_envelope(path, file_paths)
+                    or path in dependency_generated_paths
+                )
+                for path in read_envelope
+            )
             forbidden_valid = all(_valid_scope_path(path) for path in forbidden)
             evidence_scope = tuple(dict.fromkeys([*primary_write, *conditional_write, *read_envelope]))
             refs = tuple(dict.fromkeys(
@@ -764,7 +878,18 @@ def _parse_plan_result(
             if conditional_write and not conditional_valid:
                 errors.append(f"{label} conditional_write must contain exact discovered files")
             if read_envelope and not read_valid:
-                errors.append(f"{label} read_envelope must contain discovered files or directories")
+                unknown_read_paths = [
+                    path for path in read_envelope
+                    if not _valid_scope_path(path)
+                    or (
+                        not _path_is_existing_envelope(path, file_paths)
+                        and path not in dependency_generated_paths
+                    )
+                ]
+                errors.append(
+                    f"{label} read_envelope must contain discovered files or directories: "
+                    + ", ".join(unknown_read_paths)
+                )
             if forbidden and not forbidden_valid:
                 errors.append(f"{label} forbidden has an invalid workspace path")
             if primary_write and primary_valid and not _task_has_source_evidence(primary_write, refs, discovery_manifest):
@@ -793,6 +918,7 @@ def _parse_plan_result(
             )
         )
         names.add(name)
+        generated_paths_by_task[name] = dependency_generated_paths | frozenset(planned_new)
     if errors:
         return None, _contract_error_text(errors)
     return GoalPlan(contract=contract or {}, tasks=tuple(plans)), None
@@ -836,6 +962,13 @@ def build_plan_review_prompt(
         "or too narrow, missing prerequisite, untestable acceptance case, or conflict with the Goal contract.\n\n"
         "A plan is approvable only when a worker can begin each task without deciding product architecture, "
         "and primary_write is narrow exact existing-file scope. conditional_write is not initially writable.\n"
+        "Treat persistent implementation artifacts and runtime state separately: a checked-in configuration file may be "
+        "primary_write when a Task explicitly changes its schema or shipped defaults. For a current-session or non-persistent "
+        "user choice, reject only a plan that writes that runtime choice back to the configuration, or lists configuration "
+        "as writable without behavior and acceptance cases that justify the static configuration change.\n"
+        "For a plan that says a command changes permission behavior for later tool calls, require explicit scoped coverage of "
+        "the command/input registration, current-session state, and centralized enforcement hook. A configuration-only Task "
+        "does not satisfy that runtime path. Do not demand a UI/event-stream Task when the Goal is explicitly ordinary-CLI-only.\n"
         f"Already completed Task names, when present, are valid dependency anchors: {json.dumps(list(completed_task_names), ensure_ascii=False)}.\n\n"
         f"Plan to review:\n{json.dumps({'goal_contract': plan.contract, 'tasks': [task.to_dict() for task in plan.tasks]}, ensure_ascii=False)}\n\n"
         f"Write all human-readable text in {human_language}. Reply ONLY with JSON:\n"
@@ -894,9 +1027,10 @@ def plan_tasks(
     frozen_contract: dict[str, Any] | None = None,
     completed_task_names: tuple[str, ...] = (),
     replan_reason: str = "",
+    execution_workspace_paths: tuple[str, ...] = (),
 ) -> GoalPlan:
     """Compile, validate, and independently review a GoalPlan v2."""
-    from harness.agents.runner import AgentTaskStats, run_agent_task as default_runner
+    from harness.agents.runner import AgentTaskConversation, AgentTaskStats, run_agent_task as default_runner
 
     root = (workspace or get_workdir()).resolve()
     if verification_adapter is None:
@@ -905,12 +1039,14 @@ def plan_tasks(
     runner = planner_runner or default_runner
     reviewer = reviewer_runner or default_runner
     planner_stats = stats if stats is not None else AgentTaskStats()
+    planner_conversation = AgentTaskConversation()
     prompt = build_plan_prompt(
         target, full_verification, catalog, discovery_manifest,
         human_language=human_language,
         frozen_contract=frozen_contract,
         completed_task_names=completed_task_names,
         replan_reason=replan_reason,
+        execution_workspace_paths=execution_workspace_paths,
     )
     planner_call = {
         "description": "decompose goal into verifiable tasks",
@@ -920,9 +1056,16 @@ def plan_tasks(
         "max_rounds": PLANNER_MAX_ROUNDS,
         "max_tokens": PLANNER_MAX_OUTPUT_TOKENS,
         "tools_override": (),
+        # Goal planning returns a potentially large JSON contract. Stream it
+        # even when no interactive event sink is active so relay read timeouts
+        # measure idle time between chunks rather than whole-response time.
+        "stream_response": True,
+        "request_read_timeout_seconds": PLANNER_READ_TIMEOUT_SECONDS,
+        "max_request_attempts": PLANNER_MAX_REQUEST_ATTEMPTS,
         "cancel_check": cancel_check,
         "deadline": deadline,
         "stats": planner_stats,
+        "conversation": planner_conversation,
     }
     try:
         raw = runner(**planner_call)
@@ -943,34 +1086,67 @@ def plan_tasks(
     used_repair = False
     if plan is None:
         if planner_stats.stop_reason == "max_tokens":
-            raise GoalPlanningError(
-                f"Goal planner exhausted its {PLANNER_MAX_OUTPUT_TOKENS}-token output budget before returning "
-                "a complete GoalPlan contract; no execution was started."
+            # A complete Task contract can legitimately exceed the normal
+            # planning budget. Preserve the partial assistant response and
+            # grant one larger continuation instead of restarting discovery.
+            planner_stats.stop_reason = None
+            continuation_call = dict(planner_call)
+            continuation_call.update({
+                "description": "complete GoalPlan v2 after output upgrade",
+                "prompt": (
+                    "Your prior GoalPlan response exhausted its output budget before it formed a complete JSON object. "
+                    "Use the retained partial response as context and now return one COMPLETE replacement GoalPlan JSON "
+                    "object. Do not explain, call tools, or repeat analysis."
+                ),
+                "max_tokens": PLANNER_ESCALATED_OUTPUT_TOKENS,
+            })
+            try:
+                raw = runner(**continuation_call)
+            except Exception as exc:
+                raise GoalPlanningError(f"Goal planner output continuation failed: {type(exc).__name__}: {exc}") from exc
+            if raw.startswith(f"[{PLANNER_AGENT}] failed:") or raw.startswith(f"[{PLANNER_AGENT}] stopped:"):
+                raise GoalPlanningError(f"Goal planner output continuation is unavailable: {raw}")
+            plan, contract_error = _parse_plan_result(
+                raw,
+                test_catalog=catalog,
+                discovery_manifest=discovery_manifest,
+                verification_adapter=verification_adapter,
+                external_dependency_names=completed_task_names,
             )
-        repair_call = dict(planner_call)
-        repair_call["description"] = "repair GoalPlan v2 JSON"
-        repair_call["prompt"] = _format_repair_prompt(prompt, raw, contract_error or "unknown contract error")
-        repair_call["max_rounds"] = PLANNER_FORMAT_RETRY_MAX_ROUNDS
-        try:
-            raw = runner(**repair_call)
-        except Exception as exc:
-            raise GoalPlanningError(f"Goal planner contract repair failed: {type(exc).__name__}: {exc}") from exc
-        used_repair = True
-        if raw.startswith(f"[{PLANNER_AGENT}] failed:") or raw.startswith(f"[{PLANNER_AGENT}] stopped:"):
-            raise GoalPlanningError(f"Goal planner contract repair is unavailable: {raw}")
-        plan, repair_error = _parse_plan_result(
-            raw, test_catalog=catalog, discovery_manifest=discovery_manifest,
-            verification_adapter=verification_adapter, external_dependency_names=completed_task_names,
-        )
-        repair_error = repair_error or _frozen_contract_error(plan, frozen_contract)
-        if repair_error:
-            plan = None
+            contract_error = contract_error or _frozen_contract_error(plan, frozen_contract)
+            if contract_error:
+                plan = None
+            if plan is None and planner_stats.stop_reason == "max_tokens":
+                raise GoalPlanningError(
+                    f"Goal planner exhausted its automatic {PLANNER_ESCALATED_OUTPUT_TOKENS}-token output upgrade "
+                    "before returning a complete GoalPlan contract; no execution was started."
+                )
         if plan is None:
-            detail = raw.strip().replace("\n", " ")[:500] or "empty response"
-            raise GoalPlanningError(
-                "Goal planner returned no valid GoalPlan after one repair attempt; "
-                f"first error: {contract_error or 'unknown'}; repair error: {repair_error or 'unknown'}. Response: {detail}"
+            repair_call = dict(planner_call)
+            repair_call["description"] = "repair GoalPlan v2 JSON"
+            repair_call["prompt"] = _format_repair_prompt(prompt, raw, contract_error or "unknown contract error")
+            repair_call["max_rounds"] = PLANNER_FORMAT_RETRY_MAX_ROUNDS
+            try:
+                raw = runner(**repair_call)
+            except Exception as exc:
+                raise GoalPlanningError(f"Goal planner contract repair failed: {type(exc).__name__}: {exc}") from exc
+            used_repair = True
+            if raw.startswith(f"[{PLANNER_AGENT}] failed:") or raw.startswith(f"[{PLANNER_AGENT}] stopped:"):
+                raise GoalPlanningError(f"Goal planner contract repair is unavailable: {raw}")
+            plan, repair_error = _parse_plan_result(
+                raw, test_catalog=catalog, discovery_manifest=discovery_manifest,
+                verification_adapter=verification_adapter, external_dependency_names=completed_task_names,
             )
+            repair_error = repair_error or _frozen_contract_error(plan, frozen_contract)
+            if repair_error:
+                plan = None
+            if plan is None:
+                detail = raw.strip().replace("\n", " ")[:500] or "empty response"
+                raise GoalPlanningError(
+                    "Goal planner returned no valid GoalPlan after one repair attempt; "
+                    f"first error: {contract_error or 'unknown'}; repair error: {repair_error or 'unknown'}. Response: {detail}",
+                    requires_discovery_refresh=planning_error_requires_discovery(repair_error),
+                )
 
     def review_plan(current: GoalPlan) -> tuple[bool, dict[str, Any], str | None]:
         review_call = {

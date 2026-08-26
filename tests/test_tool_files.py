@@ -17,6 +17,7 @@ from harness.tools.filesystem import (
     run_git_diff,
     run_git_status,
 )
+from harness.workspace_lock import WorkspaceMutationLock
 
 
 # ---------- read_file ----------
@@ -101,6 +102,30 @@ def test_write_creates_dirs_and_reports_bytes(tmp_path):
     out = run_write("d/e/f.txt", "hello", cwd=tmp_path)
     assert out == "Wrote 5 bytes to d/e/f.txt"
     assert (tmp_path / "d" / "e" / "f.txt").read_text(encoding="utf-8") == "hello"
+
+
+def test_write_waits_for_the_workspace_mutation_lock(tmp_path):
+    lock = WorkspaceMutationLock(tmp_path, purpose="test")
+    assert lock.acquire()
+    try:
+        out = run_write("locked.txt", "blocked", cwd=tmp_path)
+        assert "workspace is busy" in out
+        assert not (tmp_path / "locked.txt").exists()
+    finally:
+        lock.release()
+
+
+def test_workspace_mutation_lock_recovers_a_stale_owner(tmp_path):
+    stale = WorkspaceMutationLock(tmp_path, purpose="stale")
+    stale.path.mkdir(parents=True)
+    (stale.path / "owner.json").write_text(
+        '{"pid":0,"token":"dead","created_at":0}', encoding="utf-8"
+    )
+
+    recovered = WorkspaceMutationLock(tmp_path, purpose="recovered")
+    assert recovered.acquire()
+    recovered.release()
+    assert not stale.path.exists()
 
 
 def test_write_size_cap(tmp_path):

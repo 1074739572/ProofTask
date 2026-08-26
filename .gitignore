@@ -119,3 +119,4 @@ _verify_*.js
 
 # Project overview is published despite the generic local-text rule above.
 !readme.txt
+docs/

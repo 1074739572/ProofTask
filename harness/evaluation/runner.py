@@ -17,6 +17,7 @@ Design rules (reliability plan §4 L5):
 from __future__ import annotations
 
 import hashlib
+import re
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -30,6 +31,32 @@ from harness.verification.snapshot import capture_code_snapshot
 
 EVALUATOR_AGENT = "evaluator"
 MAX_RAW_OUTPUT_TAIL = 2_000
+
+
+def _requires_scope_replan(task: Any, payload: dict[str, Any]) -> bool:
+    """Return whether an evaluator finding demands a frozen-scope replan."""
+    approved = {
+        str(path).replace("\\", "/").lstrip("./")
+        for path in (
+            *getattr(task, "primary_write", []),
+            *getattr(task, "planned_new", []),
+            *getattr(task, "conditional_write", []),
+        )
+        if str(path).strip()
+    }
+    if not approved:
+        return False
+    findings = payload.get("findings") if isinstance(payload.get("findings"), list) else []
+    text = "\n".join(
+        " ".join(str(item.get(key) or "") for key in ("issue", "evidence"))
+        for item in findings
+        if isinstance(item, dict)
+    ).replace("\\", "/")
+    mentioned = set(re.findall(r"(?<![\w.-])(?:[\w.-]+/)+[\w.-]+\.(?:py|pyi|js|jsx|ts|tsx|java|go|rs|rb|php|cs)", text))
+    return any(
+        not path.startswith("tests/") and path not in approved
+        for path in mentioned
+    )
 
 
 def _run_evaluator(
@@ -105,6 +132,10 @@ def build_evaluation_prompt(inputs) -> str:
         "- Judge every acceptance case against the diff and evidence.\n"
         "- A missing binding, zero collected tests, a non-zero verification result, "
         "or a command/evidence mismatch is never passable. Report it as a high finding.\n"
+        "- For a Task, judge verification from the current evidence section. Earlier failed runs are audit history; "
+        "a later matching successful bound verification supersedes them for the current verdict.\n"
+        "- When an acceptance case requires a source path outside the Task's approved writable scope, route replan. "
+        "Do not route implementation_fix for work this Task is not authorized to perform.\n"
         "- Passing tests are necessary but not sufficient: report unmet behavior, "
         "weak tests, and unrelated scope changes.\n"
         "- When Cross-Task impact context is present, verify the bound tests and diff address it; "
@@ -251,5 +282,14 @@ def run_task_evaluation(
         payload["passed"] = False
         payload["summary"] = evidence_error
         payload.setdefault("findings", []).append({"issue": evidence_error, "severity": "high", "evidence": "VerificationSpec/evidence"})
+    if _requires_scope_replan(task, payload):
+        payload["passed"] = False
+        payload["route"] = "replan"
+        payload["summary"] = "Evaluation requires source changes outside this Task's approved writable scope; replanning is required."
+        payload.setdefault("findings", []).append({
+            "issue": "The evaluator identified an implementation boundary outside this Task's approved writable scope.",
+            "severity": "high",
+            "evidence": "Task scope contract",
+        })
     payload.update({"evaluated_by": profile.model_id if profile else EVALUATOR_AGENT, "evaluated_at": evaluated_at})
     return record_task_evaluation(task_id, payload)

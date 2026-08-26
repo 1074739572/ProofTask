@@ -4,6 +4,7 @@ from harness.goal.discovery import (
     DISCOVERY_MAX_ROUNDS,
     DiscoverySupervisor,
     _assigned_paths,
+    _explicit_target_paths,
     _parse_report,
     build_repo_map,
     iter_readable_files,
@@ -253,6 +254,16 @@ def test_discovery_scopes_files_to_the_goal_and_ignores_generated_worktrees(tmp_
     assert "node_tui/test/input.test.ts" in test_paths
     assert all(not path.startswith((".worktrees/", ".task_outputs/")) for path in (*test_paths, *implementation_paths))
     assert "node_tui/src-open/App.tsx" in implementation_paths
+
+
+def test_explicit_target_paths_accepts_windows_absolute_file_path(tmp_path):
+    target = tmp_path / "docs" / "goal.md"
+    target.parent.mkdir()
+    target.write_text("sandbox requirements", encoding="utf-8")
+
+    paths = _explicit_target_paths(tmp_path, f"implement {target}")
+
+    assert paths == ("docs/goal.md",)
 
 
 def test_discovery_follows_requirement_references_and_typescript_imports(tmp_path):

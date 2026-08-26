@@ -354,6 +354,25 @@ def archive_goal(state: GoalState, workspace: str | Path | None = None) -> Path:
     return history_dir(ws) / f"{state.id}.json"
 
 
+def archive_goal_change_patch(state: GoalState, patch: str, workspace: str | Path | None = None) -> Path:
+    """Atomically retain isolated Goal changes beside its terminal state."""
+    ws = workspace if workspace is not None else state.workspace
+    destination = history_dir(ws) / f"{state.id}.patch"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{state.id}.", suffix=".patch.tmp", dir=destination.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
+            fh.write(patch)
+        os.replace(tmp_name, destination)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+    return destination
+
+
 def archive_unsupported_goal(workspace: str | Path | None = None) -> Path:
     """Preserve, but never migrate, a Goal from an older schema.
 
