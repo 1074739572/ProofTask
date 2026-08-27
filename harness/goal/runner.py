@@ -2018,6 +2018,41 @@ class GoalRunner(threading.Thread):
             # pause must identify the Task that is actually being prepared.
             state.current_task_id = task.id
             save_goal(state)
+            prior_baseline_failure = str(state.last_error or "")
+            if (
+                f"Task {task.id} test baseline is invalid:" in prior_baseline_failure
+                and "generated tests passed before implementation" in prior_baseline_failure
+            ):
+                # Older checkpoints used the generic pause path. Recover them
+                # directly into the one-time boundary replan below rather than
+                # paying for another writer call that can only reproduce the
+                # same passing baseline.
+                detail = prior_baseline_failure.split("test baseline is invalid:", 1)[-1].strip()
+                self._record_execution_trace(
+                    state,
+                    "test_baseline_overlap_replan",
+                    task_id=task.id,
+                    route="replan",
+                    summary="Recovered a persisted passing generated baseline; recompiling unfinished Task boundaries.",
+                    detail={"task_subject": task.subject, "recovered": True},
+                )
+                self._replan_remaining_tasks(
+                    state,
+                    task=task,
+                    evaluation={
+                        "passed": False,
+                        "route": "replan",
+                        "summary": detail,
+                        "findings": [{
+                            "issue": "A prior generated test baseline passed before this Task ran.",
+                            "severity": "high",
+                            "evidence": detail[-1_200:],
+                        }],
+                        "required_write_paths": [],
+                    },
+                    reason=detail,
+                )
+                return
             adapter = select_adapter(root, task.verification_spec.get("adapter") or state.verification)
             verification_context = VerificationContext(root, command=state.verification)
             before_catalog = (
@@ -2590,11 +2625,81 @@ class GoalRunner(threading.Thread):
                 or "fixture" in output.lower() and "error" in output.lower()
             ) and not self._is_expected_planned_new_module_import_failure(task, output)
             posthoc = bool(task.verification_spec.get("allow_posthoc_test"))
-            if baseline.error or baseline.timed_out or (baseline.passed and not posthoc) or infrastructure_failure:
+            if baseline.passed and not posthoc:
+                # A green pre-implementation baseline means the generated
+                # test is exercising behavior supplied by completed Goal work
+                # (or is otherwise not proving a missing behavior). Retrying
+                # the same frozen Task only asks the writer to rediscover the
+                # same already-green seam, so replace the unfinished contracts
+                # once with a boundary-focused replan instead of pausing in a
+                # test-generation loop.
+                output_tail = output[-1_200:].strip()
+                skipped = re.search(r"\b(\d+)\s+skipped\b", output, re.IGNORECASE)
+                skipped_detail = (
+                    f" The generated command also skipped {skipped.group(1)} test(s); skipped cases are not proof of "
+                    "the remaining acceptance behavior."
+                    if skipped else ""
+                )
+                detail = (
+                    "Generated tests passed before this Task's implementation, so the Task overlaps completed work "
+                    "or its test seam is not a missing behavior."
+                    f"{skipped_detail}"
+                )
+                if output_tail:
+                    detail = f"{detail} Verification output tail: {output_tail}"
+                self._restore_test_tree(root, before_tree, write_roots, expected_after=self._snapshot_test_tree(root, write_roots))
+                prior_overlap_replans = sum(
+                    1
+                    for entry in state.execution_trace
+                    if entry.get("event") == "test_baseline_overlap_replan"
+                    and entry.get("detail", {}).get("task_subject") == task.subject
+                )
+                if prior_overlap_replans:
+                    state.last_error = (
+                        f"Task {task.id} generated a passing pre-implementation baseline after its automatic boundary "
+                        "replan. The replacement contract still overlaps completed work; refusing to loop. "
+                        f"{detail}"
+                    )
+                    self._record_execution_trace(
+                        state,
+                        "test_baseline_overlap_replan",
+                        task_id=task.id,
+                        route="blocked",
+                        summary="Automatic boundary replan already ran for this Task subject; refusing a second loop.",
+                        detail={"task_subject": task.subject, "prior_replans": prior_overlap_replans},
+                    )
+                    self._pause(state, "test_generation_overlap_replan_exhausted", stop_reason=StopReason.task_blocked.value)
+                    save_goal(state)
+                    return
+                self._record_execution_trace(
+                    state,
+                    "test_baseline_overlap_replan",
+                    task_id=task.id,
+                    route="replan",
+                    summary="Generated baseline is already green; recompiling unfinished Task boundaries.",
+                    detail={"task_subject": task.subject, "skipped": int(skipped.group(1)) if skipped else 0},
+                )
+                state.last_error = f"Task {task.id} requires boundary replan: {detail}"
+                self._replan_remaining_tasks(
+                    state,
+                    task=task,
+                    evaluation={
+                        "passed": False,
+                        "route": "replan",
+                        "summary": detail,
+                        "findings": [{
+                            "issue": "Generated test baseline was already passing before this Task ran.",
+                            "severity": "high",
+                            "evidence": output_tail or "zero-exit generated baseline",
+                        }],
+                        "required_write_paths": [],
+                    },
+                    reason=detail,
+                )
+                return
+            if baseline.error or baseline.timed_out or infrastructure_failure:
                 detail = baseline.error or (
-                    "generated tests passed before implementation; they do not prove the missing behavior"
-                    if baseline.passed
-                    else "generated test baseline failed outside the requested behavior"
+                    "generated test baseline failed outside the requested behavior"
                 )
                 output_tail = output[-1_200:].strip()
                 if output_tail:

@@ -1490,12 +1490,17 @@ def test_test_generation_receives_and_preserves_cross_task_impact_context(tmp_pa
     assert bound.verification_spec["impact_context"] == task.verification_spec["impact_context"]
 
 
-def test_test_generation_rejects_a_passing_baseline(tmp_path, monkeypatch):
+def test_test_generation_replans_a_passing_baseline_once(tmp_path, monkeypatch):
     import harness.goal.runner as runner_mod
-    from harness.tasks import load_task
 
     task, state = _needs_generation_task(tmp_path, monkeypatch)
+    replans = []
     monkeypatch.setattr(runner_mod, "save_goal", lambda state: None)
+    monkeypatch.setattr(
+        runner_mod.GoalRunner,
+        "_replan_remaining_tasks",
+        lambda self, state, *, task, evaluation, reason: replans.append((task.id, evaluation, reason)),
+    )
     monkeypatch.setattr(runner_mod, "run_agent_task", lambda **kwargs: '{"test_selectors":["tests/test_new.py::test_new"],"case_selectors":{"AC1":["tests/test_new.py::test_new"]}}')
     catalogs = iter((
         TestCatalog(),
@@ -1510,9 +1515,63 @@ def test_test_generation_rejects_a_passing_baseline(tmp_path, monkeypatch):
 
     GoalRunner(state=state, history=[], context={}, binding=None)._prepare_tests(state)
 
+    assert state.phase == GoalPhase.PREPARE_TESTS.value
+    assert replans[0][0] == task.id
+    assert replans[0][1]["route"] == "replan"
+    assert "passed before this Task" in replans[0][2]
+    assert state.execution_trace[-1]["event"] == "test_baseline_overlap_replan"
+
+
+def test_test_generation_recovers_a_persisted_passing_baseline_without_calling_writer(tmp_path, monkeypatch):
+    import harness.goal.runner as runner_mod
+
+    task, state = _needs_generation_task(tmp_path, monkeypatch)
+    state.last_error = (
+        f"Task {task.id} test baseline is invalid: generated tests passed before implementation; "
+        "they do not prove the missing behavior."
+    )
+    replans = []
+    monkeypatch.setattr(runner_mod, "save_goal", lambda state: None)
+    monkeypatch.setattr(
+        runner_mod.GoalRunner,
+        "_replan_remaining_tasks",
+        lambda self, state, *, task, evaluation, reason: replans.append((task.id, evaluation, reason)),
+    )
+    monkeypatch.setattr(runner_mod, "run_agent_task", lambda **kwargs: pytest.fail("writer should not run"))
+
+    GoalRunner(state=state, history=[], context={}, binding=None)._prepare_tests(state)
+
+    assert replans[0][0] == task.id
+    assert replans[0][1]["route"] == "replan"
+    assert state.execution_trace[-1]["detail"]["recovered"] is True
+
+
+def test_test_generation_stops_after_replan_repeats_the_same_passing_baseline(tmp_path, monkeypatch):
+    import harness.goal.runner as runner_mod
+
+    task, state = _needs_generation_task(tmp_path, monkeypatch)
+    state.execution_trace.append({
+        "event": "test_baseline_overlap_replan",
+        "detail": {"task_subject": task.subject},
+    })
+    monkeypatch.setattr(runner_mod, "save_goal", lambda state: None)
+    monkeypatch.setattr(runner_mod, "run_agent_task", lambda **kwargs: '{"test_selectors":["tests/test_new.py::test_new"],"case_selectors":{"AC1":["tests/test_new.py::test_new"]}}')
+    catalogs = iter((
+        TestCatalog(),
+        TestCatalog(selectors=("tests/test_new.py::test_new",), test_files=("tests/test_new.py",)),
+    ))
+    monkeypatch.setattr(runner_mod, "collect_pytest_catalog", lambda workspace: next(catalogs))
+    monkeypatch.setattr(
+        runner_mod,
+        "run_verification",
+        lambda *args, **kwargs: type("Result", (), {"passed": True, "error": None, "timed_out": False, "stdout": "1 passed, 2 skipped", "exit_code": 0, "duration_ms": 5, "command": "pytest -q tests/test_new.py::test_new"})(),
+    )
+
+    GoalRunner(state=state, history=[], context={}, binding=None)._prepare_tests(state)
+
     assert state.phase == GoalPhase.PAUSED.value
-    assert load_task(task.id).verification_state == "needs_generation"
-    assert "passed before implementation" in state.last_error
+    assert state.stop_reason == "task_blocked"
+    assert "refusing to loop" in state.last_error
 
 
 def test_test_generation_rolls_back_files_when_baseline_is_invalid(tmp_path, monkeypatch):
