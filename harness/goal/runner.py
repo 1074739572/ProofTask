@@ -2020,6 +2020,57 @@ class GoalRunner(threading.Thread):
             save_goal(state)
             prior_baseline_failure = str(state.last_error or "")
             if (
+                f"Task {task.id} test writer reused an existing or non-generated selector" in prior_baseline_failure
+            ):
+                detail = prior_baseline_failure
+                prior_selector_replans = sum(
+                    1
+                    for entry in state.execution_trace
+                    if entry.get("event") == "test_selector_overlap_replan"
+                    and entry.get("detail", {}).get("task_subject") == task.subject
+                )
+                if prior_selector_replans:
+                    state.last_error = (
+                        f"Task {task.id} still requires selectors from pre-existing tests after its automatic boundary "
+                        "replan. The replacement contract overlaps earlier test evidence; refusing to loop."
+                    )
+                    self._record_execution_trace(
+                        state,
+                        "test_selector_overlap_replan",
+                        task_id=task.id,
+                        route="blocked",
+                        summary="Automatic selector-overlap replan already ran for this Task subject; refusing a second loop.",
+                        detail={"task_subject": task.subject, "prior_replans": prior_selector_replans},
+                    )
+                    self._pause(state, "test_generation_selector_overlap_replan_exhausted", stop_reason=StopReason.task_blocked.value)
+                    save_goal(state)
+                    return
+                self._record_execution_trace(
+                    state,
+                    "test_selector_overlap_replan",
+                    task_id=task.id,
+                    route="replan",
+                    summary="Recovered selector reuse: recompiling unfinished Task boundaries around existing test evidence.",
+                    detail={"task_subject": task.subject, "recovered": True},
+                )
+                self._replan_remaining_tasks(
+                    state,
+                    task=task,
+                    evaluation={
+                        "passed": False,
+                        "route": "replan",
+                        "summary": detail,
+                        "findings": [{
+                            "issue": "The test writer needed pre-existing selectors to cover this Task.",
+                            "severity": "high",
+                            "evidence": detail[-2_000:],
+                        }],
+                        "required_write_paths": [],
+                    },
+                    reason=detail,
+                )
+                return
+            if (
                 f"Task {task.id} test baseline is invalid:" in prior_baseline_failure
                 and "generated tests passed before implementation" in prior_baseline_failure
             ):
@@ -2579,12 +2630,57 @@ class GoalRunner(threading.Thread):
                 self._pause(state, "test_generation_case_mapping_required", stop_reason=StopReason.test_generation_required.value)
                 return
             if any(selector not in generated_selector_set for selector in selectors):
-                state.last_error = (
-                    f"Task {task.id} test writer reused an existing or non-generated selector; it must add focused coverage. "
-                    f"Diagnostic: {mismatch_diagnostic()}"
-                )
                 self._restore_test_tree(root, before_tree, write_roots, expected_after=self._snapshot_test_tree(root, write_roots))
-                self._pause(state, "test_generation_reused_existing_selector", stop_reason=StopReason.test_generation_required.value)
+                detail = (
+                    f"Task {task.id} test writer reused an existing or non-generated selector; "
+                    f"the Task overlaps existing test evidence. Diagnostic: {mismatch_diagnostic()}"
+                )
+                prior_selector_replans = sum(
+                    1
+                    for entry in state.execution_trace
+                    if entry.get("event") == "test_selector_overlap_replan"
+                    and entry.get("detail", {}).get("task_subject") == task.subject
+                )
+                if prior_selector_replans:
+                    state.last_error = (
+                        f"{detail} Automatic boundary replan already ran for this Task subject; refusing to loop."
+                    )
+                    self._record_execution_trace(
+                        state,
+                        "test_selector_overlap_replan",
+                        task_id=task.id,
+                        route="blocked",
+                        summary="Automatic selector-overlap replan already ran for this Task subject; refusing a second loop.",
+                        detail={"task_subject": task.subject, "prior_replans": prior_selector_replans},
+                    )
+                    self._pause(state, "test_generation_selector_overlap_replan_exhausted", stop_reason=StopReason.task_blocked.value)
+                    save_goal(state)
+                    return
+                self._record_execution_trace(
+                    state,
+                    "test_selector_overlap_replan",
+                    task_id=task.id,
+                    route="replan",
+                    summary="Generated test contract reused existing selectors; recompiling unfinished Task boundaries.",
+                    detail={"task_subject": task.subject, "selectors": list(selectors)},
+                )
+                state.last_error = detail
+                self._replan_remaining_tasks(
+                    state,
+                    task=task,
+                    evaluation={
+                        "passed": False,
+                        "route": "replan",
+                        "summary": detail,
+                        "findings": [{
+                            "issue": "Generated test contract reused existing selectors instead of adding focused coverage.",
+                            "severity": "high",
+                            "evidence": mismatch_diagnostic(),
+                        }],
+                        "required_write_paths": [],
+                    },
+                    reason=detail,
+                )
                 return
             files = tuple(dict.fromkeys(item.split("::", 1)[0] for item in selectors))
             architecture_error = self._generated_test_architecture_error(root, task, files)

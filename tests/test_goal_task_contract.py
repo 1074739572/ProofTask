@@ -1546,6 +1546,27 @@ def test_test_generation_recovers_a_persisted_passing_baseline_without_calling_w
     assert state.execution_trace[-1]["detail"]["recovered"] is True
 
 
+def test_test_generation_recovers_persisted_selector_reuse_with_one_boundary_replan(tmp_path, monkeypatch):
+    import harness.goal.runner as runner_mod
+
+    task, state = _needs_generation_task(tmp_path, monkeypatch)
+    state.last_error = f"Task {task.id} test writer reused an existing or non-generated selector; it must add focused coverage."
+    replans = []
+    monkeypatch.setattr(runner_mod, "save_goal", lambda state: None)
+    monkeypatch.setattr(
+        runner_mod.GoalRunner,
+        "_replan_remaining_tasks",
+        lambda self, state, *, task, evaluation, reason: replans.append((task.id, evaluation, reason)),
+    )
+    monkeypatch.setattr(runner_mod, "run_agent_task", lambda **kwargs: pytest.fail("writer should not run"))
+
+    GoalRunner(state=state, history=[], context={}, binding=None)._prepare_tests(state)
+
+    assert replans[0][0] == task.id
+    assert replans[0][1]["route"] == "replan"
+    assert state.execution_trace[-1]["event"] == "test_selector_overlap_replan"
+
+
 def test_test_generation_stops_after_replan_repeats_the_same_passing_baseline(tmp_path, monkeypatch):
     import harness.goal.runner as runner_mod
 
