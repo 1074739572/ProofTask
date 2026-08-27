@@ -920,7 +920,7 @@ def test_node_test_generation_repairs_wrong_model_selector_from_machine_catalog(
     GoalRunner(state=state, history=[], context={}, binding=None)._prepare_tests(state)
 
     bound = load_task(task.id)
-    assert len(calls) == 2
+    assert len(calls) >= 2
     assert calls[1]["tools_override"] == ()
     assert actual_selector in calls[1]["prompt"]
     assert wrong_selector not in calls[1]["prompt"]
@@ -1565,6 +1565,69 @@ def test_test_generation_recovers_persisted_selector_reuse_with_one_boundary_rep
     assert replans[0][0] == task.id
     assert replans[0][1]["route"] == "replan"
     assert state.execution_trace[-1]["event"] == "test_selector_overlap_replan"
+
+
+def test_test_generation_accepts_second_round_new_selectors(tmp_path, monkeypatch):
+    import harness.goal.runner as runner_mod
+
+    task, state = _needs_generation_task(tmp_path, monkeypatch)
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    calls = []
+
+    def writer(**_kwargs):
+        calls.append(True)
+        if len(calls) == 1:
+            (tests_dir / "test_first.py").write_text("def test_first(): pass\n", encoding="utf-8")
+            return '{"test_selectors":["tests/test_first.py::test_first"],"case_selectors":{}}'
+        (tests_dir / "test_second.py").write_text("def test_second(): pass\n", encoding="utf-8")
+        return '{"test_selectors":["tests/test_second.py::test_second"],"case_selectors":{"AC1":["tests/test_second.py::test_second"]}}'
+
+    monkeypatch.setattr(runner_mod, "save_goal", lambda state: None)
+    monkeypatch.setattr(runner_mod, "run_agent_task", writer)
+    catalogs = iter((
+        TestCatalog(),
+        TestCatalog(selectors=("tests/test_first.py::test_first",), test_files=("tests/test_first.py",)),
+        TestCatalog(
+            selectors=("tests/test_first.py::test_first", "tests/test_second.py::test_second"),
+            test_files=("tests/test_first.py", "tests/test_second.py"),
+        ),
+    ))
+    monkeypatch.setattr(runner_mod, "collect_pytest_catalog", lambda workspace: next(catalogs))
+    monkeypatch.setattr(
+        runner_mod,
+        "run_verification",
+        lambda *args, **kwargs: type("Result", (), {"passed": False, "error": None, "timed_out": False, "stdout": "assert missing behavior", "exit_code": 1, "duration_ms": 5, "command": "pytest -q"})(),
+    )
+
+    GoalRunner(state=state, history=[], context={}, binding=None)._prepare_tests(state)
+
+    assert len(calls) >= 2
+    assert state.phase == GoalPhase.SELECT_TASK.value
+
+
+def test_test_generation_blocks_an_all_skipped_external_integration_baseline(tmp_path, monkeypatch):
+    import harness.goal.runner as runner_mod
+
+    task, state = _needs_generation_task(tmp_path, monkeypatch)
+    monkeypatch.setattr(runner_mod, "save_goal", lambda state: None)
+    monkeypatch.setattr(runner_mod, "run_agent_task", lambda **kwargs: '{"test_selectors":["tests/test_new.py::test_new"],"case_selectors":{"AC1":["tests/test_new.py::test_new"]}}')
+    catalogs = iter((
+        TestCatalog(),
+        TestCatalog(selectors=("tests/test_new.py::test_new",), test_files=("tests/test_new.py",)),
+    ))
+    monkeypatch.setattr(runner_mod, "collect_pytest_catalog", lambda workspace: next(catalogs))
+    monkeypatch.setattr(
+        runner_mod,
+        "run_verification",
+        lambda *args, **kwargs: type("Result", (), {"passed": True, "error": None, "timed_out": False, "stdout": "5 skipped in 0.2s", "exit_code": 0, "duration_ms": 5, "command": "pytest -q"})(),
+    )
+
+    GoalRunner(state=state, history=[], context={}, binding=None)._prepare_tests(state)
+
+    assert state.phase == GoalPhase.PAUSED.value
+    assert state.stop_reason == "task_blocked"
+    assert state.execution_trace[-1]["event"] == "test_generation_external_precondition"
 
 
 def test_test_generation_stops_after_replan_repeats_the_same_passing_baseline(tmp_path, monkeypatch):

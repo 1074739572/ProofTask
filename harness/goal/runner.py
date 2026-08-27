@@ -2563,6 +2563,7 @@ class GoalRunner(threading.Thread):
                     selector for selector in after_catalog.selectors
                     if selector not in before_catalog.selectors
                 )
+                generated_selector_set = set(generated_selectors)
                 added_selectors = self._selectors_from_generation(raw, root, catalog=after_catalog)
                 selectors = tuple(dict.fromkeys((*prior_selectors, *added_selectors)))
                 added_case_selectors = self._case_selectors_from_generation(raw, selectors, task.acceptance_cases)
@@ -2721,6 +2722,38 @@ class GoalRunner(threading.Thread):
                 or "fixture" in output.lower() and "error" in output.lower()
             ) and not self._is_expected_planned_new_module_import_failure(task, output)
             posthoc = bool(task.verification_spec.get("allow_posthoc_test"))
+            skipped_match = re.search(r"\b(\d+)\s+skipped\b", output, re.IGNORECASE)
+            skipped_only = bool(
+                baseline.passed
+                and skipped_match
+                and not re.search(r"\b\d+\s+passed\b", output, re.IGNORECASE)
+            )
+            if skipped_only and not posthoc:
+                # A test suite that could not run because an explicitly
+                # required external runtime is absent is neither a red TDD
+                # baseline nor proof of the Task. Preserve the distinction as
+                # a capability block instead of repeatedly replanning or
+                # accepting skipped behavior as successful verification.
+                detail = (
+                    f"Generated {adapter.id} tests were all skipped ({skipped_match.group(1)} skipped); "
+                    "the Task requires an unavailable external verification precondition."
+                )
+                output_tail = output[-1_200:].strip()
+                if output_tail:
+                    detail = f"{detail} Verification output tail: {output_tail}"
+                self._restore_test_tree(root, before_tree, write_roots, expected_after=self._snapshot_test_tree(root, write_roots))
+                state.last_error = f"Task {task.id} is blocked: {detail}"
+                self._record_execution_trace(
+                    state,
+                    "test_generation_external_precondition",
+                    task_id=task.id,
+                    route="blocked",
+                    summary="Generated integration tests were all skipped because their external runtime is unavailable.",
+                    detail={"skipped": int(skipped_match.group(1)), "adapter": adapter.id},
+                )
+                self._pause(state, "test_generation_external_precondition", stop_reason=StopReason.task_blocked.value)
+                save_goal(state)
+                return
             if baseline.passed and not posthoc:
                 # A green pre-implementation baseline means the generated
                 # test is exercising behavior supplied by completed Goal work
@@ -2730,7 +2763,7 @@ class GoalRunner(threading.Thread):
                 # once with a boundary-focused replan instead of pausing in a
                 # test-generation loop.
                 output_tail = output[-1_200:].strip()
-                skipped = re.search(r"\b(\d+)\s+skipped\b", output, re.IGNORECASE)
+                skipped = skipped_match
                 skipped_detail = (
                     f" The generated command also skipped {skipped.group(1)} test(s); skipped cases are not proof of "
                     "the remaining acceptance behavior."
