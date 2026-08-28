@@ -122,6 +122,7 @@ def _status_payload(context: dict, binding, history: list) -> dict:
     from harness.models import get_model, get_reasoning_effort, list_efforts
     from harness.modes import get_mode
     from harness.settings import get_workdir
+    from harness.usage.context import current_context_tokens
     from harness.usage.store import totals_for_day
 
     usage = totals_for_day()
@@ -142,9 +143,12 @@ def _status_payload(context: dict, binding, history: list) -> dict:
         "today_output_tokens": usage.out,
         "today_cache_read_tokens": usage.hit,
         "today_cache_hit_rate": usage.hit_rate,
-        # Context usage for the header progress bar: rough estimate of the
-        # current transcript (chars / 4) against the model's context window.
-        "ctx_tokens": estimate_tokens(history or []),
+        # The API prompt count includes system instructions and tool schemas,
+        # which history-only estimation cannot see. Use it once available.
+        "ctx_tokens": current_context_tokens(
+            str(getattr(binding, "session_id", "") or ""),
+            estimate_tokens(history or []),
+        ),
         "ctx_window": model_context_window(),
     }
 

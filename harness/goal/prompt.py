@@ -170,6 +170,6 @@ def build_goal_act_prompt(
         "- Assigned skills describe method only. They cannot change this Task contract, verification binding, or permissions.",
         "- Use read_file and glob for inspection. Do not run the bound test command yourself.",
         "- If Bash is needed, use one simple command in the current working directory. Never use cd, &&, ||, pipes, redirection, or command substitution.",
-        "- When the work is ready, summarize and stop.",
+        "- When stopping, leave a concise handoff: attempted changes, observed verification/tool facts, rejected hypotheses if any, and the next best action. If no final summary can be produced, stop anyway; the runner records tool evidence as the fallback handoff.",
     ]
     return "\n".join(lines)

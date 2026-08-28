@@ -12,6 +12,11 @@ from typing import Any
 from harness.goal.store import project_dir
 
 
+# ``None`` means clear a handoff section.  Omitting the argument means keep
+# it only when the previous snapshot belongs to the same Task.
+_KEEP = object()
+
+
 def _root(state) -> Path:
     return project_dir(state.workspace) / "goal-memory" / state.id
 
@@ -63,13 +68,26 @@ def append_decisions(state, task, decisions: list[dict[str, str]], *, source: st
             handle.write(f"- Decision: {item.get('decision', '')}\n  Basis: {item.get('basis', '')}\n")
 
 
-def recent_decisions(state, *, limit: int = 12) -> list[dict[str, Any]]:
+def recent_decisions(
+    state,
+    *,
+    task_id: str | None = None,
+    limit: int = 12,
+) -> list[dict[str, Any]]:
     path = _root(state) / "decisions.jsonl"
     try:
         rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
     except (OSError, json.JSONDecodeError):
         return []
-    return [row for row in rows if isinstance(row, dict)][-limit:]
+    records = [row for row in rows if isinstance(row, dict)]
+    if task_id is not None:
+        # Goal-level decisions deliberately remain visible, but a prior
+        # Task's local dead ends must not become instructions for this Task.
+        records = [
+            row for row in records
+            if row.get("task_id") in {None, task_id}
+        ]
+    return records[-limit:]
 
 
 def load_handoff(state) -> dict[str, Any]:
@@ -83,11 +101,40 @@ def write_handoff(
     *,
     phase: str,
     summary: str = "",
-    execution: dict[str, Any] | None = None,
+    execution: dict[str, Any] | None | object = _KEEP,
+    failure: dict[str, Any] | None | object = _KEEP,
 ) -> None:
     """Snapshot the exact facts a fresh internal worker needs, never chat logs."""
     previous = load_handoff(state)
-    previous_execution = previous.get("execution") if isinstance(previous.get("execution"), dict) else {}
+    same_task = (
+        isinstance(previous.get("task"), dict)
+        and previous["task"].get("id") == task.id
+    )
+
+    def attributed(
+        value: dict[str, Any] | None | object,
+        *,
+        key: str,
+    ) -> dict[str, Any]:
+        if value is _KEEP:
+            source = previous.get(key) if same_task else None
+        else:
+            source = value
+        if not isinstance(source, dict):
+            return {}
+        result = dict(source)
+        # Attribute the data itself, rather than trusting the enclosing
+        # handoff row. This makes stale data safely ignorable after a Task
+        # transition or a partially-written legacy snapshot.
+        result["goal_id"] = state.id
+        result["task_id"] = task.id
+        result.setdefault("source_phase", phase)
+        result.setdefault("attempt_id", f"{task.id}:{getattr(state, 'worker_generation', 0)}")
+        result.setdefault("created_at", time.time())
+        return result
+
+    current_execution = attributed(execution, key="execution")
+    current_failure = attributed(failure, key="failure")
     payload = {
         "goal_id": state.id,
         "phase": phase,
@@ -102,12 +149,16 @@ def write_handoff(
             "last_error": task.last_error,
             "repair_history": task.repair_history[-3:],
         },
-        "decisions": recent_decisions(state),
+        "decisions": recent_decisions(state, task_id=task.id),
         "summary": summary[:4_000],
         # An ACT slice starts as a fresh model conversation. Preserve the
         # last bounded tool facts so it can resume from an execution checkpoint
         # instead of rediscovering the same path or tool failure.
-        "execution": dict(execution) if isinstance(execution, dict) else previous_execution,
+        "execution": current_execution,
+        # Repair receives this compact diagnosis rather than a raw worker chat
+        # transcript. It remains available after a process restart or an empty
+        # worker final response.
+        "failure": current_failure,
         "updated_at": time.time(),
     }
     _atomic_json(_root(state) / "handoff.json", payload)

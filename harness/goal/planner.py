@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -27,6 +28,10 @@ PLAN_REVIEWER_AGENT = "goal_plan_reviewer"
 PLANNER_MAX_ROUNDS = 1
 PLANNER_MAX_OUTPUT_TOKENS = 12_000
 PLANNER_ESCALATED_OUTPUT_TOKENS = 24_000
+# The continuation is a new provider request. It must not inherit a nearly
+# exhausted read deadline from the 12k attempt, otherwise the advertised 24k
+# upgrade deterministically fails before the model can answer.
+PLANNER_CONTINUATION_TIMEOUT_SECONDS = 600.0
 # The configured Sol relay buffers the initial response, so the shared 90s
 # read timeout is too short for a high-reasoning Goal contract. One longer
 # attempt is more predictable than three full 90s retries.
@@ -497,8 +502,8 @@ def build_plan_prompt(
             "\nThis is execution-time replanning, not a new product-planning pass. "
             "The frozen goal_contract below is authoritative: reproduce its six fields exactly and do not "
             "broaden its outcome, constraints, assumptions, or verification preconditions. Return only replacement "
-            "Tasks for unfinished work. Completed Tasks are historical facts and must not be emitted again. "
-            "A replacement Task may depend on one of these already completed Task names: "
+            "Tasks for the affected unfinished work only. Retained Tasks are existing dependency anchors and must not be emitted again. "
+            "A replacement Task may depend on one of these retained Task names: "
             f"{json.dumps(list(completed_task_names), ensure_ascii=False)}.\n"
             "Use the replan trigger below to correct task boundaries. Every acceptance case assigned "
             "to a Task must be satisfiable by that Task and its completed dependencies; do not assign "
@@ -508,7 +513,7 @@ def build_plan_prompt(
             "from the original Discovery evidence. An existing listed path may be primary_write or read_envelope, "
             "but must never be planned_new. Do not emit a missing original path as a Task scope.\n"
             f"Current execution-workspace paths: {json.dumps(list(execution_workspace_paths), ensure_ascii=False)}\n"
-            f"Replan trigger evidence:\n{replan_reason[:12_000] or '(none supplied)'}\n"
+            f"Replan trigger evidence:\n{replan_reason or '(none supplied)'}\n"
             f"Frozen goal_contract:\n{json.dumps(_contract_projection(frozen_contract), ensure_ascii=False)}\n\n"
         )
     return (
@@ -974,7 +979,7 @@ def build_plan_review_prompt(
         "For a plan that says a command changes permission behavior for later tool calls, require explicit scoped coverage of "
         "the command/input registration, current-session state, and centralized enforcement hook. A configuration-only Task "
         "does not satisfy that runtime path. Do not demand a UI/event-stream Task when the Goal is explicitly ordinary-CLI-only.\n"
-        f"Already completed Task names, when present, are valid dependency anchors: {json.dumps(list(completed_task_names), ensure_ascii=False)}.\n\n"
+        f"Retained Task names, when present, are valid dependency anchors: {json.dumps(list(completed_task_names), ensure_ascii=False)}.\n\n"
         f"Plan to review:\n{json.dumps({'goal_contract': plan.contract, 'tasks': [task.to_dict() for task in plan.tasks]}, ensure_ascii=False)}\n\n"
         f"Write all human-readable text in {human_language}. Reply ONLY with JSON:\n"
         '{"approved":true,"summary":"...","findings":[]}\n'
@@ -1033,6 +1038,8 @@ def plan_tasks(
     completed_task_names: tuple[str, ...] = (),
     replan_reason: str = "",
     execution_workspace_paths: tuple[str, ...] = (),
+    candidate_plan: GoalPlan | None = None,
+    candidate_callback: Callable[[GoalPlan], None] | None = None,
 ) -> GoalPlan:
     """Compile, validate, and independently review a GoalPlan v2."""
     from harness.agents.runner import AgentTaskConversation, AgentTaskStats, run_agent_task as default_runner
@@ -1072,22 +1079,31 @@ def plan_tasks(
         "stats": planner_stats,
         "conversation": planner_conversation,
     }
-    try:
-        raw = runner(**planner_call)
-    except Exception as exc:
-        raise GoalPlanningError(f"Goal planner request failed: {type(exc).__name__}: {exc}") from exc
-    if raw.startswith(f"[{PLANNER_AGENT}] failed:") or raw.startswith(f"[{PLANNER_AGENT}] stopped:"):
-        raise GoalPlanningError(f"Goal planner is unavailable: {raw}")
-    plan, contract_error = _parse_plan_result(
-        raw,
-        test_catalog=catalog,
-        discovery_manifest=discovery_manifest,
-        verification_adapter=verification_adapter,
-        external_dependency_names=completed_task_names,
-    )
-    contract_error = contract_error or _frozen_contract_error(plan, frozen_contract)
-    if contract_error:
-        plan = None
+    raw = ""
+    plan = candidate_plan
+    contract_error: str | None = None
+    if plan is not None:
+        raw = json.dumps(
+            {"goal_contract": plan.contract, "tasks": [task.to_dict() for task in plan.tasks]},
+            ensure_ascii=False,
+        )
+    else:
+        try:
+            raw = runner(**planner_call)
+        except Exception as exc:
+            raise GoalPlanningError(f"Goal planner request failed: {type(exc).__name__}: {exc}") from exc
+        if raw.startswith(f"[{PLANNER_AGENT}] failed:") or raw.startswith(f"[{PLANNER_AGENT}] stopped:"):
+            raise GoalPlanningError(f"Goal planner is unavailable: {raw}")
+        plan, contract_error = _parse_plan_result(
+            raw,
+            test_catalog=catalog,
+            discovery_manifest=discovery_manifest,
+            verification_adapter=verification_adapter,
+            external_dependency_names=completed_task_names,
+        )
+        contract_error = contract_error or _frozen_contract_error(plan, frozen_contract)
+        if contract_error:
+            plan = None
     used_repair = False
     if plan is None:
         if planner_stats.stop_reason == "max_tokens":
@@ -1104,6 +1120,10 @@ def plan_tasks(
                     "object. Do not explain, call tools, or repeat analysis."
                 ),
                 "max_tokens": PLANNER_ESCALATED_OUTPUT_TOKENS,
+                "deadline": max(
+                    deadline or 0.0,
+                    time.monotonic() + PLANNER_CONTINUATION_TIMEOUT_SECONDS,
+                ),
             })
             try:
                 raw = runner(**continuation_call)
@@ -1177,6 +1197,8 @@ def plan_tasks(
             raise GoalPlanningError(f"Goal plan reviewer returned invalid JSON: {error}")
         return approved, result, None
 
+    if candidate_callback is not None:
+        candidate_callback(GoalPlan(contract=plan.contract, tasks=plan.tasks))
     approved, review, _ = review_plan(plan)
     if approved:
         return GoalPlan(contract=plan.contract, tasks=plan.tasks, review=review)
@@ -1199,6 +1221,8 @@ def plan_tasks(
         repaired = None
     if repaired is None:
         raise GoalPlanningError("Goal planner did not repair the reviewed GoalPlan: " + (repair_error or "unknown error"))
+    if candidate_callback is not None:
+        candidate_callback(GoalPlan(contract=repaired.contract, tasks=repaired.tasks))
     approved, final_review, _ = review_plan(repaired)
     if not approved:
         raise GoalPlanningError("GoalPlan remains rejected after one correction: " + str(final_review.get("summary") or final_review.get("findings")))

@@ -165,6 +165,49 @@ def _with_repair_output_audit(
     )
 
 
+def _repair_handoff(state, task) -> dict[str, Any]:
+    """Return only the current Task's bounded durable execution facts."""
+    from harness.goal.memory import load_handoff
+
+    handoff = load_handoff(state)
+    task_row = handoff.get("task") if isinstance(handoff.get("task"), dict) else {}
+    if task_row.get("id") != task.id:
+        return {}
+    execution = handoff.get("execution") if isinstance(handoff.get("execution"), dict) else {}
+    failure = handoff.get("failure") if isinstance(handoff.get("failure"), dict) else {}
+    def belongs_to_current_task(section: dict[str, Any]) -> bool:
+        return (
+            section.get("goal_id") == state.id
+            and section.get("task_id") == task.id
+        )
+
+    # The outer handoff Task is not sufficient: an interrupted write from a
+    # previous Task can otherwise be enclosed by a newer top-level snapshot.
+    if not belongs_to_current_task(execution):
+        execution = {}
+    if not belongs_to_current_task(failure):
+        failure = {}
+    return {
+        "artifact": f".project/goal-memory/{state.id}/handoff.json",
+        "worker_summary": str(execution.get("worker_summary") or "")[:4_000],
+        "worker_summary_missing": bool(execution.get("worker_summary_missing")),
+        "stop_reason": str(execution.get("stop_reason") or ""),
+        "write_paths": list(execution.get("write_paths") or [])[-12:],
+        "write_outcomes": list(execution.get("write_outcomes") or [])[-12:],
+        "tool_errors": list(execution.get("tool_errors") or [])[-8:],
+        "failure": {
+            "classification": failure.get("classification"),
+            "route": failure.get("route"),
+            "summary": str(failure.get("summary") or "")[:2_000],
+            "task_error": str(failure.get("task_error") or "")[:4_000],
+            "verification": failure.get("verification") if isinstance(failure.get("verification"), dict) else {},
+            "attempts": list(failure.get("attempts") or [])[-4:],
+            "retry": failure.get("retry") if isinstance(failure.get("retry"), dict) else {},
+            "next_action": str(failure.get("next_action") or "")[:1_000],
+        },
+    }
+
+
 def fallback_repair_decision(
     error: str | None,
     *,
@@ -234,6 +277,7 @@ def parse_goal_regression_decision(raw: str, task_ids: set[str]) -> GoalRegressi
 
 
 def build_repair_prompt(state, task, evaluation: dict[str, Any]) -> str:
+    handoff = _repair_handoff(state, task)
     return (
         "Plan one autonomous repair. Return ONLY JSON:\n"
         '{"action":"implementation_fix|test_gap|replan|blocked","instructions":"...",'
@@ -242,6 +286,7 @@ def build_repair_prompt(state, task, evaluation: dict[str, Any]) -> str:
         "- The Goal Contract is frozen. Do not remove acceptance cases, weaken tests, or expand the product scope.\n"
         "- Do not ask the user ordinary clarification questions. Resolve ambiguity from the contract, tests, and repository conventions.\n"
         "- implementation_fix changes current Task code; test_gap adds focused coverage; replan replaces only unfinished Task contracts inside the frozen contract after planner review; blocked only for authority/external impossibility.\n"
+        "- A failed test, empty worker summary, timeout, or tool/runtime error is an implementation blocker, not a reason to replan. Choose replan only when the evaluator explicitly marks a contract/scope/dependency mismatch, or when Evaluation contains a machine-generated stalled_task_review with repeated failed bound-verification evidence.\n"
         "- Treat the evaluator route as a diagnosis to verify, not as vague advice. Do not return implementation_fix after repeated no-progress evidence without explaining the changed direction.\n\n"
         f"Goal Contract:\n{json.dumps(state.goal_contract, ensure_ascii=False, sort_keys=True)}\n\n"
         f"Task: {task.id} {task.subject}\nBehavior: {task.description}\n"
@@ -252,7 +297,8 @@ def build_repair_prompt(state, task, evaluation: dict[str, Any]) -> str:
         f"Latest task/clean-gate error: {task.last_error or '(none)'}\n"
         f"Task-start snapshot: {task.start_snapshot or '(not recorded)'}\n"
         f"Task-start diff: {(task.start_diff or '(clean)').strip()[:8000]}\n"
-        f"Evaluation: {json.dumps(evaluation, ensure_ascii=False)[:12000]}"
+        f"Evaluation: {json.dumps(evaluation, ensure_ascii=False)[:12000]}\n"
+        f"Durable failure handoff: {json.dumps(handoff, ensure_ascii=False)}"
     )
 
 

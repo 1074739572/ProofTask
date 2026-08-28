@@ -24,8 +24,15 @@ def _log_cache_usage(response, *, model_id: str, usage_context: dict[str, str] |
     parsed = parse_cache_usage(getattr(response, "usage", None))
     if parsed is None:
         return
+    metadata = dict(usage_context or {})
+    session_id = str(metadata.get("session_id") or "")
+    is_primary_turn = not metadata.get("agent_type")
+    if is_primary_turn and session_id:
+        from harness.usage.context import record_prompt_tokens
+
+        record_prompt_tokens(session_id, parsed.input_tokens)
     try:
-        record_usage(model=model_id, cache=parsed, context=usage_context)
+        record_usage(model=model_id, cache=parsed, context=metadata)
     except OSError as exc:
         renderer.warn(f"usage ledger write failed: {exc}")
     from harness.ui.events import emit, is_enabled
@@ -36,7 +43,8 @@ def _log_cache_usage(response, *, model_id: str, usage_context: dict[str, str] |
             output_tokens=parsed.output_tokens,
             output_tokens_known=parsed.output_tokens is not None,
             cache_read_tokens=parsed.hit_tokens,
-            **dict(usage_context or {}),
+            context_tokens=parsed.input_tokens if is_primary_turn and session_id else None,
+            **metadata,
         )
     if not hooks_verbose():
         return

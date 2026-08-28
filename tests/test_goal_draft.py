@@ -653,7 +653,7 @@ def test_resume_discovery_failure_runs_discovery_again(tmp_path, monkeypatch):
 
 
 def test_schema_v2_draft_loads_with_a_planning_resume_checkpoint(tmp_path):
-    from harness.goal.draft import GoalDraft, draft_path
+    from harness.goal.draft import DRAFT_SCHEMA_VERSION, GoalDraft, draft_path
 
     legacy = GoalDraft(
         id="legacy-planning", target="add rate limits", verification="python -m pytest -q",
@@ -668,12 +668,12 @@ def test_schema_v2_draft_loads_with_a_planning_resume_checkpoint(tmp_path):
     loaded = load_draft(tmp_path)
 
     assert loaded is not None
-    assert loaded.schema_version == 4
+    assert loaded.schema_version == DRAFT_SCHEMA_VERSION
     assert loaded.resume_from == "planning"
 
 
 def test_schema_v3_draft_migrates_language_from_a_chinese_target(tmp_path):
-    from harness.goal.draft import GoalDraft, draft_path
+    from harness.goal.draft import DRAFT_SCHEMA_VERSION, GoalDraft, draft_path
 
     legacy = GoalDraft(
         id="legacy-language", target="优化输入交互", verification="python -m pytest -q",
@@ -687,7 +687,7 @@ def test_schema_v3_draft_migrates_language_from_a_chinese_target(tmp_path):
     loaded = load_draft(tmp_path)
 
     assert loaded is not None
-    assert loaded.schema_version == 4
+    assert loaded.schema_version == DRAFT_SCHEMA_VERSION
     assert loaded.language == "zh-CN"
 
 

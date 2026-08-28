@@ -114,6 +114,34 @@ def test_v2_planner_continues_once_with_an_upgraded_output_budget():
     assert "exhausted its output budget" in calls[1]["prompt"]
 
 
+def test_valid_candidate_can_resume_at_review_without_replanning():
+    checkpoints = []
+
+    with pytest.raises(GoalPlanningError, match="reviewer returned invalid JSON"):
+        plan_tasks(
+            "add a rate limit", "pytest -q",
+            planner_runner=lambda **_: json.dumps(_plan()),
+            reviewer_runner=lambda **_: "",
+            discovery_manifest=MANIFEST,
+            test_catalog=TestCatalog(),
+            candidate_callback=checkpoints.append,
+        )
+
+    assert len(checkpoints) == 1
+    review_calls = []
+    resumed = plan_tasks(
+        "add a rate limit", "pytest -q",
+        planner_runner=lambda **_: pytest.fail("a saved candidate must not call the planner again"),
+        reviewer_runner=lambda **kwargs: review_calls.append(kwargs["agent_type"]) or '{"approved":true,"summary":"ready","findings":[]}',
+        discovery_manifest=MANIFEST,
+        test_catalog=TestCatalog(),
+        candidate_plan=checkpoints[0],
+    )
+
+    assert resumed.review["approved"] is True
+    assert review_calls == ["goal_plan_reviewer"]
+
+
 def test_v2_allows_a_new_module_only_under_an_evidenced_parent():
     result = parse_plan(
         json.dumps(_plan(primary_write=[], planned_new=["src/rate_limit.py"])),

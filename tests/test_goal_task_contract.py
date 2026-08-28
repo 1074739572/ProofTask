@@ -516,9 +516,11 @@ def test_initialize_persists_every_task_in_a_large_plan(tmp_path, monkeypatch):
     assert final_task.blockedBy == [state.task_name_ids["task 19"]]
 
 
-def test_repair_planning_pauses_after_repeated_task_repairs(tmp_path, monkeypatch):
+def test_repair_threshold_keeps_the_current_task_and_records_local_direction(tmp_path, monkeypatch):
     import harness.goal.runner as runner_mod
+    import harness.goal.repair as repair_mod
     import harness.tasks as tasks
+    from harness.goal.repair import RepairDecision
     from harness.goal.policy import MAX_REPAIR_ATTEMPTS_PER_TASK
 
     monkeypatch.setattr(tasks, "TASKS_DIR", tmp_path / ".tasks")
@@ -531,11 +533,126 @@ def test_repair_planning_pauses_after_repeated_task_repairs(tmp_path, monkeypatc
     state.current_task_id = task.id
     monkeypatch.setattr(runner_mod, "save_goal", lambda state: None)
     monkeypatch.setattr(runner_mod, "_emit_goal", lambda *args: None)
+    monkeypatch.setattr(
+        repair_mod,
+        "plan_task_repair",
+        lambda *args, **kwargs: RepairDecision("implementation_fix", "change the local implementation direction"),
+    )
 
     GoalRunner(state=state, history=[], context={}, binding=None)._repair_plan(state)
 
-    assert state.phase == GoalPhase.PAUSED.value
-    assert state.stop_reason == "repair_limit_reached"
+    assert state.phase == GoalPhase.ACT.value
+    assert state.stop_reason in {None, ""}
+    assert state.execution_trace[-1]["event"] == "repair_threshold"
+    assert state.execution_trace[-1]["route"] == "implementation_fix"
+
+
+def test_repair_threshold_replans_a_stalled_task_with_repair_and_verification_history(tmp_path, monkeypatch):
+    import harness.goal.runner as runner_mod
+    import harness.tasks as tasks
+    from harness.goal.policy import MAX_REPAIR_ATTEMPTS_PER_TASK
+
+    monkeypatch.setattr(tasks, "TASKS_DIR", tmp_path / ".tasks")
+    task = tasks.create_task("stalled", "still fails", verification_spec={"command": "pytest -q"})
+    task.status = "in_progress"
+    task.repair_history = [
+        {
+            "repair_epoch": 0,
+            "action": "implementation_fix",
+            "summary": f"local direction {index}",
+            "instructions": f"try local fix {index}",
+            "assumptions": [{"decision": "stay local", "basis": "previous bound test failed"}],
+            "evaluation": {"passed": False, "route": "implementation_fix"},
+        }
+        for index in range(13)
+    ]
+    task.evidence = [
+        {
+            "command": "pytest -q tests/test_stalled.py",
+            "exit_code": 1,
+            "stdout_tail": (
+                "1 pass\n3 fail\nAssertionError: expected boundary "
+                + ("diagnostic detail " * 80)
+            ),
+            "code_snapshot": f"snapshot-{index}",
+        }
+        for index in range(15)
+    ]
+    tasks.save_task(task)
+    tasks.record_task_evaluation(task.id, {"passed": False, "route": "implementation_fix", "summary": "still failing"})
+    state = GoalState.new(target="repair", verification="pytest -q", workspace=str(tmp_path))
+    state.current_task_id = task.id
+    state.task_ids = [task.id]
+    state.phase = GoalPhase.REPAIR_PLAN.value
+    captured = {}
+
+    def capture_replan(_self, _state, **kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(runner_mod, "save_goal", lambda state: None)
+    monkeypatch.setattr(runner_mod.GoalRunner, "_replan_remaining_tasks", capture_replan)
+
+    runner_mod.GoalRunner(state=state, history=[], context={}, binding=None)._repair_plan(state)
+
+    evaluation = captured["evaluation"]
+    stalled = evaluation["stalled_task_evidence"]
+    assert evaluation["route"] == "replan"
+    assert evaluation["replan_trigger"] == "stalled_task_review"
+    assert stalled["repair_count"] == 13
+    assert stalled["failed_verification_count"] == 15
+    assert stalled["recent_verification_detail"][0]["result_summary"] == {"passed": 1, "failed": 3}
+    assert stalled["recent_repair_detail"][0]["instructions"] == "try local fix 9"
+    assert [item["attempt"] for item in stalled["attempt_timeline"]] == list(range(1, 14))
+    assert stalled["attempt_timeline"][12]["outcome"] == "local direction 12"
+    assert [item["run"] for item in stalled["verification_timeline"]] == list(range(1, 16))
+    assert all(item["result"] == "1 pass / 3 fail" for item in stalled["verification_timeline"])
+    assert len(json.dumps(stalled, ensure_ascii=False, sort_keys=True)) <= runner_mod.STALLED_REPLAN_EVIDENCE_BUDGET
+    request, request_error = runner_mod.GoalRunner(
+        state=state, history=[], context={}, binding=None,
+    )._replan_request(
+        state,
+        task=task,
+        evaluation={
+            "route": "replan",
+            "replan_trigger": "stalled_task_review",
+            "stalled_task_evidence": stalled,
+        },
+        reason="complete compact stalled-task history",
+    )
+    assert request_error is None
+    assert request is not None
+    assert request["stalled_task_evidence"] is stalled
+    assert state.execution_trace[-1]["event"] == "stalled_task_review"
+
+
+def test_repair_replan_without_contract_evidence_stays_on_current_task(tmp_path, monkeypatch):
+    import harness.goal.repair as repair_mod
+    import harness.goal.runner as runner_mod
+    import harness.tasks as tasks
+    from harness.goal.repair import RepairDecision
+
+    monkeypatch.setattr(tasks, "TASKS_DIR", tmp_path / ".tasks")
+    task = tasks.create_task("current", "still failing", verification_spec={})
+    tasks.claim_task(task.id)
+    tasks.record_task_evaluation(task.id, {"passed": False, "route": "implementation_fix"})
+    state = GoalState.new(target="repair", verification="pytest -q", workspace=str(tmp_path))
+    state.current_task_id = task.id
+    state.task_ids = [task.id]
+    state.phase = GoalPhase.REPAIR_PLAN.value
+    monkeypatch.setattr(runner_mod, "save_goal", lambda state: None)
+    monkeypatch.setattr(runner_mod, "_emit_goal", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        repair_mod,
+        "plan_task_repair",
+        lambda *args, **kwargs: RepairDecision("replan", "replace the remaining tasks"),
+    )
+
+    GoalRunner(state=state, history=[], context={}, binding=None)._repair_plan(state)
+
+    repaired = tasks.load_task(task.id)
+    assert state.phase == GoalPhase.ACT.value
+    assert repaired.repair_history[-1]["action"] == "implementation_fix"
+    assert any(entry["event"] == "repair_replan_rejected" for entry in state.execution_trace)
 
 
 def test_resume_starts_a_new_bounded_repair_epoch_after_limit(tmp_path, monkeypatch):
@@ -591,6 +708,36 @@ def test_resume_verifies_a_workspace_change_before_starting_another_worker(tmp_p
     assert runner_mod._resume_target(state) == GoalPhase.VERIFY.value
     assert state.repair_epoch == 1
     assert "Workspace changed" in state.last_error
+
+
+def test_preflight_allows_existing_planned_new_path_created_by_prior_slice(tmp_path, monkeypatch):
+    import harness.goal.runner as runner_mod
+    import harness.tasks as tasks
+
+    monkeypatch.setattr(tasks, "TASKS_DIR", tmp_path / ".tasks")
+    planned = tmp_path / "src" / "StatusLine.tsx"
+    planned.parent.mkdir(parents=True)
+    planned.write_text("export function StatusLine() {}\n", encoding="utf-8")
+    task = tasks.create_task(
+        "status line", "finish the status line", verification_spec={"source": "generated"},
+        goal_id="goal-test", planned_new=["src/StatusLine.tsx"],
+    )
+    state = GoalState.new(target="repair", verification="pytest -q", workspace=str(tmp_path))
+    state.phase = GoalPhase.PREPARE_EXECUTION.value
+    state.current_task_id = task.id
+    state.goal_contract = {"verification_preconditions": []}
+    state.execution_trace = [{
+        "event": "implementation_slice",
+        "task_id": task.id,
+        "detail": {"write_paths": ["src/StatusLine.tsx"]},
+    }]
+    monkeypatch.setattr(runner_mod, "save_goal", lambda state: None)
+    monkeypatch.setattr(runner_mod, "_emit_goal", lambda *args: None)
+
+    runner_mod.GoalRunner(state=state, history=[], context={}, binding=None)._prepare_execution(state)
+
+    assert state.phase == GoalPhase.CLAIM.value
+    assert state.execution_preflight[task.id]["passed"] is True
 
 
 def test_resume_skips_implementation_when_task_verification_and_evaluation_pass(tmp_path, monkeypatch):
@@ -753,6 +900,84 @@ def test_repair_planner_preserves_provider_failure_over_missing_json(tmp_path):
 
     assert decision.unavailable
     assert decision.error == "repair planner stopped: provider_error"
+
+
+def test_repair_prompt_includes_durable_failure_handoff_for_empty_worker_summary(tmp_path):
+    from harness.goal.memory import write_handoff
+    from harness.goal.repair import build_repair_prompt
+    from harness.tasks import Task
+
+    state = GoalState.new(target="repair", verification="pytest -q", workspace=str(tmp_path))
+    task = Task(
+        id="task_repair",
+        subject="repair",
+        description="restore behavior",
+        status="in_progress",
+        owner="goal:test",
+        blockedBy=[],
+        verification_spec={"command": "pytest -q tests/test_repair.py", "selectors": ["tests/test_repair.py::test_case"]},
+    )
+    write_handoff(
+        state,
+        task,
+        phase="repair_plan",
+        execution={
+            "task_id": task.id,
+            "worker_summary": "",
+            "worker_summary_missing": True,
+            "stop_reason": "max_tokens",
+            "write_paths": ["src/repair.py"],
+            "tool_errors": ["renderer rejected an empty text node"],
+        },
+        failure={
+            "classification": "implementation_blocker",
+            "verification": {"output_tail": "Orphan text error"},
+            "next_action": "Inspect the render tree before retrying.",
+        },
+    )
+
+    prompt = build_repair_prompt(state, task, {"passed": False, "route": "implementation_fix"})
+
+    assert "Durable failure handoff" in prompt
+    assert "worker_summary_missing" in prompt
+    assert "renderer rejected an empty text node" in prompt
+    assert "Orphan text error" in prompt
+    assert f".project/goal-memory/{state.id}/handoff.json" in prompt
+
+
+def test_task_handoff_clears_previous_task_failure_and_repair_filters_stale_sections(tmp_path):
+    import json
+
+    from harness.goal.memory import load_handoff, write_handoff
+    from harness.goal.repair import _repair_handoff
+    from harness.tasks import Task
+
+    state = GoalState.new(target="handoff", verification="pytest -q", workspace=str(tmp_path))
+    first = Task(id="task_first", subject="first", description="first", status="in_progress", owner="goal:test", blockedBy=[])
+    second = Task(id="task_second", subject="second", description="second", status="in_progress", owner="goal:test", blockedBy=[])
+    write_handoff(
+        state, first, phase="repair_plan",
+        execution={"worker_summary": "first worker", "stop_reason": "max_tokens"},
+        failure={"classification": "implementation_blocker", "summary": "first-only failure"},
+    )
+
+    # The second Task has no execution evidence yet, so omission means clear,
+    # never inherit the first Task's failure diagnosis.
+    write_handoff(state, second, phase="act")
+    handoff = load_handoff(state)
+    assert handoff["execution"] == {}
+    assert handoff["failure"] == {}
+
+    # Simulate an interrupted legacy write where the enclosing Task changed
+    # but a section from the first Task remained. Repair must reject it.
+    handoff["execution"] = {"goal_id": state.id, "task_id": first.id, "worker_summary": "do not leak"}
+    handoff["failure"] = {"goal_id": state.id, "task_id": first.id, "summary": "do not leak"}
+    path = tmp_path / ".project" / "goal-memory" / state.id / "handoff.json"
+    path.write_text(json.dumps(handoff), encoding="utf-8")
+
+    repair_handoff = _repair_handoff(state, second)
+    assert repair_handoff["worker_summary"] == ""
+    assert repair_handoff["failure"]["summary"] == ""
 
 
 def test_test_generation_expands_a_collected_test_file_to_real_node_ids(tmp_path):
@@ -2206,7 +2431,7 @@ def test_node_goal_regression_creates_a_node_bound_repair_task(tmp_path, monkeyp
     assert repair.verification_spec["selectors"] == ["test/queue.test.ts::queue drains in FIFO order"]
 
 
-def test_replan_returns_current_task_to_additive_test_preparation(tmp_path, monkeypatch):
+def test_replan_without_structured_scope_evidence_is_rejected(tmp_path, monkeypatch):
     import harness.goal.repair as repair_mod
     import harness.goal.runner as runner_mod
     import harness.tasks as tasks
@@ -2238,10 +2463,9 @@ def test_replan_returns_current_task_to_additive_test_preparation(tmp_path, monk
     GoalRunner(state=state, history=[], context={}, binding=None)._repair_plan(state)
 
     repaired = tasks.load_task(task.id)
-    assert state.phase == GoalPhase.PREPARE_TESTS.value
-    assert repaired.verification_state == "needs_generation"
-    assert repaired.verification_spec["allow_posthoc_test"] is True
-    assert repaired.repair_history[-1]["action"] == "replan"
+    assert state.phase == GoalPhase.PAUSED.value
+    assert repaired.status == "in_progress"
+    assert any(entry["event"] == "execution_replan_rejected" for entry in state.execution_trace)
 
 
 def test_repair_plan_json_format_failure_resumes_current_task(tmp_path, monkeypatch):
@@ -2274,7 +2498,7 @@ def test_repair_plan_json_format_failure_resumes_current_task(tmp_path, monkeypa
     assert repaired.repair_history[-1]["format_fallback"] is True
 
 
-def test_repair_plan_json_format_failure_replans_after_repair_threshold(tmp_path, monkeypatch):
+def test_repair_plan_json_format_failure_keeps_current_task_after_repair_threshold(tmp_path, monkeypatch):
     import harness.goal.repair as repair_mod
     import harness.goal.runner as runner_mod
     import harness.tasks as tasks
@@ -2308,9 +2532,9 @@ def test_repair_plan_json_format_failure_replans_after_repair_threshold(tmp_path
     GoalRunner(state=state, history=[], context={}, binding=None)._repair_plan(state)
 
     repaired = tasks.load_task(task.id)
-    assert captured["task"] == task.id
-    assert captured["route"] == "replan"
-    assert repaired.repair_history[-1]["action"] == "replan"
+    assert captured == {}
+    assert state.phase == GoalPhase.ACT.value
+    assert repaired.repair_history[-1]["action"] == "implementation_fix"
     assert repaired.repair_history[-1]["format_fallback"] is True
 
 
@@ -2485,8 +2709,8 @@ def test_round_limit_with_repeated_no_progress_still_routes_through_verification
 
     runner._act(state)
 
-    assert state.phase == GoalPhase.ROLLOVER.value
-    assert state.worker_rollovers == 1
+    assert state.phase == GoalPhase.VERIFY.value
+    assert state.worker_rollovers == 0
 
 
 def test_repeated_no_progress_routes_to_repair_only_after_failed_verification(tmp_path, monkeypatch):
@@ -2511,7 +2735,7 @@ def test_repeated_no_progress_routes_to_repair_only_after_failed_verification(tm
     runner_mod.GoalRunner(state=state, history=[], context={}, binding=None)._verify(state)
 
     assert state.phase == GoalPhase.REPAIR_PLAN.value
-    assert "verification still fails" in state.last_error
+    assert "durable failure handoff" in state.last_error
 
 
 def test_provider_error_pauses_without_consuming_repair_budget(tmp_path, monkeypatch):

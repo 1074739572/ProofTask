@@ -54,6 +54,7 @@ def test_usage_update_emitted_when_event_stream_enabled():
         assert payload["input_tokens"] == 10
         assert payload["output_tokens"] == 3
         assert payload["cache_read_tokens"] == 8
+        assert payload["context_tokens"] is None
     finally:
         events.disable_event_stream()
 
@@ -82,6 +83,29 @@ def test_usage_update_keeps_agent_context_and_unknown_output_visible():
         assert payload["agent_run_id"] == "run-1"
         assert payload["output_tokens"] is None
         assert payload["output_tokens_known"] is False
+        assert payload["context_tokens"] is None
+    finally:
+        events.disable_event_stream()
+
+
+def test_primary_session_usage_reports_authoritative_context_tokens():
+    import io
+    import json
+    from harness.ui import events
+    from harness.usage.context import current_context_tokens
+
+    sink = io.StringIO()
+    events.enable_event_stream(sink)
+    try:
+        with patch("harness.llm.record_usage"):
+            _log_cache_usage(
+                _response(hit=900, miss=100),
+                model_id="qwen-max",
+                usage_context={"session_id": "session-1"},
+            )
+        payload = [json.loads(line) for line in sink.getvalue().splitlines() if line.strip()][-1]
+        assert payload["context_tokens"] == 1000
+        assert current_context_tokens("session-1", 25) == 1000
     finally:
         events.disable_event_stream()
 

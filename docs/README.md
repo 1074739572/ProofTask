@@ -12,6 +12,7 @@
 | 为什么要让机器判定交付 | [`proof-task-design.md`](./proof-task-design.md) |
 | Goal / Task / 测试验证如何落地 | [`goal-task-verification-plan.md`](./goal-task-verification-plan.md) |
 | Goal 中模型与 Task 如何传递上下文 | [`goal-context-handoff.md`](./goal-context-handoff.md) |
+| 每个 Goal 持久化 JSON 记录什么 | [`goal-persistence-reference.md`](./goal-persistence-reference.md) |
 
 ## ProofTask 设计
 
@@ -19,6 +20,7 @@
 - [`proof-task-design.md`](./proof-task-design.md)：问题、原则、职责边界和当前实现的完整说明。
 - [`goal-task-verification-plan.md`](./goal-task-verification-plan.md)：Goal 状态、Task 契约、测试绑定和完成门槛。
 - [`goal-context-handoff.md`](./goal-context-handoff.md)：模型阶段与跨 Task 的持久化上下文交接。
+- [`goal-persistence-reference.md`](./goal-persistence-reference.md)：Goal、Draft、Task、handoff、测试绑定和 Discovery 文件的字段参考，使用当前运行 Goal 的真实例子。
 - [`goal-mode-mvp-spec.md`](./goal-mode-mvp-spec.md)：早期 MVP 方案，仅用于了解演进过程；当前实现以 Goal / Task 文档为准。
 - [`harness-reliability-plan.md`](./harness-reliability-plan.md)：从评估、状态、验证到自主循环的可靠性建设记录。
 

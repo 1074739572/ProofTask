@@ -74,6 +74,9 @@ def test_execution_replan_replaces_only_unfinished_tasks(tmp_path, monkeypatch):
     state.task_ids = [completed.id, active.id]
     state.task_name_ids = {completed.subject: completed.id, active.subject: active.id}
     state.goal_contract = {"summary": "x"}
+    generated = tmp_path / "src" / "generated_during_execution.py"
+    generated.parent.mkdir(parents=True)
+    generated.write_text("# generated\n", encoding="utf-8")
 
     replacement_plan = GoalPlan(
         contract={"summary": "x"},
@@ -87,7 +90,18 @@ def test_execution_replan_replaces_only_unfinished_tasks(tmp_path, monkeypatch):
         ),),
         review={"approved": True},
     )
-    monkeypatch.setattr(runner_module, "plan_tasks", lambda *_, **__: replacement_plan)
+    planner_calls = []
+
+    def plan_remaining(*args, **kwargs):
+        planner_calls.append(kwargs)
+        return replacement_plan
+
+    monkeypatch.setattr(runner_module, "plan_tasks", plan_remaining)
+    state.execution_trace = [{
+        "event": "implementation_slice",
+        "task_id": active.id,
+        "detail": {"write_paths": ["src/generated_during_execution.py"]},
+    }]
 
     runner = runner_module.GoalRunner(state=state, history=[], context={}, binding=None)
     runner._replan_remaining_tasks(
@@ -103,6 +117,7 @@ def test_execution_replan_replaces_only_unfinished_tasks(tmp_path, monkeypatch):
     assert state.task_ids == [completed.id, replacement_id]
     assert load_task(active.id).status == "cancelled"
     assert replacement.blockedBy == [completed.id]
+    assert "src/generated_during_execution.py" in planner_calls[0]["execution_workspace_paths"]
 
 
 def test_execution_replan_manifest_uses_current_worktree_files(tmp_path):

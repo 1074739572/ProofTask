@@ -110,6 +110,7 @@ def call_llm(
     *,
     model_id: str | None = None,
     reasoning_effort: str | None = None,
+    usage_context: dict[str, str] | None = None,
 ):
     # Optional per-run override (rare). Prefer shared identity + lookup constraints
     # over swapping personas for evals — see harness.prompts.lookup.
@@ -136,6 +137,7 @@ def call_llm(
             messages=api_messages,
             tools=tools,
             max_tokens=max_tokens,
+            usage_context=usage_context,
         ),
         state,
     )
@@ -256,7 +258,16 @@ def agent_loop(
 
         try:
             llm_rounds += 1
-            response = call_llm(messages, context, tools, state, max_tokens, **model_overrides)
+            primary_usage_context = (
+                {"session_id": str(getattr(binding, "session_id", "") or "")}
+                if binding is not None
+                else None
+            )
+            response = call_llm(
+                messages, context, tools, state, max_tokens,
+                usage_context=primary_usage_context,
+                **model_overrides,
+            )
         except Exception as exc:
             if is_cancelled():
                 return _finish(True, "cancelled")
@@ -278,7 +289,11 @@ def agent_loop(
                     state.fallback_model = candidate
                     attempted_models.append(candidate)
                     try:
-                        response = call_llm(messages, context, tools, state, max_tokens, **model_overrides)
+                        response = call_llm(
+                            messages, context, tools, state, max_tokens,
+                            usage_context=primary_usage_context,
+                            **model_overrides,
+                        )
                         break
                     except Exception as retry_exc:
                         formatted = format_api_error(retry_exc)

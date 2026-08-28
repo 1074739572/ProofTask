@@ -9,7 +9,7 @@ import re
 import subprocess
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -23,7 +23,7 @@ from harness.goal.coordinator import ParallelGoalSupervisor, SupervisorRun
 from harness.goal.language import human_language_label
 from harness.goal.models import GoalPhase, GoalStatus, GoalState, StopReason
 from harness.goal.planner import VerificationSpec, plan_tasks
-from harness.goal.policy import MAX_REPAIR_ATTEMPTS_PER_TASK, NO_PROGRESS_REPLAN_LIMIT, validate_limits
+from harness.goal.policy import MAX_REPAIR_ATTEMPTS_PER_TASK, validate_limits
 from harness.goal.supervision import StagePolicy, StageProgress, StageSupervisor, emit_stage_supervision
 from harness.goal.store import (
     GoalLeaseError,
@@ -56,6 +56,10 @@ class GoalBusyError(Exception):
 TEST_WRITER_MAX_ROUNDS = 8
 TEST_WRITER_MAX_IDLE_CHUNKS = 3
 MAX_PERMISSION_BOUNDARY_RETRIES = 3
+# The planner receives this evidence as JSON inside an already substantial
+# prompt. Keep it below this limit before serializing the replan request so
+# it can be consumed whole; never slice serialized JSON at the prompt edge.
+STALLED_REPLAN_EVIDENCE_BUDGET = 10_500
 # Routine progress reports used to start an independent Sol request after
 # nearly every worker slice and phase transition.  They competed with the
 # implementation worker for the same provider connection while carrying a
@@ -2066,6 +2070,7 @@ class GoalRunner(threading.Thread):
                             "evidence": detail[-2_000:],
                         }],
                         "required_write_paths": [],
+                        "replan_trigger": "generated_test_selector_overlap",
                     },
                     reason=detail,
                 )
@@ -2100,6 +2105,7 @@ class GoalRunner(threading.Thread):
                             "evidence": detail[-1_200:],
                         }],
                         "required_write_paths": [],
+                        "replan_trigger": "generated_test_baseline_overlap",
                     },
                     reason=detail,
                 )
@@ -2679,6 +2685,7 @@ class GoalRunner(threading.Thread):
                             "evidence": mismatch_diagnostic(),
                         }],
                         "required_write_paths": [],
+                        "replan_trigger": "generated_test_selector_overlap",
                     },
                     reason=detail,
                 )
@@ -2822,6 +2829,7 @@ class GoalRunner(threading.Thread):
                             "evidence": output_tail or "zero-exit generated baseline",
                         }],
                         "required_write_paths": [],
+                        "replan_trigger": "generated_test_baseline_overlap",
                     },
                     reason=detail,
                 )
@@ -3174,6 +3182,7 @@ class GoalRunner(threading.Thread):
         return tuple(sorted(roots))
 
     def _select_task(self, state: GoalState) -> None:
+        from harness.goal.memory import write_handoff
         from harness.tasks import load_task
 
         if not state.execution_approved:
@@ -3207,6 +3216,16 @@ class GoalRunner(threading.Thread):
             if is_new_task:
                 state.attempts = 0
                 state.no_progress_count = 0
+                # A handoff is a Task-local checkpoint. Clear both sections
+                # before the new Task has a worker slice, so a repair cannot
+                # inherit failure evidence from the previous Task.
+                write_handoff(
+                    state,
+                    task,
+                    phase=GoalPhase.PREPARE_EXECUTION.value,
+                    execution=None,
+                    failure=None,
+                )
             save_goal(state)
             self._apply(state, GoalPhase.PREPARE_EXECUTION, "task_selected")
             return
@@ -3261,6 +3280,17 @@ class GoalRunner(threading.Thread):
         if set(writes).intersection(task.forbidden):
             errors.append("Task writable paths overlap forbidden paths")
         root = Path(_execution_workspace(state))
+        # A planned_new path is required to be absent for the first
+        # implementation slice.  Once this Task has created it, later
+        # verification/repair slices must be allowed to edit the same file;
+        # otherwise a normal test-gap repair is incorrectly converted into a
+        # full replan (and the worker can never finish its own Task).
+        previously_created = {
+            str(path).replace("\\", "/").removeprefix("./")
+            for entry in state.execution_trace
+            if entry.get("task_id") == task.id and entry.get("event") == "implementation_slice"
+            for path in (entry.get("detail") or {}).get("write_paths", [])
+        }
         for path in [*task.primary_write, *task.read_envelope, *task.conditional_write]:
             relative, candidate, error = self._scope_candidate(root, str(path))
             if error or relative is None or candidate is None or not candidate.exists():
@@ -3269,7 +3299,7 @@ class GoalRunner(threading.Thread):
             relative, candidate, error = self._scope_candidate(root, str(path))
             if error or relative is None or candidate is None:
                 errors.append(f"Planned new path is invalid: {path}")
-            elif candidate.exists():
+            elif candidate.exists() and str(relative).replace("\\", "/").removeprefix("./") not in previously_created:
                 errors.append(f"Planned new path already exists: {path}")
 
         record = {
@@ -3292,6 +3322,7 @@ class GoalRunner(threading.Thread):
             record_task_evaluation(task.id, {
                 "passed": False, "route": "replan", "summary": task.last_error,
                 "findings": [{"issue": error, "severity": "high", "evidence": "execution preflight"} for error in errors[:6]],
+                "replan_trigger": "execution_preflight",
             })
             self._record_execution_trace(state, "execution_preflight", task_id=task.id, route="replan", summary=task.last_error, detail=record)
             save_goal(state)
@@ -3420,6 +3451,9 @@ class GoalRunner(threading.Thread):
             summary=summary,
             extra={"task_id": task.id, "worker_generation": state.worker_generation},
         )
+        worker_summary = str(summary or "").strip()
+        agent_detail["worker_summary"] = worker_summary[:4_000]
+        agent_detail["worker_summary_missing"] = not bool(worker_summary)
         scope_error = self._validate_task_scope(state, task)
         if scope_error:
             self._observe_supervisor(
@@ -3461,6 +3495,9 @@ class GoalRunner(threading.Thread):
                 "rounds": stats.llm_rounds,
                 "tools": stats.tool_count,
                 "idle_slices": state.no_progress_count,
+                "worker_generation": state.worker_generation,
+                "worker_summary": agent_detail["worker_summary"],
+                "worker_summary_missing": agent_detail["worker_summary_missing"],
                 "write_paths": agent_detail["write_paths"],
                 "write_outcomes": agent_detail["write_outcomes"],
                 "tool_errors": agent_detail["tool_errors"],
@@ -3545,11 +3582,220 @@ class GoalRunner(threading.Thread):
         external_markers = ("docker daemon", "cannot connect to docker", "connection refused", "service unavailable", "missing credential", "api key")
         if any(marker in detail for marker in external_markers):
             return "external_blocked", "Verification depends on an unavailable external runtime or credential."
-        if state.no_progress_count >= NO_PROGRESS_REPLAN_LIMIT:
-            return "replan", "Consecutive implementation slices changed neither Task evidence nor scoped code."
+        if state.no_progress_count:
+            return (
+                "implementation_fix",
+                "Recent implementation slices made no observable progress; use the durable failure handoff to change the local repair approach.",
+            )
         return "implementation_fix", "Bound verification failed after an implementation attempt."
 
+    def _failure_handoff(self, state: GoalState, task: Any, *, route: str, summary: str) -> dict[str, Any]:
+        """Persist enough evidence for a fresh repair worker without replaying chat."""
+        verification_spec = task.verification_spec if isinstance(task.verification_spec, dict) else {}
+        evidence = task.evidence[-1] if task.evidence else {}
+        if not isinstance(evidence, dict):
+            evidence = {}
+        slices = [
+            entry for entry in state.execution_trace
+            if entry.get("task_id") == task.id and entry.get("event") == "implementation_slice"
+        ][-4:]
+        attempts = [
+            {
+                "generation": (entry.get("detail") or {}).get("worker_generation"),
+                "route": entry.get("route"),
+                "summary": str(entry.get("summary") or "")[:800],
+                "stop_reason": str((entry.get("detail") or {}).get("stop_reason") or ""),
+                "worker_summary": str((entry.get("detail") or {}).get("worker_summary") or "")[:1_500],
+                "write_paths": list((entry.get("detail") or {}).get("write_paths") or [])[-8:],
+                "tool_errors": list((entry.get("detail") or {}).get("tool_errors") or [])[-6:],
+            }
+            for entry in slices
+        ]
+        classification = "contract_mismatch" if route in {"replan", "scope_omission"} else (
+            "external_blocker" if route == "external_blocked" else "implementation_blocker"
+        )
+        return {
+            "goal_id": state.id,
+            "task_id": task.id,
+            "attempt_id": f"{task.id}:{state.worker_generation}",
+            "source_phase": GoalPhase.VERIFY.value,
+            "workspace_snapshot": task.start_snapshot or "",
+            "created_at": time.time(),
+            "classification": classification,
+            "route": route,
+            "summary": str(summary or "")[:2_000],
+            "task_error": str(task.last_error or "")[:4_000],
+            "verification": {
+                "command": str(verification_spec.get("command") or ""),
+                "selectors": list(verification_spec.get("selectors") or [])[-12:],
+                "exit_code": evidence.get("exit_code"),
+                "output_tail": str(evidence.get("stdout_tail") or evidence.get("output_tail") or "")[-4_000:],
+            },
+            "attempts": attempts,
+            "retry": {
+                "repair_count": len(task.repair_history),
+                "no_progress_count": state.no_progress_count,
+            },
+            "next_action": (
+                "Continue the current Task with the bound verification; inspect the recorded tool errors and changed paths before retrying."
+                if classification == "implementation_blocker"
+                else "Validate the contract mismatch against the recorded verification evidence before changing Task boundaries."
+            ),
+        }
+
+    def _stalled_task_replan_evidence(
+        self,
+        state: GoalState,
+        task: Any,
+        *,
+        repair_count: int,
+    ) -> dict[str, Any] | None:
+        """Return bounded proof that local repair has stopped converging.
+
+        A repair count alone is not enough: a large Task can make measurable
+        progress across many slices. Escalation requires repeated failed Task
+        verdicts and repeated non-zero bound verification evidence, both of
+        which the replan compiler can inspect.
+        """
+        if repair_count < MAX_REPAIR_ATTEMPTS_PER_TASK:
+            return None
+        all_repairs = [
+            item for item in task.repair_history
+            if isinstance(item, dict)
+            and (
+                state.repair_epoch <= 0
+                or item.get("repair_epoch") == state.repair_epoch
+            )
+        ]
+        recent_repairs = all_repairs[-4:]
+        failed_repairs = [
+            item for item in all_repairs
+            if isinstance(item.get("evaluation"), dict)
+            and item["evaluation"].get("passed") is False
+        ]
+        all_verification_runs = [
+            item for item in (task.evidence or [])
+            if isinstance(item, dict) and item.get("exit_code") not in {None, 0}
+        ]
+        recent_verification_runs = all_verification_runs[-4:]
+        if len(failed_repairs) < MAX_REPAIR_ATTEMPTS_PER_TASK or len(recent_verification_runs) < 2:
+            return None
+
+        def verification_summary(item: dict[str, Any]) -> dict[str, Any]:
+            output = str(item.get("stdout_tail") or item.get("output_tail") or "")
+            match = re.search(r"\b(\d+)\s+pass(?:ed)?\b.*?\b(\d+)\s+fail(?:ed)?\b", output, re.IGNORECASE | re.DOTALL)
+            return {
+                "command": str(item.get("command") or "")[:240],
+                "exit_code": item.get("exit_code"),
+                "timed_out": bool(item.get("timed_out")),
+                "result_summary": (
+                    {"passed": int(match.group(1)), "failed": int(match.group(2))}
+                    if match else {}
+                ),
+                "output_tail": output[-120:],
+                "code_snapshot": str(item.get("code_snapshot") or "")[:80],
+            }
+
+        def repair_timeline_entry(index: int, item: dict[str, Any]) -> dict[str, Any]:
+            assumptions = [
+                str(assumption.get("decision") or "")[:64]
+                for assumption in (item.get("assumptions") or [])[:1]
+                if isinstance(assumption, dict)
+            ]
+            evaluation = item.get("evaluation") if isinstance(item.get("evaluation"), dict) else {}
+            return {
+                "attempt": index,
+                "action": str(item.get("action") or "")[:48],
+                "route": str(evaluation.get("route") or "")[:48],
+                "passed": evaluation.get("passed"),
+                "direction": assumptions or [str(item.get("instructions") or "")[:80]],
+                "outcome": str(item.get("summary") or evaluation.get("summary") or "")[:80],
+            }
+
+        def verification_timeline_entry(index: int, item: dict[str, Any]) -> dict[str, Any]:
+            output = str(item.get("stdout_tail") or item.get("output_tail") or "")
+            match = re.search(r"\b(\d+)\s+pass(?:ed)?\b.*?\b(\d+)\s+fail(?:ed)?\b", output, re.IGNORECASE | re.DOTALL)
+            return {
+                "run": index,
+                "exit_code": item.get("exit_code"),
+                "result": (
+                    f"{match.group(1)} pass / {match.group(2)} fail"
+                    if match else "non-zero exit"
+                ),
+                "failure_tail": output[-50:].replace("\n", " "),
+                "code_snapshot": str(item.get("code_snapshot") or "")[:24],
+            }
+
+        task_slices = [
+            entry for entry in state.execution_trace
+            if entry.get("task_id") == task.id and entry.get("event") == "implementation_slice"
+        ]
+        write_paths = list(dict.fromkeys(
+            str(path) for entry in task_slices
+            for path in (entry.get("detail") or {}).get("write_paths", [])
+            if str(path).strip()
+        ))
+        tool_error_count = sum(
+            len((entry.get("detail") or {}).get("tool_errors") or [])
+            for entry in task_slices
+        )
+        evidence = {
+            "goal_id": state.id,
+            "task_id": task.id,
+            "repair_count": repair_count,
+            "failed_repair_count": len(failed_repairs),
+            "failed_verification_count": len(all_verification_runs),
+            # Every current-epoch repair and non-zero verification run is
+            # represented once. Detailed records are limited to the newest
+            # four, avoiding duplicated 20KB replan payloads.
+            "attempt_timeline": [
+                repair_timeline_entry(index, item)
+                for index, item in enumerate(all_repairs, start=1)
+            ],
+            "verification_timeline": [
+                verification_timeline_entry(index, item)
+                for index, item in enumerate(all_verification_runs, start=1)
+            ],
+            "implementation_summary": {
+                "slice_count": len(task_slices),
+                "write_paths": write_paths[-20:],
+                "write_path_count": len(write_paths),
+                "tool_error_count": tool_error_count,
+            },
+            "recent_repair_detail": [
+                {
+                    "attempt": index,
+                    "instructions": str(item.get("instructions") or "")[:120],
+                    "decision": next((
+                        str(assumption.get("decision") or "")[:80]
+                        for assumption in (item.get("assumptions") or [])
+                        if isinstance(assumption, dict)
+                    ), ""),
+                }
+                for index, item in enumerate(recent_repairs, start=len(all_repairs) - len(recent_repairs) + 1)
+            ],
+            "recent_verification_detail": [verification_summary(item) for item in recent_verification_runs],
+            "last_error": str(task.last_error or "")[:600],
+            "required_action": (
+                "Recompile only this stalled Task and its unfinished dependents. Preserve unrelated active Tasks, "
+                "the frozen Goal contract, the bound tests, and the failed-attempt evidence above."
+            ),
+        }
+        serialized = json.dumps(evidence, ensure_ascii=False, sort_keys=True)
+        if len(serialized) > STALLED_REPLAN_EVIDENCE_BUDGET:
+            # Do not discard timeline rows: they are the reason this route
+            # exists. Remove only optional, duplicated newest-attempt detail.
+            evidence.pop("recent_repair_detail", None)
+            evidence.pop("recent_verification_detail", None)
+            serialized = json.dumps(evidence, ensure_ascii=False, sort_keys=True)
+        if len(serialized) > STALLED_REPLAN_EVIDENCE_BUDGET:
+            raise ValueError(
+                "Stalled-Task evidence exceeds its whole-JSON budget; refusing to truncate repair history."
+            )
+        return evidence
+
     def _verify(self, state: GoalState) -> None:
+        from harness.goal.memory import write_handoff
         from harness.tasks import record_task_evaluation
 
         task = verify_task_command(
@@ -3592,6 +3838,13 @@ class GoalRunner(threading.Thread):
         self._record_execution_trace(
             state, "verification_failure", task_id=task.id, route=route,
             summary=reason, detail={"error": str(task.last_error or "")[:2_000], "idle_slices": state.no_progress_count},
+        )
+        write_handoff(
+            state,
+            task,
+            phase=GoalPhase.REPAIR_PLAN.value,
+            summary=reason,
+            failure=self._failure_handoff(state, task, route=route, summary=reason),
         )
         state.last_error = f"{reason} Verification: {task.last_error or 'failed'}"
         save_goal(state)
@@ -3656,6 +3909,84 @@ class GoalRunner(threading.Thread):
             return
         self._apply(state, GoalPhase.REPAIR_PLAN, "evaluation_requires_repair", error=state.last_error)
 
+    def _replan_request(
+        self,
+        state: GoalState,
+        *,
+        task: Any,
+        evaluation: dict[str, Any],
+        reason: str,
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        """Normalize the minimum evidence required to replace Task contracts."""
+        trigger = str(evaluation.get("replan_trigger") or "evaluator_scope").strip()
+        findings = [item for item in (evaluation.get("findings") or []) if isinstance(item, dict)][-8:]
+        required_paths = list(dict.fromkeys(
+            str(path).replace("\\", "/").removeprefix("./")
+            for path in (evaluation.get("required_write_paths") or [])
+            if str(path).strip()
+        ))[:16]
+        affected = list(dict.fromkeys(
+            [task.id, *(
+                str(task_id) for task_id in (evaluation.get("affected_task_ids") or [])
+                if str(task_id).strip()
+            )]
+        ))[:12]
+        approved = {
+            str(path).replace("\\", "/").removeprefix("./")
+            for path in getattr(task, "scope_paths", [])
+        }
+        known_tasks = set(state.task_ids)
+        affected = [task_id for task_id in affected if task_id in known_tasks]
+        machine_refs = [
+            {
+                "event": entry.get("event"),
+                "task_id": entry.get("task_id"),
+                "route": entry.get("route"),
+                "at": entry.get("at"),
+            }
+            for entry in state.execution_trace[-12:]
+            if entry.get("task_id") == task.id
+        ]
+        overlap_triggers = {
+            "generated_test_selector_overlap",
+            "generated_test_baseline_overlap",
+        }
+        if trigger == "evaluator_scope":
+            outside_scope = [path for path in required_paths if path not in approved]
+            if not outside_scope:
+                return None, "Evaluator replan request lacks a concrete write path outside the current Task scope."
+        elif trigger == "execution_preflight":
+            if not findings:
+                return None, "Execution-preflight replan request lacks its recorded contract error."
+        elif trigger in overlap_triggers:
+            if not findings or not any(str(item.get("evidence") or "").strip() for item in findings):
+                return None, "Generated-test boundary replan lacks selector or baseline evidence."
+        elif trigger == "stalled_task_review":
+            stalled = evaluation.get("stalled_task_evidence")
+            if not isinstance(stalled, dict):
+                return None, "Stalled-Task replan lacks the durable repair and verification evidence."
+            if stalled.get("goal_id") != state.id or stalled.get("task_id") != task.id:
+                return None, "Stalled-Task replan evidence belongs to a different Goal or Task."
+            if int(stalled.get("repair_count") or 0) < MAX_REPAIR_ATTEMPTS_PER_TASK:
+                return None, "Stalled-Task replan has not reached the local-repair threshold."
+            if int(stalled.get("failed_verification_count") or 0) < 2:
+                return None, "Stalled-Task replan lacks repeated failed bound-verification evidence."
+        else:
+            return None, f"Unsupported automatic replan trigger: {trigger or '(empty)'}"
+        request = {
+            "trigger_type": trigger,
+            "origin_task_id": task.id,
+            "affected_task_ids": affected,
+            "required_write_paths": required_paths,
+            "machine_evidence_refs": machine_refs,
+            "scope_delta": {"current_approved_paths": sorted(approved), "requested_paths": required_paths},
+            "reason": str(reason or evaluation.get("summary") or "")[:4_000],
+            "findings": findings,
+            "stalled_task_evidence": evaluation.get("stalled_task_evidence") if trigger == "stalled_task_review" else {},
+            "workspace_snapshot": getattr(task, "start_snapshot", "") or "",
+        }
+        return request, None
+
     def _replan_remaining_tasks(
         self,
         state: GoalState,
@@ -3668,6 +3999,18 @@ class GoalRunner(threading.Thread):
         from harness.goal.discovery_store import load_manifest
         from harness.tasks import create_task, load_task, save_task
 
+        request, request_error = self._replan_request(
+            state, task=task, evaluation=evaluation, reason=reason,
+        )
+        if request is None:
+            detail = request_error or "Execution replan request has insufficient evidence."
+            self._record_execution_trace(
+                state, "execution_replan_rejected", task_id=task.id, route="blocked", summary=detail,
+                detail={"evaluation_route": evaluation.get("route"), "reason": str(reason or "")[:1_500]},
+            )
+            self._pause(state, "execution_replan_evidence_missing", stop_reason=StopReason.execution_preflight_failed.value)
+            return
+
         try:
             current_tasks = [load_task(task_id) for task_id in state.task_ids]
         except (FileNotFoundError, OSError, TypeError, ValueError) as exc:
@@ -3678,9 +4021,28 @@ class GoalRunner(threading.Thread):
 
         completed = [candidate for candidate in current_tasks if candidate.status == "completed"]
         unfinished = [candidate for candidate in current_tasks if candidate.status != "completed"]
-        completed_names = tuple(candidate.subject for candidate in completed)
-        if len(set(completed_names)) != len(completed_names):
-            detail = "Cannot replan because completed Task names are not unique. Start a new Goal with a fresh contract."
+        selected_ids = set(request["affected_task_ids"])
+        # A changed Task contract invalidates only its unfinished dependents.
+        # Independent work stays in the active graph and is supplied to the
+        # planner as an existing dependency anchor.
+        changed = True
+        while changed:
+            changed = False
+            for candidate in unfinished:
+                if candidate.id not in selected_ids and set(candidate.blockedBy).intersection(selected_ids):
+                    selected_ids.add(candidate.id)
+                    changed = True
+        superseded = [candidate for candidate in unfinished if candidate.id in selected_ids]
+        preserved_unfinished = [candidate for candidate in unfinished if candidate.id not in selected_ids]
+        if not superseded:
+            detail = "Execution replan request does not identify a live unfinished Task."
+            self._record_execution_trace(state, "execution_replan", task_id=task.id, route="blocked", summary=detail)
+            self._pause(state, "execution_replan_target_unavailable", stop_reason=StopReason.execution_preflight_failed.value)
+            return
+        dependency_anchors = [*completed, *preserved_unfinished]
+        anchor_names = tuple(candidate.subject for candidate in dependency_anchors)
+        if len(set(anchor_names)) != len(anchor_names):
+            detail = "Cannot replan because retained Task names are not unique. Start a new Goal with a fresh contract."
             self._record_execution_trace(state, "execution_replan", task_id=task.id, route="blocked", summary=detail)
             self._pause(state, "execution_replan_duplicate_completed_names", stop_reason=StopReason.task_blocked.value)
             return
@@ -3694,7 +4056,7 @@ class GoalRunner(threading.Thread):
         root = Path(_execution_workspace(state))
         replan_scope_paths = tuple(dict.fromkeys(
             str(path)
-            for candidate in unfinished
+            for candidate in superseded
             for path in (
                 *getattr(candidate, "primary_write", []),
                 *getattr(candidate, "planned_new", []),
@@ -3703,6 +4065,18 @@ class GoalRunner(threading.Thread):
             )
             if str(path).strip()
         ))
+        # Include files created or edited by earlier implementation slices in
+        # the planner's current-worktree facts.  Replanning must see those
+        # paths as existing source files; otherwise it can incorrectly emit
+        # them as planned_new and fail its own contract validation.
+        prior_slice_paths = tuple(dict.fromkeys(
+            str(path)
+            for entry in state.execution_trace
+            if entry.get("event") == "implementation_slice" and entry.get("task_id") in selected_ids
+            for path in (entry.get("detail") or {}).get("write_paths", [])
+            if str(path).strip()
+        ))
+        replan_scope_paths = tuple(dict.fromkeys((*replan_scope_paths, *prior_slice_paths)))
         manifest, execution_workspace_paths = _execution_replan_manifest(
             manifest,
             root,
@@ -3723,19 +4097,9 @@ class GoalRunner(threading.Thread):
                 verification_adapter=adapter,
                 human_language=human_language_label((state.goal_contract or {}).get("language")),
                 frozen_contract=dict(state.goal_contract or {}),
-                completed_task_names=completed_names,
+                completed_task_names=anchor_names,
                 execution_workspace_paths=execution_workspace_paths,
-                replan_reason=json.dumps(
-                    {
-                        "summary": reason,
-                        "evaluation": {
-                            "summary": evaluation.get("summary"),
-                            "route": evaluation.get("route"),
-                            "findings": evaluation.get("findings", []),
-                        },
-                    },
-                    ensure_ascii=False,
-                )[:12_000],
+                replan_reason=json.dumps(request, ensure_ascii=False, sort_keys=True),
             )
         except Exception as exc:
             state.total_llm_rounds += stats.llm_rounds
@@ -3769,22 +4133,23 @@ class GoalRunner(threading.Thread):
         )
 
         replacement_names = [item.name for item in compiled.tasks]
-        if len(set(replacement_names)) != len(replacement_names) or set(replacement_names).intersection(completed_names):
-            detail = "Execution replan reused a completed Task name; refusing to replace unfinished work."
+        if len(set(replacement_names)) != len(replacement_names) or set(replacement_names).intersection(anchor_names):
+            detail = "Execution replan reused a retained Task name; refusing to replace unfinished work."
             self._record_execution_trace(state, "execution_replan", task_id=task.id, route="blocked", summary=detail)
             self._pause(state, "execution_replan_name_conflict", stop_reason=StopReason.execution_preflight_failed.value)
             return
 
         # The new contracts were fully validated before any existing Task is
-        # superseded. Completed Task ids remain dependency anchors; unfinished
-        # tasks remain on disk as audit records but leave the active Goal graph.
-        for candidate in unfinished:
+        # superseded. Completed and independent unfinished Tasks remain active
+        # dependency anchors; only the affected dependency closure leaves the
+        # active Goal graph.
+        for candidate in superseded:
             candidate.status = "cancelled"
             candidate.owner = None
             candidate.last_error = f"Superseded by execution replan: {reason or 'task boundaries changed'}"[:4_000]
             save_task(candidate)
 
-        names = {candidate.subject: candidate.id for candidate in completed}
+        names = {candidate.subject: candidate.id for candidate in dependency_anchors}
         replacement_ids: list[str] = []
         for item in compiled.tasks:
             dependencies = [names[name] for name in item.depends_on]
@@ -3809,9 +4174,30 @@ class GoalRunner(threading.Thread):
             names[item.name] = replacement.id
             replacement_ids.append(replacement.id)
 
-        state.task_ids = [candidate.id for candidate in completed] + replacement_ids
+        first_replaced = min(
+            index for index, candidate in enumerate(current_tasks)
+            if candidate.id in selected_ids
+        )
+        retained_before = [
+            candidate.id for candidate in current_tasks[:first_replaced]
+            if candidate.id not in selected_ids
+        ]
+        retained_after = [
+            candidate.id for candidate in current_tasks[first_replaced:]
+            if candidate.id not in selected_ids
+        ]
+        state.task_ids = retained_before + replacement_ids + retained_after
         state.task_name_ids = names
-        state.task_plan = [item.to_dict() for item in compiled.tasks]
+        old_plan_by_name = {
+            str(item.get("name") or ""): item
+            for item in state.task_plan
+            if isinstance(item, dict) and str(item.get("name") or "")
+        }
+        state.task_plan = [
+            old_plan_by_name[candidate.subject]
+            for candidate in dependency_anchors
+            if candidate.subject in old_plan_by_name
+        ] + [item.to_dict() for item in compiled.tasks]
         state.current_task_id = replacement_ids[0] if replacement_ids else None
         state.planning_review = {
             **dict(state.planning_review or {}),
@@ -3822,12 +4208,14 @@ class GoalRunner(threading.Thread):
             "execution_replan",
             task_id=task.id,
             route="continue",
-            summary=f"Replaced {len(unfinished)} unfinished Task contract(s) with {len(replacement_ids)} reviewed contract(s).",
+            summary=f"Replaced {len(superseded)} affected Task contract(s) with {len(replacement_ids)} reviewed contract(s); preserved {len(preserved_unfinished)} independent unfinished Task(s).",
             detail={
                 "reason": reason[:1_500],
+                "request": request,
                 "evaluation_route": str(evaluation.get("route") or ""),
                 "completed_preserved": [candidate.id for candidate in completed],
-                "superseded": [candidate.id for candidate in unfinished],
+                "unfinished_preserved": [candidate.id for candidate in preserved_unfinished],
+                "superseded": [candidate.id for candidate in superseded],
                 "replacement": replacement_ids,
             },
         )
@@ -3866,21 +4254,59 @@ class GoalRunner(threading.Thread):
             # the only available circuit-breaker evidence.
             repair_count = len(task.repair_history)
         if repair_count >= MAX_REPAIR_ATTEMPTS_PER_TASK:
-            # This is a diagnostic threshold, never an execution ceiling. A
-            # large Goal may legitimately need many repairs; force the next
-            # planner decision to reconsider task decomposition instead of
-            # silently stopping at an arbitrary number.
+            stalled_evidence = self._stalled_task_replan_evidence(
+                state, task, repair_count=repair_count,
+            )
+            if stalled_evidence is not None:
+                summary = (
+                    f"{repair_count} local repair decisions and repeated bound verification failures did not converge; "
+                    "reviewing the current Task boundary with the complete repair and verification history."
+                )
+                stalled_evaluation = {
+                    **evaluation,
+                    "passed": False,
+                    "route": "replan",
+                    "replan_trigger": "stalled_task_review",
+                    "stalled_task_evidence": stalled_evidence,
+                    "summary": summary,
+                    "findings": [
+                        *(item for item in (evaluation.get("findings") or []) if isinstance(item, dict)),
+                        {
+                            "issue": "Repeated local repairs did not improve the bound verification verdict.",
+                            "severity": "high",
+                            "evidence": "repair_history plus repeated bound verification runs",
+                        },
+                    ][-8:],
+                }
+                self._record_execution_trace(
+                    state, "stalled_task_review", task_id=task.id, route="replan", summary=summary,
+                    detail={
+                        "repair_count": repair_count,
+                        "failed_verification_count": stalled_evidence["failed_verification_count"],
+                        "failed_repair_count": stalled_evidence["failed_repair_count"],
+                    },
+                )
+                self._replan_remaining_tasks(
+                    state, task=task, evaluation=stalled_evaluation, reason=summary,
+                )
+                return
+            # Do not treat count alone as failure: the Task may still be
+            # making progress and have too little repeated proof to safely
+            # replace its boundary.
             evaluation = {
                 **evaluation,
-                "route": "replan",
+                "repair_threshold": {
+                    "repair_count": repair_count,
+                    "instruction": "Keep the current Task until repeated failed bound verification supplies evidence for a stalled-Task review.",
+                },
                 "summary": (
                     f"{repair_count} prior repair decisions did not complete the Task; "
-                    "reassess task boundaries, test seam, and architecture direction."
+                    "the current evidence is insufficient to replace its boundary yet."
                 ),
             }
             self._record_execution_trace(
-                state, "repair_threshold", task_id=task.id, route="replan",
-                summary=str(evaluation["summary"]), detail={"repair_count": repair_count},
+                state, "repair_threshold", task_id=task.id, route=str(evaluation.get("route") or "implementation_fix"),
+                summary=str(evaluation["summary"]), detail={"repair_count": repair_count, "stalled_review": "insufficient_evidence"},
             )
         if evaluation.get("passed") is None:
             self._fail(
@@ -3924,6 +4350,20 @@ class GoalRunner(threading.Thread):
             decision = fallback_repair_decision(
                 state.last_error,
                 route=str(evaluation.get("route") or "implementation_fix"),
+            )
+        if decision.action == "replan" and evaluation.get("route") not in {"replan", "scope_omission"}:
+            detail = "Repair planner requested a replan without evaluator evidence of a contract, scope, or dependency mismatch. Continuing the current Task."
+            self._record_execution_trace(
+                state, "repair_replan_rejected", task_id=task.id, route="implementation_fix", summary=detail,
+            )
+            decision = replace(
+                decision,
+                action="implementation_fix",
+                instructions=(
+                    "Continue the current Task. Use the durable failure handoff and bound verification evidence to make a different local implementation fix; "
+                    "do not change Task boundaries or regenerate the plan."
+                ),
+                summary=detail,
             )
         self._observe_supervisor(
             "agent_finished",

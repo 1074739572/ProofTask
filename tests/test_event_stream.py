@@ -65,6 +65,20 @@ def test_open_without_argument_returns_usage(tmp_path, monkeypatch):
     assert list_mode
 
 
+def test_status_uses_provider_prompt_tokens_when_available():
+    from types import SimpleNamespace
+
+    from harness.event_stream import _status_payload
+    from harness.usage.context import record_prompt_tokens
+
+    binding = SimpleNamespace(session_id="context-session")
+    record_prompt_tokens(binding.session_id, 123_456)
+
+    payload = _status_payload({}, binding, [])
+
+    assert payload["ctx_tokens"] == 123_456
+
+
 def test_open_numeric_selects_recent_project(tmp_path, monkeypatch):
     from harness import workspace as workspace_mod
 

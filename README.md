@@ -110,5 +110,6 @@ cd node_tui && npm run typecheck
 
 - [项目规则与阶段约束](HARNESS.md)
 - [Goal 系统总览：范围、重规划与失败路线](docs/goal-system-guide.md)
+- [Goal 持久化文件参考：每类 JSON 的真实示例](docs/goal-persistence-reference.md)
 - [设计原则与机器交付判定](docs/proof-task-design.md)
 - [文档索引](docs/README.md)
