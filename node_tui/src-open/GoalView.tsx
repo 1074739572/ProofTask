@@ -1,10 +1,10 @@
-import {createRenderEffect, createSignal} from 'solid-js';
+import {createRenderEffect, createSignal, Show} from 'solid-js';
 import {useRenderer} from '@opentui/solid';
-import {GoalDetails} from './GoalDetails';
-import {GoalSummary} from './GoalSummary';
-import {goalDetailsExpanded, type GoalDraftSnapshot, type GoalSnapshot} from './goal-state';
-import type {InteractionTrace} from './interaction-trace';
-import {submitRenderFrame} from './interaction-trace';
+import {GoalDetails} from './GoalDetails.tsx';
+import {GoalSummary} from './GoalSummary.tsx';
+import {goalDetailsExpanded, type GoalDraftSnapshot, type GoalSnapshot} from './goal-state.ts';
+import type {InteractionTrace} from './interaction-trace.ts';
+import {submitRenderFrame} from './interaction-trace.ts';
 
 export * from './goal-state.ts';
 

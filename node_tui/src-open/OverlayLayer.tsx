@@ -1,4 +1,4 @@
-import {For, Show, createMemo} from 'solid-js';
+import {For, Show, createMemo, type Accessor} from 'solid-js';
 import type {CompletionMenuState, CompletionOption} from '../src/autocomplete.ts';
 import {
   completionMenuWindow,

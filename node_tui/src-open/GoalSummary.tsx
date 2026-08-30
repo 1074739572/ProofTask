@@ -1,4 +1,4 @@
-import type {GoalDraftSnapshot, GoalDraftTaskSummary, GoalSnapshot, GoalTaskSnapshot} from './goal-state';
+import type {GoalDraftSnapshot, GoalDraftTaskSummary, GoalSnapshot, GoalTaskSnapshot} from './goal-state.ts';
 
 type GoalLike = GoalSnapshot | GoalDraftSnapshot;
 type TaskLike = GoalTaskSnapshot | GoalDraftTaskSummary;

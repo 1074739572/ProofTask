@@ -1,6 +1,6 @@
 import {For, Show} from 'solid-js';
-import type {GoalDraftSnapshot, GoalSnapshot, GoalTaskSnapshot} from './goal-state';
-import {eventCoordinates, type InteractionTrace} from './interaction-trace';
+import type {GoalDraftSnapshot, GoalSnapshot, GoalTaskSnapshot} from './goal-state.ts';
+import {eventCoordinates, type InteractionTrace} from './interaction-trace.ts';
 
 type GoalLike = GoalSnapshot | GoalDraftSnapshot;
 
