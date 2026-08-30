@@ -1,6 +1,6 @@
-import {BoxRenderable, ScrollBoxRenderable, SyntaxStyle} from '@opentui/core';
+import {BoxRenderable, ScrollBoxRenderable, SyntaxStyle, CliRenderEvents} from '@opentui/core';
 import {batch, createSignal, createMemo, createEffect, For, Show as SolidShow, onCleanup} from 'solid-js';
-import {useTerminalDimensions, useKeyboard} from '@opentui/solid';
+import {useTerminalDimensions, useKeyboard, useRenderer} from '@opentui/solid';
 import {startBackend, type Backend} from '../src/backend.ts';
 import {alwaysSeparate, setPreLayoutSiblingMargin} from './layout.ts';
 import {buildSections} from './sections.ts';
@@ -1504,6 +1504,13 @@ function resolveDebugValue<T>(value: T | (() => T) | undefined): T | undefined {
 
 export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal; debugDraft?: DebugDraft; debugDecisions?: DebugDecisions; debugRunning?: DebugFlag; debugStartedAt?: number; debugOverlay?: Overlay; debugUsage?: {input: number; output: number; cacheRead: number; contextUsed?: number; contextWindow?: number}; debugEffort?: {value: string; label: string; options: OverlayOption[]}; debugWelcome?: {quote: string; art: string[]}; debugUsageOpen?: boolean; debugUsageRange?: UsageRange}) {
   const dims = useTerminalDimensions();
+  const renderer = useRenderer();
+  const copySelection = (selection: any) => {
+    const text = String(selection?.getSelectedText?.() ?? '').trim();
+    if (text) (renderer as any).copyToClipboardOSC52?.(text);
+  };
+  renderer.on(CliRenderEvents.SELECTION, copySelection);
+  onCleanup(() => (renderer as any).off?.(CliRenderEvents.SELECTION, copySelection));
   const debugEntriesAccessor = () => resolveDebugValue(props?.debugEntries) ?? [];
   const initialDebugEntries = props?.debugEntries != null ? debugEntriesAccessor() : [];
   const [entries, setEntries] = createSignal<Entry[]>(initialDebugEntries); const [input, setInput] = createSignal('');

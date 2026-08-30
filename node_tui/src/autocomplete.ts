@@ -96,11 +96,13 @@ export function applyCompletionResult(
   const structured = options
     .map(normalizeCompletionOption)
     .filter(isRenderableCompletionOption);
+  const legacyStrings = current.options.length > 0 && current.options.every(option => typeof option === 'string')
+    && options.every(option => typeof option === 'string');
   return {
     ...current,
     requestId,
     mode: structured.length > 0 ? current.mode : null,
-    options: structured,
+    options: legacyStrings ? (structured.map(option => option.label) as any) : structured,
     selected: 0,
   };
 }
