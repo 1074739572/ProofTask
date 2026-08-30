@@ -1432,6 +1432,9 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
         setTodayInput(total => total + Number(event.input_tokens || 0));
         setTodayOutput(total => total + output);
         setTodayCacheRead(total => total + Number(event.cache_read_tokens || 0));
+        if (event.context_tokens !== null && event.context_tokens !== undefined) {
+          setContextUsed(Math.max(0, Number(event.context_tokens) || 0));
+        }
         turnTokens.inp += Number(event.input_tokens || 0);
         turnTokens.out += output;
         turnTokens.cache += Number(event.cache_read_tokens || 0);
