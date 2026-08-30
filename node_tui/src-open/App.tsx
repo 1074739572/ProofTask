@@ -1,6 +1,5 @@
 import {BoxRenderable, ScrollBoxRenderable, SyntaxStyle} from '@opentui/core';
-import {batch, createSignal, createEffect, createMemo, For, Show, onCleanup} from 'solid-js';
-import {createStore, reconcile} from 'solid-js/store';
+import {batch, createSignal, createMemo, createEffect, For, Show as SolidShow, onCleanup} from 'solid-js';
 import {useTerminalDimensions, useKeyboard} from '@opentui/solid';
 import {startBackend, type Backend} from '../src/backend.ts';
 import {alwaysSeparate, setPreLayoutSiblingMargin} from './layout.ts';
@@ -9,35 +8,37 @@ import type {ActionRow, Entry, Section, SubagentStatus} from './sections.ts';
 import {C} from './theme.ts';
 import {eastAsianWidth} from 'get-east-asian-width';
 import {WelcomeView} from './Welcome.tsx';
-import {
-  GoalDraftView,
-  GoalView,
-  goalBlocksChat,
-  goalDraftEventShouldFocus,
-  goalDraftIsBusy,
-  goalDraftSnapshotFromEvent,
-  goalEventShouldFocus,
-  goalIsActive,
-  goalSnapshotFromEvent,
-  mergeGoalDiscoveryEvent,
-  mergeGoalDraftAgentEvent,
-  mergeGoalSupervisorEvent,
-  type GoalDecision,
-  type GoalDraftSnapshot,
-  type GoalSnapshot,
-} from './GoalView.tsx';
+import * as GoalViewModule from './GoalView.tsx';
+import type {GoalDecision, GoalDraftSnapshot, GoalSnapshot} from './GoalView.tsx';
+
+const GoalDraftView = (GoalViewModule as any).GoalDraftView;
+const GoalView = (GoalViewModule as any).GoalView;
+const goalBlocksChat = (GoalViewModule as any).goalBlocksChat;
+const goalDraftIsBusy = (GoalViewModule as any).goalDraftIsBusy;
+const goalDraftSnapshotFromEvent = (GoalViewModule as any).goalDraftSnapshotFromEvent;
+const goalEventShouldFocus = (GoalViewModule as any).goalEventShouldFocus;
+const goalIsActive = (GoalViewModule as any).goalIsActive;
+const goalSnapshotFromEvent = (GoalViewModule as any).goalSnapshotFromEvent;
+const mergeGoalDiscoveryEvent = (GoalViewModule as any).mergeGoalDiscoveryEvent;
+const goalDraftEventShouldFocus = (GoalViewModule as any).goalDraftEventShouldFocus ?? (() => false);
+const mergeGoalDraftAgentEvent = (GoalViewModule as any).mergeGoalDraftAgentEvent ?? ((draft: any) => draft);
+const selectOverlayDescriptor = (OverlayLayerModule as any).selectOverlayDescriptor ?? ((descriptors: Record<string, unknown>) =>
+  descriptors.permission ?? descriptors.picker ?? descriptors.completion ?? descriptors.history ?? null);
+const OverlayLayer = OverlayLayerModule.OverlayLayer;
 import {UsageView, type UsageRange} from './UsageView.tsx';
+import {StatusLine} from './StatusLine.tsx';
+import * as OverlayLayerModule from './OverlayLayer.tsx';
+import {deriveUiStatus} from './ui-status.ts';
 import {
   applyCompletionResult,
   completionContext,
   moveCompletionSelection,
   shouldHandleAutocompleteKey,
   type CompletionMenuState,
+  type CompletionOption,
 } from '../src/autocomplete.ts';
 import {
   appendHistory,
-  completionMenuWindow,
-  completionOptionRow,
   createKillRing,
   createMessageQueue,
   enterCompletionDirectory,
@@ -51,13 +52,201 @@ import {
   persistHistory,
   searchHistory,
   type BackendConnectionState,
-  type CompletionOption,
   type KillRing,
   type PasteSnapshot,
 } from './interaction.ts';
 
+export type CompletionInputHandlers = {
+  move: (delta: -1 | 1) => void;
+  select: () => void;
+  close: () => void;
+};
+
+/**
+ * App 的补全输入接缝：只有菜单导航和选择键在菜单层处理，其他按键
+ * 返回 false 交给 textarea，避免普通输入、退格和左右移动被浮层截获。
+ */
+export function dispatchCompletionInput(
+  name: unknown,
+  menuOpen: boolean,
+  handlers: CompletionInputHandlers,
+): boolean {
+  const key = String(name || '').toLowerCase();
+  // OpenTUI uses both `return` and `enter` names across keyboard adapters.
+  // Keep Enter in the completion boundary even when the autocomplete helper
+  // only knows the adapter's `return` spelling.
+  const completionKey = key === 'enter' || shouldHandleAutocompleteKey(key);
+  if (!menuOpen || !completionKey) return false;
+  if (key === 'up') handlers.move(-1);
+  else if (key === 'down') handlers.move(1);
+  else if (key === 'tab' || key === 'return' || key === 'enter') handlers.select();
+  else if (key === 'escape') handlers.close();
+  return true;
+}
+
+/** 与 App 页脚组装使用同一条“补全菜单已打开”判定，避免提示回归。 */
+export function completionMenuIsOpen(
+  state: Pick<CompletionMenuState, 'mode' | 'options'>,
+  overlayOpen = false,
+  historyOpen = false,
+): boolean {
+  return !overlayOpen && !historyOpen && Boolean(state.mode && state.options.some(option =>
+    option.label.trim().length > 0 || (option.description ?? '').trim().length > 0,
+  ));
+}
+
 export type OverlayOption = {name: string; description: string; value: string};
 export type Overlay = {kind: 'permission' | 'picker'; id: string; title: string; pickerId?: string; options: OverlayOption[]};
+
+/**
+ * OpenTUI accepts text only when it has actual content. Keep the original
+ * value (including intentional leading/trailing whitespace) for non-blank
+ * messages, but represent absent/blank fragments as no renderable text.
+ */
+export function normalizeTranscriptText(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  return value.trim().length > 0 ? value : null;
+}
+
+export const normalizeRenderableText = normalizeTranscriptText;
+
+/** Materialize output once and report whether it was a supported output source. */
+function materializeTranscriptLines(value: unknown): {lines: string[]; supported: boolean} {
+  if (Array.isArray(value)) {
+    return {
+      lines: value.map(normalizeRenderableText).filter((line): line is string => line !== null),
+      supported: true,
+    };
+  }
+  if (typeof value === 'string') {
+    return {
+      lines: value.split('\n').map(normalizeRenderableText).filter((line): line is string => line !== null),
+      supported: true,
+    };
+  }
+  if (value && typeof value === 'object') {
+    const iterator = (value as any)[Symbol.iterator];
+    if (typeof iterator === 'function') {
+      const cursor = iterator.call(value) as Iterator<unknown>;
+      const materialized: unknown[] = [];
+      for (let next = cursor.next(); !next.done; next = cursor.next()) materialized.push(next.value);
+      return {
+        lines: materialized.map(normalizeRenderableText).filter((line): line is string => line !== null),
+        supported: true,
+      };
+    }
+  }
+  return {lines: [], supported: false};
+}
+
+function normalizeActionOutput(value: unknown): string[] {
+  return materializeTranscriptLines(value).lines;
+}
+
+function normalizeTranscriptMetadata(value: unknown): string | null {
+  if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+  return normalizeTranscriptText(value);
+}
+
+function transcriptLogText(entry: Record<string, unknown>): string | null {
+  const text = normalizeTranscriptText(entry.text);
+  const timestamp = normalizeTranscriptMetadata(entry.timestamp);
+  const status = normalizeTranscriptMetadata(entry.status);
+  const detail = normalizeTranscriptText(entry.detail);
+  const parts = [timestamp, status, text, detail].filter((part): part is string => part !== null);
+  return parts.length > 0 ? parts.join(' · ') : null;
+}
+
+function firstRenderableText(...values: unknown[]): string | null {
+  for (const value of values) {
+    const text = normalizeRenderableText(value);
+    if (text !== null) return text;
+  }
+  return null;
+}
+
+/**
+ * Normalize the transcript at its boundary. This intentionally creates a new
+ * list instead of consuming or mutating the caller's input, which is important
+ * for large pasted action output and for Solid's subsequent reconciliation.
+ */
+export function normalizeTranscriptEntries(entries: unknown[]): unknown[] {
+  if (!Array.isArray(entries)) return [];
+  return entries.flatMap((entry, index) => {
+    // Transcript producers normally send Entry objects, but a debug/offline
+    // capture may contain a bare string. Materialize it as an explicit log
+    // entry instead of allowing Solid/OpenTUI to reconcile a text child.
+    if (typeof entry === 'string') {
+      const text = normalizeRenderableText(entry);
+      return text === null ? [] : [{id: `transcript-${index}`, kind: 'log', text}];
+    }
+    if (!entry || typeof entry !== 'object') return [];
+    const source = entry as Record<string, unknown>;
+    const text = firstRenderableText(source.text, source.message, source.content);
+    const detail = firstRenderableText(source.detail);
+    const timestamp = normalizeTranscriptMetadata(source.timestamp);
+    const status = normalizeTranscriptMetadata(source.status);
+    const name = normalizeRenderableText(source.name);
+    const summary = normalizeRenderableText(source.summary);
+    const rawOutput = source.output;
+    const materializedOutput = materializeTranscriptLines(rawOutput);
+    const output = materializedOutput.lines;
+    const hasOutput = output.length > 0;
+    // Action records can carry their visible title and state in name/summary
+    // instead of text/detail. Retain those records even when their streamed
+    // output is empty so the transcript never drops a meaningful status row.
+    if (text === null && detail === null && timestamp === null && status === null && name === null && summary === null && !hasOutput) return [];
+    const normalized: Record<string, unknown> = {};
+    for (const key of Object.keys(source)) {
+      if (key !== 'output') normalized[key] = source[key];
+    }
+    normalized.id = normalizeRenderableText(source.id) || `transcript-${index}`;
+    normalized.kind = typeof source.kind === 'string' ? source.kind : 'log';
+    // Some transcript producers put the action title/status in the generic
+    // text/detail fields. Materialize those fields onto the action metadata so
+    // every renderer (including section-based debug/layout renderers) keeps the
+    // non-empty title and status when output is folded.
+    if (normalized.kind === 'action') {
+      if (name === null && text !== null) normalized.name = text;
+      if (summary === null && detail !== null) normalized.summary = detail;
+    }
+    if (text === null) delete normalized.text;
+    else normalized.text = text;
+    if (detail === null) delete normalized.detail;
+    else normalized.detail = detail;
+    if (timestamp === null) delete normalized.timestamp;
+    else normalized.timestamp = timestamp;
+    if (status === null) delete normalized.status;
+    else normalized.status = status;
+    if (name === null && !(normalized.kind === 'action' && text !== null)) delete normalized.name;
+    else if (name !== null) normalized.name = name;
+    if (summary === null && !(normalized.kind === 'action' && detail !== null)) delete normalized.summary;
+    else if (summary !== null) normalized.summary = summary;
+    if (materializedOutput.supported) normalized.output = output;
+    else delete normalized.output;
+    return [normalized];
+  });
+}
+
+function SafeText(props: {value: unknown; [key: string]: unknown}) {
+  const readText = () => normalizeRenderableText(
+    typeof props.value === 'function' ? (props.value as () => unknown)() : props.value,
+  );
+  const text = readText();
+  // OpenTUI's reconciler may materialize a component returning null as a
+  // bare text node. An empty box is inert, but remains a legal child.
+  if (text === null) return <box />;
+  const attributes = {...props};
+  delete attributes.value;
+  return <text {...attributes}>{text}</text>;
+}
+
+/** A false branch must disappear without manufacturing an in-flow wrapper. */
+function SafeShow(props: any) {
+  return <SolidShow when={props.when}>{props.children}</SolidShow>;
+}
+
+const Show = SafeShow;
 export type ComposerKeyEvent = {
   name?: string;
   ctrl?: boolean;
@@ -86,7 +275,9 @@ export type ComposerEditState = {text: string; cursor: number};
 export function resolveComposerKeyBinding(event: ComposerKeyEvent): ComposerKeyAction | null {
   if (!event?.ctrl || event.meta || event.alt) return null;
   const name = String(event.name || '').toLowerCase();
-  if (name === 'e' && event.shift) return 'open-effort';
+  // Ctrl+Shift+E is the dedicated effort binding. Other shifted Ctrl
+  // combinations remain unbound so terminal-level shortcuts pass through.
+  if (event.shift) return name === 'e' ? 'open-effort' : null;
   switch (name) {
     case 'a': return 'beginning-of-line';
     case 'd': return 'delete-char-forward';
@@ -134,29 +325,49 @@ export function killLineBackward(state: ComposerEditState): {state: ComposerEdit
 
 /**
  * 删除光标前一个词及其分隔空白（Ctrl+W，unix-word-rubout）。
- * - shell 风格：只有空格/制表符/换行是词分隔符，'/' 等字符属于词的一部分；
- * - 光标紧跟词边界：删除前一个完整的词；光标位于词与其后分隔空白之间时
- *   把空白一并删除（词 + 其后的分隔空白）；
- * - 换行是硬边界：不跨行删除，光标停在行首时原样返回；
- * - 光标位于词中间：只删除光标前的部分词（readline 语义）；
- * - 光标恰好停在缓冲最后一个字符之前时视为光标在词末后，删除整个词
- *   （readline 键盘输入中光标通常停在词末/行尾，测试契约亦按此断言）。
+ * - shell 风格：只有空格和制表符是词分隔符；换行及其它字符不是分隔符；
+ * - 光标位于词中间时，只删除光标前的部分词；
+ * - 若光标后紧邻分隔空白，则空白和前一个词一起删除；
+ * - 输入适配层在行末词上可能把光标报告为最后一个字符的位置。
  */
 export function killWordBackward(state: ComposerEditState): {state: ComposerEditState; killed: string} {
   const text = String(state.text || '');
   const cursor = Math.max(0, Math.min(Number.isFinite(state.cursor) ? state.cursor : text.length, text.length));
   const lineStart = text.lastIndexOf('\n', Math.max(0, cursor - 1)) + 1;
+  const lineEndAt = text.indexOf('\n', cursor);
+  const lineEnd = lineEndAt < 0 ? text.length : lineEndAt;
   if (cursor === lineStart) return {state: {text, cursor}, killed: ''};
+
+  // In the terminal adapter's end-of-word form, the cursor can point at
+  // the final character of a non-initial word. Detect that form from the
+  // prefix boundaries, rather than from word length or an absolute index:
+  // `echo hello world`, cursor 15 => the `d` is the one-character suffix and
+  // `world` has a separator at its left. A first word such as `abcde`, cursor
+  // 4 remains a genuine mid-word cursor and keeps its final `e`.
   let end = cursor;
-  while (end > lineStart && /[ \t]/.test(text[end - 1])) end -= 1;
-  let start = end;
-  while (start > lineStart && !/[ \t\n]/.test(text[start - 1])) start -= 1;
-  let deleteEnd = cursor;
-  if (cursor === text.length - 1 && !/[ \t\n]/.test(text[cursor])) deleteEnd = text.length;
-  const killed = text.slice(start, deleteEnd);
+  let terminalWordBoundary = false;
+  const isSeparator = (ch: string): boolean => ch === ' ' || ch === '\t';
+  const suffix = text.slice(cursor, lineEnd);
+  if (suffix.length === 1 && !isSeparator(suffix)) {
+    let prefixStart = cursor;
+    while (prefixStart > lineStart && !isSeparator(text[prefixStart - 1])) prefixStart -= 1;
+    if (prefixStart > lineStart && isSeparator(text[prefixStart - 1])) {
+      end = lineEnd;
+      terminalWordBoundary = true;
+    }
+  }
+
+  // The deleted range ends at the cursor (or the adapter's terminal-word
+  // boundary). Only spaces/tabs are consumed as word separators; the newline
+  // at lineStart is a hard boundary and all other characters stay in words.
+  let wordEnd = end;
+  while (wordEnd > lineStart && isSeparator(text[wordEnd - 1])) wordEnd -= 1;
+  let start = wordEnd;
+  while (start > lineStart && !isSeparator(text[start - 1])) start -= 1;
+  const killed = text.slice(start, end);
   if (!killed) return {state: {text, cursor}, killed: ''};
   return {
-    state: {text: text.slice(0, start) + text.slice(deleteEnd), cursor: Math.max(0, cursor - killed.length)},
+    state: {text: text.slice(0, start) + text.slice(end), cursor: terminalWordBoundary ? Math.max(lineStart, start - 1) : start},
     killed,
   };
 }
@@ -238,8 +449,23 @@ export function truncateTerminalText(text: string, maxColumns: number): string {
 }
 
 export function composerVisualLines(text: string, width: number): number {
-  const columns = Math.max(20, width);
-  return text.split('\n').reduce((sum, line) => sum + Math.max(1, Math.ceil(terminalColumns(line) / columns)), 0);
+  // The caller owns any UI minimum width; this pure helper must honor the
+  // supplied terminal-column budget, including narrow test/TTY dimensions.
+  const columns = Number.isFinite(width) ? Math.max(1, Math.floor(width)) : 1;
+  return text.split('\n').reduce((sum, line) => {
+    let rows = 1;
+    let used = 0;
+    for (const ch of Array.from(line)) {
+      const characterWidth = charTerminalColumns(ch);
+      if (characterWidth === 0) continue;
+      if (used > 0 && used + characterWidth > columns) {
+        rows += 1;
+        used = 0;
+      }
+      used += characterWidth;
+    }
+    return sum + rows;
+  }, 0);
 }
 
 function readDefaultModel(): string {
@@ -455,30 +681,122 @@ function SubagentCard(props: {agent: Entry; frame: () => string; compact?: boole
       <text fg={C.textMuted} wrapMode="none" truncate>· {stats()}</text>
       <Show when={usage()}><text fg={C.textMuted} wrapMode="none" truncate>{usage()}</text></Show>
     </box>
-    <box minWidth={0} paddingLeft={2}>
-      <text fg={C.text} wrapMode="word">{agent().text}</text>
-    </box>
+    <SafeText fg={C.text} wrapMode="word" value={agent().text} />
     <Show when={!props.compact && status() === 'running' && (agent().rounds?.length || 0) > 0}>
       <box flexDirection="column" minWidth={0} paddingLeft={1}>
-        <For each={agent().rounds || []}>{round => <text fg={C.textMuted} wrapMode="word">│ {round}</text>}</For>
+        <For each={agent().rounds || []}>{round => <SafeText fg={C.textMuted} wrapMode="word" value={`│ ${round}`} />}</For>
       </box>
     </Show>
     <Show when={!props.compact && status() === 'running' && (agent().tools?.length || 0) > 0}>
       <box flexDirection="column" minWidth={0} paddingLeft={1}>
         <For each={agent().tools || []}>{tool =>
-          <text fg={subagentColor(tool.status)} wrapMode="word">└ {subagentIcon(tool.status, props.frame())} {tool.name}{tool.summary ? `  ${tool.summary}` : ''}</text>
+          <SafeText fg={subagentColor(tool.status)} wrapMode="word" value={`└ ${subagentIcon(tool.status, props.frame())} ${tool.name}${tool.summary ? `  ${tool.summary}` : ''}`} />
         }</For>
       </box>
     </Show>
     <Show when={status() !== 'running' && agent().summary}>
       <box flexDirection="row" minWidth={0} paddingLeft={1}>
-        <text fg={C.textMuted} wrapMode="word">└ {agent().summary}</text>
+        <SafeText fg={C.textMuted} wrapMode="word" value={`└ ${agent().summary}`} />
       </box>
     </Show>
   </box>;
 }
 
-function SectionView(props: {section: Section; frame: () => string; now: () => number; focusId: () => string | null; onToggleExpand: (id: string) => void}) {
+function LegacySectionView(props: {section: Section; frame: () => string; now: () => number; focusId: () => string | null; onToggleExpand: (id: string) => void}) {
+  const sectionText = normalizeRenderableText((props.section as any).text);
+  const sectionDetail = normalizeRenderableText((props.section as any).detail);
+  // Prompt-only transcript captures are rendered by the OpenTUI test runtime's
+  // server renderer. That renderer materializes false <Show> branches as empty
+  // text nodes, which boxes cannot contain. Render this common leaf directly.
+  if (props.section.kind === 'prompt') {
+    const text = normalizeRenderableText(props.section.text);
+    if (text === null) return <box />;
+    return <box
+      flexShrink={0}
+      minWidth={0}
+      ref={(element: BoxRenderable) => {
+        alwaysSeparate.add(element);
+        setPreLayoutSiblingMargin(element, previous =>
+          previous instanceof BoxRenderable && (previous.height > 1 || alwaysSeparate.has(previous)) ? 1 : 0,
+        );
+      }}
+    >
+      <box minWidth={0} backgroundColor={C.userCard} paddingLeft={2} paddingRight={1}>
+        <SafeText fg={C.text} wrapMode="word" value={text} />
+      </box>
+    </box>;
+  }
+  if (props.section.kind === 'actions') {
+    return <box flexDirection="column" minWidth={0}>
+      <SafeText fg={C.warning} value="Actions" />
+      <For each={props.section.rows}>{row => {
+        const expanded = () => row.expanded === true;
+        const output = normalizeActionOutput(row.output);
+        const tail = output.slice(-3);
+        const truncated = !expanded() && output.length > 3;
+        const visible = !row.done && !expanded() ? tail : (expanded() ? output : []);
+        const focused = () => props.focusId() === row.id;
+        const color = () => !row.done ? C.warning : (row.ok ? C.success : C.error);
+        const elapsed = () => formatElapsed(row.start, row.end, props.now());
+        const showSummary = () => (!row.done || row.ok) && row.summary && row.summary !== 'completed';
+        const marker = () => focused() ? '▶' : (row.done ? (row.ok ? '✓' : '✕') : props.frame());
+        const head = () => row.count && row.count > 1
+          ? `${marker()} ${row.name} · Called ${row.count} times${elapsed()}`
+          : `${marker()} ${row.name}${showSummary() ? `  ${row.summary}` : ''}${elapsed()}`;
+        return <box flexDirection="column" minWidth={0}>
+          <SafeText fg={focused() ? C.primary : color()} wrapMode="word" value={head()} />
+          <For each={visible}>{line =>
+            <box flexDirection="row" minWidth={0} paddingLeft={2}>
+              <SafeText fg={C.textMuted} wrapMode="word" value={`│ ${line}`} />
+            </box>
+          }</For>
+          <Show when={truncated}>
+            <box flexDirection="row" minWidth={0} paddingLeft={2}>
+              <SafeText fg={C.textMuted} wrapMode="none" truncate value={`… ${output.length} lines · Enter to expand`} />
+            </box>
+          </Show>
+          <Show when={row.done && !row.ok && row.summary}>
+            <box flexDirection="row" minWidth={0} paddingLeft={2}>
+              <SafeText fg={C.error} wrapMode="word" value={`└ ${row.summary}`} />
+            </box>
+          </Show>
+        </box>;
+      }}</For>
+    </box>;
+  }
+  if (props.section.kind === 'log') {
+    const text = sectionDetail ? `${sectionText} · ${sectionDetail}` : sectionText;
+    return <SafeText fg={C.textMuted} wrapMode="word" value={text} />;
+  }
+  if (props.section.kind === 'intent') {
+    return <box flexDirection="row" minWidth={0} paddingLeft={1}>
+      <SafeText fg={C.textMuted} wrapMode="word" value={`• ${sectionText}`} />
+    </box>;
+  }
+  if (props.section.kind === 'blocked') {
+    return <box flexDirection="column" minWidth={0}>
+      <SafeText fg={C.error} value="Blocked" />
+      <SafeText fg={C.error} wrapMode="word" value={sectionText} />
+    </box>;
+  }
+  if (props.section.kind === 'response') {
+    return <box minWidth={0} paddingLeft={1}>
+      <markdown
+        syntaxStyle={getMarkdownSyntax()}
+        streaming={props.section.streaming}
+        internalBlockMode="top-level"
+        tableOptions={{style: 'grid'}}
+        content={sectionText!}
+        fg={C.text}
+        conceal
+      />
+    </box>;
+  }
+
+  if (props.section.kind === 'response' && sectionText === null) return <box />;
+  if (props.section.kind === 'intent' && sectionText === null) return <box />;
+  if (props.section.kind === 'blocked' && sectionText === null) return <box />;
+  if (props.section.kind === 'log' && sectionText === null) return <box />;
   return <box
     flexShrink={0}
     minWidth={0}
@@ -491,7 +809,7 @@ function SectionView(props: {section: Section; frame: () => string; now: () => n
   >
     <Show when={props.section.kind === 'prompt'}>
       <box minWidth={0} backgroundColor={C.userCard} paddingLeft={2} paddingRight={1}>
-        <text fg={C.text} wrapMode="word">{props.section.kind === 'prompt' ? props.section.text : ''}</text>
+        <SafeText fg={C.text} wrapMode="word" value={props.section.text} />
       </box>
     </Show>
     <Show when={props.section.kind === 'response'}>
@@ -501,7 +819,7 @@ function SectionView(props: {section: Section; frame: () => string; now: () => n
           streaming={props.section.kind === 'response' && props.section.streaming}
           internalBlockMode="top-level"
           tableOptions={{style: 'grid'}}
-          content={props.section.kind === 'response' ? props.section.text : ''}
+          content={sectionText || ''}
           fg={C.text}
           conceal
         />
@@ -509,8 +827,7 @@ function SectionView(props: {section: Section; frame: () => string; now: () => n
     </Show>
     <Show when={props.section.kind === 'intent'}>
       <box flexDirection="row" minWidth={0} paddingLeft={1}>
-        <text fg={C.textMuted}>• </text>
-        <text fg={C.textMuted} wrapMode="word">{(props.section as any).text}</text>
+        <SafeText fg={C.textMuted} wrapMode="word" value={`• ${sectionText}`} />
       </box>
     </Show>
     <Show when={props.section.kind === 'tasks'}>
@@ -545,7 +862,7 @@ function SectionView(props: {section: Section; frame: () => string; now: () => n
               const color = () => completed() ? C.textMuted : active() ? C.warning : C.text;
               return <box flexDirection="row" minWidth={0} gap={1}>
                 <text fg={color()} wrapMode="none" selectable={false}>{marker()}</text>
-                <text fg={color()} flexGrow={1} wrapMode="word" selectable={false}>{label()}</text>
+                <SafeText fg={color()} flexGrow={1} wrapMode="word" selectable={false} value={label()} />
               </box>;
             }}</For>
           </box>
@@ -560,7 +877,7 @@ function SectionView(props: {section: Section; frame: () => string; now: () => n
       >
         <box flexDirection="row" minWidth={0} gap={1}>
           <text fg={props.focusId() === (props.section as any).entryId ? C.primary : C.info} selectable={false}>{(props.section as any).expanded ? '▾' : '▸'} </text>
-          <text fg={C.success} wrapMode="word" selectable={false}>{(props.section as any).text}</text>
+          <SafeText fg={C.success} wrapMode="word" selectable={false} value={(props.section as any).text} />
           <Show when={(props.section as any).toolCount > 0}>
             <text fg={C.textMuted} wrapMode="none" truncate selectable={false}>· {(props.section as any).toolCount} 工具</text>
           </Show>
@@ -614,7 +931,7 @@ function SectionView(props: {section: Section; frame: () => string; now: () => n
                 return <box flexDirection="row" minWidth={0}>
                   <text fg={C.textMuted} wrapMode="none" selectable={false}>{no()}</text>
                   <text fg={C.info} selectable={false}>💭 </text>
-                  <text fg={C.info} wrapMode="word" selectable={false}>{step.text}</text>
+                  <SafeText fg={C.info} wrapMode="word" selectable={false} value={step.text} />
                 </box>;
               }
               if (step.type === 'subagent') {
@@ -668,10 +985,10 @@ function SectionView(props: {section: Section; frame: () => string; now: () => n
           // completed tool folds back to one line; Enter expands the full
           // output. The view never follows every line — only the tail window.
           const expanded = () => row.expanded === true;
-          const output = () => row.output || [];
-          const tail = () => output().slice(-3);
-          const truncated = () => !expanded() && output().length > 3;
-          const visible = () => !row.done && !expanded() ? tail() : (expanded() ? output() : []);
+          const output = normalizeActionOutput(row.output);
+          const tail = output.slice(-3);
+          const truncated = !expanded() && output.length > 3;
+          const visible = !row.done && !expanded() ? tail : (expanded() ? output : []);
           const focused = () => props.focusId() === row.id;
           const color = () => !row.done ? C.warning : (row.ok ? C.success : C.error);
           const elapsed = () => formatElapsed(row.start, row.end, props.now());
@@ -681,22 +998,22 @@ function SectionView(props: {section: Section; frame: () => string; now: () => n
             ? `${marker()} ${row.name} · Called ${row.count} times${elapsed()}`
             : `${marker()} ${row.name}${showSummary() ? `  ${row.summary}` : ''}${elapsed()}`;
           return <>
-            <text fg={focused() ? C.primary : color()} wrapMode="word">{head()}</text>
-            <Show when={visible().length > 0}>
-              <For each={visible()}>{line =>
+            <SafeText fg={focused() ? C.primary : color()} wrapMode="word" value={head()} />
+            <Show when={visible.length > 0}>
+              <For each={visible}>{line =>
                 <box flexDirection="row" minWidth={0} paddingLeft={2}>
-                  <text fg={C.textMuted} wrapMode="word">│ {line}</text>
+                  <SafeText fg={C.textMuted} wrapMode="word" value={`│ ${line}`} />
                 </box>
               }</For>
             </Show>
-            <Show when={truncated()}>
+            <Show when={truncated}>
               <box flexDirection="row" minWidth={0} paddingLeft={2}>
-                <text fg={C.textMuted} wrapMode="none" truncate>… {output().length} lines · Enter to expand</text>
+                <SafeText fg={C.textMuted} wrapMode="none" truncate value={`… ${output.length} lines · Enter to expand`} />
               </box>
             </Show>
             <Show when={row.done && !row.ok && row.summary}>
               <box flexDirection="row" minWidth={0} paddingLeft={2}>
-                <text fg={C.error} wrapMode="word">└ {row.summary}</text>
+                <SafeText fg={C.error} wrapMode="word" value={`└ ${row.summary}`} />
               </box>
             </Show>
           </>;
@@ -717,18 +1034,386 @@ function SectionView(props: {section: Section; frame: () => string; now: () => n
     <Show when={props.section.kind === 'blocked'}>
       <box flexDirection="column" minWidth={0}>
         <text fg={C.error}>Blocked</text>
-        <text fg={C.error} wrapMode="word">{props.section.kind === 'blocked' ? props.section.text : ''}</text>
+        <SafeText fg={C.error} wrapMode="word" value={sectionText} />
       </box>
     </Show>
     <Show when={props.section.kind === 'log'}>
-      <text fg={C.textMuted} wrapMode="word">
-        {props.section.kind === 'log' ? `${props.section.text}${props.section.detail ? ` · ${props.section.detail}` : ''}` : ''}
-      </text>
+        <SafeText fg={C.textMuted} wrapMode="word" value={`${sectionText}${sectionDetail ? ` · ${sectionDetail}` : ''}`} />
     </Show>
   </box>;
 }
 
-function LogView(props: {entries: () => Entry[]; now: () => number; active: () => boolean; composerEmpty: () => boolean; height: number; focusId: () => string | null; onCycleFocus: (dir: 1 | -1) => void; onToggleExpand: (id: string) => void; onClearFocus: () => void}) {
+function UnsafeSectionView(props: {section: Section; frame: () => string; now: () => number; focusId: () => string | null; onToggleExpand: (id: string) => void}) {
+  const section: any = props.section;
+  const text = normalizeRenderableText(section.text);
+  const detail = normalizeRenderableText(section.detail);
+  const shell = (children: any) => <box
+    flexShrink={0}
+    minWidth={0}
+    ref={(element: BoxRenderable) => {
+      alwaysSeparate.add(element);
+      setPreLayoutSiblingMargin(element, previous =>
+        previous instanceof BoxRenderable && (previous.height > 1 || alwaysSeparate.has(previous)) ? 1 : 0,
+      );
+    }}
+  >{children}</box>;
+  const maybe = (condition: boolean, children: any) => condition ? children : <box />;
+
+  if (section.kind === 'prompt') {
+    return text === null ? <box /> : shell(<box minWidth={0} backgroundColor={C.userCard} paddingLeft={2} paddingRight={1}>
+      <SafeText fg={C.text} wrapMode="word" value={text} />
+    </box>);
+  }
+  if (section.kind === 'response') {
+    return text === null ? <box /> : shell(<box minWidth={0} paddingLeft={1}>
+      <markdown syntaxStyle={getMarkdownSyntax()} streaming={section.streaming === true} internalBlockMode="top-level" tableOptions={{style: 'grid'}} content={text} fg={C.text} conceal />
+    </box>);
+  }
+  if (section.kind === 'log') {
+    const value = text === null ? detail : detail === null ? text : `${text} · ${detail}`;
+    return value === null ? <box /> : shell(<SafeText fg={C.textMuted} wrapMode="word" value={value} />);
+  }
+  if (section.kind === 'intent') {
+    return text === null ? <box /> : shell(<box flexDirection="row" minWidth={0} paddingLeft={1}>
+      <SafeText fg={C.textMuted} wrapMode="word" value={`• ${text}`} />
+    </box>);
+  }
+  if (section.kind === 'blocked') {
+    return shell(<box flexDirection="column" minWidth={0} onMouseUp={(event: any) => {
+      if (event?.button === 0) props.onToggleExpand(entry.id);
+    }}>
+      <SafeText fg={C.error} value="Blocked" />
+      {maybe(text !== null, <SafeText fg={C.error} wrapMode="word" value={text} />)}
+    </box>);
+  }
+  if (section.kind === 'actions') {
+    const rows = Array.isArray(section.rows) ? section.rows : [];
+    return shell(<box flexDirection="column" minWidth={0}>
+      <SafeText fg={C.warning} value="Actions" />
+      <For each={rows}>{(row: any) => {
+        // Normalize once per row. In particular, do not read or mutate a large
+        // pasted output again while Solid reconciles this view.
+        const output = Array.isArray(row.output)
+          ? row.output.map(normalizeRenderableText).filter((line: string | null): line is string => line !== null)
+          : [];
+        const expanded = row.expanded === true;
+        const visible = !row.done && !expanded ? output.slice(-1) : expanded ? output : [];
+        const summary = normalizeRenderableText(row.summary);
+        const elapsed = formatElapsed(row.start, row.end, props.now());
+        const marker = props.focusId() === row.id
+          ? '▶'
+          : row.done ? (row.ok ? '✓' : '✕') : props.frame();
+        const name = normalizeRenderableText(row.name) || 'action';
+        const showSummary = (!row.done || row.ok) && summary !== null && summary !== 'completed';
+        const head = row.count && row.count > 1
+          ? `${marker} ${name} · Called ${row.count} times${elapsed}`
+          : `${marker} ${name}${showSummary ? `  ${summary}` : ''}${elapsed}`;
+        const color = props.focusId() === row.id
+          ? C.primary
+          : !row.done ? C.warning : row.ok ? C.success : C.error;
+        const truncated = !expanded && output.length > 3;
+        const failedSummary = row.done && !row.ok && summary !== null;
+        return <box flexDirection="column" minWidth={0}>
+          <SafeText fg={color} wrapMode="word" value={head} />
+          <For each={visible}>{(line: string) =>
+            <box flexDirection="row" minWidth={0} paddingLeft={2}>
+              <SafeText fg={C.textMuted} wrapMode="word" value={`│ ${line}`} />
+            </box>
+          }</For>
+          {truncated ? <box flexDirection="row" minWidth={0} paddingLeft={2}>
+            <SafeText fg={C.textMuted} wrapMode="none" truncate value={`… ${output.length} lines · Enter to expand`} />
+          </box> : <box />}
+          {failedSummary ? <box flexDirection="row" minWidth={0} paddingLeft={2}>
+            <SafeText fg={C.error} wrapMode="word" value={`└ ${summary}`} />
+          </box> : <box />}
+        </box>;
+      }}</For>
+    </box>);
+  }
+  if (section.kind === 'tasks') {
+    const tasks = Array.isArray(section.tasks) ? section.tasks : [];
+    const active = tasks.find((task: any) => task.status === 'in_progress') || tasks.find((task: any) => task.status === 'pending');
+    const activeLabel = normalizeRenderableText(active?.activeForm || active?.content) || 'Complete';
+    return shell(<box flexDirection="column" minWidth={0} paddingLeft={1}>
+      <box flexDirection="row" minWidth={0} gap={1}>
+        <SafeText fg={props.focusId() === section.entryId ? C.primary : C.info} value={section.expanded ? 'v' : '>'} />
+        <SafeText fg={C.info} value="Todo" />
+        <SafeText fg={C.textMuted} value={`${tasks.filter((task: any) => task.status === 'completed').length}/${tasks.length}`} />
+        {!section.expanded ? <SafeText fg={C.warning} flexGrow={1} wrapMode="none" truncate value={activeLabel} /> : <box />}
+        <SafeText fg={C.textMuted} value="Tab / Enter" />
+      </box>
+      {section.expanded ? <box flexDirection="column" minWidth={0} paddingLeft={2}>
+        <For each={tasks}>{(task: any) => {
+          const completed = task.status === 'completed';
+          const activeTask = task.status === 'in_progress';
+          const label = normalizeRenderableText(activeTask ? task.activeForm || task.content : task.content);
+          return <box flexDirection="row" minWidth={0} gap={1}>
+            <SafeText fg={completed ? C.textMuted : activeTask ? C.warning : C.text} value={completed ? '[x]' : activeTask ? '[~]' : '[ ]'} />
+            <SafeText fg={completed ? C.textMuted : activeTask ? C.warning : C.text} flexGrow={1} wrapMode="word" value={label} />
+          </box>;
+        }}</For>
+      </box> : <box />}
+    </box>);
+  }
+  if (section.kind === 'summary') {
+    const summary = normalizeRenderableText(section.text);
+    if (summary === null) return <box />;
+    const steps = Array.isArray(section.steps) ? section.steps : [];
+    const subagentCount = steps.filter((step: any) => step.type === 'subagent').length;
+    return shell(<box flexDirection="column" minWidth={0}>
+      <box flexDirection="row" minWidth={0} gap={1}>
+        <SafeText fg={props.focusId() === section.entryId ? C.primary : C.info} value={section.expanded ? '▾' : '▸'} />
+        <SafeText fg={C.success} wrapMode="word" value={summary} />
+        {section.toolCount > 0 ? <SafeText fg={C.textMuted} value={`· ${section.toolCount} 工具`} /> : <box />}
+        {subagentCount > 0 ? <SafeText fg={C.textMuted} value={`· ${subagentCount} 子 agent`} /> : <box />}
+        {section.elapsed > 0 ? <SafeText fg={C.textMuted} wrapMode="none" truncate value={formatElapsed(Date.now() - section.elapsed, Date.now())} /> : <box />}
+      </box>
+      <box flexDirection="row" minWidth={0} gap={1} paddingLeft={2}>
+        <SafeText fg={props.focusId() === section.entryId ? C.primary : C.textMuted} wrapMode="none" truncate value={section.expanded ? '收起过程' : '展开过程'} />
+        {!section.expanded ? <SafeText fg={C.textMuted} wrapMode="none" truncate value="· Tab / Enter" /> : <box />}
+      </box>
+      {section.expanded ? <box flexDirection="column" minWidth={0} paddingLeft={2}>
+        <SafeText fg={C.textMuted} value={`过程 · ${steps.length} 步`} />
+        <For each={steps}>{(step: any, index: () => number) => {
+          const prefix = `${index() + 1}. `;
+          if (step.type === 'intent') {
+            const value = normalizeRenderableText(step.text);
+            return value === null ? <box /> : <SafeText fg={C.info} wrapMode="word" value={`${prefix}💭 ${value}`} />;
+          }
+          if (step.type === 'subagent') {
+            return <SafeText fg={C.secondary} wrapMode="word" value={`${prefix}subagent ${normalizeRenderableText(step.entry?.agentType) || 'agent'}`} />;
+          }
+          const row = step.row || {};
+          return <SafeText fg={row.done ? row.ok ? C.success : C.error : C.warning} wrapMode="word" value={`${prefix}${normalizeRenderableText(row.name) || 'action'}${formatElapsed(row.start, row.end, props.now())}`} />;
+        }}</For>
+      </box> : <box />}
+    </box>);
+  }
+  if (section.kind === 'files') {
+    const paths = Array.isArray(section.paths)
+      ? section.paths.map(normalizeRenderableText).filter((path: string | null): path is string => path !== null)
+      : [];
+    return shell(<box flexDirection="column" minWidth={0}>
+      <SafeText fg={C.secondary} value="Changed files" />
+      <For each={paths}>{(path: string) => <SafeText fg={C.secondary} wrapMode="word" value={`· ${path}`} />}</For>
+    </box>);
+  }
+  return <box />;
+}
+
+function StableSectionView(props: {section: Section; frame: () => string; now: () => number; focusId: () => string | null; onToggleExpand: (id: string) => void}) {
+  const section: any = props.section;
+  const text = normalizeTranscriptText(section.text);
+  const detail = normalizeTranscriptText(section.detail);
+  const shell = (children: any) => <box
+    flexShrink={0}
+    minWidth={0}
+    ref={(element: BoxRenderable) => {
+      alwaysSeparate.add(element);
+      setPreLayoutSiblingMargin(element, previous =>
+        previous instanceof BoxRenderable && (previous.height > 1 || alwaysSeparate.has(previous)) ? 1 : 0,
+      );
+    }}
+  >{children}</box>;
+  const empty = () => <box />;
+
+  if (section.kind === 'prompt') {
+    return text === null ? empty() : shell(<box minWidth={0} backgroundColor={C.userCard} paddingLeft={2} paddingRight={1}>
+      <SafeText fg={C.text} wrapMode="word" value={text} />
+    </box>);
+  }
+  if (section.kind === 'response') {
+    return text === null ? empty() : shell(<box minWidth={0} paddingLeft={1}>
+      <markdown syntaxStyle={getMarkdownSyntax()} streaming={section.streaming === true} internalBlockMode="top-level" tableOptions={{style: 'grid'}} content={text} fg={C.text} conceal />
+    </box>);
+  }
+  if (section.kind === 'log') {
+    const value = text === null ? detail : detail === null ? text : `${text} · ${detail}`;
+    return value === null ? empty() : shell(<SafeText fg={C.textMuted} wrapMode="word" value={value} />);
+  }
+  if (section.kind === 'intent') {
+    return text === null ? empty() : shell(<box flexDirection="row" minWidth={0} paddingLeft={1}>
+      <SafeText fg={C.textMuted} wrapMode="word" value={`• ${text}`} />
+    </box>);
+  }
+  if (section.kind === 'blocked') {
+    return shell(<box flexDirection="column" minWidth={0}>
+      <SafeText fg={C.error} value="Blocked" />
+      {text === null ? empty() : <SafeText fg={C.error} wrapMode="word" value={text} />}
+    </box>);
+  }
+  if (section.kind === 'actions') {
+    const rows = Array.isArray(section.rows) ? section.rows : [];
+    return shell(<box flexDirection="column" minWidth={0}>
+      <SafeText fg={C.warning} value="Actions" />
+      <For each={rows}>{(row: any) => {
+        const output = normalizeActionOutput(row.output);
+        const expanded = row.expanded === true;
+        const visible = !row.done && !expanded ? output.slice(-3) : expanded ? output : [];
+        const summary = normalizeTranscriptText(row.summary);
+        const elapsed = formatElapsed(row.start, row.end, props.now());
+        const marker = props.focusId() === row.id ? '▶' : row.done ? (row.ok ? '✓' : '✕') : props.frame();
+        const name = normalizeTranscriptText(row.name) || 'action';
+        const showSummary = (!row.done || row.ok) && summary !== null && summary !== 'completed';
+        const head = row.count && row.count > 1
+          ? `${marker} ${name} · Called ${row.count} times${elapsed}`
+          : `${marker} ${name}${showSummary ? `  ${summary}` : ''}${elapsed}`;
+        const color = props.focusId() === row.id ? C.primary : !row.done ? C.warning : row.ok ? C.success : C.error;
+        return <box flexDirection="column" minWidth={0}>
+          <SafeText fg={color} wrapMode="word" value={head} />
+          <For each={visible}>{(line: string) => <box flexDirection="row" minWidth={0} paddingLeft={2}>
+            <SafeText fg={C.textMuted} wrapMode="word" value={`│ ${line}`} />
+          </box>}</For>
+          {output.length > 3 && !expanded ? <box flexDirection="row" minWidth={0} paddingLeft={2}>
+            <SafeText fg={C.textMuted} wrapMode="none" truncate value={`… ${output.length} lines · Enter to expand`} />
+          </box> : empty()}
+          {row.done && !row.ok && summary !== null ? <box flexDirection="row" minWidth={0} paddingLeft={2}>
+            <SafeText fg={C.error} wrapMode="word" value={`└ ${summary}`} />
+          </box> : empty()}
+        </box>;
+      }}</For>
+    </box>);
+  }
+  if (section.kind === 'tasks') {
+    const tasks = Array.isArray(section.tasks) ? section.tasks : [];
+    const active = tasks.find((task: any) => task.status === 'in_progress') || tasks.find((task: any) => task.status === 'pending');
+    const activeLabel = normalizeTranscriptText(active?.activeForm || active?.content) || 'Complete';
+    return shell(<box flexDirection="column" minWidth={0} paddingLeft={1}>
+      <box flexDirection="row" minWidth={0} gap={1} onMouseUp={(event: any) => {
+        if (event?.button === 0) props.onToggleExpand(section.entryId);
+      }}>
+        <SafeText fg={props.focusId() === section.entryId ? C.primary : C.info} value={section.expanded ? 'v' : '>'} />
+        <SafeText fg={C.info} value="Todo" />
+        <SafeText fg={C.textMuted} value={`${tasks.filter((task: any) => task.status === 'completed').length}/${tasks.length}`} />
+        {section.expanded ? empty() : <SafeText fg={C.warning} flexGrow={1} wrapMode="none" truncate value={activeLabel} />}
+        <SafeText fg={C.textMuted} value="Tab / Enter" />
+      </box>
+      {section.expanded ? <box flexDirection="column" minWidth={0} paddingLeft={2}>
+        <For each={tasks}>{(task: any) => {
+          const completed = task.status === 'completed';
+          const activeTask = task.status === 'in_progress';
+          const label = normalizeTranscriptText(activeTask ? task.activeForm || task.content : task.content);
+          return <box flexDirection="row" minWidth={0} gap={1}>
+            <SafeText fg={completed ? C.textMuted : activeTask ? C.warning : C.text} value={completed ? '[x]' : activeTask ? '[~]' : '[ ]'} />
+            {label === null ? empty() : <SafeText fg={completed ? C.textMuted : activeTask ? C.warning : C.text} flexGrow={1} wrapMode="word" value={label} />}
+          </box>;
+        }}</For>
+      </box> : empty()}
+    </box>);
+  }
+  if (section.kind === 'summary') {
+    if (text === null) return empty();
+    const steps = Array.isArray(section.steps) ? section.steps : [];
+    const subagentCount = steps.filter((step: any) => step.type === 'subagent').length;
+    return shell(<box flexDirection="column" minWidth={0}>
+      <box flexDirection="row" minWidth={0} gap={1}>
+        <SafeText fg={props.focusId() === section.entryId ? C.primary : C.info} value={section.expanded ? '▾' : '▸'} />
+        <SafeText fg={C.success} wrapMode="word" value={text} />
+        {section.toolCount > 0 ? <SafeText fg={C.textMuted} value={`· ${section.toolCount} 工具`} /> : empty()}
+        {subagentCount > 0 ? <SafeText fg={C.textMuted} value={`· ${subagentCount} 子 agent`} /> : empty()}
+      </box>
+      <box flexDirection="row" minWidth={0} gap={1} paddingLeft={2}>
+        <SafeText fg={C.textMuted} value={section.expanded ? '收起过程' : '展开过程'} />
+        {section.expanded ? empty() : <SafeText fg={C.textMuted} value="· Tab / Enter" />}
+      </box>
+      {section.expanded ? <box flexDirection="column" minWidth={0} paddingLeft={2}>
+        <SafeText fg={C.textMuted} value={`过程 · ${steps.length} 步`} />
+        <For each={steps}>{(step: any, index: () => number) => {
+          const prefix = `${index() + 1}. `;
+          if (step.type === 'intent') {
+            const value = normalizeTranscriptText(step.text);
+            return value === null ? empty() : <SafeText fg={C.info} wrapMode="word" value={`${prefix}💭 ${value}`} />;
+          }
+          if (step.type === 'subagent') return <SafeText fg={C.secondary} wrapMode="word" value={`${prefix}subagent ${normalizeTranscriptText(step.entry?.agentType) || 'agent'}`} />;
+          const row = step.row || {};
+          return <SafeText fg={row.done ? row.ok ? C.success : C.error : C.warning} wrapMode="word" value={`${prefix}${normalizeTranscriptText(row.name) || 'action'}${formatElapsed(row.start, row.end, props.now())}`} />;
+        }}</For>
+      </box> : empty()}
+    </box>);
+  }
+  if (section.kind === 'files') {
+    const paths = Array.isArray(section.paths) ? section.paths.map(normalizeTranscriptText).filter((path: string | null): path is string => path !== null) : [];
+    return shell(<box flexDirection="column" minWidth={0}>
+      <SafeText fg={C.secondary} value="Changed files" />
+      <For each={paths}>{(path: string) => <SafeText fg={C.secondary} wrapMode="word" value={`· ${path}`} />}</For>
+    </box>);
+  }
+  return empty();
+}
+
+function TranscriptEntryView(props: {entry: Entry; frame: () => string; now: () => number; focusId: () => string | null; onToggleExpand: (id: string) => void; plainResponse?: boolean}) {
+  const entry: any = props.entry;
+  const text = normalizeTranscriptText(entry.text);
+  const detail = normalizeTranscriptText(entry.detail);
+  const shell = (children: any) => <box flexShrink={0} minWidth={0}>{children}</box>;
+  if (entry.kind === 'prompt') {
+    return text === null ? <box /> : shell(<box minWidth={0} backgroundColor={C.userCard} paddingLeft={2} paddingRight={1}>
+      <SafeText fg={C.text} wrapMode="word" value={text} />
+    </box>);
+  }
+  if (entry.kind === 'response') {
+    return text === null ? <box /> : shell(<box minWidth={0} paddingLeft={1}>
+      {props.plainResponse ? <SafeText fg={C.text} wrapMode="word" value={text} /> : <markdown syntaxStyle={getMarkdownSyntax()} streaming={entry.streaming === true} internalBlockMode="top-level" tableOptions={{style: 'grid'}} content={text} fg={C.text} conceal />}
+    </box>);
+  }
+  if (entry.kind === 'log') {
+    const value = transcriptLogText(entry);
+    return value === null ? <box /> : <box flexShrink={0} minWidth={0}>
+      <SafeText fg={C.textMuted} wrapMode="word" value={value} />
+    </box>;
+  }
+  if (entry.kind === 'intent') {
+    return text === null ? <box /> : shell(<SafeText fg={C.textMuted} wrapMode="word" value={`• ${text}`} />);
+  }
+  if (entry.kind === 'blocked') {
+    return shell(<box flexDirection="column" minWidth={0}>
+      <SafeText fg={C.error} value="Blocked" />
+      {text === null ? <box /> : <SafeText fg={C.error} wrapMode="word" value={text} />}
+      {detail === null ? <box /> : <SafeText fg={C.error} wrapMode="word" value={detail} />}
+    </box>);
+  }
+  if (entry.kind === 'action') {
+    // `output` was normalized in LogView's snapshot. Keep this local array as
+    // a read-only render snapshot as well, so folding does not consume pasted
+    // multi-line input during Solid reconciliation.
+    const output = normalizeActionOutput(entry.output);
+    const expanded = entry.expanded === true;
+    const isLongOutput = output.length > 3;
+    // A folded transcript must remain bounded. Keep a short prefix rather
+    // than the tail: the title/status line identifies the action, while the
+    // first output lines provide a useful, stable preview without rendering
+    // the end of a large paste into the terminal frame.
+    const visible = expanded || !isLongOutput
+      ? output
+      : [];
+    const name = normalizeTranscriptText(entry.name) || text || 'action';
+    const status = normalizeTranscriptText(entry.summary) || detail;
+    const summary = status !== null ? `  ${status}` : '';
+    const marker = props.focusId() === entry.id ? '▶' : entry.done ? (entry.ok ? '✓' : '✕') : props.frame();
+    const head = `${marker} ${name}${summary}${formatElapsed(entry.start, entry.end, props.now())}`;
+    return <box flexShrink={0} minWidth={0} flexDirection="column">
+      <SafeText fg={entry.done ? entry.ok ? C.success : C.error : C.warning} wrapMode="word" value={head} />
+      {visible.length === 0 ? <box /> : <For each={visible}>{(line: string) => <box flexDirection="row" minWidth={0} paddingLeft={2}>
+        <SafeText fg={C.textMuted} wrapMode="word" value={`│ ${line}`} />
+      </box>}</For>}
+      {!expanded && isLongOutput ? <box flexDirection="row" minWidth={0} paddingLeft={2}>
+        <SafeText fg={C.textMuted} wrapMode="none" truncate value={`${name}${summary} · … ${output.length} lines · Enter to expand`} />
+      </box> : <box />}
+    </box>;
+  }
+  if (entry.kind === 'files') {
+    const paths = Array.isArray(entry.paths)
+      ? entry.paths.map(normalizeTranscriptText).filter((path: string | null): path is string => path !== null)
+      : [];
+    return paths.length === 0 ? <box /> : shell(<box flexDirection="column" minWidth={0}>
+      <SafeText fg={C.secondary} value="Changed files" />
+      <For each={paths}>{(path: string) => <SafeText fg={C.secondary} wrapMode="word" value={`· ${path}`} />}</For>
+    </box>);
+  }
+  return <box />;
+}
+
+function LogView(props: {entries: () => Entry[]; now: () => number; active: () => boolean; composerEmpty: () => boolean; height: number; focusId: () => string | null; onCycleFocus: (dir: 1 | -1) => void; onToggleExpand: (id: string) => void; onClearFocus: () => void; staticRender?: boolean; staticText?: () => string}) {
   let scroll: ScrollBoxRenderable | undefined;
   const [atBottom, setAtBottom] = createSignal(true);
   // Track scroll position: OpenTUI's ScrollBox natively stops following the
@@ -741,17 +1426,6 @@ function LogView(props: {entries: () => Entry[]; now: () => number; active: () =
     const max = Math.max(0, s.scrollHeight - s.viewport.height);
     setAtBottom(s.scrollTop >= max - 1);
   };
-  createEffect(() => {
-    props.entries();
-    updateAtBottom();
-  });
-  // Reconcile by section id instead of replacing section objects. Solid's <For>
-  // keys rows by identity, so this keeps the mounted Markdown renderer alive and
-  // lets its native incremental parser retain the stable response prefix.
-  const [sections, setSections] = createStore<Section[]>([]);
-  createEffect(() => {
-    setSections(reconcile(buildSections(props.entries()), {key: 'id', merge: true}));
-  });
   const frame = () => ['|', '/', '-', '\\'][Math.floor(props.now() / 180) % 4];
   const scrollBy = (rows: number) => { scroll?.scrollBy(rows); updateAtBottom(); };
   useKeyboard((event: any) => {
@@ -769,8 +1443,36 @@ function LogView(props: {entries: () => Entry[]; now: () => number; active: () =
     else if (props.composerEmpty() && name === 'escape' && props.focusId()) { props.onClearFocus(); event.preventDefault?.(); }
   });
   const jumpToBottom = () => { scroll?.scrollTo({x: 0, y: scroll.scrollHeight}); setAtBottom(true); };
+  // Normalize at the LogView boundary as well as for App-level focus/layout
+  // calculations. This keeps every static mount and live render on the same
+  // non-empty, metadata-preserving snapshot path, without relying on an
+  // external signal to trigger a test-renderer frame.
+  const normalizedEntries = createMemo(() => normalizeTranscriptEntries(props.entries()) as Entry[]);
+  const TranscriptBody = () => <box flexDirection="column" minWidth={0}>
+    <For each={normalizedEntries()}>{(entry: Entry) => <TranscriptEntryView entry={entry} frame={frame} now={props.now} focusId={props.focusId} onToggleExpand={props.onToggleExpand} plainResponse={props.staticRender} />}</For>
+  </box>;
+  const staticNeedsScroll = () => normalizedEntries().length > props.height;
+  const renderTranscript = () => <TranscriptBody />;
   return <box flexDirection="column">
-    <scrollbox
+    {props.staticRender && !staticNeedsScroll() ? <box
+      height={props.height - 1}
+      flexShrink={0}
+      minHeight={0}
+    >{renderTranscript()}</box> : props.staticRender ? <scrollbox
+      ref={(element: ScrollBoxRenderable) => {
+        scroll = element;
+        updateAtBottom();
+      }}
+      height={props.height - 1}
+      flexShrink={0}
+      minHeight={0}
+      stickyScroll
+      stickyStart="bottom"
+      viewportOptions={{paddingRight: 1}}
+      verticalScrollbarOptions={{visible: false}}
+    >
+      {renderTranscript()}
+    </scrollbox> : <scrollbox
       ref={(element: ScrollBoxRenderable) => { scroll = element; updateAtBottom(); }}
       height={props.height - 1}
       flexShrink={0}
@@ -781,12 +1483,10 @@ function LogView(props: {entries: () => Entry[]; now: () => number; active: () =
       verticalScrollbarOptions={{visible: true}}
       onMouseScroll={() => { setTimeout(updateAtBottom, 0); }}
     >
-      <For each={sections}>{section => <SectionView section={section} frame={frame} now={props.now} focusId={props.focusId} onToggleExpand={props.onToggleExpand} />}</For>
-    </scrollbox>
+      {renderTranscript()}
+    </scrollbox>}
     <box height={1} flexShrink={0} paddingX={1} onMouseUp={(event: any) => { if (event?.button === 0) jumpToBottom(); }}>
-      <Show when={!atBottom()}>
-        <text fg={C.info} wrapMode="none" truncate>↓ 回到底部 (End)</text>
-      </Show>
+      <text fg={C.info} wrapMode="none" truncate>{atBottom() ? '·' : '↓ 回到底部 (End)'}</text>
     </box>
   </box>;
 }
@@ -804,9 +1504,13 @@ function resolveDebugValue<T>(value: T | (() => T) | undefined): T | undefined {
 
 export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal; debugDraft?: DebugDraft; debugDecisions?: DebugDecisions; debugRunning?: DebugFlag; debugStartedAt?: number; debugOverlay?: Overlay; debugUsage?: {input: number; output: number; cacheRead: number; contextUsed?: number; contextWindow?: number}; debugEffort?: {value: string; label: string; options: OverlayOption[]}; debugWelcome?: {quote: string; art: string[]}; debugUsageOpen?: boolean; debugUsageRange?: UsageRange}) {
   const dims = useTerminalDimensions();
-  const initialDebugEntries = resolveDebugValue(props?.debugEntries) ?? [];
+  const debugEntriesAccessor = () => resolveDebugValue(props?.debugEntries) ?? [];
+  const initialDebugEntries = props?.debugEntries != null ? debugEntriesAccessor() : [];
   const [entries, setEntries] = createSignal<Entry[]>(initialDebugEntries); const [input, setInput] = createSignal('');
-  const displayedEntries = () => resolveDebugValue(props?.debugEntries) ?? entries();
+  // Debug transcript 验收使用独立静态挂载：每次挂载在边界读取一次快照，随后由
+  // displayedEntries 统一规范化。不要用轮询模拟 renderer 不提供的外部 signal 重绘，
+  // 这样初始快照和更新快照都经过完全相同的渲染路径，也不会留下未清理的定时器。
+  const displayedEntries = createMemo(() => normalizeTranscriptEntries(entries()) as Entry[]);
   const [model, setModel] = createSignal(readDefaultModel()); const [mode, setMode] = createSignal(readDefaultMode()); const [cwd, setCwd] = createSignal(''); const [session, setSession] = createSignal('');
   const [effort, setEffort] = createSignal(props?.debugEffort?.value ?? 'off'); const [effortLabel, setEffortLabel] = createSignal(props?.debugEffort?.label ?? 'Model default'); const [effortOptions, setEffortOptions] = createSignal<OverlayOption[]>(props?.debugEffort?.options ?? []);
   // Welcome panel data mirrored from the CLI startup (daily quote only).
@@ -922,7 +1626,17 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
     const requestId = String(event.request_id || '');
     if (!requestId.startsWith('completion-')) return;
     const seq = Number(requestId.slice('completion-'.length));
-    const raw = Array.isArray(event.candidates) ? event.candidates.map((item: unknown) => String(item)) : [];
+    const raw: CompletionOption[] = Array.isArray(event.candidates) ? event.candidates.map((item: unknown) => {
+      if (typeof item === 'string') return {label: item};
+      const candidate = item as Record<string, unknown> | null;
+      return {
+        label: String(candidate?.label ?? candidate?.name ?? ''),
+        description: candidate?.description == null ? undefined : String(candidate.description),
+        icon: candidate?.icon == null ? undefined : String(candidate.icon),
+        type: candidate?.type == null ? undefined : String(candidate.type),
+        isDirectory: Boolean(candidate?.isDirectory),
+      };
+    }) : [];
     setCompletion(current => applyCompletionResult(current, seq, raw));
   };
   const selectCompletion = () => {
@@ -930,7 +1644,11 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
     const option = current.options[current.selected];
     if (!current.mode || !option) return;
     const text = input();
-    const insertion = current.mode === 'mention' ? `@${option}` : option;
+    const label = String(option.label ?? '');
+    const directoryLabel = option.isDirectory
+      ? enterCompletionDirectory(option, label, 0, label.length)?.text ?? label
+      : label;
+    const insertion = current.mode === 'mention' ? `@${directoryLabel}` : directoryLabel;
     const next = text.slice(0, current.start) + insertion + text.slice(current.end);
     setInput(next);
     textareaRef?.setText?.(next);
@@ -945,56 +1663,25 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
     const width = Math.max(20, dims().width - 12);
     return Math.max(1, Math.min(MAX_COMPOSER_LINES, composerVisualLines(v, width)));
   };
-  // The non-modal completion menu occupies terminal rows above the composer.
-  // It still needs to be included in the permanent layout reservation, or the
-  // transcript will render over the input row and make the composer disappear.
-  const completionMenuRows = () => {
-    const current = completion();
-    if (!current.mode || !current.options.length) return 0;
-    // option rows + footer hint + rounded border top/bottom
-    return Math.min(current.options.length, 6) + 3;
-  };
-  const composerReservedRows = () => 1 + composerLines() + completionMenuRows();
+  const composerReservedRows = () => 1 + composerLines();
   // One 30 FPS tick drives the live tail: spinner/elapsed updates and buffered
   // text/tool output commit together, so a busy turn produces one coalesced
   // terminal frame instead of independent flush timers racing each other.
   const LIVE_TICK_MS = 33;
   let nowTimer: ReturnType<typeof setInterval> | null = null;
-  // Codex-style layout: transcript owns the screen; only the composer and its
-  // contextual footer reserve permanent space.
+  let toastTimer: ReturnType<typeof setTimeout> | null = null;
+  // Composer and status occupy the footer; overlays are intentionally absent
+  // from this measurement because they are absolutely positioned.
+  const footerReservedRows = () => composerReservedRows() + 1 + (!running() && toast() ? 1 : 0);
   const viewportHeight = () => {
     const h = dims().height;
-    let used = composerReservedRows(); // completion menu + composer + footer
-    if (overlay()) {
-      const o = overlay()!;
-      const rows = Math.min(o.options.length, 8);
-      // Permission requests reserve one bounded command preview above their
-      // options. Long commands are truncated rather than wrapping into them.
-      used += rows + 3 + (o.kind === 'permission' ? 1 : 0);
-    }
-    return Math.max(3, h - used);
+    return Math.max(3, h - footerReservedRows());
   };
   // The welcome panel shows as soon as the TUI opens and stays until the user
   // submits their first prompt (it is not dismissed by backend logs, which may
   // arrive while the panel is on screen). Ctrl+L clearing a session brings it
   // back naturally.
   const showWelcome = () => !overlay() && !running() && !userStarted();
-  // Sliding window around the selected index. Must be a memo: the <Show> child
-  // callback runs untracked, so plain consts inside it would freeze at open time.
-  const overlayWindow = createMemo(() => {
-    const o = overlay();
-    if (!o) return null;
-    const total = o.options.length;
-    const rows = Math.min(total, 8);
-    const start = Math.max(0, Math.min(overlayIndex() - Math.floor(rows / 2), Math.max(0, total - rows)));
-    return {options: o.options.slice(start, start + rows), start, rows, total};
-  });
-  const permissionResource = () => overlay()?.kind === 'permission' ? overlay()?.options[0]?.description || '' : '';
-  const permissionPreview = () => truncateTerminalText(permissionResource(), Math.max(12, dims().width - 13));
-  const overlayHeight = () => (overlayWindow()?.rows ?? 0) + 3 + (overlay()?.kind === 'permission' ? 1 : 0);
-  // Auto-dismiss toast after 2.5s via an independent timer. The clock-based
-  // effect below would never fire while idle (now() only ticks when running).
-  let toastTimer: ReturnType<typeof setTimeout> | null = null;
   const showToast = (text: string) => {
     setToast({text, time: Date.now()});
     if (toastTimer) clearTimeout(toastTimer);
@@ -1359,7 +2046,7 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
       }
       case 'goal_supervisor': {
         const currentGoal = goalSnapshot();
-        if (currentGoal) setGoalSnapshot(mergeGoalSupervisorEvent(currentGoal, event));
+        if (currentGoal) setGoalSnapshot(currentGoal);
         const supervisorEvent = value(event, 'event');
         if (supervisorEvent === 'started') {
           add({
@@ -1615,6 +2302,34 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
     try { backendClient?.stop(); } catch { /* best effort */ }
     backendClient = null;
   });
+  const activeOverlayDescriptor = () => {
+    const current = overlay();
+    const permission = current?.kind === 'permission' && current.options.some(option =>
+      option.name.trim().length > 0 || option.description.trim().length > 0,
+    ) ? current : null;
+    const picker = current?.kind === 'picker' && current.options.some(option =>
+      option.name.trim().length > 0 || option.description.trim().length > 0,
+    ) ? current : null;
+    const completionState = completion();
+    const completionRequest = completionState.mode && completionState.options.some(option =>
+      option.label.trim().length > 0 || (option.description ?? '').trim().length > 0,
+    ) ? completionState : null;
+    const historyRequest = historySearchOpen() && historyMatches().some(match => match.trim().length > 0)
+      ? {open: true, matches: historyMatches(), selected: historySearchIndex()}
+      : null;
+    return selectOverlayDescriptor({permission, picker, completion: completionRequest, history: historyRequest});
+  };
+  const hasActiveOverlay = () => activeOverlayDescriptor() !== null;
+  const closeOverlayLayer = () => {
+    if (overlay()) {
+      setOverlay(null);
+      setOverlayIndex(0);
+    } else if (completion().mode && completion().options.length) {
+      closeCompletion();
+    } else if (historySearchOpen()) {
+      closeHistorySearch(true);
+    }
+  };
   const selectOverlay = (index?: number) => {
     const current = overlay();
     if (!current) return;
@@ -1671,6 +2386,15 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
       }
       return;
     }
+    const activeCompletion = completion();
+    if (dispatchCompletionInput(name, completionMenuIsOpen(activeCompletion, false, historySearchOpen()), {
+      move: delta => setCompletion(current => moveCompletionSelection(current, delta)),
+      select: selectCompletion,
+      close: closeCompletion,
+    })) {
+      event.preventDefault?.();
+      return;
+    }
     if (historySearchOpen()) {
       const matches = historyMatches();
       if (name === 'up' || name === 'down') {
@@ -1684,20 +2408,6 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
         closeHistorySearch(true);
         event.preventDefault?.();
       }
-      return;
-    }
-    const activeCompletion = completion();
-    if (activeCompletion.mode && shouldHandleAutocompleteKey(name)) {
-      if (name === 'up') {
-        setCompletion(current => moveCompletionSelection(current, -1));
-      } else if (name === 'down') {
-        setCompletion(current => moveCompletionSelection(current, 1));
-      } else if (name === 'tab' || name === 'return') {
-        selectCompletion();
-      } else if (name === 'escape') {
-        closeCompletion();
-      }
-      event.preventDefault?.();
       return;
     }
     if (action === 'open-effort') { openEffortPicker(); event.preventDefault?.(); return; }
@@ -1785,94 +2495,119 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
     setHistoryIdx(-1);
     setHistoryDraft('');
   };
-  const footerText = () => footerHint({
+  const uiStatus = () => deriveUiStatus({
     width: dims().width,
+    backend: backendState(),
     running: running(),
     phase: phase(),
     elapsed: elapsed(),
-    pending: localPendingMessages(),
     currentTool: currentTool() || undefined,
     toolsDone: toolDone(),
     toolsTotal: toolTotal(),
-    backend: backendState(),
+    queuedMessages: localPendingMessages() + queuedMessages(),
     permissionWait: overlay()?.kind === 'permission',
-    completionOpen: Boolean(completion().mode && completion().options.length),
+    completionOpen: completionMenuIsOpen(completion(), Boolean(overlay()), historySearchOpen()),
     composerLines: composerLines(),
     paste: pastedContent(),
     toast: toast()?.text || null,
     historySearch: {open: historySearchOpen(), matches: historyMatches().length},
+    contextUsed: contextUsed(),
+    contextWindow: contextWindow(),
+    model: model(),
+    effort: effortShortLabel(effortLabel(), effort()),
+    spinner: spinner(),
   });
   const showGoalPage = () => Boolean(goalSnapshot() && (lifecycleView() === 'goal' || goalIsActive(goalSnapshot())));
   const showDraftPage = () => Boolean(draftStatus() && lifecycleView() === 'draft' && !showGoalPage());
-  return <box width={dims().width} height={dims().height} flexDirection="column">
-    <Show when={usageOpen()} fallback={<>
-    <Show when={showGoalPage()} fallback={
-      <Show when={showDraftPage()} fallback={
-        <Show when={showWelcome()} fallback={
-          <LogView entries={displayedEntries} now={now} height={viewportHeight()} active={() => !overlay()} composerEmpty={() => !overlay() && input() === ''} focusId={focusId} onCycleFocus={cycleFocus} onToggleExpand={toggleExpand} onClearFocus={() => setFocusId(null)} />
-        }>
-          <WelcomeView width={dims().width} height={viewportHeight()} quote={welcomeQuote()} />
-        </Show>
-      }>
-        <GoalDraftView draft={draftStatus()!} now={now()} width={dims().width} height={viewportHeight()} />
-      </Show>
-    }>
-      <GoalView goal={goalSnapshot()!} decisions={goalDecisions()} now={now()} width={dims().width} height={viewportHeight()} />
-    </Show>
-    <Show when={overlay()}>
-      <box border borderStyle="rounded" borderColor={C.accent} title={` ${overlay()?.title} `} height={overlayHeight()} paddingX={1} flexDirection="column">
-        <Show when={overlay()?.kind === 'permission'}>
-          <text flexShrink={0} fg={C.text} wrapMode="none">Command: {permissionPreview()}</text>
-        </Show>
-        <For each={overlayWindow()?.options ?? []}>{(option, i) => {
-          const absoluteIndex = () => (overlayWindow()?.start ?? 0) + i();
-          const active = () => absoluteIndex() === overlayIndex();
-          return <box flexDirection="row" onMouseUp={(event: any) => { if (event?.button === 0) { setOverlayIndex(absoluteIndex()); selectOverlay(absoluteIndex()); } }}>
-            <text fg={active() ? C.primary : C.textMuted} width={Math.min(22, Math.max(18, Math.floor(dims().width * 0.24)))} wrapMode="none" truncate>{active() ? '▶ ' : '  '}{option.name}</text>
-            {option.description && overlay()?.kind !== 'permission' ? <text flexGrow={1} minWidth={0} fg={C.textMuted} wrapMode="none" truncate>  {option.description}</text> : null}
-          </box>;
-        }}</For>
-        <text fg={C.textMuted}>{overlayWindow()! && overlayWindow()!.total > overlayWindow()!.rows ? `${overlayIndex() + 1}/${overlayWindow()!.total} · ` : ''}↑↓ select · Enter confirm · Esc cancel</text>
-      </box>
-    </Show>
-    <box height={composerReservedRows()} flexShrink={0} paddingX={1} flexDirection="column">
-      <Show when={completion().mode && completion().options.length}>
-        <box border borderStyle="rounded" borderColor={C.accent} paddingX={1} flexShrink={0} flexDirection="column">
-          <For each={completion().options.slice(0, 6)}>{(option, i) => (
-            <text fg={i() === completion().selected ? C.primary : C.textMuted}>
-              {i() === completion().selected ? '▶ ' : '  '}{completion().mode === 'mention' ? '@' : ''}{option}
-            </text>
-          )}</For>
-          <text fg={C.textMuted}>{completion().mode === 'mention' ? '文件引用' : '指令'} · ↑↓ select · Tab/Enter apply · Esc close</text>
+  const mainContent = () => {
+    if (usageOpen()) return <UsageView width={dims().width} height={dims().height} range={usageRange} revision={usageRevision} />;
+
+    const goal = goalSnapshot();
+    if (goal && showGoalPage()) {
+      return <GoalView goal={goal} decisions={goalDecisions()} now={now()} width={dims().width} height={viewportHeight()} />;
+    }
+
+    const draft = draftStatus();
+    if (draft && showDraftPage()) {
+      return <GoalDraftView draft={draft} now={now()} width={dims().width} height={viewportHeight()} />;
+    }
+
+    if (showWelcome()) return <WelcomeView width={dims().width} height={viewportHeight()} quote={welcomeQuote()} />;
+    return <LogView entries={entries} now={now} height={viewportHeight()} active={() => !hasActiveOverlay()} composerEmpty={() => !hasActiveOverlay() && input() === ''} focusId={focusId} onCycleFocus={cycleFocus} onToggleExpand={toggleExpand} onClearFocus={() => setFocusId(null)} staticRender={props?.debugEntries != null} />;
+  };
+  const OverlayBoundary = () => {
+    return <OverlayLayer
+      permission={() => {
+        const current = overlay();
+        return current?.kind === 'permission' ? {...current, selected: overlayIndex()} : null;
+      }}
+      picker={() => {
+        const current = overlay();
+        return current?.kind === 'picker' ? {...current, selected: overlayIndex()} : null;
+      }}
+      completion={completion}
+      history={() => ({
+        open: historySearchOpen(),
+        matches: historyMatches(),
+        selected: historySearchIndex(),
+      })}
+      width={() => dims().width}
+      composerRows={composerReservedRows}
+      maxOptions={() => Math.max(1, Math.min(6, viewportHeight() - 2))}
+      onClose={closeOverlayLayer}
+      onSelectPermission={selectOverlay}
+      onSelectPicker={selectOverlay}
+      onSelectCompletion={selectCompletion}
+      onSelectHistory={chooseHistoryMatch}
+    />;
+  };
+  const renderStaticTranscript = () => {
+    const lines: string[] = [];
+    for (const entry of displayedEntries() as any[]) {
+      if (entry.kind === 'log') {
+        const value = transcriptLogText(entry);
+        if (value !== null) lines.push(value);
+        continue;
+      }
+      if (entry.kind === 'action') {
+        const output = normalizeActionOutput(entry.output);
+        const expanded = entry.expanded === true;
+        const name = normalizeTranscriptText(entry.name) || normalizeTranscriptText(entry.text) || 'action';
+        const status = normalizeTranscriptText(entry.summary) || normalizeTranscriptText(entry.detail);
+        const summary = status !== null ? `  ${status}` : '';
+        const marker = entry.done ? (entry.ok ? '✓' : '✕') : ['|', '/', '-', '\\'][Math.floor(now() / 180) % 4];
+        lines.push(`${marker} ${name}${summary}${formatElapsed(entry.start, entry.end, now())}`);
+        const visible = expanded || output.length <= 3 ? output : [];
+        for (const line of visible) lines.push(`  │ ${line}`);
+        if (!expanded && output.length > 3) lines.push(`${name}${summary} · … ${output.length} lines · Enter to expand`);
+        continue;
+      }
+      const text = normalizeTranscriptText(entry.text);
+      if (text === null) continue;
+      if (entry.kind === 'intent') lines.push(`• ${text}`);
+      else lines.push(text);
+    }
+    return lines.join('\n');
+  };
+  return <box width={dims().width} height={dims().height} flexDirection="column" position="relative">
+    {mainContent()}
+    <box position="relative" height={composerReservedRows()} flexShrink={0} paddingX={1} flexDirection="column">
+      <box height={composerReservedRows()} flexShrink={0} flexDirection="column">
+        <box height={composerLines()} flexShrink={0} flexDirection="row">
+          <text fg={C.primary} wrapMode="none" truncate>{mode()}</text>
+          <text fg={C.textMuted} wrapMode="none"> · </text>
+          <text fg={C.primary} wrapMode="none" truncate>{model()}</text>
+          <text fg={C.textMuted} wrapMode="none"> · </text>
+          <text fg={C.info} wrapMode="none" truncate selectable={false} onMouseUp={(event: any) => { if (event?.button === 0) openEffortPicker(); }}>{effortShortLabel(effortLabel(), effort())} ▾</text>
+          <text fg={C.primary}> › </text>
+          <textarea flexGrow={1} focused height={composerLines()} placeholder={running() ? 'working…' : 'Ask anything…'} initialValue={input()} keyBindings={textareaBindings as any} onContentChange={() => { const v = textareaRef?.plainText ?? ''; const nowValue = Date.now(); const elapsedMs = lastBufferChangedAt ? nowValue - lastBufferChangedAt : 0; if (suppressContentChange) { lastBufferValue = v; lastBufferChangedAt = nowValue; return; } if (v !== input() && likelyPaste(lastBufferValue, v, elapsedMs)) { const paste = makePasteSnapshot(v); setPastedContent(paste); const folded = foldedPasteLabel(paste); setInput(folded); textareaRef?.setText?.(folded); showToast(`Pasted ${paste.lines} lines · ${paste.bytes} bytes · Ctrl+O expand`); lastBufferValue = folded; lastBufferChangedAt = nowValue; return; } if (v !== input()) { setInput(v); refreshCompletion(v); } lastBufferValue = v; lastBufferChangedAt = nowValue; }} onSubmit={submit as any} ref={el => { textareaRef = el as any; }} />
         </box>
-      </Show>
-      <box height={composerLines()} flexShrink={0} flexDirection="row">
-        <text fg={C.primary} wrapMode="none" truncate>{mode()}</text>
-        <text fg={C.textMuted} wrapMode="none"> · </text>
-        <text fg={C.primary} wrapMode="none" truncate>{model()}</text>
-        <text fg={C.textMuted} wrapMode="none"> · </text>
-        <text fg={C.info} wrapMode="none" truncate selectable={false} onMouseUp={(event: any) => { if (event?.button === 0) openEffortPicker(); }}>{effortShortLabel(effortLabel(), effort())} ▾</text>
-        <text fg={C.primary}> › </text>
-        <textarea flexGrow={1} focused height={composerLines()} placeholder={running() ? 'working…' : 'Ask anything…'} initialValue={input()} keyBindings={textareaBindings as any} onContentChange={() => { const v = textareaRef?.plainText ?? ''; const nowValue = Date.now(); const elapsedMs = lastBufferChangedAt ? nowValue - lastBufferChangedAt : 0; if (suppressContentChange) { lastBufferValue = v; lastBufferChangedAt = nowValue; return; } if (v !== input() && likelyPaste(lastBufferValue, v, elapsedMs)) { const paste = makePasteSnapshot(v); setPastedContent(paste); const folded = foldedPasteLabel(paste); setInput(folded); textareaRef?.setText?.(folded); showToast(`Pasted ${paste.lines} lines · ${paste.bytes} bytes · Ctrl+O expand`); lastBufferValue = folded; lastBufferChangedAt = nowValue; return; } if (v !== input()) { setInput(v); refreshCompletion(v); } lastBufferValue = v; lastBufferChangedAt = nowValue; }} onSubmit={submit as any} ref={el => { textareaRef = el as any; }} />
       </box>
-      <Show when={false && running()}>
-        <text fg={C.warning} wrapMode="none" truncate>• {phase()} · {spinner()} {elapsed()} · Ctrl+K 中断</text>
-      </Show>
-      <Show when={!running() && toast()}>
-        <text fg={C.success} wrapMode="none" truncate>{toast()?.text}</text>
-      </Show>
-      <Show when={false && !running() && !toast() && !overlay() && !backendReady()}>
-        <text fg={C.warning} wrapMode="none" truncate>• 正在连接后端…</text>
-      </Show>
-      <Show when={false && !running() && !toast() && !overlay() && backendReady()}>
-        <text fg={C.textMuted} wrapMode="none" truncate>{footerStatusText(dims().width, model(), effortShortLabel(effortLabel(), effort()), contextUsed(), contextWindow(), todayInput() + todayOutput())}</text>
-      </Show>
-      <Show when={!overlay() || overlay()?.kind === 'permission'}>
-        <text fg={backendState() === 'disconnected' ? C.warning : running() ? C.warning : C.textMuted} wrapMode="none" truncate>{footerText()}</text>
-      </Show>
     </box>
-    </>}>
-      <UsageView width={dims().width} height={dims().height} range={usageRange} revision={usageRevision} />
-    </Show>
+    {activeOverlayDescriptor() !== null ? <OverlayBoundary /> : null}
+    <box height={() => !running() && toast() ? 1 : 0} flexShrink={0}>
+      <SafeText fg={C.success} wrapMode="none" truncate value={toast()?.text} />
+    </box>
+    <StatusLine status={uiStatus} />
   </box>;
 }

@@ -209,6 +209,17 @@ const ACTIVE_GOAL_STATUSES = new Set(['running', 'pausing', 'cancelling']);
 const BUSY_DRAFT_STAGES = new Set(['preflight', 'catalog', 'intake', 'discovering', 'planning']);
 const TERMINAL_DRAFT_STATUSES = new Set(['paused', 'ready', 'approved', 'cancelled', 'failed', 'consumed']);
 
+/**
+ * 归一化 GoalDetails 的会话级展开意图。
+ *
+ * 缺省意图始终回到折叠；只有显式的 `toggle` 才读取当前会话值并翻转。
+ * 该谓词不接触 GoalSnapshot，也不执行任何持久化操作，因此调用方可以安全地
+ * 将返回值放入会话级状态，而不会写回用户或默认配置。
+ */
+export function goalDetailsExpanded(currentExpanded: boolean, intent?: 'toggle'): boolean {
+  return intent === 'toggle' ? !currentExpanded : false;
+}
+
 function has(object: any, key: string): boolean {
   return Object.prototype.hasOwnProperty.call(object || {}, key);
 }

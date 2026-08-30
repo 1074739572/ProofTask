@@ -126,31 +126,39 @@ export type MessageQueue = {
 
 export function createMessageQueue(send: (command: Record<string, unknown>) => boolean): MessageQueue {
   let busy = false;
-  let queue: Record<string, unknown>[] = [];
-  return {
+  const queue: Record<string, unknown>[] = [];
+  const flush = () => {
+    while (!busy && queue.length > 0) {
+      const command = queue.shift()!;
+      // 先从 pending 中移除当前消息，再交给发送端，使发送回调读取到
+      // 当前准确的剩余数量（并允许发送端在回调中改变忙碌状态）。
+      if (!send(command)) {
+        // 发送失败时保留消息，等待下一次转为空闲时重试，避免消息丢失。
+        queue.unshift(command);
+        return;
+      }
+    }
+  };
+  const result: MessageQueue = {
     setBusy(next: boolean) {
       busy = next;
-      if (busy || queue.length === 0) return;
-      const flush = queue;
-      queue = [];
-      for (const command of flush) {
-        // 发送失败的消息留在队首，等下次空闲转换再重试，避免消息丢失。
-        if (!send(command)) queue.unshift(command);
-      }
+      if (!busy) flush();
     },
     submit(command: Record<string, unknown>) {
-      if (!busy) return send(command);
-      queue.push(command);
-      return true;
+      if (busy) {
+        queue.push(command);
+        return true;
+      }
+      return send(command);
     },
     pendingCount: () => queue.length,
     pending: () => [...queue],
   };
+  return result;
 }
 
 // ---------- 结构化滚动补全菜单（P1-02 / CM1-CM3） ----------
 
-/** 补全选项的接口形态：兼容后端返回的纯字符串与携带元数据的结构化对象。 */
 export type CompletionOption = {
   label: string;
   description?: string;
@@ -166,15 +174,14 @@ export type CompletionOptionRow = {
   directory: boolean;
 };
 
-/** 把任意补全选项（字符串或结构化对象）归一化为带安全默认值的行数据。 */
-export function completionOptionRow(option: CompletionOption | string): CompletionOptionRow {
-  const value: CompletionOption = typeof option === 'string' ? {label: option} : (option ?? {});
-  const label = String(value.label ?? '');
+/** 把结构化补全选项归一化为带安全默认值的行数据。 */
+export function completionOptionRow(option: CompletionOption): CompletionOptionRow {
+  const label = String(option?.label ?? '');
   return {
     label,
-    description: value.description ? String(value.description) : '',
-    icon: value.icon ? String(value.icon) : '',
-    directory: Boolean(value.isDirectory),
+    description: option?.description ? String(option.description) : '',
+    icon: option?.icon ? String(option.icon) : '',
+    directory: Boolean(option?.isDirectory),
   };
 }
 
@@ -196,9 +203,11 @@ export function completionMenuWindow(
   maxRows = 6,
 ): CompletionWindow {
   const total = options.length;
-  const rows = Math.max(1, Math.min(Math.max(1, maxRows), total));
-  const index = Math.max(0, Math.min(total - 1, selected));
-  const start = Math.max(0, Math.min(index - Math.floor(rows / 2), Math.max(0, total - rows)));
+  const rows = total === 0 ? 0 : Math.min(Math.max(1, maxRows), total);
+  const index = total === 0 ? 0 : Math.max(0, Math.min(total - 1, selected));
+  const start = rows === 0
+    ? 0
+    : Math.max(0, Math.min(index - Math.floor(rows / 2), Math.max(0, total - rows)));
   const visible = options.slice(start, start + rows);
   return {
     options: visible,
@@ -220,14 +229,13 @@ export type DirectoryTraversal = {
  * 分隔符），并返回子目录请求路径；非目录选项返回 null，不触发目录遍历。
  */
 export function enterCompletionDirectory(
-  option: CompletionOption | string,
+  option: CompletionOption,
   text: string,
   start: number,
   end: number,
 ): DirectoryTraversal | null {
-  const value: CompletionOption = typeof option === 'string' ? {label: option} : (option ?? {});
-  if (!value.isDirectory) return null;
-  const label = String(value.label ?? '');
+  if (!option.isDirectory) return null;
+  const label = String(option.label ?? '');
   const dir = label.endsWith('/') ? label : `${label}/`;
   const from = Math.max(0, Math.min(start, text.length));
   const to = Math.max(from, Math.min(end, text.length));

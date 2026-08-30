@@ -4,6 +4,15 @@
 
 export type CompletionMode = 'mention' | 'command';
 
+/** A completion candidate carries display metadata through the pure state layer. */
+export type CompletionOption = {
+  label: string;
+  description?: string;
+  icon?: string;
+  type?: string;
+  isDirectory?: boolean;
+};
+
 export type CompletionContext = {
   mode: CompletionMode;
   // Character offsets in the composer; safe for string replacement.
@@ -18,9 +27,18 @@ export type CompletionMenuState = {
   end: number;
   query: string;
   requestId: number;
-  options: string[];
+  options: CompletionOption[];
   selected: number;
 };
+
+function isRenderableCompletionOption(option: CompletionOption): boolean {
+  return option.label.trim().length > 0
+    || (option.description?.trim().length ?? 0) > 0;
+}
+
+function normalizeCompletionOption(option: CompletionOption | string): CompletionOption {
+  return typeof option === 'string' ? {label: option} : option;
+}
 
 /** Current completion token at the cursor, or null when no completion applies.
  *
@@ -72,10 +90,19 @@ export function shouldHandleAutocompleteKey(key: string): boolean {
 export function applyCompletionResult(
   current: CompletionMenuState,
   requestId: number,
-  options: string[],
+  options: readonly (CompletionOption | string)[],
 ): CompletionMenuState {
   if (requestId < current.requestId) return current;
-  return {...current, requestId, options, selected: 0};
+  const structured = options
+    .map(normalizeCompletionOption)
+    .filter(isRenderableCompletionOption);
+  return {
+    ...current,
+    requestId,
+    mode: structured.length > 0 ? current.mode : null,
+    options: structured,
+    selected: 0,
+  };
 }
 
 export function moveCompletionSelection(
