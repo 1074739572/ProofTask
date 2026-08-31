@@ -1452,7 +1452,21 @@ function LogView(props: {entries: () => Entry[]; now: () => number; active: () =
   // calculations. This keeps every static mount and live render on the same
   // non-empty, metadata-preserving snapshot path, without relying on an
   // external signal to trigger a test-renderer frame.
-  const normalizedEntries = createMemo(() => normalizeTranscriptEntries(props.entries()) as Entry[]);
+  const normalizedEntries = createMemo(() => {
+    const entries = normalizeTranscriptEntries(props.entries()) as Entry[];
+    // Protect long-running sessions from an unbounded render tree. Keep the
+    // newest entries interactive and replace the cold prefix with one explicit
+    // divider so users know content was intentionally folded, not lost.
+    const MAX_RENDERED_ENTRIES = 300;
+    if (entries.length <= MAX_RENDERED_ENTRIES) return entries;
+    const omitted = entries.length - MAX_RENDERED_ENTRIES;
+    return [{
+      id: `transcript-collapsed-${omitted}`,
+      kind: 'log',
+      text: `… 已折叠 ${omitted} 条较早消息 · End 回到底部`,
+      detail: '长会话保护',
+    } as Entry, ...entries.slice(-MAX_RENDERED_ENTRIES)];
+  });
   const TranscriptBody = () => <box flexDirection="column" minWidth={0}>
     <For each={normalizedEntries()}>{(entry: Entry) => <TranscriptEntryView entry={entry} frame={frame} now={props.now} focusId={props.focusId} onToggleExpand={props.onToggleExpand} plainResponse={props.staticRender} />}</For>
   </box>;
