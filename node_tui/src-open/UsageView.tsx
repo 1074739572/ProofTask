@@ -181,7 +181,7 @@ export function UsageView(props: {width: number; height: number; range: () => Us
           <MetricBox label="Input" value={formatTokens(input())} detail={`${formatTokens(totals().out)} output`} color={C.primary} />
           <MetricBox label="Cache hit" value={hitRate()} detail={`${formatTokens(totals().hit)} cached`} color={C.success} />
           <MetricBox label="Calls" value={String(totals().calls)} detail={`${dashboard().models.length} models`} color={C.info} />
-          <MetricBox label="Cost" value="pending" detail="pricing table required" color={C.warning} />
+          <MetricBox label="Ledger" value="local" detail="usage only" color={C.warning} />
         </box>
       }>
         <box flexDirection="column" gap={1} marginTop={1}>
@@ -191,7 +191,7 @@ export function UsageView(props: {width: number; height: number; range: () => Us
           </box>
           <box flexDirection="row" minWidth={0} gap={1}>
             <MetricBox label="Calls" value={String(totals().calls)} detail={`${dashboard().models.length} models`} color={C.info} />
-            <MetricBox label="Cost" value="pending" detail="pricing table required" color={C.warning} />
+            <MetricBox label="Ledger" value="local" detail="usage only" color={C.warning} />
           </box>
         </box>
       </Show>
@@ -224,7 +224,6 @@ export function UsageView(props: {width: number; height: number; range: () => Us
           <text fg={C.textMuted} width={10} wrapMode="none">Hit</text>
           <text fg={C.textMuted} width={9} wrapMode="none">Output</text>
           <text fg={C.textMuted} width={8} wrapMode="none">Calls</text>
-          <text fg={C.textMuted} wrapMode="none">Cost</text>
         </box></Show>
         <For each={dashboard().models.slice(0, compact() ? 5 : 8)}>{row => <box flexDirection={compact() ? 'column' : 'row'} minWidth={0}>
           <text fg={C.text} width={compact() ? undefined : modelWidth()} wrapMode="none" truncate>{row.model}</text>
@@ -233,7 +232,6 @@ export function UsageView(props: {width: number; height: number; range: () => Us
             <text fg={C.success} width={10} wrapMode="none">{formatPercent(row.hit, inputTokens(row))}</text>
             <text fg={C.textMuted} width={9} wrapMode="none">{formatTokens(row.out)}</text>
             <text fg={C.textMuted} width={8} wrapMode="none">{String(row.calls)}</text>
-            <text fg={C.warning} wrapMode="none">pending</text>
           </>}>
             <text fg={C.textMuted} wrapMode="none" truncate>{row.provider} · {formatTokens(inputTokens(row))} in · hit {formatPercent(row.hit, inputTokens(row))} · {row.calls} calls · cost pending</text>
           </Show>
@@ -245,7 +243,7 @@ export function UsageView(props: {width: number; height: number; range: () => Us
         <For each={recent()}>{event => <box flexDirection={compact() ? 'column' : 'row'} minWidth={0}>
           <text fg={C.textMuted} width={compact() ? undefined : 14} wrapMode="none">{compact() ? `${event.day} ${event.ts}` : event.ts}</text>
           <text fg={C.text} width={compact() ? undefined : modelWidth()} wrapMode="none" truncate>{event.model}</text>
-          <text fg={C.primary} wrapMode="none" truncate>{formatTokens(event.hit + event.miss)} in / {formatTokens(event.out)} out · hit {formatPercent(event.hit, event.hit + event.miss)} · cost pending</text>
+          <text fg={C.primary} wrapMode="none" truncate>{formatTokens(event.hit + event.miss)} in / {formatTokens(event.out)} out · hit {formatPercent(event.hit, event.hit + event.miss)}</text>
         </box>}</For>
       </box>
 
