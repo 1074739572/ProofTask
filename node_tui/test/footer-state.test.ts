@@ -47,3 +47,8 @@ test('disconnected footer keeps retry and reconnect hints', () => {
   assert.match(footerHint({...base, backend: 'disconnected'}), /retry/i);
   assert.match(footerHint({...base, backend: 'disconnected'}), /Ctrl\+R reconnect/);
 });
+
+test('disconnected footer includes a numeric backend exit code when available', () => {
+  const text = footerHint({...base, backend: 'disconnected', backendExitCode: 1});
+  assert.match(text, /exit code 1/);
+});

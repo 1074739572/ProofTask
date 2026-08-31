@@ -505,6 +505,10 @@ function readDefaultMode(): string {
 
 let reportDiagnostic: (text: string) => void = (text: string) => { process.stderr.write(`${text}\n`); };
 let backendClient: Backend | null = null;
+// Ignore lifecycle callbacks from a process that was superseded by a
+// reconnect. Without a generation guard, the old process' delayed `exit`
+// event can flip a freshly connected backend back to "disconnected".
+let backendGeneration = 0;
 function send(command: Record<string, unknown>): boolean { return backendClient?.send(command) ?? false; }
 function value(event: any, ...keys: string[]) { for (const key of keys) if (event?.[key] !== undefined && event[key] !== null && event[key] !== '') return String(event[key]); return ''; }
 
@@ -702,7 +706,7 @@ function SubagentCard(props: {agent: Entry; frame: () => string; compact?: boole
   </box>;
 }
 
-function LegacySectionView(props: {section: Section; frame: () => string; now: () => number; focusId: () => string | null; onToggleExpand: (id: string) => void}) {
+function LegacySectionView(props: {section: any; frame: () => string; now: () => number; focusId: () => string | null; onToggleExpand: (id: string) => void}) {
   const sectionText = normalizeRenderableText((props.section as any).text);
   const sectionDetail = normalizeRenderableText((props.section as any).detail);
   // Prompt-only transcript captures are rendered by the OpenTUI test runtime's
@@ -1080,7 +1084,7 @@ function UnsafeSectionView(props: {section: Section; frame: () => string; now: (
   }
   if (section.kind === 'blocked') {
     return shell(<box flexDirection="column" minWidth={0} onMouseUp={(event: any) => {
-      if (event?.button === 0) props.onToggleExpand(entry.id);
+      if (event?.button === 0) props.onToggleExpand(section.id);
     }}>
       <SafeText fg={C.error} value="Blocked" />
       {maybe(text !== null, <SafeText fg={C.error} wrapMode="word" value={text} />)}
@@ -1633,15 +1637,39 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
     const requestId = String(event.request_id || '');
     if (!requestId.startsWith('completion-')) return;
     const seq = Number(requestId.slice('completion-'.length));
+    const commandDescriptions: Record<string, string> = {
+      '/goal': 'Goal management',
+      '/model': 'Switch model',
+      '/models': 'List available models',
+      '/effort': 'Set reasoning effort',
+      '/mode': 'Switch mode',
+      '/compact': 'Compress context',
+      '/status': 'Show status',
+      '/clear': 'Clear screen',
+      '/open': 'Switch workspace',
+      '/resume': 'Resume a session',
+      '/usage': 'Show token usage',
+      '/help': 'Show help',
+    };
     const raw: CompletionOption[] = Array.isArray(event.candidates) ? event.candidates.map((item: unknown) => {
-      if (typeof item === 'string') return {label: item};
+      if (typeof item === 'string') return {
+        label: item,
+        description: commandDescriptions[item] || undefined,
+        isDirectory: /[\\/]$/.test(item),
+      };
       const candidate = item as Record<string, unknown> | null;
+      const candidateType = candidate?.type == null ? '' : String(candidate.type);
       return {
         label: String(candidate?.label ?? candidate?.name ?? ''),
-        description: candidate?.description == null ? undefined : String(candidate.description),
+        description: candidate?.description == null
+          ? (candidate?.detail == null ? undefined : String(candidate.detail))
+          : String(candidate.description),
         icon: candidate?.icon == null ? undefined : String(candidate.icon),
-        type: candidate?.type == null ? undefined : String(candidate.type),
-        isDirectory: Boolean(candidate?.isDirectory),
+        type: candidate?.type == null ? undefined : candidateType,
+        // Accept both the OpenTUI-facing camelCase field and the common
+        // snake_case/legacy spellings emitted by backend adapters.
+        isDirectory: Boolean(candidate?.isDirectory ?? candidate?.is_dir ?? candidate?.directory
+          ?? /^(dir|directory|folder)$/i.test(candidateType)),
       };
     }) : [];
     setCompletion(current => applyCompletionResult(current, seq, raw));
@@ -1652,14 +1680,27 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
     if (!current.mode || !option) return;
     const text = input();
     const label = String(option.label ?? '');
-    const directoryLabel = option.isDirectory
-      ? enterCompletionDirectory(option, label, 0, label.length)?.text ?? label
+    // Directory candidates are inserted with a trailing separator and keep
+    // the completion context open so the next request can enumerate children.
+    // Use the real token range here (rather than the label itself) so a
+    // mention embedded in prose is replaced without disturbing surrounding
+    // text.
+    const traversal = option.isDirectory
+      ? enterCompletionDirectory(option, text, current.start, current.end)
+      : null;
+    const directoryLabel = traversal
+      ? traversal.text.slice(current.start, traversal.text.length - (text.length - current.end))
       : label;
     const insertion = current.mode === 'mention' ? `@${directoryLabel}` : directoryLabel;
     const next = text.slice(0, current.start) + insertion + text.slice(current.end);
-    setInput(next);
-    textareaRef?.setText?.(next);
-    closeCompletion();
+    setComposerText(next);
+    const nextCursor = current.start + insertion.length;
+    queueMicrotask(() => {
+      if (typeof textareaRef?.setCursorByOffset === 'function') textareaRef.setCursorByOffset(nextCursor);
+      else if (textareaRef) textareaRef.cursorOffset = nextCursor;
+      if (option.isDirectory) refreshCompletion(next);
+      else closeCompletion();
+    });
   };
   // Composer grows with content up to MAX lines (then it scrolls internally);
   // the log viewport shrinks by the same amount to keep the layout stable.
@@ -1817,8 +1858,8 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
   const recordGoalSubagentRound = (id: string, text: string, round?: number) => setGoalDecisions(previous => {
     const active = [...previous].reverse().find(item => item.runId === id && item.status === 'active');
     if (!active) return previous;
-    const nextText = shortGoalDecision(text, active.text);
-    if (nextText === active.text) return previous;
+    const nextText = shortGoalDecision(text, active.text || '');
+    if (nextText === (active.text || '')) return previous;
     return [
       ...previous.map(item => item.id === active.id ? {...item, status: 'done' as const} : item),
       {...active, id: `${id}-round-${Date.now()}`, text: nextText, status: 'active' as const, round: Number.isFinite(round) ? round : (active.round || 0) + 1, at: Date.now()},
@@ -1827,13 +1868,13 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
   const recordGoalSubagentTool = (id: string, event: any) => setGoalDecisions(previous => previous.map(item => {
     if (item.runId !== id || item.status !== 'active') return item;
     const name = value(event, 'name') || 'tool';
-    const runningMatch = [...(item.tools || [])].reverse().find(value => value.name === name && value.status === 'running');
+    const runningMatch = ([...(item.tools || [])] as any[]).reverse().find((toolRow: any) => toolRow.name === name && toolRow.status === 'running');
     const toolId = value(event, 'tool_use_id') || (event.ok !== null && event.ok !== undefined ? runningMatch?.id : '') || `${name}-${(item.tools || []).length}`;
     const status = event.ok === null || event.ok === undefined ? 'running' : (event.ok ? 'done' : 'failed');
     const tool = {id: toolId, name, summary: value(event, 'summary'), status: status as 'running' | 'done' | 'failed'};
-    const existing = (item.tools || []).findIndex(value => value.id === toolId);
+    const existing = (item.tools || []).findIndex((toolRow: any) => toolRow.id === toolId);
     const tools = existing >= 0
-      ? (item.tools || []).map((value, index) => index === existing ? tool : value)
+      ? (item.tools || []).map((toolRow: any, index: number) => index === existing ? tool : toolRow)
       : [...(item.tools || []), tool].slice(-6);
     return {...item, tools, at: Date.now()};
   }));
@@ -1842,7 +1883,7 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
     const failed = /^(failed|stopped):/i.test(summary.trim());
     return {
       ...item,
-      text: shortGoalDecision(summary, item.text),
+      text: shortGoalDecision(summary, item.text || ''),
       status: failed ? 'failed' as const : 'done' as const,
       at: Date.now(),
       elapsed: Number.isFinite(elapsed) ? elapsed : item.elapsed,
@@ -2274,22 +2315,38 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
   };
   const startBackendClient = () => {
     if (process.env.DEBUG_SKIP_BACKEND === '1') return;
+    const generation = ++backendGeneration;
     setBackendState('reconnecting');
     backendClient = startBackend(handleBackendEvent, reportDiagnostic, {
       cwd: cwd() || undefined,
       onState: (state, detail) => {
+        if (generation !== backendGeneration) return;
         setBackendState(state);
         if (state === 'connected') {
           setBackendReady(true);
           setBackendExitCode(null);
-          const pending = offlineMessages();
-          if (pending.length) {
-            const remaining: OfflineMessage[] = [];
-            for (const message of pending) {
-              if (!send({type: 'user_message', text: message.text, goal_context: message.goalContext})) remaining.push(message);
+          // startBackend invokes onState('connected') synchronously, before
+          // it returns the new Backend handle. Defer delivery one microtask
+          // so `backendClient` points at that fresh process rather than the
+          // stopped predecessor.
+          queueMicrotask(() => {
+            if (generation !== backendGeneration) return;
+            // A failed flush can leave messages in the local FIFO while the
+            // backend is down. Re-trigger the idle transition after reconnect
+            // so those messages are delivered without requiring another key
+            // press. The queue itself remains busy-aware and will defer them
+            // when an agent run is already active.
+            messageQueue.setBusy(running());
+            setLocalPendingMessages(messageQueue.pendingCount());
+            const pending = offlineMessages();
+            if (pending.length) {
+              const remaining: OfflineMessage[] = [];
+              for (const message of pending) {
+                if (!send({type: 'user_message', text: message.text, goal_context: message.goalContext})) remaining.push(message);
+              }
+              setOfflineMessages(remaining);
             }
-            setOfflineMessages(remaining);
-          }
+          });
         } else if (state === 'disconnected') {
           setBackendReady(false);
           setBackendExitCode(detail?.code == null ? null : Number(detail.code));
@@ -2438,7 +2495,13 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
     if (historySearchOpen()) { chooseHistoryMatch(); return; }
     const paste = pastedContent();
     const text = (paste && !paste.expanded ? paste.text : input()).trim();
-    if (!text) return;
+    // Enter is also the documented recovery action when the backend is down;
+    // it must work with an empty composer, not only when an offline message
+    // happens to be present.
+    if (!text) {
+      if (backendState() === 'disconnected') reconnectBackend();
+      return;
+    }
     const isCommand = text.startsWith('/');
     const draftAnswerCheckpoint = draftStatus()?.status === 'clarifying' && Boolean(draftStatus()?.question);
     const goalContext = !isCommand && lifecycleView() === 'draft' && draftAnswerCheckpoint;
@@ -2505,6 +2568,7 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
   const uiStatus = () => deriveUiStatus({
     width: dims().width,
     backend: backendState(),
+    backendExitCode: backendExitCode(),
     running: running(),
     phase: phase(),
     elapsed: elapsed(),
@@ -2601,18 +2665,18 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
     <box position="relative" height={composerReservedRows()} flexShrink={0} paddingX={1} flexDirection="column">
       <box height={composerReservedRows()} flexShrink={0} flexDirection="column">
         <box height={composerLines()} flexShrink={0} flexDirection="row">
-          <text fg={C.primary} wrapMode="none" truncate>{mode()}</text>
-          <text fg={C.textMuted} wrapMode="none"> · </text>
-          <text fg={C.primary} wrapMode="none" truncate>{model()}</text>
-          <text fg={C.textMuted} wrapMode="none"> · </text>
+          <text fg={C.primary} wrapMode="none" truncate selectable={false}>{mode()}</text>
+          <text fg={C.textMuted} wrapMode="none" selectable={false}> · </text>
+          <text fg={C.primary} wrapMode="none" truncate selectable={false}>{model()}</text>
+          <text fg={C.textMuted} wrapMode="none" selectable={false}> · </text>
           <text fg={C.info} wrapMode="none" truncate selectable={false} onMouseUp={(event: any) => { if (event?.button === 0) openEffortPicker(); }}>{effortShortLabel(effortLabel(), effort())} ▾</text>
-          <text fg={C.primary}> › </text>
+          <text fg={C.primary} selectable={false}> › </text>
           <textarea flexGrow={1} focused height={composerLines()} placeholder={running() ? 'working…' : 'Ask anything…'} initialValue={input()} keyBindings={textareaBindings as any} onContentChange={() => { const v = textareaRef?.plainText ?? ''; const nowValue = Date.now(); const elapsedMs = lastBufferChangedAt ? nowValue - lastBufferChangedAt : 0; if (suppressContentChange) { lastBufferValue = v; lastBufferChangedAt = nowValue; return; } if (v !== input() && likelyPaste(lastBufferValue, v, elapsedMs)) { const paste = makePasteSnapshot(v); setPastedContent(paste); const folded = foldedPasteLabel(paste); setInput(folded); textareaRef?.setText?.(folded); showToast(`Pasted ${paste.lines} lines · ${paste.bytes} bytes · Ctrl+O expand`); lastBufferValue = folded; lastBufferChangedAt = nowValue; return; } if (v !== input()) { setInput(v); refreshCompletion(v); } lastBufferValue = v; lastBufferChangedAt = nowValue; }} onSubmit={submit as any} ref={el => { textareaRef = el as any; }} />
         </box>
       </box>
     </box>
     {activeOverlayDescriptor() !== null ? <OverlayBoundary /> : null}
-    <box height={() => !running() && toast() ? 1 : 0} flexShrink={0}>
+    <box height={(() => !running() && toast() ? 1 : 0) as any} flexShrink={0}>
       <SafeText fg={C.success} wrapMode="none" truncate value={toast()?.text} />
     </box>
     <StatusLine status={uiStatus} />

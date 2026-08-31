@@ -24,6 +24,8 @@ export type FooterState = {
   toolsDone: number;
   toolsTotal: number;
   backend: BackendConnectionState;
+  /** Optional process exit code shown while the backend is unavailable. */
+  backendExitCode?: number | null;
   permissionWait?: boolean;
   completionOpen?: boolean;
   composerLines: number;
@@ -236,13 +238,13 @@ export function enterCompletionDirectory(
 ): DirectoryTraversal | null {
   if (!option.isDirectory) return null;
   const label = String(option.label ?? '');
-  const dir = label.endsWith('/') ? label : `${label}/`;
+  const dir = /[\\/]$/.test(label) ? label : `${label}/`;
   const from = Math.max(0, Math.min(start, text.length));
   const to = Math.max(from, Math.min(end, text.length));
   return {
     text: text.slice(0, from) + dir + text.slice(to),
     cursor: from + dir.length,
-    path: label.replace(/\/+$/, ''),
+    path: label.replace(/[\\/]+$/, ''),
   };
 }
 
@@ -274,7 +276,12 @@ export function foldedPasteLabel(paste: PasteSnapshot): string {
 
 export function footerHint(state: FooterState): string {
   if (state.backend === 'reconnecting') return 'Reconnecting backend...';
-  if (state.backend === 'disconnected') return 'Backend unavailable · Enter retry · Ctrl+R reconnect';
+  if (state.backend === 'disconnected') {
+    const code = state.backendExitCode == null || !Number.isFinite(state.backendExitCode)
+      ? ''
+      : ` (exit code ${state.backendExitCode})`;
+    return `Backend unavailable${code} · Enter retry · Ctrl+R reconnect`;
+  }
   if (state.permissionWait) return 'Permission approval required · choose Allow or Deny · Esc cancel';
   if (state.completionOpen) return '↑↓ select · Tab/Enter apply · Esc close';
   if (state.toast && !state.running) return state.toast;

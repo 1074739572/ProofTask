@@ -41,5 +41,8 @@ export function StatusLine(props: {status: UiStatus | (() => UiStatus)}): any {
     const current = status();
     return current.backend === 'connected' && !current.running && !current.permissionWait ? C.textMuted : C.warning;
   };
-  return <text fg={color()} wrapMode="none" truncate>{() => statusLineText(status())}</text>;
+  // Footer/status content is an interaction hint, not transcript data. Keep
+  // it out of mouse selection so dragging across the bottom bar never copies
+  // controls instead of the conversation.
+  return <text fg={color()} wrapMode="none" truncate selectable={false} content={statusLineText(status())} />;
 }

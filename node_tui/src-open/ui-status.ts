@@ -7,6 +7,7 @@ import type {BackendConnectionState, PasteSnapshot} from './interaction.ts';
 export type UiStatus = {
   width: number;
   backend: BackendConnectionState;
+  backendExitCode?: number | null;
   running: boolean;
   phase: string;
   elapsed: string;
@@ -49,10 +50,13 @@ export function deriveUiStatus(input: UiStatusInput): UiStatus {
   const contextWindow = Math.max(0, Number(input.contextWindow) || 0);
   const queuedMessages = Math.max(0, Number(input.queuedMessages ?? input.pending) || 0);
   const permissionWait = Boolean(input.permissionWait);
+  const rawExitCode = input.backendExitCode == null ? null : Number(input.backendExitCode);
+  const backendExitCode = rawExitCode != null && Number.isFinite(rawExitCode) ? rawExitCode : null;
 
   return {
     width: Math.max(1, Number(input.width) || 1),
     backend,
+    backendExitCode,
     running: Boolean(input.running),
     phase: String(input.phase || (input.running ? 'working' : 'idle')),
     elapsed: String(input.elapsed || '0s'),

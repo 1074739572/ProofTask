@@ -37,7 +37,12 @@ function isRenderableCompletionOption(option: CompletionOption): boolean {
 }
 
 function normalizeCompletionOption(option: CompletionOption | string): CompletionOption {
-  return typeof option === 'string' ? {label: option} : option;
+  // The backend's wire-compatible form is a plain path string. A trailing
+  // separator is the only directory metadata available in that form, so
+  // preserve it for the UI's directory traversal affordance.
+  return typeof option === 'string'
+    ? {label: option, isDirectory: /[\\/]$/.test(option)}
+    : option;
 }
 
 /** Current completion token at the cursor, or null when no completion applies.

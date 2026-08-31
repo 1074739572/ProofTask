@@ -138,6 +138,13 @@ function optionRowText(option: OverlayOptionRow): string {
   return `${selectedPrefix}${primary || description}`;
 }
 
+function commandGroup(label: string): string {
+  const value = label.trim().toLowerCase();
+  if (value === '/goal' || value.startsWith('/plan')) return 'Goal';
+  if (value === '/model' || value === '/models' || value === '/effort') return 'Model';
+  return 'Session';
+}
+
 function OverlayPanel(props: {
   panel: Accessor<ActivePanel>;
   width: Accessor<number>;
@@ -198,7 +205,15 @@ function OverlayPanel(props: {
     const panel = props.panel();
     const options = visibleOptions();
     const rows: OverlayPanelRow[] = [];
+    let lastGroup = '';
     for (const option of options) {
+      if (panel.kind === 'completion' && option.label.trim().startsWith('/')) {
+        const group = commandGroup(option.label);
+        if (group !== lastGroup) {
+          rows.push({text: `▸ ${group}`, color: C.primary, wrapMode: 'none', truncate: true});
+          lastGroup = group;
+        }
+      }
       const text = optionRowText(option).trim();
       if (text.length === 0) continue;
       rows.push({
@@ -212,7 +227,7 @@ function OverlayPanel(props: {
   });
   const title = createMemo(() => textValue(props.panel().title));
   const showHint = createMemo(() => title().length > 0 && visibleOptions().length > 0);
-  return <box position="absolute" left={Math.max(0, props.width() - panelWidth())} bottom={props.composerRows()} width={panelWidth()} maxHeight={Math.max(1, Math.min(23, props.composerRows() + 3))} flexDirection="column" backgroundColor={C.userCard} paddingX={1} zIndex={20}><Show when={title().length > 0}>{() => <text fg={C.primary} wrapMode="none" truncate>{title()}</text>}</Show><For each={panelRows()}>{row => <text fg={row.color} wrapMode={row.wrapMode} truncate={row.truncate}>{row.text}</text>}</For><Show when={showHint()}>{() => <text fg={C.textMuted} wrapMode="none" truncate>{props.panel().kind === 'history' ? 'Enter select · Esc cancel' : '↑↓ select · Tab/Enter apply · Esc close'}</text>}</Show></box>;
+  return <box position="absolute" left={Math.max(0, props.width() - panelWidth())} bottom={props.composerRows()} width={panelWidth()} maxHeight={Math.max(1, Math.min(23, props.composerRows() + 3))} flexDirection="column" backgroundColor={C.userCard} paddingX={1} zIndex={20}><Show when={title().length > 0}><text fg={C.primary} wrapMode="none" truncate>{title()}</text></Show><For each={panelRows()}>{row => <text fg={row.color} wrapMode={row.wrapMode} truncate={row.truncate}>{row.text}</text>}</For><Show when={showHint()}><text fg={C.textMuted} wrapMode="none" truncate>{props.panel().kind === 'history' ? 'Enter select · Esc cancel' : '↑↓ select · Tab/Enter apply · Esc close'}</text></Show></box>;
 
 }
 
@@ -250,7 +265,7 @@ export function OverlayLayer(props: OverlayLayerProps) {
         kind: 'permission',
         title: typeof permission.title === 'string' ? permission.title.trim() : '',
         options: renderableOptions(permission.options),
-        selected: permission.selected ?? props.overlayIndex?.() ?? 0,
+        selected: (permission as any).selected ?? props.overlayIndex?.() ?? 0,
       };
     }
 
@@ -260,7 +275,7 @@ export function OverlayLayer(props: OverlayLayerProps) {
         kind: 'picker',
         title: typeof picker.title === 'string' ? picker.title.trim() : '',
         options: renderableOptions(picker.options),
-        selected: picker.selected ?? props.overlayIndex?.() ?? 0,
+        selected: (picker as any).selected ?? props.overlayIndex?.() ?? 0,
       };
     }
 

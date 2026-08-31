@@ -10,6 +10,17 @@ export type TodoItem = {
 
 export type PickerItem = {id: string; label: string; detail?: string};
 export type PickerState = {id: string; title: string; items: PickerItem[]; selected: number};
+export type CompletionCandidate = string | {
+  label?: string;
+  name?: string;
+  description?: string;
+  detail?: string;
+  icon?: string;
+  type?: string;
+  isDirectory?: boolean;
+  is_dir?: boolean;
+  directory?: boolean;
+};
 
 export type WelcomeState = {
   art: string[];
@@ -46,7 +57,7 @@ export type UiEvent =
   | { type: 'files_changed'; seq?: number; ts?: number; paths: string[] }
   | { type: 'log'; seq?: number; ts?: number; level?: string; text: string }
   | { type: 'error'; seq?: number; ts?: number; text: string }
-  | { type: 'completion_result'; seq?: number; ts?: number; request_id?: string; candidates: string[] }
+  | { type: 'completion_result'; seq?: number; ts?: number; request_id?: string; candidates: CompletionCandidate[] }
   | { type: 'workspace_switched'; seq?: number; ts?: number; cwd: string }
   | { type: 'workspace_list'; seq?: number; ts?: number; projects: Array<{path: string; current: boolean}> }
   | { type: 'subagent_start'; seq?: number; ts?: number; id: string; agent_type: string; description: string; model: string; cwd?: string }
