@@ -1608,6 +1608,10 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
   const [completion, setCompletion] = createSignal<CompletionMenuState>({
     mode: null, start: 0, end: 0, query: '', requestId: 0, options: [], selected: 0,
   });
+  // Keep a small in-session MRU list for @ references. It is intentionally
+  // workspace-local and bounded; durable chat history already captures the
+  // complete prompt text without making completion startup perform I/O.
+  const [recentMentionPaths, setRecentMentionPaths] = createSignal<string[]>([]);
   let completionRequestSeq = 0;
   let completionDebounce: ReturnType<typeof setTimeout> | null = null;
   const closeCompletion = () => {
@@ -1672,6 +1676,14 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
           ?? /^(dir|directory|folder)$/i.test(candidateType)),
       };
     }) : [];
+    const recent = recentMentionPaths();
+    if (completion().mode === 'mention' && recent.length > 0) {
+      raw.sort((a, b) => {
+        const ai = recent.indexOf(a.label.replace(/[\\/]$/, ''));
+        const bi = recent.indexOf(b.label.replace(/[\\/]$/, ''));
+        return (ai < 0 ? recent.length : ai) - (bi < 0 ? recent.length : bi);
+      });
+    }
     setCompletion(current => applyCompletionResult(current, seq, raw));
   };
   const selectCompletion = () => {
@@ -1693,6 +1705,10 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
       : label;
     const insertion = current.mode === 'mention' ? `@${directoryLabel}` : directoryLabel;
     const next = text.slice(0, current.start) + insertion + text.slice(current.end);
+    if (current.mode === 'mention' && !option.isDirectory) {
+      const normalized = label.replace(/[\\/]$/, '');
+      if (normalized) setRecentMentionPaths(previous => [normalized, ...previous.filter(item => item !== normalized)].slice(0, 12));
+    }
     setComposerText(next);
     const nextCursor = current.start + insertion.length;
     queueMicrotask(() => {

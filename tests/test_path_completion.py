@@ -41,6 +41,15 @@ def test_completion_clamps_cursor_out_of_bounds(tmp_path):
     assert complete_paths("@al", -10, cwd=tmp_path) == []
 
 
+def test_completion_fuzzy_matches_when_prefix_is_not_typed(tmp_path):
+    (tmp_path / "AppController.tsx").write_text("", encoding="utf-8")
+    (tmp_path / "README.md").write_text("", encoding="utf-8")
+
+    # "act" is a subsequence of AppController but not a prefix. Prefix and
+    # fuzzy candidates share the same full-line replacement contract.
+    assert complete_paths("@act", cwd=tmp_path) == ["@AppController.tsx"]
+
+
 class FakeReadline:
     def __init__(self, line: str) -> None:
         self.line = line

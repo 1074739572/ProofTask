@@ -54,17 +54,48 @@ def complete_paths(
     except OSError:
         return []
 
-    results: list[str] = []
+    ranked: list[tuple[int, str, str]] = []
     for entry in entries:
-        if not entry.name.casefold().startswith(prefix.casefold()):
+        score = _fuzzy_match_score(prefix, entry.name)
+        if score is None:
             continue
         if context.directories_only and not entry.is_dir():
             continue
         completed_path = directory_text + entry.name
         if entry.is_dir():
             completed_path += separator
-        results.append(text[: context.start] + completed_path + text[context.end :])
-    return results
+        ranked.append((score, entry.name.casefold(), text[: context.start] + completed_path + text[context.end :]))
+    # Prefix matches remain first; fuzzy subsequence matches make deep paths
+    # discoverable without changing the wire format or replacement semantics.
+    ranked.sort(key=lambda item: (item[0], item[1]))
+    return [item[2] for item in ranked]
+
+
+def _fuzzy_match_score(query: str, candidate: str) -> int | None:
+    """Return a stable ranking score when *query* is a candidate subsequence.
+
+    A score of zero is reserved for ordinary prefix matches. Fuzzy matches are
+    penalized by gaps and by a non-prefix start, while still remaining
+    deterministic for equal scores. Empty queries match every candidate.
+    """
+    needle = query.casefold()
+    haystack = candidate.casefold()
+    if not needle:
+        return 0
+    if haystack.startswith(needle):
+        return 0
+    pos = 0
+    first = -1
+    gaps = 0
+    for char in needle:
+        found = haystack.find(char, pos)
+        if found < 0:
+            return None
+        if first < 0:
+            first = found
+        gaps += max(0, found - pos)
+        pos = found + 1
+    return 10 + first + gaps
 
 
 def _preferred_separator(value: str) -> str:
