@@ -166,6 +166,23 @@ def _emit_welcome() -> None:
     )
 
 
+def _emit_history_replay(history: list, *, limit: int = 300) -> None:
+    """Send a bounded, display-ready transcript when the TUI reconnects."""
+    from harness.project.resume import _message_text
+
+    rows = []
+    for index, message in enumerate(history[-max(1, limit):]):
+        role = str(message.get("role") or "")
+        if role not in ("user", "assistant"):
+            continue
+        text = _message_text(message.get("content")).strip()
+        if not text:
+            continue
+        rows.append({"id": f"history-{index}", "role": role, "text": text})
+    if rows:
+        emit("history_replay", messages=rows, truncated=len(history) > limit)
+
+
 def _emit_status(context: dict, binding, history: list, *, running: bool = False) -> None:
     payload = _status_payload(context, binding, history)
     payload["running"] = running
@@ -675,6 +692,7 @@ def run_event_stream() -> None:
     worker_thread.start()
 
     _emit_status(context, binding, history, running=False)
+    _emit_history_replay(history)
     # Restore a paused/in-progress Goal after a TUI restart. Terminal Goals stay
     # out of the startup view, but `/goal status` can still request them.
     from harness.goal.runner import emit_current_goal_status

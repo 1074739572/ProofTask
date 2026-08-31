@@ -44,7 +44,9 @@ export function startBackend(
   const child = spawn(python, buildBackendArgs(options.cwd), {
     cwd: repoRoot,
     stdio: ['pipe', 'pipe', 'pipe'],
-    env: {...process.env, PYTHONIOENCODING: 'utf-8'},
+    // The TUI is a continuing session: re-entering the app should restore the
+    // active session transcript instead of starting with an empty viewport.
+    env: {...process.env, HARNESS_CONTINUE_SESSION: process.env.HARNESS_CONTINUE_SESSION ?? '1', PYTHONIOENCODING: 'utf-8'},
   });
   options.onState?.('connected');
 

@@ -2053,6 +2053,21 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
         }
       }
       switch (event.type) {
+      case 'history_replay': {
+        if (entries().length > 0 || !Array.isArray(event.messages)) break;
+        const replay = event.messages.flatMap((item: any, index: number) => {
+          const text = normalizeRenderableText(item?.text);
+          if (!text) return [];
+          const role = item?.role === 'assistant' ? 'response' : 'prompt';
+          return [{id: String(item?.id || `history-${index}`), kind: role, text}];
+        });
+        if (replay.length > 0) {
+          const prefix = event.truncated ? [{id: 'history-replay-divider', kind: 'log', text: '… 已折叠更早的历史消息 · 最近 300 条'} as Entry] : [];
+          setEntries([...prefix, ...replay] as Entry[]);
+          setUserStarted(true);
+        }
+        break;
+      }
       case 'session_status': {
         setModel(value(event, 'model') || 'model'); setMode(value(event, 'mode') || 'mode'); setCwd(value(event, 'cwd', 'working_dir')); setSession(value(event, 'session', 'session_id'));
         setEffort(value(event, 'reasoning_effort') || 'off'); setEffortLabel(value(event, 'reasoning_effort_label') || 'Model default');
