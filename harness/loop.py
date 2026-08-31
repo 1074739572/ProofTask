@@ -263,10 +263,12 @@ def agent_loop(
                 if binding is not None
                 else None
             )
+            call_overrides = dict(model_overrides)
+            if primary_usage_context is not None:
+                call_overrides["usage_context"] = primary_usage_context
             response = call_llm(
                 messages, context, tools, state, max_tokens,
-                usage_context=primary_usage_context,
-                **model_overrides,
+                **call_overrides,
             )
         except Exception as exc:
             if is_cancelled():
@@ -291,8 +293,7 @@ def agent_loop(
                     try:
                         response = call_llm(
                             messages, context, tools, state, max_tokens,
-                            usage_context=primary_usage_context,
-                            **model_overrides,
+                            **call_overrides,
                         )
                         break
                     except Exception as retry_exc:

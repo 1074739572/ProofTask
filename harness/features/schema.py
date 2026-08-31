@@ -61,6 +61,9 @@ class VerificationEvidence:
     code_snapshot: str = ""  # git HEAD:worktree-fingerprint at verification time
     selectors: tuple[str, ...] = ()
     collected_count: int = 0
+    # Structured explanation of non-zero test output.  This is deliberately
+    # advisory: the exit code remains the source of truth for the verdict.
+    diagnostics: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

@@ -28,6 +28,7 @@
     "get_task": "low",
     "list_features": "low",
     "project_status": "low",
+    "verify_command": "low",
     "load_skill": "low",
     "todo_write": "low",
     "web_search": "low",

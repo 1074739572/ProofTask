@@ -274,7 +274,7 @@ def case_f005_atomic_write_no_corruption() -> None:
 # --- F006: task backward compatibility ---------------------------------------
 
 def case_f006_task_schema_is_strict() -> None:
-    """Old Feature-linked task state is rejected instead of migrated."""
+    """Legacy Feature links remain loadable during the Task migration."""
     import harness.tasks as tasks_mod
     from harness.tasks import Task
 
@@ -286,11 +286,8 @@ def case_f006_task_schema_is_strict() -> None:
             data = json.loads(path.read_text(encoding="utf-8"))
             data["feature_ids"] = ["feat_old"]
             path.write_text(json.dumps(data), encoding="utf-8")
-            try:
-                tasks_mod.load_task(data["id"])
-                assert False, "old Feature-linked task must not load"
-            except ValueError:
-                pass
+            loaded = tasks_mod.load_task(data["id"])
+            assert loaded.feature_ids == ["feat_old"]
             t = Task(id="t1", subject="s", description="d", status="pending", owner=None, blockedBy=[])
             assert t.verification_state == "not_started" and t.evidence == []
     finally:
@@ -444,7 +441,7 @@ CASES = [
     ),
     EvalCase(
         "f006.task_extension_backcompat",
-        "F006: Task schema rejects old Feature links",
+        "F006: Task schema preserves legacy Feature links during migration",
         "features",
         case_f006_task_schema_is_strict,
     ),

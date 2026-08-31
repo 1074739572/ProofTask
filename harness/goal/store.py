@@ -24,6 +24,7 @@ import json
 import os
 import tempfile
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +40,7 @@ from harness.settings import get_workspace_paths
 GOAL_FILENAME = "goal.json"
 HISTORY_DIRNAME = "goal-history"
 LEASE_FILENAME = "goal.lock"
+EVENT_LOG_FILENAME = "goal-events.jsonl"
 
 
 class GoalStoreError(Exception):
@@ -73,6 +75,10 @@ def history_dir(workspace: str | Path | None = None) -> Path:
 
 def lease_path(workspace: str | Path | None = None) -> Path:
     return project_dir(workspace) / LEASE_FILENAME
+
+
+def event_log_path(workspace: str | Path | None = None) -> Path:
+    return project_dir(workspace) / EVENT_LOG_FILENAME
 
 
 def _pid_is_alive(pid: int) -> bool:
@@ -214,7 +220,49 @@ def _atomic_write(path: Path, payload: dict[str, Any]) -> None:
 
 def save_goal(state: GoalState) -> None:
     state.updated_at = time.time()
-    _atomic_write(goal_path(state.workspace or None), state.to_dict())
+    state.sequence = max(0, int(state.sequence or 0)) + 1
+    state.transaction_id = uuid.uuid4().hex
+    payload = state.to_dict()
+    _atomic_write(goal_path(state.workspace or None), payload)
+    # The materialized JSON is the fast read path; the append-only log is the
+    # recovery/audit source. Append only after the atomic snapshot is durable.
+    log = event_log_path(state.workspace or None)
+    log.parent.mkdir(parents=True, exist_ok=True)
+    with log.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps({
+            "sequence": state.sequence,
+            "transaction_id": state.transaction_id,
+            "goal_id": state.id,
+            "at": state.updated_at,
+            "snapshot": payload,
+        }, ensure_ascii=False) + "\n")
+
+
+def reconcile_goal(state: GoalState, workspace: str | Path | None = None) -> GoalState:
+    """Replay the newest valid snapshot when the materialized file lags log."""
+    path = event_log_path(workspace or state.workspace or None)
+    if not path.exists():
+        return state
+    latest: dict[str, Any] | None = None
+    try:
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if not line.strip():
+                continue
+            item = json.loads(line)
+            snapshot = item.get("snapshot") if isinstance(item, dict) else None
+            if not isinstance(snapshot, dict) or snapshot.get("id") != state.id:
+                continue
+            if latest is None or int(item.get("sequence") or 0) > int(latest.get("sequence") or 0):
+                latest = item
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return state
+    if latest is None or int(latest.get("sequence") or 0) <= int(state.sequence or 0):
+        return state
+    snapshot = latest.get("snapshot")
+    try:
+        return GoalState.from_dict(snapshot)
+    except (TypeError, ValueError, KeyError):
+        return state
 
 
 def load_goal(workspace: str | Path | None = None) -> GoalState | None:
@@ -233,16 +281,29 @@ def load_goal(workspace: str | Path | None = None) -> GoalState | None:
         raise GoalStoreError("goal_state_corrupt", f"cannot parse {path}: {exc}") from exc
     if not isinstance(data, dict):
         raise GoalStoreError("goal_state_corrupt", f"{path} is not a JSON object")
-    if data.get("schema_version") != GOAL_SCHEMA_VERSION:
+    version = data.get("schema_version")
+    if version not in {5, GOAL_SCHEMA_VERSION}:
         raise GoalStoreError(
             "unsupported_schema",
-            f"{path} uses schema_version={data.get('schema_version')!r}, "
+            f"{path} uses schema_version={version!r}, "
             f"expected {GOAL_SCHEMA_VERSION}",
         )
+    if version != GOAL_SCHEMA_VERSION:
+        # Goal checkpoints are user work, not disposable cache. v5 predates
+        # execution-time replan recovery, so an empty checkpoint is a safe
+        # forward migration and the next save persists the v6 schema.
+        data = dict(data)
+        data["schema_version"] = GOAL_SCHEMA_VERSION
+        data.setdefault("execution_replan_checkpoint", {})
+        data.setdefault("budget_limits", {})
+        data.setdefault("usage_ledger", {})
+        data.setdefault("sequence", 0)
+        data.setdefault("transaction_id", "")
     try:
         state = GoalState.from_dict(data)
     except (TypeError, ValueError, KeyError) as exc:
         raise GoalStoreError("goal_state_corrupt", f"invalid goal state in {path}: {exc}") from exc
+    state = reconcile_goal(state, workspace)
 
     # Older impact-review code classified a completed model response with no
     # parseable JSON as a provider outage. The exact diagnostic proves this is
@@ -410,6 +471,12 @@ def clear_goal_for_test(workspace: str | Path | None = None) -> None:
     if lock.exists():
         try:
             lock.unlink()
+        except OSError:
+            pass
+    events = event_log_path(workspace)
+    if events.exists():
+        try:
+            events.unlink()
         except OSError:
             pass
     hdir = history_dir(workspace)

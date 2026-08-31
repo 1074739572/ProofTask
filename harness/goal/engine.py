@@ -39,14 +39,17 @@ LEGAL: dict[str, set[str]] = _with_terminal_escapes(
     {
         GoalPhase.INITIALIZE.value: {GoalPhase.SELECT_TASK.value, GoalPhase.PREPARE_TESTS.value},
         GoalPhase.PREPARE_TESTS.value: {GoalPhase.PAUSED.value, GoalPhase.SELECT_TASK.value},
-        GoalPhase.SELECT_TASK.value: {GoalPhase.PREPARE_TESTS.value, GoalPhase.PREPARE_EXECUTION.value, GoalPhase.CLEAN_CHECK.value, GoalPhase.FULL_VERIFY.value},
-        GoalPhase.PREPARE_EXECUTION.value: {GoalPhase.PREPARE_TESTS.value, GoalPhase.CLAIM.value, GoalPhase.ACT.value, GoalPhase.REPAIR_PLAN.value},
-        GoalPhase.CLAIM.value: {GoalPhase.PREPARE_EXECUTION.value, GoalPhase.ACT.value},
-        GoalPhase.ACT.value: {GoalPhase.ROLLOVER.value, GoalPhase.VERIFY.value, GoalPhase.REPAIR_PLAN.value},
+        GoalPhase.SELECT_TASK.value: {GoalPhase.PREPARE_TESTS.value, GoalPhase.PREPARE_EXECUTION.value, GoalPhase.CLAIM.value, GoalPhase.EVALUATE.value, GoalPhase.CLEAN_CHECK.value, GoalPhase.FULL_VERIFY.value},
+        GoalPhase.PREPARE_EXECUTION.value: {GoalPhase.PREPARE_TESTS.value, GoalPhase.CLAIM.value, GoalPhase.ACT.value, GoalPhase.VERIFY.value, GoalPhase.EVALUATE.value, GoalPhase.CLEAN_CHECK.value, GoalPhase.REPAIR_PLAN.value},
+        GoalPhase.CLAIM.value: {GoalPhase.PREPARE_EXECUTION.value, GoalPhase.ACT.value, GoalPhase.EVALUATE.value, GoalPhase.CLEAN_CHECK.value},
+        GoalPhase.ACT.value: {GoalPhase.ROLLOVER.value, GoalPhase.VERIFY.value, GoalPhase.EVALUATE.value, GoalPhase.CLEAN_CHECK.value, GoalPhase.REPAIR_PLAN.value},
         GoalPhase.ROLLOVER.value: {GoalPhase.ACT.value, GoalPhase.VERIFY.value},
         GoalPhase.VERIFY.value: {GoalPhase.ACT.value, GoalPhase.EVALUATE.value, GoalPhase.CLEAN_CHECK.value, GoalPhase.SELECT_TASK.value, GoalPhase.FULL_VERIFY.value, GoalPhase.REPAIR_PLAN.value},
         GoalPhase.EVALUATE.value: {GoalPhase.CLEAN_CHECK.value, GoalPhase.REPAIR_PLAN.value},
-        GoalPhase.REPAIR_PLAN.value: {GoalPhase.ACT.value, GoalPhase.PREPARE_TESTS.value, GoalPhase.SELECT_TASK.value},
+        # A verification-contract observation can require one deterministic
+        # recheck before a planner is allowed to rewrite Task boundaries.
+        # This edge does not authorize another implementation worker.
+        GoalPhase.REPAIR_PLAN.value: {GoalPhase.ACT.value, GoalPhase.VERIFY.value, GoalPhase.PREPARE_TESTS.value, GoalPhase.SELECT_TASK.value},
         GoalPhase.CLEAN_CHECK.value: {GoalPhase.DONE.value, GoalPhase.ACT.value, GoalPhase.REPAIR_PLAN.value, GoalPhase.IMPACT_REVIEW.value},
         GoalPhase.IMPACT_REVIEW.value: {GoalPhase.SELECT_TASK.value, GoalPhase.PREPARE_TESTS.value},
         GoalPhase.FULL_VERIFY.value: {GoalPhase.CLEAN_CHECK.value, GoalPhase.DONE.value, GoalPhase.REPAIR_PLAN.value},

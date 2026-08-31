@@ -32,6 +32,7 @@ from harness.tools.filesystem import (
     run_write,
 )
 from harness.ui.renderer import renderer
+from harness.usage.parse import parse_cache_usage
 
 _BASE_TOOL_DEFS = {
     "bash": {
@@ -199,6 +200,10 @@ class AgentTaskStats:
     tool_errors: list[str] = field(default_factory=list)
     write_audits: list[str] = field(default_factory=list)
     elapsed_seconds: float = 0.0
+    # Provider-reported token usage accumulated across this bounded slice.
+    # These remain zero when a provider omits usage metadata.
+    input_tokens: int = 0
+    output_tokens: int = 0
 
     def record_tool(self, name: str, tool_input: Any, output: object) -> None:
         self.tool_count += 1
@@ -598,6 +603,10 @@ def run_agent_task(
         response = value
         if stats is not None:
             stats.llm_rounds += 1
+            usage = parse_cache_usage(getattr(response, "usage", None))
+            if usage is not None:
+                stats.input_tokens += max(0, int(usage.input_tokens or 0))
+                stats.output_tokens += max(0, int(usage.output_tokens or 0))
             if getattr(response, "stop_reason", None) == "max_tokens":
                 stats.stop_reason = "max_tokens"
 

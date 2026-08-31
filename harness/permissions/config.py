@@ -204,6 +204,35 @@ def _normalize_rules(raw: object) -> dict[str, PermissionRule]:
             return copy.deepcopy(preset)
     if not isinstance(section, dict):
         return dict(DEFAULT_PERMISSIONS)
+    # Shipped permissions.json uses the declarative v1 envelope with tool
+    # severities under ``tools`` plus mode auto-approval metadata.  Resolve
+    # that envelope into the engine's flat effect table; low/medium/high are
+    # risk labels, so deterministic read-only tools become allow while
+    # mutating/high-risk tools remain ask unless an explicit rule says deny.
+    if isinstance(section.get("tools"), dict):
+        flat: dict[str, PermissionRule] = {}
+        for tool_pattern, risk in section["tools"].items():
+            if not isinstance(tool_pattern, str):
+                continue
+            # Detailed top-level rule blocks (notably bash deny patterns) are
+            # more authoritative than the coarse risk label in ``tools``.
+            if tool_pattern in section and isinstance(section.get(tool_pattern), dict):
+                continue
+            level = str(risk or "").lower()
+            effect: PermissionRule = "allow" if level == "low" else "ask"
+            # Keep path-level safety rules from the built-in policy when the
+            # coarse v1 envelope marks a file-inspection tool as low risk.
+            # Otherwise ``inspect_file: low`` would replace the nested
+            # ``*.env: deny`` guard with an unrestricted allow rule.
+            existing = DEFAULT_PERMISSIONS.get(tool_pattern)
+            if isinstance(existing, dict) and effect == "allow":
+                continue
+            flat[tool_pattern] = effect
+        # Preserve structural safety defaults from the built-in policy for
+        # commands not represented by the envelope.
+        merged = dict(DEFAULT_PERMISSIONS)
+        merged.update(flat)
+        return merged
 
     rules: dict[str, PermissionRule] = {}
     for tool_pattern, rule in section.items():

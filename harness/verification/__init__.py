@@ -33,7 +33,7 @@ from harness.features import (
     get_feature,
     verify_feature,
 )
-from harness.verification.evidence import evidence_from_result
+from harness.verification.evidence import diagnose_verification_output, evidence_from_result
 from harness.verification.catalog import (
     TestCatalog,
     build_pytest_command,
@@ -68,6 +68,7 @@ __all__ = [
     "TestCatalog",
     "VerificationDecision",
     "VerificationRunResult",
+    "diagnose_verification_output",
     "check_verification_command",
     "build_pytest_command",
     "collect_pytest_catalog",
@@ -241,11 +242,27 @@ def _run_task_verification(
                 return False, None, f"bound test file is unavailable: {rel}: {exc}"
             if current != str(expected):
                 return False, None, f"bound test file changed after it was approved: {rel}"
+    from harness.verification.snapshot import capture_code_snapshot
+
+    snapshot_before = capture_code_snapshot(root)
     result = run_verification(
         command, workspace=root, timeout_s=timeout_s, cancel_check=cancel_check,
         controller_authorized=controller_authorized,
     )
+    snapshot_after = capture_code_snapshot(root)
+    diagnostics = diagnose_verification_output(result.stdout or "", selectors=selectors)
     error = result.error or (None if result.passed else f"verification failed with exit code {result.exit_code}")
+    if not result.passed and diagnostics.get("failure_mode") == "common_runtime_error":
+        summary = diagnostics.get("result_summary") or {}
+        common = str(diagnostics.get("common_failure") or "common runtime error")[:500]
+        failed_cases = diagnostics.get("failed_cases") or []
+        affected = f"; affected cases: {len(failed_cases)}" if failed_cases else ""
+        case_names = ", ".join(str(name)[:120] for name in failed_cases[:8])
+        case_detail = f"; cases: {case_names}" if case_names else ""
+        error = (
+            f"verification blocked before assertions: {common} "
+            f"({summary.get('passed', 0)} pass / {summary.get('failed', 0)} fail{affected}{case_detail})"
+        )
     executed = result.error is None or result.timed_out
     evidence = (
         evidence_from_result(
@@ -257,4 +274,60 @@ def _run_task_verification(
         if executed
         else None
     )
+    # Every executed Task verification gets a durable, source-locatable debug
+    # bundle.  The bundle is advisory evidence; the exit code remains the
+    # only machine verdict.  Writing under .project is excluded from code
+    # snapshots, so diagnostics cannot make a read-only test look mutated.
+    if executed:
+        try:
+            from harness.verification.debug import build_debug_bundle, write_debug_bundle
+
+            bundle = build_debug_bundle(
+                result,
+                workspace=root,
+                goal_id=str(getattr(task, "goal_id", "") or ""),
+                task_id=str(getattr(task, "id", "") or ""),
+                phase="task_verify",
+                selectors=selectors,
+                test_files=spec.get("test_files") or [],
+                acceptance_ids=[
+                    str(case.get("id"))
+                    for case in (getattr(task, "acceptance_cases", []) or [])
+                    if isinstance(case, dict) and case.get("id")
+                ],
+                approved_paths=[
+                    *(getattr(task, "primary_write", []) or []),
+                    *(getattr(task, "planned_new", []) or []),
+                ],
+                control_group=spec.get("control_group") if isinstance(spec.get("control_group"), dict) else None,
+                snapshot_before=snapshot_before,
+                snapshot_after=snapshot_after,
+            )
+            paths = write_debug_bundle(bundle, workspace=root)
+            if evidence is not None:
+                evidence_diagnostics = evidence.setdefault("diagnostics", {})
+                evidence_diagnostics["debug_bundle"] = paths
+                # Promote the debug classifier into the durable evidence so
+                # Goal repair routing does not need to reopen bundle files or
+                # infer an invalid test contract from a plain 1-failure exit.
+                failure = bundle.get("failure") if isinstance(bundle.get("failure"), dict) else {}
+                contract = bundle.get("contract") if isinstance(bundle.get("contract"), dict) else {}
+                evidence_diagnostics["debug_failure_category"] = str(failure.get("category") or "")
+                evidence_diagnostics["debug_underlying_category"] = str(failure.get("underlying_category") or "")
+                evidence_diagnostics["verification_contract_status"] = str(contract.get("status") or "")
+                evidence_diagnostics["verification_contract_invalid"] = bool(contract.get("invalid"))
+                issues = contract.get("issues") if isinstance(contract.get("issues"), list) else []
+                evidence_diagnostics["verification_contract_issues"] = [
+                    {
+                        "code": str(item.get("code") or "")[:100],
+                        "message": str(item.get("message") or "")[:500],
+                        "severity": str(item.get("severity") or "")[:30],
+                    }
+                    for item in issues[:8]
+                    if isinstance(item, dict)
+                ]
+                evidence["debug_bundle"] = paths
+        except Exception as exc:  # pragma: no cover - diagnostics must not gate verification
+            if evidence is not None:
+                evidence.setdefault("diagnostics", {})["debug_bundle_error"] = f"{type(exc).__name__}: {exc}"
     return result.passed, evidence, error

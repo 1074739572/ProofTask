@@ -1,7 +1,8 @@
 """Built-in reliability eval tasks.
 
-First version ships H001 only; H002–H005 are planned and documented in
-docs/harness-reliability-plan.md §2.3, to be enabled as their fixtures land.
+The reliability suite covers H001–H008 across single-file, cross-module,
+multi-session, overreach, premature-victory, vague-requirement, and refactor
+tasks. Each task is evaluated independently by its hidden oracle.
 """
 
 from __future__ import annotations

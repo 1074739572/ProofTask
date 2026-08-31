@@ -1,5 +1,28 @@
 # ProofTask 项目规则
 
+## Commands
+
+- 运行完整回归：`python -m pytest -q`
+- 运行机制评测：`python -m evals`
+- 运行 Goal 相关测试：`python -m pytest -q tests/test_goal_module.py tests/test_goal_task_contract.py`
+
+## Hard Constraints
+
+- Goal 合同必须冻结；Task 只能在明确范围内修改。
+- 机器验证证据优先于模型自报完成。
+- 外部权限、凭据和敏感操作必须暂停并记录。
+
+## Task Routing
+
+- 先 Discovery，再规划，再生成聚焦测试，最后实现与验证。
+- 失败进入 `implementation_fix`、`test_gap`、`replan` 或 `blocked` 的确定性路线。
+
+## Definition Of Done
+
+- 所有绑定测试和全局回归通过。
+- 当前快照、clean check、范围和恢复证据均为最新。
+- Goal/Task 状态与事件日志可幂等恢复。
+
 ## 项目目标
 
 ProofTask 的核心不是“让模型多做几轮”，而是把大型、抽象的需求变成可审计、可恢复、
@@ -74,4 +97,4 @@ python -m pytest -q tests/test_goal_planning_v2.py tests/test_goal_execution_v2.
 cd node_tui && npm run typecheck
 ```
 
-更完整的设计和故障处理见 [docs/goal-system-guide.md](docs/goal-system-guide.md)。
+更完整的设计和故障处理见 [docs/goal-final-improvement-plan.md](docs/goal-final-improvement-plan.md)。

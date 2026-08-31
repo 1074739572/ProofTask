@@ -21,6 +21,32 @@ _ORIGINAL_TASKS_DIR = TASKS_DIR
 MAX_TASK_HISTORY = 20
 
 
+@dataclass(frozen=True)
+class AttemptRecord:
+    id: str
+    task_revision: int
+    at: float
+    outcome: str
+    scoped_diff: str = ""
+    verification_result_vector: dict = field(default_factory=dict)
+    failure_signature: str = ""
+    new_evidence_refs: list[str] = field(default_factory=list)
+    tested_hypothesis: str = ""
+
+
+@dataclass(frozen=True)
+class FailureRecord:
+    id: str
+    attempt_id: str
+    task_revision: int
+    at: float
+    failure_signature: str
+    failure_mode: str
+    blocked_before_assertions: bool
+    summary: str
+    next_machine_check: str
+
+
 def _tasks_dir() -> Path:
     if TASKS_DIR != _ORIGINAL_TASKS_DIR:
         return TASKS_DIR
@@ -53,6 +79,9 @@ class Task:
     evaluation: dict | None = None
     evaluation_history: list[dict] = field(default_factory=list)
     repair_history: list[dict] = field(default_factory=list)
+    attempt_history: list[dict] = field(default_factory=list)
+    failure_history: list[dict] = field(default_factory=list)
+    revision: int = 1
     evaluation_required: bool = False
     attempts: int = 0
     last_error: str | None = None
@@ -145,6 +174,7 @@ def create_task(
     evidence_refs: list[str] | None = None,
     test_strategy: str = "",
     discovery_revision: int = 0,
+    revision: int = 1,
 ) -> Task:
     spec = dict(verification_spec or {})
     task = Task(
@@ -170,6 +200,7 @@ def create_task(
         evidence_refs=list(evidence_refs or []),
         test_strategy=str(test_strategy or "")[:1000],
         discovery_revision=max(0, int(discovery_revision or 0)),
+        revision=max(1, int(revision or 1)),
     )
     save_task(task)
     return task
@@ -266,17 +297,89 @@ def set_task_verification_result(
     task = _load_task_from_path(path)
     if task.status != "in_progress":
         raise ValueError(f"cannot verify task in state {task.status!r}")
+    attempt = _attempt_record(task, passed=passed, evidence=evidence, error=error)
+    task.attempt_history.append(asdict(attempt))
+    del task.attempt_history[:-MAX_TASK_HISTORY]
     if passed:
         if not evidence or evidence.get("exit_code") != 0:
             raise ValueError("passing verification requires zero-exit evidence")
         task.evidence.append(dict(evidence))
         task.verification_state = "passing"
         task.last_error = None
+        # A previous evaluator verdict is advisory and may describe an older
+        # failing/contradictory run. Do not let it block a fresh zero-exit
+        # verification; retain it in evaluation_history for audit only.
+        task.evaluation = None
     else:
         if evidence:
             task.evidence.append(dict(evidence))
         task.verification_state = "failing"
         task.last_error = error or "verification failed"
+        task.failure_history.append(asdict(_failure_record(task, attempt, evidence=evidence, error=task.last_error)))
+        del task.failure_history[:-MAX_TASK_HISTORY]
+    save_task(task)
+    return task
+
+
+def _attempt_record(task: Task, *, passed: bool, evidence: dict | None, error: str | None) -> AttemptRecord:
+    evidence = evidence if isinstance(evidence, dict) else {}
+    diagnostics = evidence.get("diagnostics") if isinstance(evidence.get("diagnostics"), dict) else {}
+    return AttemptRecord(
+        id=f"attempt_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}",
+        task_revision=max(1, int(task.revision or 1)),
+        at=time.time(),
+        outcome="passed" if passed else "failed",
+        scoped_diff=str(evidence.get("scoped_diff") or evidence.get("code_snapshot") or "")[:2000],
+        verification_result_vector={
+            "exit_code": evidence.get("exit_code"),
+            "collected_count": evidence.get("collected_count", 0),
+            "passed": bool(passed),
+        },
+        failure_signature=str(diagnostics.get("failure_signature") or ""),
+        new_evidence_refs=[str(item) for item in (evidence.get("evidence_refs") or []) if str(item).strip()][:24],
+        tested_hypothesis=str(evidence.get("tested_hypothesis") or error or "")[:1000],
+    )
+
+
+def _failure_record(task: Task, attempt: AttemptRecord, *, evidence: dict | None, error: str | None) -> FailureRecord:
+    evidence = evidence if isinstance(evidence, dict) else {}
+    diagnostics = evidence.get("diagnostics") if isinstance(evidence.get("diagnostics"), dict) else {}
+    mode = str(diagnostics.get("failure_mode") or "assertion_failure")
+    blocked = bool(diagnostics.get("blocked_before_assertions"))
+    next_check = str(diagnostics.get("next_machine_check") or "")
+    if not next_check:
+        next_check = (
+            f"Run a focused {mode} diagnostic probe before changing product code."
+            if blocked
+            else "Rerun the bound Task verification after one scoped repair."
+        )
+    return FailureRecord(
+        id=f"failure_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}",
+        attempt_id=attempt.id,
+        task_revision=max(1, int(task.revision or 1)),
+        at=time.time(),
+        failure_signature=attempt.failure_signature,
+        failure_mode=mode,
+        blocked_before_assertions=blocked,
+        summary=str(error or "verification failed")[:2000],
+        next_machine_check=next_check[:2000],
+    )
+
+
+def reopen_blocked_task(task_id: str, *, reason: str = "verification evidence refreshed") -> Task:
+    """Reopen a blocked Task after its binding/evidence contract is repaired."""
+    path = _active_path(task_id)
+    if not path.exists():
+        raise FileNotFoundError(task_id)
+    task = _load_task_from_path(path)
+    if task.status != "blocked":
+        raise ValueError(f"cannot reopen task in state {task.status!r}")
+    task.status = "in_progress"
+    task.owner = None
+    task.last_error = None
+    task.verification_state = "not_started"
+    task.repair_history.append({"action": "reopen_for_verification", "reason": reason, "at": time.time()})
+    del task.repair_history[:-MAX_TASK_HISTORY]
     save_task(task)
     return task
 
@@ -303,6 +406,70 @@ def record_task_repair(task_id: str, repair: dict) -> Task:
     del task.repair_history[:-MAX_TASK_HISTORY]
     save_task(task)
     return task
+
+
+def record_task_attempt(task_id: str, attempt: AttemptRecord | dict) -> Task:
+    """Append one structured attempt record to the current Task revision."""
+    path = _active_path(task_id)
+    if not path.exists():
+        raise FileNotFoundError(task_id)
+    task = _load_task_from_path(path)
+    payload = asdict(attempt) if isinstance(attempt, AttemptRecord) else dict(attempt)
+    task.attempt_history.append(payload)
+    del task.attempt_history[:-MAX_TASK_HISTORY]
+    save_task(task)
+    return task
+
+
+def record_task_failure(task_id: str, failure: FailureRecord | dict) -> Task:
+    """Append one structured failure record with a next machine check."""
+    path = _active_path(task_id)
+    if not path.exists():
+        raise FileNotFoundError(task_id)
+    task = _load_task_from_path(path)
+    payload = asdict(failure) if isinstance(failure, FailureRecord) else dict(failure)
+    if not str(payload.get("next_machine_check") or "").strip():
+        raise ValueError("FailureRecord requires next_machine_check")
+    task.failure_history.append(payload)
+    del task.failure_history[:-MAX_TASK_HISTORY]
+    save_task(task)
+    return task
+
+
+def mark_task_stale(task_id: str, *, reason: str = "verified inputs changed") -> Task:
+    """Invalidate a passing Task when its inputs or verification snapshot move."""
+    path = _find_task_path(task_id)
+    if path is None:
+        raise FileNotFoundError(task_id)
+    task = _load_task_from_path(path)
+    if task.verification_state == "passing":
+        task.verification_state = "stale"
+        task.last_error = reason[:2000]
+        task.revision = max(1, int(task.revision or 1)) + 1
+        task.repair_history.append({"action": "mark_stale", "reason": reason[:2000], "at": time.time()})
+        del task.repair_history[:-MAX_TASK_HISTORY]
+        save_task(task, archived=path.parent == _archive_dir())
+    return task
+
+
+def invalidate_stale_passing_tasks(
+    task_ids: list[str] | tuple[str, ...],
+    *,
+    current_snapshot: str,
+) -> list[str]:
+    """Mark passing Tasks stale when their recorded verification snapshot moves."""
+    stale: list[str] = []
+    for task_id in task_ids:
+        try:
+            task = load_task(task_id)
+        except (FileNotFoundError, OSError, ValueError):
+            continue
+        latest = task.evidence[-1] if task.evidence else {}
+        recorded = str(latest.get("code_snapshot") or "") if isinstance(latest, dict) else ""
+        if task.verification_state == "passing" and recorded and recorded != str(current_snapshot or ""):
+            mark_task_stale(task_id, reason="verified workspace snapshot changed")
+            stale.append(task_id)
+    return stale
 
 
 def record_task_start(
@@ -338,10 +505,18 @@ def record_task_reverification(
     if path is None:
         raise FileNotFoundError(task_id)
     task = _load_task_from_path(path)
+    attempt = _attempt_record(task, passed=passed, evidence=evidence, error=error)
+    task.attempt_history.append(asdict(attempt))
+    del task.attempt_history[:-MAX_TASK_HISTORY]
     if evidence:
         task.evidence.append(dict(evidence))
     task.verification_state = "passing" if passed else "failing"
     task.last_error = None if passed else (error or "final task verification failed")
+    if not passed:
+        task.failure_history.append(
+            asdict(_failure_record(task, attempt, evidence=evidence, error=task.last_error))
+        )
+        del task.failure_history[:-MAX_TASK_HISTORY]
     save_task(task, archived=path.parent == _archive_dir())
     return task
 
@@ -391,8 +566,13 @@ def bind_task_verification(task_id: str, verification_spec: dict) -> Task:
     return task
 
 
-def request_task_test_repair(task_id: str) -> Task:
-    """Request additive coverage without discarding the existing binding."""
+def request_task_test_repair(task_id: str, *, coverage_only: bool = False) -> Task:
+    """Request additive coverage without discarding the existing binding.
+
+    ``coverage_only`` is used when an already implemented Task needs stronger
+    evidence after evaluator review.  Such a test repair must not reopen the
+    implementation worker once the new test is bound.
+    """
     path = _active_path(task_id)
     if not path.exists():
         raise FileNotFoundError(task_id)
@@ -403,6 +583,9 @@ def request_task_test_repair(task_id: str) -> Task:
     spec["previous_test_hashes"] = dict(spec.get("test_hashes") or {})
     spec["source"] = "needs_generation"
     spec["allow_posthoc_test"] = True
+    if coverage_only:
+        spec["coverage_only"] = True
+        spec["coverage_repair_count"] = int(spec.get("coverage_repair_count") or 0) + 1
     task.verification_spec = spec
     task.verification_state = "needs_generation"
     task.last_error = "evaluator requested additional focused coverage"

@@ -56,7 +56,7 @@ def git_changed_files(workspace: Path) -> list[str]:
     except (OSError, subprocess.TimeoutExpired):
         return []
     runtime_dirs = {".project", ".transcripts", ".tasks", ".mailboxes",
-                    ".worktrees", ".memory", ".rag", ".scheduled_tasks.json"}
+                    ".worktrees", ".memory", ".rag", ".features", ".scheduled_tasks.json"}
     files: list[str] = []
     for line in proc.stdout.splitlines():
         if len(line) < 4:

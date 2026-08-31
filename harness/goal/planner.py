@@ -205,6 +205,11 @@ class TaskPlan:
     test_strategy: str = ""
     discovery_revision: int = 0
 
+    @property
+    def scope_paths(self) -> tuple[str, ...]:
+        """Legacy v1 view of the task's declared scope."""
+        return self.primary_write or self.planned_new or self.read_envelope
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "name": self.name,
@@ -251,7 +256,20 @@ class GoalPlan:
 
     contract: dict[str, Any]
     tasks: tuple[TaskPlan, ...]
+    replacement_coverage: tuple[dict[str, Any], ...] = ()
     review: dict[str, Any] = field(default_factory=dict)
+
+    # Compatibility sequence facade for callers written against planning v1.
+    # The durable representation remains the v2 GoalPlan object; this only
+    # lets old integrations inspect the task projection while they migrate.
+    def __len__(self) -> int:
+        return len(self.tasks)
+
+    def __iter__(self):
+        return iter(self.tasks)
+
+    def __getitem__(self, index):
+        return self.tasks[index]
 
 
 def _parse_acceptance_cases(raw: Any) -> tuple[AcceptanceCase, ...]:
@@ -484,6 +502,7 @@ def build_plan_prompt(
     human_language: str = "English",
     frozen_contract: dict[str, Any] | None = None,
     completed_task_names: tuple[str, ...] = (),
+    replacement_scope: tuple[dict[str, Any], ...] = (),
     replan_reason: str = "",
     execution_workspace_paths: tuple[str, ...] = (),
 ) -> str:
@@ -500,8 +519,9 @@ def build_plan_prompt(
     if frozen_contract is not None:
         replan_context = (
             "\nThis is execution-time replanning, not a new product-planning pass. "
-            "The frozen goal_contract below is authoritative: reproduce its six fields exactly and do not "
-            "broaden its outcome, constraints, assumptions, or verification preconditions. Return only replacement "
+            "The frozen goal_contract below is authoritative and will be injected by the system. Do not include "
+            "goal_contract in your response and do not broaden its outcome, constraints, assumptions, or "
+            "verification preconditions. Return only replacement "
             "Tasks for the affected unfinished work only. Retained Tasks are existing dependency anchors and must not be emitted again. "
             "A replacement Task may depend on one of these retained Task names: "
             f"{json.dumps(list(completed_task_names), ensure_ascii=False)}.\n"
@@ -509,6 +529,10 @@ def build_plan_prompt(
             "to a Task must be satisfiable by that Task and its completed dependencies; do not assign "
             "a runtime integration acceptance case to an earlier Task when its execution route is a "
             "separate pending Task.\n"
+            "The superseded Task closure below is the exact replacement obligation. Your replacement Tasks may "
+            "regroup or split this work, but must cover every listed behavior and acceptance case. Do not add "
+            "work owned by retained Tasks.\n"
+            f"Superseded Task closure:\n{json.dumps(list(replacement_scope), ensure_ascii=False)}\n"
             "The execution-workspace paths below are authoritative current facts, even when they differ "
             "from the original Discovery evidence. An existing listed path may be primary_write or read_envelope, "
             "but must never be planned_new. Do not emit a missing original path as a Task scope.\n"
@@ -516,9 +540,44 @@ def build_plan_prompt(
             f"Replan trigger evidence:\n{replan_reason or '(none supplied)'}\n"
             f"Frozen goal_contract:\n{json.dumps(_contract_projection(frozen_contract), ensure_ascii=False)}\n\n"
         )
-    return (
-        "You are the Goal planning compiler. Convert repository evidence and a confirmed request into "
+    contract_instructions = (
+        "First compile goal_contract, then split it into Tasks:\n"
+        "- goal_contract.summary states the intended outcome in one precise sentence.\n"
+        "- constraints are non-negotiable product, safety, compatibility, and user decisions.\n"
+        "- assumptions are bounded decisions inferred from evidence; never hide an unresolved product choice here.\n"
+        "- unresolved must be an empty array before execution. If the request genuinely needs a user decision, return it here and no tasks.\n"
+        "- verification_preconditions state external/runtime facts that must hold before a real integration test.\n"
+        "- decision_ledger records important architecture choices as objects with id, decision, rationale, and evidence_refs.\n"
+        if frozen_contract is None else
+        "Compile only replacement Tasks against the injected frozen goal_contract.\n"
+    )
+    output_schema = (
+        '{"goal_contract":{"summary":"...","constraints":["..."],"assumptions":["..."],"unresolved":[],"verification_preconditions":["..."],"decision_ledger":[{"id":"D1","decision":"...","rationale":"...","evidence_refs":["E1"]}]},"tasks":['
+        if frozen_contract is None else
+        '{"tasks":['
+    )
+    compiler_intro = (
         "one decision contract plus independently executable Task contracts.\n"
+        if frozen_contract is None else
+        "independently executable replacement Task contracts.\n"
+    )
+    replacement_coverage_instructions = (
+        "Execution-time replan coverage protocol:\n"
+        "- In addition to tasks, return replacement_coverage. It must contain exactly one entry for every "
+        "superseded_task_id in the supplied closure.\n"
+        "- Each entry has superseded_task_id, acceptance_case_ids, and replacement_task_names. "
+        "acceptance_case_ids must list every AC ID for that superseded Task exactly once; "
+        "replacement_task_names must name one or more Tasks in this response that deliver those ACs.\n"
+        "- The system validates this mapping before independent review. It is a coverage declaration, not a substitute "
+        "for concrete Task behavior, scope, and verification.\n\n"
+        if frozen_contract is not None else ""
+    )
+    response_suffix = (
+        '],"replacement_coverage":[{"superseded_task_id":"task_...","acceptance_case_ids":["AC1"],"replacement_task_names":["replacement task name"]}]}'
+        if frozen_contract is not None else "]}"
+    )
+    return (
+        f"You are the Goal planning compiler. Convert repository evidence and a confirmed request into {compiler_intro}"
         "Do not ask questions, inspect files, or call tools. Do not solve uncertainty by making a worker guess later.\n\n"
         f"Goal target: {target}\n"
         f"Goal-level full verification command: {full_verification}\n\n"
@@ -538,13 +597,8 @@ def build_plan_prompt(
         f"{catalog_text}\n\n"
         f"{manifest_text}\n\n"
         f"{replan_context}"
-        "First compile goal_contract, then split it into Tasks:\n"
-        "- goal_contract.summary states the intended outcome in one precise sentence.\n"
-        "- constraints are non-negotiable product, safety, compatibility, and user decisions.\n"
-        "- assumptions are bounded decisions inferred from evidence; never hide an unresolved product choice here.\n"
-        "- unresolved must be an empty array before execution. If the request genuinely needs a user decision, return it here and no tasks.\n"
-        "- verification_preconditions state external/runtime facts that must hold before a real integration test.\n"
-        "- decision_ledger records important architecture choices as objects with id, decision, rationale, and evidence_refs.\n"
+        f"{contract_instructions}"
+        f"{replacement_coverage_instructions}"
         "- Task scope has five explicit classes: primary_write (existing files to edit), planned_new (new files/directories), conditional_write (existing files that may be added only after proof), read_envelope (existing paths needed to understand the task), forbidden (paths that must not change).\n"
         "- Never put a whole project root or a broad parent directory in primary_write. Use the smallest exact existing files.\n"
         "- primary_write, conditional_write, and read_envelope must be discovered paths. planned_new must not already exist.\n\n"
@@ -553,7 +607,7 @@ def build_plan_prompt(
         "- A current-session, temporary, or non-persistent user selection belongs in session/runtime state. It must not be written back to a user/default configuration file on each command invocation.\n"
         "- When a Task writes a configuration file and the Goal has session-scoped behavior, its behavior and acceptance cases must explicitly say that the write creates static schema/default support while the runtime selection remains session-scoped. If it only reads the configuration, list it only in read_envelope.\n\n"
         "Integration-closure rule:\n"
-        "- implementation_candidates are exact source files from the machine-collected repository map whose extension-point names were cited by Discovery. They are valid existing-file scope candidates; do not replace them with guessed paths.\n"
+        "- implementation_candidates (the legacy scope_candidates or evidence.path view) are exact source files from the machine-collected repository map whose extension-point names were cited by Discovery. They are valid existing-file scope candidates; do not replace them with guessed paths.\n"
         "- For a feature that changes how a command affects later tool calls, the Tasks together must explicitly cover: command/input registration, current-session state ownership, and the centralized enforcement hook. A static configuration/schema task is separate from, and cannot substitute for, the runtime enforcement task.\n"
         "- Put every required integration boundary in primary_write or read_envelope. Do not hide command routing, session state, hook registration, or an explicitly requested client/event bridge only in broad behavior prose. Add a dependency when one boundary needs another.\n"
         "- Do not invent a UI or event-stream task when the confirmed Goal limits the feature to the ordinary CLI; include such a boundary only when the Goal or Discovery evidence requires it.\n\n"
@@ -576,14 +630,15 @@ def build_plan_prompt(
         f"Write all human-readable Task names, behavior, acceptance-case text, and test_strategy in {human_language}. "
         "Keep JSON keys, evidence IDs, paths, commands, and selectors exactly as supplied.\n\n"
         "Reply with ONLY one JSON object in this schema:\n"
-        '{"goal_contract":{"summary":"...","constraints":["..."],"assumptions":["..."],"unresolved":[],"verification_preconditions":["..."],"decision_ledger":[{"id":"D1","decision":"...","rationale":"...","evidence_refs":["E1"]}]},"tasks":['
+        f"{output_schema}"
         '{"name":"paginate list","behavior":"list returns every page",'
         '"acceptance_cases":[{"id":"AC1","given":"more than one page",'
         '"when":"the caller requests pages","then":"no row is skipped"}],'
         '"test_selectors":["tests/test_pagination.py::test_all_pages"],'
         '"depends_on":[],"primary_write":["src/list.py"],"planned_new":[],"conditional_write":[],"read_envelope":["src/list.py"],"forbidden":[".env"],"evidence_refs":["E1"],'
         '"test_strategy":"one selector per acceptance case", "case_selectors":{"AC1":["tests/test_pagination.py::test_all_pages"]},'
-        '"skills":["test-driven-development"]}]}\n'
+        '"skills":["test-driven-development"]}'
+        f"{response_suffix}\n"
         "No prose and no code fence."
     )
 
@@ -622,14 +677,35 @@ def _extract_json_object(text: str) -> str | None:
     return None
 
 
+def _looks_like_incomplete_json(text: str) -> bool:
+    """Detect a provider response cut off inside the requested JSON object.
+
+    Providers do not consistently report ``max_tokens`` for streamed output;
+    a truncated object is still recoverable when the conversation is resumed.
+    Empty/prose responses remain ordinary format errors and use the bounded
+    repair path instead.
+    """
+    cleaned = _strip_agent_header(text or "")
+    return bool(
+        cleaned
+        and cleaned.lstrip().startswith(("{", "```"))
+        and _extract_json_object(cleaned) is None
+    )
+
+
 def _spec_from_entry(
-    entry: dict[str, Any], catalog, cases: tuple[AcceptanceCase, ...], verification_adapter=None,
+    entry: dict[str, Any], catalog, cases: tuple[AcceptanceCase, ...], verification_adapter=None, *, legacy: bool = False,
 ) -> VerificationSpec:
     spec_data = entry.get("verification_spec") if isinstance(entry.get("verification_spec"), dict) else {}
     requested = _normalise_strings(
         entry.get("test_selectors", spec_data.get("selectors")),
     )
     raw_mapping = entry.get("case_selectors", spec_data.get("case_selectors"))
+    # v1 had a flat selector list and implicitly treated it as covering the
+    # single acceptance case. The migration reader supplies that mapping only
+    # for legacy responses; native v2 must declare it explicitly.
+    if legacy and raw_mapping is None and requested and len(cases) == 1:
+        raw_mapping = {cases[0].id: list(requested)}
     case_selectors = {
         str(case): _normalise_strings(values)
         for case, values in raw_mapping.items()
@@ -708,11 +784,15 @@ def _path_is_existing_envelope(path: str, files: set[str]) -> bool:
     return any(item == path or item.startswith(path.rstrip("/") + "/") for item in files)
 
 
-def _path_can_be_planned_new(path: str, files: set[str]) -> bool:
+def _path_can_be_planned_new(path: str, files: set[str], directories: set[str] | None = None) -> bool:
     if not _valid_scope_path(path) or _path_is_existing_envelope(path, files):
         return False
     parent = Path(path).parent.as_posix()
-    return parent in {"", "."} or _path_is_existing_envelope(parent, files)
+    return (
+        parent in {"", "."}
+        or _path_is_existing_envelope(parent, files)
+        or (directories is not None and parent in directories)
+    )
 
 
 def planning_error_requires_discovery(error: str | None) -> bool:
@@ -791,29 +871,130 @@ def _frozen_contract_error(plan: GoalPlan | None, frozen_contract: dict[str, Any
     return None
 
 
+def _replacement_coverage_error(
+    raw: str,
+    plan: GoalPlan | None,
+    replacement_scope: tuple[dict[str, Any], ...],
+) -> str | None:
+    """Require an execution replan to account for every superseded Task AC."""
+    if plan is None or not replacement_scope:
+        return None
+    block = _extract_json_object(_strip_agent_header(raw or ""))
+    if block is None:
+        return "execution-time replan response is missing replacement_coverage"
+    try:
+        data = json.loads(block)
+    except json.JSONDecodeError:
+        return "execution-time replan response has malformed replacement_coverage"
+    coverage = data.get("replacement_coverage") if isinstance(data, dict) else None
+    if not isinstance(coverage, list):
+        return "execution-time replan needs a replacement_coverage array for every superseded Task"
+    expected: dict[str, set[str]] = {}
+    for item in replacement_scope:
+        task_id = str(item.get("task_id") or "").strip()
+        if task_id:
+            expected[task_id] = {
+                str(case.get("id") or "").strip()
+                for case in (item.get("acceptance_cases") or [])
+                if isinstance(case, dict) and str(case.get("id") or "").strip()
+            }
+    rows: dict[str, dict[str, Any]] = {}
+    for entry in coverage:
+        if not isinstance(entry, dict):
+            return "replacement_coverage entries must be JSON objects"
+        task_id = str(entry.get("superseded_task_id") or "").strip()
+        if not task_id or task_id in rows:
+            return "replacement_coverage needs one unique entry per superseded_task_id"
+        rows[task_id] = entry
+    if set(rows) != set(expected):
+        missing = sorted(set(expected) - set(rows))
+        unexpected = sorted(set(rows) - set(expected))
+        details = []
+        if missing:
+            details.append("missing " + ", ".join(missing))
+        if unexpected:
+            details.append("unknown " + ", ".join(unexpected))
+        return "replacement_coverage does not match the superseded Task closure: " + "; ".join(details)
+    plan_names = {task.name for task in plan.tasks}
+    for task_id, expected_cases in expected.items():
+        row = rows[task_id]
+        actual_cases = {
+            str(case_id).strip()
+            for case_id in (row.get("acceptance_case_ids") or [])
+            if str(case_id).strip()
+        }
+        replacement_names = {
+            str(name).strip() for name in (row.get("replacement_task_names") or []) if str(name).strip()
+        }
+        if actual_cases != expected_cases:
+            return (
+                f"replacement_coverage for {task_id} must list exactly its acceptance_case_ids "
+                f"({', '.join(sorted(expected_cases)) or 'none'})"
+            )
+        if not replacement_names or not replacement_names.issubset(plan_names):
+            return f"replacement_coverage for {task_id} must name one or more replacement Tasks in this response"
+    return None
+
+
 def _parse_plan_result(
     raw: str, *, test_catalog=None, discovery_manifest: dict[str, Any] | None = None, verification_adapter=None,
     external_dependency_names: tuple[str, ...] = (),
+    contract_override: dict[str, Any] | None = None,
 ) -> tuple[GoalPlan | None, str | None]:
     """Parse planner output and collect all repairable contract errors."""
-    block = _extract_json_object(_strip_agent_header(raw or ""))
+    stripped = _strip_agent_header(raw or "").strip()
+    legacy_mode = stripped.startswith("[")
+    block = None if legacy_mode else _extract_json_object(stripped)
     if block is None:
-        return None, "response does not contain a complete JSON object"
+        # Planning v1 emitted a bare Task array.  Keep a bounded migration
+        # reader so persisted fixtures and third-party planner callbacks can
+        # be upgraded without weakening the v2 object contract.
+        start = stripped.find("[")
+        end = stripped.rfind("]")
+        if start >= 0 and end > start:
+            block = stripped[start:end + 1]
+            legacy_mode = True
+        else:
+            return None, "response does not contain a complete JSON object"
     try:
         data = json.loads(block)
     except json.JSONDecodeError:
         return None, "response contains malformed JSON"
+    if legacy_mode:
+        if not isinstance(data, list) or not data:
+            return None, "legacy plan must be a non-empty task array"
+        data = {"tasks": data}
     if not isinstance(data, dict) or not isinstance(data.get("tasks"), list) or not data["tasks"]:
         return None, "plan must be an object with a non-empty tasks array"
-    if discovery_readiness_error(discovery_manifest):
+    if contract_override is None and discovery_readiness_error(discovery_manifest):
         return None, discovery_readiness_error(discovery_manifest)
     plans: list[TaskPlan] = []
     errors: list[str] = []
     evidence_ids = {
         str(item.get("id")) for item in (discovery_manifest or {}).get("evidence", []) if isinstance(item, dict)
     }
-    contract, contract_errors = _parse_goal_contract(data.get("goal_contract"), evidence_ids)
-    errors.extend(contract_errors)
+    if legacy_mode and contract_override is None:
+        contract = {
+            "summary": "Migrated planning v1 task contract.",
+            "constraints": [],
+            "assumptions": ["Task array was loaded through the planning v1 compatibility reader."],
+            "unresolved": [],
+            "verification_preconditions": [],
+            "decision_ledger": [{
+                "id": "legacy-v1",
+                "decision": "Preserve the validated v1 Task projection during migration.",
+                "rationale": "Existing persisted plans and callbacks must remain resumable while writers move to v2.",
+                "evidence_refs": [],
+            }],
+        }
+    elif contract_override is None:
+        contract, contract_errors = _parse_goal_contract(data.get("goal_contract"), evidence_ids)
+        errors.extend(contract_errors)
+    else:
+        # An execution-time replan cannot modify the Goal boundary. The
+        # durable contract belongs to the runner, not a model response that
+        # may paraphrase or corrupt long human-language fields.
+        contract = _contract_projection(contract_override)
     if "scope_paths" in data:
         errors.append("planning v2 does not support root-level scope_paths")
     names: set[str] = set()
@@ -841,10 +1022,33 @@ def _parse_plan_result(
         dependency_generated_paths = frozenset().union(
             *(generated_paths_by_task.get(dependency, frozenset()) for dependency in dependencies)
         )
-        spec = _spec_from_entry(entry, test_catalog, cases, verification_adapter)
+        spec = _spec_from_entry(entry, test_catalog, cases, verification_adapter, legacy=legacy_mode)
         primary_write = _normalise_strings(entry.get("primary_write"))
         planned_new = _normalise_strings(entry.get("planned_new"))
         conditional_write = _normalise_strings(entry.get("conditional_write"))
+        if contract_override is not None and discovery_manifest is not None:
+            # Execution replans operate on a moving worktree. Models often
+            # preserve an old scope label after an earlier slice created a
+            # file, or label a genuinely new component as primary_write. The
+            # filesystem is authoritative here, so canonicalize only these
+            # unambiguous classifications before contract validation.
+            file_paths = {str(item) for item in discovery_manifest.get("repo_files", [])}
+            directory_paths = {
+                str(item).replace("\\", "/").strip().strip("/")
+                for item in (discovery_manifest.get("repo_dirs", []) if contract_override is not None else [])
+                if str(item).strip()
+            }
+            existing_planned = tuple(path for path in planned_new if path in file_paths)
+            if existing_planned:
+                planned_new = tuple(path for path in planned_new if path not in file_paths)
+                primary_write = tuple(dict.fromkeys((*primary_write, *existing_planned)))
+            promotable_primary = tuple(
+                path for path in primary_write
+                if path not in file_paths and _path_can_be_planned_new(path, file_paths, directory_paths)
+            )
+            if promotable_primary:
+                primary_write = tuple(path for path in primary_write if path not in promotable_primary)
+                planned_new = tuple(dict.fromkeys((*planned_new, *promotable_primary)))
         # A file declared as planned_new cannot be read yet. Some planners
         # redundantly include it in read_envelope; omit only that impossible
         # overlap, while preserving discovery refreshes for every other
@@ -856,16 +1060,49 @@ def _parse_plan_result(
         forbidden = _normalise_strings(entry.get("forbidden"))
         requested_refs = _normalise_strings(entry.get("evidence_refs"))
         strategy = str(entry.get("test_strategy") or "")[:1000]
-        if "scope_paths" in entry:
+        if legacy_mode and "scope_paths" in entry and not primary_write and not planned_new:
+            legacy_scope = _normalise_strings(entry.get("scope_paths"))
+            if discovery_manifest is None:
+                read_envelope = tuple(dict.fromkeys((*read_envelope, *legacy_scope)))
+            else:
+                discovered_files = {str(item) for item in discovery_manifest.get("repo_files", [])}
+                valid_scope = tuple(path for path in legacy_scope if _path_is_existing_envelope(path, discovered_files))
+                invalid_scope = tuple(path for path in legacy_scope if path not in valid_scope)
+                if invalid_scope:
+                    errors.append(
+                        f"{label} scope_paths must be discovered workspace files or directories: "
+                        + ", ".join(invalid_scope)
+                    )
+                primary_write = tuple(path for path in valid_scope if path in discovered_files)
+                read_envelope = tuple(
+                    dict.fromkeys((*read_envelope, *(path for path in valid_scope if path not in primary_write)))
+                )
+        elif "scope_paths" in entry:
             errors.append(f"{label} uses removed scope_paths; use planning v2 scope classes")
-        if not primary_write and not planned_new:
+        if legacy_mode and discovery_manifest is not None and not primary_write and not planned_new and "scope_paths" not in entry:
+            errors.append(f"{label} is missing scope_paths")
+        if not legacy_mode and not primary_write and not planned_new:
             errors.append(f"{label} needs primary_write or planned_new")
-        if not strategy:
+        if legacy_mode and not strategy and discovery_manifest is None:
+            strategy = "Preserve the planning v1 verification binding or generate focused coverage."
+        elif legacy_mode and not strategy and "scope_paths" not in entry and not entry.get("test_selectors"):
+            # Preserve the v1 repair diagnostic used by manifest-backed
+            # planning callbacks while allowing already-bound selector plans
+            # to migrate without inventing a strategy string.
+            errors.append(f"{label} is missing test_strategy")
+        elif not strategy:
             errors.append(f"{label} is missing test_strategy")
         if discovery_manifest is not None:
             file_paths = {str(item) for item in discovery_manifest.get("repo_files", [])}
             primary_valid = all(_valid_scope_path(path) and _path_is_existing(path, file_paths) for path in primary_write)
-            planned_new_valid = all(_path_can_be_planned_new(path, file_paths) for path in planned_new)
+            directory_paths = {
+                str(item).replace("\\", "/").strip().strip("/")
+                for item in (discovery_manifest.get("repo_dirs", []) if contract_override is not None else [])
+                if str(item).strip()
+            }
+            planned_new_valid = all(
+                _path_can_be_planned_new(path, file_paths, directory_paths) for path in planned_new
+            )
             conditional_valid = all(_valid_scope_path(path) and _path_is_existing(path, file_paths) for path in conditional_write)
             read_valid = all(
                 _valid_scope_path(path)
@@ -902,7 +1139,18 @@ def _parse_plan_result(
                 )
             if forbidden and not forbidden_valid:
                 errors.append(f"{label} forbidden has an invalid workspace path")
-            if primary_write and primary_valid and not _task_has_source_evidence(primary_write, refs, discovery_manifest):
+            # Initial planning requires a Discovery evidence reference for
+            # every source file. Execution-time replanning is different: the
+            # runner overlays the live worktree and records existing files as
+            # execution-snapshot evidence. Requiring the original Discovery
+            # reference here rejects valid replacement Tasks after a file was
+            # created or moved during implementation.
+            if (
+                primary_write
+                and primary_valid
+                and contract_override is None
+                and not _task_has_source_evidence(primary_write, refs, discovery_manifest)
+            ):
                 errors.append(f"{label} has no source-code evidence for primary_write")
         else:
             refs = requested_refs
@@ -931,7 +1179,8 @@ def _parse_plan_result(
         generated_paths_by_task[name] = dependency_generated_paths | frozenset(planned_new)
     if errors:
         return None, _contract_error_text(errors)
-    return GoalPlan(contract=contract or {}, tasks=tuple(plans)), None
+    coverage = tuple(dict(item) for item in data.get("replacement_coverage", []) if isinstance(item, dict))
+    return GoalPlan(contract=contract or {}, tasks=tuple(plans), replacement_coverage=coverage), None
 
 
 def parse_plan(raw: str, *, test_catalog=None, discovery_manifest: dict[str, Any] | None = None, verification_adapter=None) -> GoalPlan | None:
@@ -945,9 +1194,49 @@ def parse_plan(raw: str, *, test_catalog=None, discovery_manifest: dict[str, Any
     return plan
 
 
-def _format_repair_prompt(original_prompt: str, raw: str, error: str) -> str:
+def _format_repair_prompt(
+    original_prompt: str,
+    raw: str,
+    error: str,
+    *,
+    compact: bool = False,
+    replacement_scope: tuple[dict[str, Any], ...] = (),
+    execution_workspace_paths: tuple[str, ...] = (),
+) -> str:
     """Ask the planner to repair only its structured response, not rediscover work."""
     previous = _strip_agent_header(raw).strip()[:PLANNER_REPAIR_INPUT_LIMIT]
+    if compact:
+        # The initial execution-replan prompt is already in the conversation
+        # for a normal continuation. Saved candidates have no such history,
+        # so retain only the candidate and the compact closure needed to fix
+        # omissions instead of replaying the full catalog and manifest.
+        compact_scope = [
+            {
+                "task_id": item.get("task_id"),
+                "name": item.get("name"),
+                "behavior": item.get("behavior"),
+                "acceptance_cases": item.get("acceptance_cases", []),
+                "primary_write": item.get("primary_write", []),
+                "planned_new": item.get("planned_new", []),
+                "conditional_write": item.get("conditional_write", []),
+                "read_envelope": item.get("read_envelope", []),
+                "verification": item.get("verification", {}),
+            }
+            for item in replacement_scope
+        ]
+        return (
+            "Repair the execution-time GoalPlan JSON below. Return ONLY one COMPLETE JSON object with a "
+            "non-empty tasks array and replacement_coverage covering every supplied superseded Task. "
+            "Preserve valid fields from the candidate; fix only the listed contract/reviewer errors. "
+            "The frozen goal contract is authoritative and must not be emitted or changed. Do not explain.\n"
+            f"Contract/reviewer errors: {error}\n"
+            "Scope rules: primary_write/conditional_write/read_envelope must be existing paths in the "
+            "current workspace; planned_new must be absent paths with an evidenced parent. Never invent a "
+            "primary_write path.\n"
+            f"Current workspace source paths: {json.dumps(list(execution_workspace_paths), ensure_ascii=False)}\n"
+            f"Superseded behavior closure: {json.dumps(compact_scope, ensure_ascii=False)}\n"
+            f"Candidate response (possibly truncated):\n{previous}"
+        )
     return (
         f"{original_prompt}\n\n"
         "Your previous response was rejected before any execution began. "
@@ -964,8 +1253,28 @@ def build_plan_review_prompt(
     *,
     human_language: str = "English",
     completed_task_names: tuple[str, ...] = (),
+    replacement_scope: tuple[dict[str, Any], ...] = (),
+    execution_workspace_paths: tuple[str, ...] = (),
 ) -> str:
     """Ask an independent model whether a validated plan is executable."""
+    execution_workspace_context = (
+        "Current execution-workspace scope paths (authoritative): "
+        f"{json.dumps(list(execution_workspace_paths), ensure_ascii=False)}.\n"
+        "These paths can include files that an unfinished superseded Task already created. "
+        "Treat each listed path as an existing implementation artifact: a replacement Task may take it over "
+        "through primary_write, but must not be required to repeat its creation in planned_new. Review whether "
+        "the Task behavior and acceptance cases justify that takeover; do not reject it merely because the "
+        "original Task first introduced the file.\n\n"
+        if execution_workspace_paths else ""
+    )
+    replacement_context = (
+        "This is execution-time replanning. Review the candidate only against the supplied superseded Task "
+        "closure, not against work owned by retained Tasks. Reject a candidate that fails to cover every "
+        "behavior or acceptance case in that closure, including when a replacement Task omits a required "
+        "verification path. Do not require the candidate to restate retained work.\n"
+        f"Superseded Task closure to cover:\n{json.dumps(list(replacement_scope), ensure_ascii=False)}\n\n"
+        if replacement_scope else "\n"
+    )
     return (
         "You are the independent reviewer for a Goal plan. You do not redesign it and you never grant "
         "permissions. Find only execution-blocking ambiguity, invalid task dependency, scope that is too broad "
@@ -979,7 +1288,12 @@ def build_plan_review_prompt(
         "For a plan that says a command changes permission behavior for later tool calls, require explicit scoped coverage of "
         "the command/input registration, current-session state, and centralized enforcement hook. A configuration-only Task "
         "does not satisfy that runtime path. Do not demand a UI/event-stream Task when the Goal is explicitly ordinary-CLI-only.\n"
-        f"Retained Task names, when present, are valid dependency anchors: {json.dumps(list(completed_task_names), ensure_ascii=False)}.\n\n"
+        "A verification_spec with source=needs_generation and empty selectors is valid: the system binds a focused "
+        "generated regression test before that Task executes. Reject it only when the acceptance case itself cannot be tested.\n"
+        f"Retained Task names, when present, are valid dependency anchors: {json.dumps(list(completed_task_names), ensure_ascii=False)}.\n"
+        + execution_workspace_context
+        + replacement_context
+        +
         f"Plan to review:\n{json.dumps({'goal_contract': plan.contract, 'tasks': [task.to_dict() for task in plan.tasks]}, ensure_ascii=False)}\n\n"
         f"Write all human-readable text in {human_language}. Reply ONLY with JSON:\n"
         '{"approved":true,"summary":"...","findings":[]}\n'
@@ -1014,7 +1328,11 @@ def _review_result(raw: str) -> tuple[bool | None, dict[str, Any] | None, str | 
             return None, None, f"reviewer finding {index} needs severity, issue, and repair"
         normalized.append({"severity": severity, "task": task[:120], "issue": issue[:1000], "repair": repair[:1000]})
     if data["approved"] and normalized:
-        return None, None, "reviewer cannot approve while findings are present"
+        # Reviewers sometimes attach non-blocking observations to an
+        # executable plan. High/medium findings still reject the plan;
+        # low-severity findings are retained as warnings.
+        if any(item["severity"] in {"high", "medium"} for item in normalized):
+            data["approved"] = False
     if not data["approved"] and not normalized:
         return None, None, "reviewer rejection needs at least one finding"
     return bool(data["approved"]), {"approved": bool(data["approved"]), "summary": str(data.get("summary") or "")[:1000], "findings": normalized}, None
@@ -1036,10 +1354,13 @@ def plan_tasks(
     human_language: str = "English",
     frozen_contract: dict[str, Any] | None = None,
     completed_task_names: tuple[str, ...] = (),
+    replacement_scope: tuple[dict[str, Any], ...] = (),
     replan_reason: str = "",
     execution_workspace_paths: tuple[str, ...] = (),
     candidate_plan: GoalPlan | None = None,
     candidate_callback: Callable[[GoalPlan], None] | None = None,
+    review_feedback: dict[str, Any] | None = None,
+    review_callback: Callable[[GoalPlan, dict[str, Any]], None] | None = None,
 ) -> GoalPlan:
     """Compile, validate, and independently review a GoalPlan v2."""
     from harness.agents.runner import AgentTaskConversation, AgentTaskStats, run_agent_task as default_runner
@@ -1052,11 +1373,13 @@ def plan_tasks(
     reviewer = reviewer_runner or default_runner
     planner_stats = stats if stats is not None else AgentTaskStats()
     planner_conversation = AgentTaskConversation()
+    output_upgrade_tokens = 32_000 if discovery_manifest is None else PLANNER_ESCALATED_OUTPUT_TOKENS
     prompt = build_plan_prompt(
         target, full_verification, catalog, discovery_manifest,
         human_language=human_language,
         frozen_contract=frozen_contract,
         completed_task_names=completed_task_names,
+        replacement_scope=replacement_scope,
         replan_reason=replan_reason,
         execution_workspace_paths=execution_workspace_paths,
     )
@@ -1066,7 +1389,9 @@ def plan_tasks(
         "agent_type": PLANNER_AGENT,
         "cwd": str(root),
         "max_rounds": PLANNER_MAX_ROUNDS,
-        "max_tokens": PLANNER_MAX_OUTPUT_TOKENS,
+        # Keep the historical 32k allowance for bare v1 callbacks. Native v2
+        # plans use the bounded first attempt and an explicit continuation.
+        "max_tokens": 32_000 if discovery_manifest is None else PLANNER_MAX_OUTPUT_TOKENS,
         "tools_override": (),
         # Goal planning returns a potentially large JSON contract. Stream it
         # even when no interactive event sink is active so relay read timeouts
@@ -1083,10 +1408,15 @@ def plan_tasks(
     plan = candidate_plan
     contract_error: str | None = None
     if plan is not None:
-        raw = json.dumps(
-            {"goal_contract": plan.contract, "tasks": [task.to_dict() for task in plan.tasks]},
-            ensure_ascii=False,
+        saved_payload = {"goal_contract": plan.contract, "tasks": [task.to_dict() for task in plan.tasks]}
+        if plan.replacement_coverage:
+            saved_payload["replacement_coverage"] = list(plan.replacement_coverage)
+        raw = json.dumps(saved_payload, ensure_ascii=False)
+        contract_error = _frozen_contract_error(plan, frozen_contract) or _replacement_coverage_error(
+            raw, plan, replacement_scope,
         )
+        if contract_error:
+            plan = None
     else:
         try:
             raw = runner(**planner_call)
@@ -1100,13 +1430,19 @@ def plan_tasks(
             discovery_manifest=discovery_manifest,
             verification_adapter=verification_adapter,
             external_dependency_names=completed_task_names,
+            contract_override=frozen_contract,
         )
-        contract_error = contract_error or _frozen_contract_error(plan, frozen_contract)
+        contract_error = contract_error or _frozen_contract_error(plan, frozen_contract) or _replacement_coverage_error(
+            raw, plan, replacement_scope,
+        )
         if contract_error:
             plan = None
+    legacy_mode = raw.lstrip().startswith("[") or (
+        plan is not None and str(plan.contract.get("summary") or "").startswith("Migrated planning v1")
+    )
     used_repair = False
     if plan is None:
-        if planner_stats.stop_reason == "max_tokens":
+        if planner_stats.stop_reason == "max_tokens" or _looks_like_incomplete_json(raw):
             # A complete Task contract can legitimately exceed the normal
             # planning budget. Preserve the partial assistant response and
             # grant one larger continuation instead of restarting discovery.
@@ -1119,7 +1455,7 @@ def plan_tasks(
                     "Use the retained partial response as context and now return one COMPLETE replacement GoalPlan JSON "
                     "object. Do not explain, call tools, or repeat analysis."
                 ),
-                "max_tokens": PLANNER_ESCALATED_OUTPUT_TOKENS,
+                "max_tokens": output_upgrade_tokens,
                 "deadline": max(
                     deadline or 0.0,
                     time.monotonic() + PLANNER_CONTINUATION_TIMEOUT_SECONDS,
@@ -1137,32 +1473,76 @@ def plan_tasks(
                 discovery_manifest=discovery_manifest,
                 verification_adapter=verification_adapter,
                 external_dependency_names=completed_task_names,
+                contract_override=frozen_contract,
             )
-            contract_error = contract_error or _frozen_contract_error(plan, frozen_contract)
+            contract_error = contract_error or _frozen_contract_error(plan, frozen_contract) or _replacement_coverage_error(
+                raw, plan, replacement_scope,
+            )
             if contract_error:
                 plan = None
             if plan is None and planner_stats.stop_reason == "max_tokens":
+                if discovery_manifest is None:
+                    raise GoalPlanningError(
+                        f"Goal planner exhausted its {output_upgrade_tokens}-token output budget; no execution was started."
+                    )
                 raise GoalPlanningError(
-                    f"Goal planner exhausted its automatic {PLANNER_ESCALATED_OUTPUT_TOKENS}-token output upgrade "
+                    f"Goal planner exhausted its automatic {output_upgrade_tokens}-token output upgrade "
                     "before returning a complete GoalPlan contract; no execution was started."
                 )
         if plan is None:
             repair_call = dict(planner_call)
             repair_call["description"] = "repair GoalPlan v2 JSON"
-            repair_call["prompt"] = _format_repair_prompt(prompt, raw, contract_error or "unknown contract error")
+            repair_reason = contract_error or "unknown contract error"
+            if review_feedback is not None and review_feedback.get("approved") is False:
+                repair_reason += "; Saved independent review rejected the candidate: " + json.dumps(review_feedback, ensure_ascii=False)
+            repair_call["prompt"] = _format_repair_prompt(
+                prompt,
+                raw,
+                repair_reason,
+                compact=frozen_contract is not None,
+                replacement_scope=replacement_scope,
+                execution_workspace_paths=execution_workspace_paths,
+            )
             repair_call["max_rounds"] = PLANNER_FORMAT_RETRY_MAX_ROUNDS
             try:
                 raw = runner(**repair_call)
             except Exception as exc:
                 raise GoalPlanningError(f"Goal planner contract repair failed: {type(exc).__name__}: {exc}") from exc
             used_repair = True
+            legacy_mode = legacy_mode or raw.lstrip().startswith("[")
             if raw.startswith(f"[{PLANNER_AGENT}] failed:") or raw.startswith(f"[{PLANNER_AGENT}] stopped:"):
                 raise GoalPlanningError(f"Goal planner contract repair is unavailable: {raw}")
+            if planner_stats.stop_reason == "max_tokens" or _looks_like_incomplete_json(raw):
+                planner_stats.stop_reason = None
+                continuation_call = dict(repair_call)
+                continuation_call.update({
+                    "description": "complete repaired GoalPlan v2 after output upgrade",
+                    "prompt": (
+                        "Your repaired GoalPlan response was cut off before a complete JSON object was formed. "
+                        "Continue the same response and return one COMPLETE valid GoalPlan JSON object only."
+                    ),
+                    "max_tokens": output_upgrade_tokens,
+                    "deadline": max(
+                        deadline or 0.0,
+                        time.monotonic() + PLANNER_CONTINUATION_TIMEOUT_SECONDS,
+                    ),
+                })
+                try:
+                    raw = runner(**continuation_call)
+                except Exception as exc:
+                    raise GoalPlanningError(
+                        f"Goal planner repair output continuation failed: {type(exc).__name__}: {exc}"
+                    ) from exc
+                if raw.startswith(f"[{PLANNER_AGENT}] failed:") or raw.startswith(f"[{PLANNER_AGENT}] stopped:"):
+                    raise GoalPlanningError(f"Goal planner repair output continuation is unavailable: {raw}")
             plan, repair_error = _parse_plan_result(
                 raw, test_catalog=catalog, discovery_manifest=discovery_manifest,
                 verification_adapter=verification_adapter, external_dependency_names=completed_task_names,
+                contract_override=frozen_contract,
             )
-            repair_error = repair_error or _frozen_contract_error(plan, frozen_contract)
+            repair_error = repair_error or _frozen_contract_error(plan, frozen_contract) or _replacement_coverage_error(
+                raw, plan, replacement_scope,
+            )
             if repair_error:
                 plan = None
             if plan is None:
@@ -1180,6 +1560,8 @@ def plan_tasks(
                 current,
                 human_language=human_language,
                 completed_task_names=completed_task_names,
+                replacement_scope=replacement_scope,
+                execution_workspace_paths=execution_workspace_paths,
             ),
             "agent_type": PLAN_REVIEWER_AGENT,
             "cwd": str(root), "max_rounds": PLAN_REVIEW_MAX_ROUNDS,
@@ -1198,32 +1580,93 @@ def plan_tasks(
         return approved, result, None
 
     if candidate_callback is not None:
-        candidate_callback(GoalPlan(contract=plan.contract, tasks=plan.tasks))
-    approved, review, _ = review_plan(plan)
+        candidate_callback(GoalPlan(
+            contract=plan.contract, tasks=plan.tasks, replacement_coverage=plan.replacement_coverage,
+        ))
+    if review_feedback is not None and not used_repair:
+        if review_feedback.get("approved") is not False:
+            raise GoalPlanningError("Saved execution replan review feedback is not a rejection.")
+        approved, review = False, dict(review_feedback)
+    elif legacy_mode and reviewer_runner is None:
+        # v1 had no independent review stage. Avoid requiring a live reviewer
+        # provider for compatibility callbacks while callers migrate to v2.
+        approved, review = True, {
+            "approved": True,
+            "summary": "Legacy planning output accepted by compatibility reader.",
+            "findings": [],
+        }
+    else:
+        approved, review, _ = review_plan(plan)
     if approved:
-        return GoalPlan(contract=plan.contract, tasks=plan.tasks, review=review)
+        return GoalPlan(
+            contract=plan.contract, tasks=plan.tasks, replacement_coverage=plan.replacement_coverage, review=review,
+        )
+    if review_callback is not None:
+        review_callback(GoalPlan(
+            contract=plan.contract, tasks=plan.tasks, replacement_coverage=plan.replacement_coverage,
+        ), review)
     if used_repair:
         raise GoalPlanningError("GoalPlan was rejected after its one permitted correction: " + str(review.get("summary") or review.get("findings")))
     repair_call = dict(planner_call)
     repair_call["description"] = "repair GoalPlan v2 after independent review"
-    repair_call["prompt"] = _format_repair_prompt(prompt, raw, "Independent review rejected the plan: " + json.dumps(review, ensure_ascii=False))
+    repair_call["prompt"] = _format_repair_prompt(
+        prompt,
+        raw,
+        "Independent review rejected the plan: " + json.dumps(review, ensure_ascii=False),
+        compact=frozen_contract is not None,
+        replacement_scope=replacement_scope,
+        execution_workspace_paths=execution_workspace_paths,
+    )
     repair_call["max_rounds"] = PLANNER_FORMAT_RETRY_MAX_ROUNDS
     try:
         repaired_raw = runner(**repair_call)
     except Exception as exc:
         raise GoalPlanningError(f"Goal planner review repair failed: {type(exc).__name__}: {exc}") from exc
+    if planner_stats.stop_reason == "max_tokens" or _looks_like_incomplete_json(repaired_raw):
+        planner_stats.stop_reason = None
+        continuation_call = dict(repair_call)
+        continuation_call.update({
+            "description": "complete reviewed GoalPlan v2 after output upgrade",
+            "prompt": (
+                "Your corrected GoalPlan response was cut off before a complete JSON object was formed. "
+                "Continue the same response and return one COMPLETE valid GoalPlan JSON object only."
+            ),
+            "max_tokens": output_upgrade_tokens,
+            "deadline": max(
+                deadline or 0.0,
+                time.monotonic() + PLANNER_CONTINUATION_TIMEOUT_SECONDS,
+            ),
+        })
+        try:
+            repaired_raw = runner(**continuation_call)
+        except Exception as exc:
+            raise GoalPlanningError(
+                f"Goal planner reviewed-repair output continuation failed: {type(exc).__name__}: {exc}"
+            ) from exc
     repaired, repair_error = _parse_plan_result(
         repaired_raw, test_catalog=catalog, discovery_manifest=discovery_manifest,
         verification_adapter=verification_adapter, external_dependency_names=completed_task_names,
+        contract_override=frozen_contract,
     )
-    repair_error = repair_error or _frozen_contract_error(repaired, frozen_contract)
+    repair_error = repair_error or _frozen_contract_error(repaired, frozen_contract) or _replacement_coverage_error(
+        repaired_raw, repaired, replacement_scope,
+    )
     if repair_error:
         repaired = None
     if repaired is None:
         raise GoalPlanningError("Goal planner did not repair the reviewed GoalPlan: " + (repair_error or "unknown error"))
     if candidate_callback is not None:
-        candidate_callback(GoalPlan(contract=repaired.contract, tasks=repaired.tasks))
+        candidate_callback(GoalPlan(
+            contract=repaired.contract, tasks=repaired.tasks, replacement_coverage=repaired.replacement_coverage,
+        ))
     approved, final_review, _ = review_plan(repaired)
     if not approved:
+        if review_callback is not None:
+            review_callback(GoalPlan(
+                contract=repaired.contract, tasks=repaired.tasks, replacement_coverage=repaired.replacement_coverage,
+            ), final_review)
         raise GoalPlanningError("GoalPlan remains rejected after one correction: " + str(final_review.get("summary") or final_review.get("findings")))
-    return GoalPlan(contract=repaired.contract, tasks=repaired.tasks, review=final_review)
+    return GoalPlan(
+        contract=repaired.contract, tasks=repaired.tasks,
+        replacement_coverage=repaired.replacement_coverage, review=final_review,
+    )

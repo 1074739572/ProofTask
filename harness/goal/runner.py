@@ -19,10 +19,11 @@ from harness.agents.runner import AgentTaskConversation, AgentTaskStats, run_age
 from harness.evaluation import run_task_evaluation
 from harness.goal.engine import GoalEngine
 from harness.goal.authority import goal_authority
+from harness.goal.budget import add_usage, exhausted as budget_exhausted, refresh_active_seconds, remaining as budget_remaining
 from harness.goal.coordinator import ParallelGoalSupervisor, SupervisorRun
 from harness.goal.language import human_language_label
 from harness.goal.models import GoalPhase, GoalStatus, GoalState, StopReason
-from harness.goal.planner import VerificationSpec, plan_tasks
+from harness.goal.planner import GoalPlan, TaskPlan, VerificationSpec, plan_tasks
 from harness.goal.policy import MAX_REPAIR_ATTEMPTS_PER_TASK, validate_limits
 from harness.goal.supervision import StagePolicy, StageProgress, StageSupervisor, emit_stage_supervision
 from harness.goal.store import (
@@ -60,6 +61,14 @@ MAX_PERMISSION_BOUNDARY_RETRIES = 3
 # prompt. Keep it below this limit before serializing the replan request so
 # it can be consumed whole; never slice serialized JSON at the prompt edge.
 STALLED_REPLAN_EVIDENCE_BUDGET = 10_500
+EXECUTION_REPLAN_CHECKPOINT_VERSION = 2
+# A malformed or reviewer-rejected replacement plan may be retried after a
+# pause, but the same checkpoint must not become an automatic hot loop.
+MAX_EXECUTION_REPLAN_ATTEMPTS = 2
+# One evaluator-requested coverage repair may add focused proof. If the
+# evaluator still asks for more coverage afterwards, stop for contract review
+# instead of cycling through test generation indefinitely.
+MAX_COVERAGE_REPAIR_ATTEMPTS = 1
 # Routine progress reports used to start an independent Sol request after
 # nearly every worker slice and phase transition.  They competed with the
 # implementation worker for the same provider connection while carrying a
@@ -103,18 +112,26 @@ def _execution_replan_manifest(
     """Overlay initial Discovery with the files that actually exist in the Goal worktree."""
     workspace = root.resolve()
     files: list[str] = []
+    directories: list[str] = []
     for directory, child_dirs, child_files in os.walk(workspace):
         child_dirs[:] = [name for name in child_dirs if name not in _EXECUTION_REPLAN_IGNORED_DIRS]
         current = Path(directory)
+        if current != workspace:
+            try:
+                directories.append(current.resolve().relative_to(workspace).as_posix())
+            except (OSError, ValueError):
+                pass
         for name in child_files:
             try:
                 files.append((current / name).resolve().relative_to(workspace).as_posix())
             except (OSError, ValueError):
                 continue
     snapshot = tuple(sorted(dict.fromkeys(files)))
+    directory_snapshot = tuple(sorted(dict.fromkeys(directories)))
     snapshot_set = set(snapshot)
     result = dict(manifest)
     result["repo_files"] = list(snapshot)
+    result["repo_dirs"] = list(directory_snapshot)
     evidence = [dict(item) for item in manifest.get("evidence", []) if isinstance(item, dict)]
     evidenced_paths = {
         str(item.get("path") or "").replace("\\", "/").strip()
@@ -243,8 +260,7 @@ def goal_event_payload(state: GoalState) -> dict[str, Any]:
                 "selectors": list(evidence_selectors) if isinstance(evidence_selectors, (list, tuple)) else [],
                 "collected_count": latest_evidence.get("collected_count") or 0,
             }
-        tasks.append(
-            {
+        task_payload = {
                 "id": task.id,
                 "subject": task.subject,
                 "status": task.status,
@@ -252,6 +268,7 @@ def goal_event_payload(state: GoalState) -> dict[str, Any]:
                 "blocked_by": list(task.blockedBy) if isinstance(task.blockedBy, list) else [],
                 "acceptance_cases": task.acceptance_cases if isinstance(task.acceptance_cases, list) else [],
                 "skills": list(task.skill_names) if isinstance(task.skill_names, list) else [],
+                "scope_paths": list(task.scope_paths) if isinstance(task.scope_paths, list) else [],
                 "primary_write": list(task.primary_write) if isinstance(task.primary_write, list) else [],
                 "planned_new": list(task.planned_new) if isinstance(task.planned_new, list) else [],
                 "conditional_write": list(task.conditional_write) if isinstance(task.conditional_write, list) else [],
@@ -264,7 +281,13 @@ def goal_event_payload(state: GoalState) -> dict[str, Any]:
                 "latest_evidence": evidence_summary,
                 "last_error": task.last_error,
             }
-        )
+        # Keep the terminal UI payload compatible with v1 consumers when a
+        # legacy Task has no v2 scope-class declarations at all. Native v2
+        # Tasks retain the richer fields for auditing and handoff.
+        if not any(task_payload[key] for key in ("primary_write", "planned_new", "conditional_write", "read_envelope", "forbidden", "evidence_refs", "test_strategy")):
+            for key in ("primary_write", "planned_new", "conditional_write", "read_envelope", "forbidden"):
+                task_payload.pop(key, None)
+        tasks.append(task_payload)
     payload = {
         "id": state.id,
         "target": state.target,
@@ -280,6 +303,9 @@ def goal_event_payload(state: GoalState) -> dict[str, Any]:
         "worker_generation": state.worker_generation,
         "worker_rollovers": state.worker_rollovers,
         "worker_round_limit": state.worker_round_limit,
+        "budget_limits": dict(state.budget_limits) if isinstance(state.budget_limits, dict) else {},
+        "usage_ledger": dict(state.usage_ledger) if isinstance(state.usage_ledger, dict) else {},
+        "budget_remaining": budget_remaining(state),
         "updated_at": state.updated_at,
         "paused_at": state.paused_at,
         "stop_reason": state.stop_reason,
@@ -580,7 +606,14 @@ def start_goal(request: GoalRequest, *, history: list, context: dict, binding: A
             raise
 
 
-def resume_goal(*, history: list, context: dict, binding: Any, approve_execution: bool = False) -> GoalState:
+def resume_goal(
+    *,
+    history: list,
+    context: dict,
+    binding: Any,
+    approve_execution: bool = False,
+    additional_budget: dict[str, float] | None = None,
+) -> GoalState:
     global _runner
     _reap_runner()
     with _runner_lock:
@@ -627,6 +660,25 @@ def resume_goal(*, history: list, context: dict, binding: Any, approve_execution
                 # future Task's tests first.
                 state.execution_approved = True
 
+            # An explicit resume may append envelope budget.  Historical
+            # usage remains untouched; only positive, known ledger keys are
+            # accepted so a typo cannot silently create an unbounded quota.
+            if additional_budget:
+                from harness.goal.budget import LEDGER_KEYS
+
+                limits = dict(state.budget_limits or {})
+                for key, amount in additional_budget.items():
+                    if key not in LEDGER_KEYS:
+                        raise GoalNotRunningError(f"Unknown Goal budget key: {key}")
+                    try:
+                        value = float(amount)
+                    except (TypeError, ValueError):
+                        raise GoalNotRunningError(f"Invalid Goal budget amount for {key}")
+                    if value <= 0:
+                        raise GoalNotRunningError(f"Goal budget amount for {key} must be positive")
+                    limits[key] = float(limits.get(key, 0) or 0) + value
+                state.budget_limits = limits
+
             # Pauses are outside the active execution budget. This also makes
             # a draft safely resumable the next day after test review.
             if state.paused_at is not None:
@@ -650,6 +702,31 @@ def resume_goal(*, history: list, context: dict, binding: Any, approve_execution
             _runner = None
             release_goal_lease(state, lease_token)
             raise
+
+
+def _verification_contract_invalid(evidence: dict[str, Any]) -> bool:
+    """Read the durable debug classification, including pre-migration evidence."""
+    diagnostics = evidence.get("diagnostics") if isinstance(evidence, dict) else {}
+    if not isinstance(diagnostics, dict):
+        return False
+    if diagnostics.get("verification_contract_invalid"):
+        return True
+    if diagnostics.get("debug_failure_category") == "invalid_verification_contract":
+        return True
+    bundle = diagnostics.get("debug_bundle")
+    json_path = bundle.get("json") if isinstance(bundle, dict) else ""
+    if not json_path:
+        return False
+    try:
+        payload = json.loads(Path(str(json_path)).read_text(encoding="utf-8", errors="replace"))
+    except (OSError, ValueError, TypeError):
+        return False
+    contract = payload.get("contract") if isinstance(payload, dict) else {}
+    failure = payload.get("failure") if isinstance(payload, dict) else {}
+    return bool(
+        isinstance(contract, dict) and contract.get("invalid")
+        or isinstance(failure, dict) and failure.get("category") == "invalid_verification_contract"
+    )
 
 
 def _resume_target(state: GoalState) -> str:
@@ -679,6 +756,40 @@ def _resume_target(state: GoalState) -> str:
     # waiting for their dependencies.  Otherwise a review pause on Task A is
     # incorrectly routed through test generation for Task B and returns to ACT.
     current = tasks.get(state.current_task_id or "")
+    # A contract-review pause may predate the second machine observation. On
+    # resume, collect that missing evidence first instead of re-entering the
+    # planner and immediately pausing on the repetition guard.
+    # A scope-omission decision is also recoverable: the runtime may have
+    # loaded a newer runner whose import classifier now excludes a type-only
+    # dependency. Do not feed that stale expansion request into repair
+    # planning. Re-run the frozen verification so the current error can take
+    # its normal in-scope repair route.
+    if (
+        candidate == GoalPhase.REPAIR_PLAN.value
+        and state.stop_reason == StopReason.execution_preflight_failed.value
+        and current is not None
+        and current.status == "in_progress"
+        and isinstance(current.evaluation, dict)
+        and current.evaluation.get("route") == "scope_omission"
+        and not GoalRunner(
+            state=state, history=[], context={}, binding=None,
+        )._verification_scope_omission_candidates(state, current)
+    ):
+        state.last_error = "范围遗漏诊断已失效，先重新验证当前 Task 并按最新证据返修。"
+        candidate = GoalPhase.VERIFY.value
+    if (
+        candidate == GoalPhase.REPAIR_PLAN.value
+        and state.stop_reason == StopReason.execution_preflight_failed.value
+        and current is not None
+        and current.status == "in_progress"
+        and isinstance(current.evaluation, dict)
+        and current.evaluation.get("replan_trigger") == "verification_contract_review"
+    ):
+        contract_evidence = current.evaluation.get("verification_contract_evidence")
+        repeated = int(contract_evidence.get("repeated_count") or 0) if isinstance(contract_evidence, dict) else 0
+        if repeated < 2:
+            state.last_error = "重规划证据不足，先重新运行当前 Task 验证以收集第二次失败证据。"
+            candidate = GoalPhase.VERIFY.value
     if (
         state.stop_reason == StopReason.repair_limit_reached.value
         and candidate == GoalPhase.REPAIR_PLAN.value
@@ -719,6 +830,22 @@ def _resume_target(state: GoalState) -> str:
             candidate = GoalPhase.CLEAN_CHECK.value
         elif state.evaluation_required and candidate in {GoalPhase.ACT.value, GoalPhase.REPAIR_PLAN.value}:
             candidate = GoalPhase.EVALUATE.value
+    # A paused implementation checkpoint must not resume a worker when its
+    # latest proof never reached a behavior assertion. Re-run verification so
+    # the contract-review guard can preserve the evidence and stop cleanly.
+    if current is not None and current.status == "in_progress" and candidate in {
+        GoalPhase.ACT.value,
+        GoalPhase.CLAIM.value,
+        GoalPhase.ROLLOVER.value,
+    }:
+        latest = current.evidence[-1] if current.evidence else {}
+        diagnostics = latest.get("diagnostics") if isinstance(latest, dict) else {}
+        if isinstance(diagnostics, dict) and (
+            diagnostics.get("blocked_before_assertions")
+            or _verification_contract_invalid(latest)
+        ):
+            state.last_error = "最近一次验证证据表明测试契约无效或未完成断言，恢复时先复验验证契约，不重新进入实现。"
+            candidate = GoalPhase.VERIFY.value
     task_phases = {
         GoalPhase.PREPARE_EXECUTION.value,
         GoalPhase.CLAIM.value,
@@ -1060,7 +1187,7 @@ class GoalRunner(threading.Thread):
         for plan in state.task_plan:
             if not isinstance(plan, dict):
                 continue
-            for key in ("primary_write", "planned_new", "conditional_write"):
+            for key in ("primary_write", "planned_new", "conditional_write", "scope_paths"):
                 scopes = plan.get(key) if isinstance(plan.get(key), list) else []
                 values.extend(str(item) for item in scopes if str(item).strip())
         for task_id in state.task_ids:
@@ -1090,6 +1217,8 @@ class GoalRunner(threading.Thread):
             "summary": str(summary or "")[:2_000],
             "stop_reason": str(stats.stop_reason or ""),
             "llm_rounds": max(0, int(stats.llm_rounds)),
+            "input_tokens": max(0, int(getattr(stats, "input_tokens", 0) or 0)),
+            "output_tokens": max(0, int(getattr(stats, "output_tokens", 0) or 0)),
             "elapsed_seconds": max(0.0, float(stats.elapsed_seconds)),
             "tool_count": max(0, int(stats.tool_count)),
             "tool_names": list(dict.fromkeys(str(item) for item in stats.tool_names))[-12:],
@@ -1258,6 +1387,21 @@ class GoalRunner(threading.Thread):
                 r"\bfrom\s*[\"']([^\"']+)[\"']|\bimport\s*[\"']([^\"']+)[\"']|\brequire\s*\(\s*[\"']([^\"']+)[\"']",
                 source,
             ):
+                # ``import type {Foo} from './types'`` is erased by the
+                # TypeScript compiler and cannot make a source file a runtime
+                # implementation dependency.  Treating it as a write-scope
+                # dependency creates a false ``scope_omission`` before the
+                # actual renderer/test failure can reach repair planning.
+                if match.group(1):
+                    last_import = max(
+                        source.rfind("import ", 0, match.start()),
+                        source.rfind("import\t", 0, match.start()),
+                    )
+                    last_statement = source.rfind(";", 0, match.start())
+                    if last_import > last_statement:
+                        import_prefix = source[last_import:match.start()]
+                        if re.match(r"import\s+type\b", import_prefix, re.IGNORECASE | re.DOTALL):
+                            continue
                 raw_import = next((value for value in match.groups() if value), "")
                 if not raw_import.startswith("."):
                     continue
@@ -1347,8 +1491,42 @@ class GoalRunner(threading.Thread):
         if error:
             return False
         self._record_scope_amendment(state, task, paths)
-        task.last_error = f"Task scope reconciled from {source}."
+        reconciliation_summary = f"Task scope reconciled from {source}."
+        task.last_error = reconciliation_summary
         save_task(task)
+        # A malformed advisory response must remain auditable in history, but
+        # it is no longer the current Goal health once frozen test evidence has
+        # deterministically repaired the exact missing source-file scope.
+        # Without this replacement the TUI keeps showing "supervisor
+        # unavailable" while ACT is correctly continuing under local rules.
+        supervision = state.supervision if isinstance(state.supervision, dict) else {}
+        history = list(supervision.get("history") or [])
+        reconciliation = {
+            "action": "watch",
+            "summary": reconciliation_summary,
+            "reason": "An unchanged Task-bound test directly imports the reconciled source file.",
+            "next_step": "Continue the current Task within its amended scope.",
+            "scope_paths": list(paths),
+            "evidence": ["unchanged bound test import"],
+            "confidence": "high",
+            "unavailable": False,
+            "error": "",
+            "trigger": "verification_scope_amended",
+            "observation_id": f"deterministic-{task.id}-{supervision.get('observation_revision') or 0}",
+            "revision": int(supervision.get("observation_revision") or 0),
+            "stale": False,
+            "at": time.time(),
+            "source": "deterministic_test_evidence",
+        }
+        history.append(reconciliation)
+        state.supervision = {
+            **supervision,
+            "status": "observing",
+            "latest": reconciliation,
+            "history": history[-12:],
+            "error": "",
+            "updated_at": reconciliation["at"],
+        }
         state.last_error = task.last_error
         state.no_progress_count = 0
         state.permission_boundary_attempts.pop(task.id, None)
@@ -1481,6 +1659,13 @@ class GoalRunner(threading.Thread):
             current_revision = int(supervision.get("observation_revision") or 0)
         except (TypeError, ValueError):
             current_revision = 0
+        # Test doubles and older persisted states may not carry the
+        # observation revision populated by the live supervisor. Bind the
+        # first boundary result to its supplied revision instead of treating
+        # an otherwise valid decision as stale.
+        if "observation_revision" not in supervision:
+            current_revision = run.revision
+            state.supervision = {**supervision, "observation_revision": run.revision}
         if run.revision != current_revision:
             pause("Global supervisor returned a stale permission decision; no authority was changed.")
             return
@@ -1802,6 +1987,16 @@ class GoalRunner(threading.Thread):
     def _drive(self) -> None:
         while self.is_running():
             state = self._state
+            exhausted_key = budget_exhausted(state)
+            if exhausted_key:
+                state.last_error = f"Goal budget exhausted: {exhausted_key}"
+                self._pause(
+                    state,
+                    "budget_exhausted",
+                    stop_reason=StopReason.budget_exhausted.value,
+                )
+                save_goal(state)
+                return
             self._poll_supervisor()
             if workspace_generation() != state.workspace_generation:
                 self._fail(state, StopReason.workspace_changed, "workspace switched while goal was active")
@@ -1870,6 +2065,7 @@ class GoalRunner(threading.Thread):
                         human_language=human_language_label((state.goal_contract or {}).get("language")),
                     )
                 except Exception as exc:
+                    self._record_agent_usage(state, stats)
                     state.total_llm_rounds += stats.llm_rounds
                     state.last_error = f"Goal planner unavailable: {type(exc).__name__}: {exc}"
                     self._observe_supervisor(
@@ -1890,6 +2086,7 @@ class GoalRunner(threading.Thread):
                     return
             finally:
                 self._phase_in_flight = False
+            self._record_agent_usage(state, stats)
             state.total_llm_rounds += stats.llm_rounds
             self._observe_supervisor(
                 "agent_finished",
@@ -2176,6 +2373,8 @@ class GoalRunner(threading.Thread):
                 "The test file must be machine-collectable even though its pre-implementation baseline is expected "
                 "to fail on the missing behavior. An explanation or empty selector list is not a valid result. "
                 "Test-design protocol: inspect the relevant source and existing tests before choosing a boundary. "
+                "Solve the currently specified behavior without hard-coding the test or production design to this single example; "
+                "keep the observable boundary extensible for later compatible Goal upgrades. "
                 "For a broad Task, make multiple focused test groups when its acceptance cases cross pure state/data, "
                 "async coordination, input routing, and rendering. Each group must state its layer, existing target module, "
                 "observed seam, and covered acceptance IDs in test_design. Do not invent a new production API or module just "
@@ -2500,6 +2699,26 @@ class GoalRunner(threading.Thread):
                     ),
                 )
                 empty_response = retry_stats.stop_reason == "empty_response"
+                # The completion turn may itself create a new test artifact.
+                # Recollect before validating its selector so the machine
+                # evidence includes both generations, not just the first
+                # writer slice.
+                try:
+                    after_catalog = (
+                        collect_pytest_catalog(root)
+                        if adapter.id == "pytest"
+                        else adapter.discover(verification_context)
+                    )
+                    generated_selectors = tuple(
+                        selector for selector in after_catalog.selectors
+                        if selector not in before_catalog.selectors
+                    )
+                    generated_selector_set = set(generated_selectors)
+                except StopIteration:
+                    # Lightweight adapters and older test doubles expose only
+                    # one post-write catalog. Keep the last machine snapshot
+                    # rather than turning an optional refresh into a blocker.
+                    pass
                 selectors = self._selectors_from_generation(raw, root, catalog=after_catalog)
                 case_selectors = self._case_selectors_from_generation(raw, selectors, task.acceptance_cases)
                 requested_selectors = self._requested_selectors_from_generation(raw)
@@ -2510,7 +2729,10 @@ class GoalRunner(threading.Thread):
             # for the remaining acceptance cases rather than falsely mapping
             # an unrelated selector to them.
             missing_cases = self._missing_case_selectors(required_cases, case_selectors)
-            coverage_repair_attempted = bool(missing_cases and generated_selectors)
+            # A selector-binding repair that still produced no valid selector
+            # cannot be followed by a coverage repair: doing so would invoke
+            # the writer a third time without any new machine evidence.
+            coverage_repair_attempted = bool(missing_cases and generated_selectors and selectors)
             if coverage_repair_attempted:
                 prior_selectors = selectors
                 prior_case_selectors = case_selectors
@@ -2698,6 +2920,61 @@ class GoalRunner(threading.Thread):
                 state.last_error = f"Task {task.id} generated an invalid test architecture: {architecture_error}"
                 save_goal(state)
                 return
+            # Reject an unambiguous contradiction before running or binding a
+            # generated test. This keeps a visible current-Task summary marker
+            # from being mistaken for hidden detail content and prevents the
+            # resulting failure from reopening the product implementation.
+            # Catalog-driven unit tests may provide selectors without writing
+            # real files. Run source lint only when every generated file is
+            # present; missing-file/empty-catalog errors remain owned by the
+            # normal generation checks below.
+            lint_paths = []
+            for raw_file in files:
+                candidate = Path(str(raw_file))
+                if not candidate.is_absolute():
+                    candidate = root / candidate
+                lint_paths.append(candidate)
+            contract_lint: dict[str, Any] = {"invalid": False, "issues": []}
+            if lint_paths and all(path.is_file() for path in lint_paths):
+                try:
+                    from harness.verification.debug import lint_test_contract
+
+                    contract_lint = lint_test_contract(
+                        files,
+                        workspace=root,
+                        acceptance_ids=required_cases,
+                    )
+                except Exception as exc:  # pragma: no cover - lint must not crash generation
+                    contract_lint = {
+                        "invalid": True,
+                        "issues": [{
+                            "severity": "high",
+                            "code": "contract_lint_error",
+                            "message": f"{type(exc).__name__}: {exc}",
+                        }],
+                    }
+            if contract_lint.get("invalid"):
+                issues = [
+                    item for item in (contract_lint.get("issues") or [])
+                    if isinstance(item, dict)
+                ]
+                detail = "; ".join(
+                    str(item.get("message") or item.get("code") or "invalid generated test contract")
+                    for item in issues[:4]
+                ) or "invalid generated test contract"
+                self._restore_test_tree(root, before_tree, write_roots, expected_after=self._snapshot_test_tree(root, write_roots))
+                state.last_error = f"Task {task.id} generated an invalid verification contract: {detail}"
+                self._record_execution_trace(
+                    state,
+                    "test_generation_contract_invalid",
+                    task_id=task.id,
+                    route="test_gap",
+                    summary="Rejected a generated test whose assertions contradict its own fixture or acceptance scope.",
+                    detail={"issues": issues[:8]},
+                )
+                self._pause(state, "test_generation_contract_invalid", stop_reason=StopReason.test_generation_required.value)
+                save_goal(state)
+                return
             # The writer is allowed to add a focused test, never alter any
             # pre-existing fixture/helper/conftest under a permitted test root.
             # Hashing only collected nodes misses these semantic escape hatches.
@@ -2713,6 +2990,7 @@ class GoalRunner(threading.Thread):
                 save_goal(state)
                 return
             command = adapter.build_command(selectors)
+            add_usage(state, verification_runs=1)
             baseline = run_verification(
                 command,
                 workspace=root,
@@ -2847,7 +3125,15 @@ class GoalRunner(threading.Thread):
                 save_goal(state)
                 return
             previous_selectors = tuple(str(item) for item in task.verification_spec.get("previous_selectors", []) if item)
-            all_selectors = tuple(dict.fromkeys((*previous_selectors, *selectors)))
+            # Coverage-only repairs prove the newly requested seam. Reusing
+            # every prior selector here makes an AC2 Task inherit unrelated
+            # AC1/AC3/AC4/AC5 cases and causes contract lint to reject a valid
+            # focused test before its own assertions are evaluated.
+            all_selectors = (
+                tuple(dict.fromkeys(selectors))
+                if task.verification_spec.get("coverage_only")
+                else tuple(dict.fromkeys((*previous_selectors, *selectors)))
+            )
             files = tuple(dict.fromkeys(item.split("::", 1)[0] for item in all_selectors))
             baseline_evidence = evidence_from_result(
                 baseline,
@@ -2877,6 +3163,14 @@ class GoalRunner(threading.Thread):
                     )
                 ),
             ).to_dict()
+            # Preserve the routing mode that requested this additive test.
+            # ``bind_task_verification`` replaces the old spec, so without
+            # carrying this bit forward SELECT_TASK would reopen ACT.
+            if task.verification_spec.get("coverage_only"):
+                bound_spec["coverage_only"] = True
+                bound_spec["coverage_repair_count"] = int(
+                    task.verification_spec.get("coverage_repair_count") or 1
+                )
             # Binding replaces the verification spec. Preserve the durable
             # cross-Task reason that caused this additive test generation.
             if impact_context:
@@ -2901,6 +3195,18 @@ class GoalRunner(threading.Thread):
             # A successful retry must not leave the prior baseline diagnostic
             # visible while the Goal proceeds to implementation.
             state.last_error = None
+            if bound.verification_spec.get("coverage_only"):
+                self._record_execution_trace(
+                    state,
+                    "test_coverage_bound",
+                    task_id=task.id,
+                    route="verify",
+                    summary="Coverage-only test bound; verifying existing implementation without reopening ACT.",
+                    detail={"test_files": list(files), "selectors": list(all_selectors)},
+                )
+                save_goal(state)
+                self._apply(state, GoalPhase.VERIFY, "coverage_only_tests_bound")
+                return
             # Test preparation is deliberately lazy. The next Task is chosen
             # only after this one has been implemented and reviewed.
             break
@@ -3213,6 +3519,15 @@ class GoalRunner(threading.Thread):
                 save_goal(state)
                 self._apply(state, GoalPhase.PREPARE_TESTS, "task_test_generation_required")
                 return
+            # Verification is a durable capability boundary. A Task that is
+            # already proven must never be sent through implementation again,
+            # even when SELECT_TASK was reached after a stale/restarted phase
+            # checkpoint.
+            verified_target = self._verified_task_target(task)
+            if verified_target is not None:
+                save_goal(state)
+                self._apply(state, verified_target, "verified_task_routed_to_gate")
+                return
             if is_new_task:
                 state.attempts = 0
                 state.no_progress_count = 0
@@ -3230,6 +3545,15 @@ class GoalRunner(threading.Thread):
             self._apply(state, GoalPhase.PREPARE_EXECUTION, "task_selected")
             return
         self._apply(state, GoalPhase.FULL_VERIFY, "all_tasks_completed")
+
+    @staticmethod
+    def _verified_task_target(task) -> GoalPhase | None:
+        """Return the next deterministic gate for a passing Task."""
+        if task.verification_state != "passing":
+            return None
+        if task.evaluation_required and (task.evaluation or {}).get("passed") is not True:
+            return GoalPhase.EVALUATE
+        return GoalPhase.CLEAN_CHECK
 
     def _record_execution_trace(
         self,
@@ -3258,6 +3582,24 @@ class GoalRunner(threading.Thread):
         from harness.tasks import load_task, record_task_evaluation, save_task
 
         task = load_task(state.current_task_id)
+        # Evaluator-requested coverage is evidence work for an already
+        # implemented Task. Once its focused test is bound, never reopen the
+        # product worker; run the new proof against the current workspace.
+        if (
+            task.verification_state != "needs_generation"
+            and isinstance(task.verification_spec, dict)
+            and task.verification_spec.get("coverage_only")
+        ):
+            self._record_execution_trace(
+                state,
+                "execution_preflight_coverage_only",
+                task_id=task.id,
+                route="verify",
+                summary="Coverage-only verification is bound; implementation writes are not authorized.",
+            )
+            save_goal(state)
+            self._apply(state, GoalPhase.VERIFY, "coverage_only_verification")
+            return
         if task.verification_state == "needs_generation":
             self._record_execution_trace(
                 state, "execution_preflight", task_id=task.id, route="test_gap",
@@ -3265,6 +3607,18 @@ class GoalRunner(threading.Thread):
             )
             save_goal(state)
             self._apply(state, GoalPhase.PREPARE_TESTS, "execution_preflight_needs_tests")
+            return
+        verified_target = self._verified_task_target(task)
+        if verified_target is not None:
+            self._record_execution_trace(
+                state,
+                "execution_preflight_verified",
+                task_id=task.id,
+                route=verified_target.value,
+                summary="Task verification is already passing; implementation worker is not authorized.",
+            )
+            save_goal(state)
+            self._apply(state, verified_target, "execution_preflight_verified")
             return
 
         errors: list[str] = []
@@ -3371,7 +3725,22 @@ class GoalRunner(threading.Thread):
         from harness.tasks import load_task
 
         task = load_task(state.current_task_id)
+        # Hard stop immediately before invoking the worker. This protects
+        # against a concurrent/stale phase checkpoint that reaches ACT after
+        # verification persisted a passing result.
+        verified_target = self._verified_task_target(task)
+        if verified_target is not None:
+            self._record_execution_trace(
+                state,
+                "implementation_skipped_verified",
+                task_id=task.id,
+                route=verified_target.value,
+                summary="Skipped implementation because the current Task is already verified.",
+            )
+            self._apply(state, verified_target, "implementation_skipped_verified")
+            return
         before = self._progress_snapshot(state)
+        prior_no_progress = state.no_progress_count
         stats = AgentTaskStats()
         state.worker_generation += 1
         save_goal(state)
@@ -3441,6 +3810,7 @@ class GoalRunner(threading.Thread):
         finally:
             set_goal_noninteractive(False)
             self._phase_in_flight = False
+        self._record_agent_usage(state, stats, worker=True)
         state.total_llm_rounds += stats.llm_rounds
         state.attempts += 1
         permission_pending = goal_permission_pending()
@@ -3543,9 +3913,13 @@ class GoalRunner(threading.Thread):
                 "goal_worker_provider_error",
                 stop_reason=StopReason.provider_unavailable.value,
             )
-        elif resumable_slice and worker_progressed:
+        elif resumable_slice and (worker_progressed or prior_no_progress == 0):
             state.worker_rollovers += 1
-            self._apply(state, GoalPhase.ROLLOVER, "worker_progress_extended")
+            self._apply(
+                state,
+                GoalPhase.ROLLOVER,
+                "worker_progress_extended" if worker_progressed else "worker_slice_limit_reached",
+            )
         else:
             # Always verify after a worker slice, even when it made no new
             # write. Existing implementation may already satisfy the Task,
@@ -3582,6 +3956,60 @@ class GoalRunner(threading.Thread):
         external_markers = ("docker daemon", "cannot connect to docker", "connection refused", "service unavailable", "missing credential", "api key")
         if any(marker in detail for marker in external_markers):
             return "external_blocked", "Verification depends on an unavailable external runtime or credential."
+        evidence = [item for item in (task.evidence or []) if isinstance(item, dict)]
+        signatures = [
+            str((item.get("diagnostics") or {}).get("failure_signature") or "")
+            for item in evidence
+        ]
+        latest_signature = signatures[-1] if signatures else ""
+        latest_diagnostics = evidence[-1].get("diagnostics") if evidence else {}
+        latest_failure_mode = str((latest_diagnostics or {}).get("failure_mode") or "")
+        if (
+            (latest_diagnostics or {}).get("blocked_before_assertions")
+            and latest_failure_mode == "common_runtime_error"
+        ):
+            return (
+                "replan",
+                "Verification failed before behavior assertions because the renderer/test harness raised a common runtime error; review the observation contract before changing product code.",
+            )
+        if latest_failure_mode == "test_observation_gap":
+            return (
+                "replan",
+                "The component interaction trace shows callback/state transition, but the test renderer did not expose the updated frame; review the observation contract before changing product code.",
+            )
+        if latest_failure_mode == "event_delivery_timeout":
+            return (
+                "replan",
+                "Verification timed out before a behavior assertion; review the test renderer event-delivery contract before changing product code.",
+            )
+        repeated = 0
+        if latest_signature:
+            for signature in reversed(signatures):
+                if signature != latest_signature:
+                    break
+                repeated += 1
+        if repeated >= 2 and latest_failure_mode != "common_runtime_error":
+            hypotheses = [
+                str(item.get("tested_hypothesis") or "").strip()
+                for item in (getattr(task, "attempt_history", []) or [])
+                if isinstance(item, dict)
+                and str(item.get("failure_signature") or "") == latest_signature
+            ]
+            same_hypothesis = bool(
+                hypotheses
+                and len(hypotheses) >= 2
+                and hypotheses[-1]
+                and hypotheses[-1] == hypotheses[-2]
+            )
+            return (
+                "replan",
+                (
+                    f"The same verification failure signature repeated {repeated} times with the same tested hypothesis; "
+                    "force a materially different hypothesis before another repair."
+                    if same_hypothesis
+                    else f"The same verification failure signature repeated {repeated} times; review the bound test contract and control-group assumptions before another implementation repair."
+                ),
+            )
         if state.no_progress_count:
             return (
                 "implementation_fix",
@@ -3595,6 +4023,7 @@ class GoalRunner(threading.Thread):
         evidence = task.evidence[-1] if task.evidence else {}
         if not isinstance(evidence, dict):
             evidence = {}
+        diagnostics = evidence.get("diagnostics") if isinstance(evidence.get("diagnostics"), dict) else {}
         slices = [
             entry for entry in state.execution_trace
             if entry.get("task_id") == task.id and entry.get("event") == "implementation_slice"
@@ -3630,18 +4059,42 @@ class GoalRunner(threading.Thread):
                 "selectors": list(verification_spec.get("selectors") or [])[-12:],
                 "exit_code": evidence.get("exit_code"),
                 "output_tail": str(evidence.get("stdout_tail") or evidence.get("output_tail") or "")[-4_000:],
+                "diagnostics": diagnostics,
+            },
+            "failure_record": {
+                "failure_signature": str(diagnostics.get("failure_signature") or ""),
+                "failure_mode": str(diagnostics.get("failure_mode") or ""),
+                "blocked_before_assertions": bool(diagnostics.get("blocked_before_assertions")),
+                "next_machine_check": str(diagnostics.get("next_machine_check") or "Rerun bound verification."),
             },
             "attempts": attempts,
             "retry": {
                 "repair_count": len(task.repair_history),
                 "no_progress_count": state.no_progress_count,
             },
+            "remaining_budget": budget_remaining(state),
             "next_action": (
-                "Continue the current Task with the bound verification; inspect the recorded tool errors and changed paths before retrying."
+                "Before changing code, perform the required evidence recheck: compare expected and observed output, "
+                "confirm the bound command/selectors/workspace, and state whether this failure signature is new or repeated. "
+                "Then continue the current Task with the bound verification."
                 if classification == "implementation_blocker"
-                else "Validate the contract mismatch against the recorded verification evidence before changing Task boundaries."
+                else "Validate the contract mismatch against the recorded verification evidence before changing Task boundaries, "
+                "including the failure signature and execution workspace."
             ),
         }
+
+    @staticmethod
+    def _record_agent_usage(state: GoalState, stats: AgentTaskStats, *, worker: bool = False) -> None:
+        """Fold one completed provider call into the durable Goal ledger."""
+        add_usage(
+            state,
+            llm_requests=1,
+            llm_input_tokens=max(0, int(getattr(stats, "input_tokens", 0) or 0)),
+            llm_output_tokens=max(0, int(getattr(stats, "output_tokens", 0) or 0)),
+            tool_calls=stats.tool_count,
+            worker_slices=1 if worker else 0,
+            active_seconds=max(0.0, float(stats.elapsed_seconds or 0.0)),
+        )
 
     def _stalled_task_replan_evidence(
         self,
@@ -3834,6 +4287,21 @@ class GoalRunner(threading.Thread):
                 "evidence": "bound verification",
             }],
         }
+        if route == "replan":
+            evaluation["replan_trigger"] = "verification_contract_review"
+            latest = task.evidence[-1] if task.evidence else {}
+            diagnostics = latest.get("diagnostics") if isinstance(latest, dict) else {}
+            signature = (diagnostics or {}).get("failure_signature")
+            evaluation["verification_contract_evidence"] = {
+                "failure_signature": str(signature or ""),
+                "expected_actual": (diagnostics or {}).get("expected_actual") or {},
+                "failure_mode": str((diagnostics or {}).get("failure_mode") or ""),
+                "repeated_count": sum(
+                    1 for item in reversed(task.evidence or [])
+                    if isinstance(item, dict)
+                    and (item.get("diagnostics") or {}).get("failure_signature") == signature
+                ),
+            }
         record_task_evaluation(task.id, evaluation)
         self._record_execution_trace(
             state, "verification_failure", task_id=task.id, route=route,
@@ -3861,6 +4329,7 @@ class GoalRunner(threading.Thread):
             deadline=self._deadline(state),
             stats=stats,
         )
+        self._record_agent_usage(state, stats)
         state.total_llm_rounds += stats.llm_rounds
         if self._honor_control_request(state):
             return
@@ -3880,6 +4349,49 @@ class GoalRunner(threading.Thread):
             ),
         )
         if evaluation.get("passed") is None:
+            # The evaluator is advisory. When machine verification already
+            # passed and the only failure is an unavailable network/provider,
+            # continue with an explicit, auditable evidence fallback. Invalid
+            # JSON without a provider error and substantive evaluator findings
+            # still require the normal retry/pause path.
+            error_text = " ".join(
+                str(evaluation.get(key) or "")
+                for key in ("error", "raw_output_tail")
+            ).lower()
+            provider_markers = (
+                "apiconnectionerror",
+                "connection error",
+                "winerror 10013",
+                "connection refused",
+                "service unavailable",
+                "provider unavailable",
+            )
+            if getattr(task, "verification_state", "") == "passing" and any(
+                marker in error_text for marker in provider_markers
+            ):
+                fallback = {
+                    **evaluation,
+                    "passed": True,
+                    "route": "pass",
+                    "summary": "Machine verification passed; evaluator provider unavailable, so deterministic evidence fallback was used.",
+                    "findings": [],
+                    "error": None,
+                    "evaluated_by": "deterministic_evidence_fallback",
+                    "fallback": True,
+                }
+                from harness.tasks import record_task_evaluation
+
+                record_task_evaluation(task.id, fallback)
+                self._record_execution_trace(
+                    state,
+                    "evaluation_fallback",
+                    task_id=task.id,
+                    route="continue",
+                    summary=fallback["summary"],
+                    detail={"reason": "evaluator_provider_unavailable", "verified": True},
+                )
+                self._apply(state, GoalPhase.CLEAN_CHECK, "evaluation_deterministic_fallback")
+                return
             state.last_error = str(
                 evaluation.get("error") or "evaluator did not return a valid verdict"
             )
@@ -3897,6 +4409,55 @@ class GoalRunner(threading.Thread):
             return
         if evaluation.get("passed") is True:
             self._apply(state, GoalPhase.CLEAN_CHECK, "evaluation_passed")
+            return
+        verification_spec = task.verification_spec if isinstance(task.verification_spec, dict) else {}
+        try:
+            coverage_repairs = int(verification_spec.get("coverage_repair_count") or 0)
+        except (TypeError, ValueError):
+            coverage_repairs = MAX_COVERAGE_REPAIR_ATTEMPTS
+        if (
+            evaluation.get("route") == "test_gap"
+            and verification_spec.get("coverage_only")
+            and coverage_repairs >= MAX_COVERAGE_REPAIR_ATTEMPTS
+        ):
+            detail = (
+                "The evaluator still reports a test gap after the bounded coverage repair. "
+                "Review the acceptance/test contract; do not generate another test or reopen implementation."
+            )
+            from harness.tasks import record_task_evaluation, save_task
+
+            contract_review = {
+                **evaluation,
+                "passed": False,
+                "route": "blocked",
+                "replan_trigger": "verification_contract_review",
+                "summary": detail,
+                "coverage_repair_count": coverage_repairs,
+            }
+            task = record_task_evaluation(task.id, contract_review)
+            task.last_error = detail
+            save_task(task)
+            self._record_execution_trace(
+                state,
+                "coverage_repair_exhausted",
+                task_id=task.id,
+                route="blocked",
+                summary=detail,
+                detail={
+                    "coverage_repair_count": coverage_repairs,
+                    "findings": [
+                        dict(item) for item in (evaluation.get("findings") or [])[-8:]
+                        if isinstance(item, dict)
+                    ],
+                },
+            )
+            state.last_error = detail
+            self._pause(
+                state,
+                "coverage_repair_contract_review",
+                stop_reason=StopReason.verification_contract_review.value,
+            )
+            save_goal(state)
             return
         state.last_error = str(evaluation.get("error") or evaluation.get("summary") or "evaluator rejected Task")
         if evaluation.get("route") == "replan":
@@ -3961,6 +4522,12 @@ class GoalRunner(threading.Thread):
         elif trigger in overlap_triggers:
             if not findings or not any(str(item.get("evidence") or "").strip() for item in findings):
                 return None, "Generated-test boundary replan lacks selector or baseline evidence."
+        elif trigger == "verification_contract_review":
+            contract_evidence = evaluation.get("verification_contract_evidence")
+            if not isinstance(contract_evidence, dict):
+                return None, "Verification contract review lacks repeated failure evidence."
+            if int(contract_evidence.get("repeated_count") or 0) < 2:
+                return None, "Verification contract review requires the same failure signature twice."
         elif trigger == "stalled_task_review":
             stalled = evaluation.get("stalled_task_evidence")
             if not isinstance(stalled, dict):
@@ -3986,6 +4553,82 @@ class GoalRunner(threading.Thread):
             "workspace_snapshot": getattr(task, "start_snapshot", "") or "",
         }
         return request, None
+
+    def _execution_replan_checkpoint_key(
+        self,
+        state: GoalState,
+        task: Any,
+        *,
+        selected_ids: set[str],
+        replacement_scope: tuple[dict[str, Any], ...],
+        execution_workspace_paths: tuple[str, ...],
+    ) -> str:
+        """Fingerprint the facts that make a saved replacement plan reusable."""
+        payload = {
+            "goal_id": state.id,
+            "task_id": task.id,
+            "selected_task_ids": sorted(selected_ids),
+            "replacement_scope": list(replacement_scope),
+            "goal_contract": dict(state.goal_contract or {}),
+            "workspace_snapshot": getattr(task, "start_snapshot", "") or "",
+        }
+        encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+        return hashlib.sha256(encoded.encode("utf-8", errors="replace")).hexdigest()
+
+    def _load_execution_replan_checkpoint(
+        self,
+        state: GoalState,
+        task: Any,
+        *,
+        key: str,
+    ) -> tuple[GoalPlan | None, dict[str, Any] | None]:
+        checkpoint = state.execution_replan_checkpoint
+        if not isinstance(checkpoint, dict):
+            return None, None
+
+        def discard_candidate() -> None:
+            # Keep the retry counter for this exact checkpoint even when no
+            # candidate was captured (for example, a malformed first model
+            # response). A later resume must still reach the bounded guard.
+            if checkpoint.get("failure_count") and checkpoint.get("key") == key:
+                state.execution_replan_checkpoint = {
+                    field: checkpoint[field]
+                    for field in ("version", "goal_id", "task_id", "key", "failure_count", "last_error", "last_failed_at")
+                    if field in checkpoint
+                }
+            else:
+                state.execution_replan_checkpoint = {}
+
+        if (
+            checkpoint.get("version") != EXECUTION_REPLAN_CHECKPOINT_VERSION
+            or checkpoint.get("goal_id") != state.id
+            or checkpoint.get("task_id") != task.id
+            or checkpoint.get("key") != key
+        ):
+            state.execution_replan_checkpoint = {}
+            return None, None
+        candidate = checkpoint.get("candidate")
+        if not isinstance(candidate, dict) or not isinstance(candidate.get("tasks"), list):
+            discard_candidate()
+            return None, None
+        try:
+            plan = GoalPlan(
+                contract=dict(state.goal_contract or {}),
+                tasks=tuple(TaskPlan.from_dict(item) for item in candidate["tasks"] if isinstance(item, dict)),
+                replacement_coverage=tuple(
+                    dict(item) for item in candidate.get("replacement_coverage", []) if isinstance(item, dict)
+                ),
+            )
+        except (KeyError, TypeError, ValueError):
+            discard_candidate()
+            return None, None
+        if not plan.tasks:
+            discard_candidate()
+            return None, None
+        review = checkpoint.get("review")
+        if checkpoint.get("stage") == "repair" and isinstance(review, dict) and review.get("approved") is False:
+            return plan, dict(review)
+        return plan, None
 
     def _replan_remaining_tasks(
         self,
@@ -4021,17 +4664,35 @@ class GoalRunner(threading.Thread):
 
         completed = [candidate for candidate in current_tasks if candidate.status == "completed"]
         unfinished = [candidate for candidate in current_tasks if candidate.status != "completed"]
-        selected_ids = set(request["affected_task_ids"])
-        # A changed Task contract invalidates only its unfinished dependents.
-        # Independent work stays in the active graph and is supplied to the
-        # planner as an existing dependency anchor.
-        changed = True
-        while changed:
-            changed = False
-            for candidate in unfinished:
-                if candidate.id not in selected_ids and set(candidate.blockedBy).intersection(selected_ids):
-                    selected_ids.add(candidate.id)
-                    changed = True
+        trigger = str(request.get("trigger_type") or "")
+        unfinished_ids = {candidate.id for candidate in unfinished}
+        selected_ids = {
+            task_id for task_id in request["affected_task_ids"]
+            if task_id in unfinished_ids
+        }
+        # A preflight contract failure is local to the Task that was checked.
+        # Replanning its entire downstream graph creates an unnecessarily large
+        # one-shot model response and can invalidate work that was not affected.
+        if trigger == "execution_preflight":
+            selected_ids = {task.id}
+        else:
+            # Semantic/stalled evidence can contain a stale dependency closure.
+            # Keep only the current Task and its direct unfinished dependents;
+            # never recursively walk the graph to the final Goal task.
+            direct_from_task = {
+                candidate.id
+                for candidate in unfinished
+                if task.id in set(candidate.blockedBy)
+            }
+            selected_ids = {task.id}
+            direct_dependents = {
+                candidate.id
+                for candidate in unfinished
+                if candidate.id in direct_from_task
+            }
+            selected_ids.update(direct_dependents.intersection(set(request["affected_task_ids"])))
+            if not direct_dependents.intersection(selected_ids):
+                selected_ids.update(direct_dependents)
         superseded = [candidate for candidate in unfinished if candidate.id in selected_ids]
         preserved_unfinished = [candidate for candidate in unfinished if candidate.id not in selected_ids]
         if not superseded:
@@ -4039,6 +4700,17 @@ class GoalRunner(threading.Thread):
             self._record_execution_trace(state, "execution_replan", task_id=task.id, route="blocked", summary=detail)
             self._pause(state, "execution_replan_target_unavailable", stop_reason=StopReason.execution_preflight_failed.value)
             return
+        replacement_scope = tuple({
+            "task_id": candidate.id,
+            "name": candidate.subject,
+            "behavior": candidate.description,
+            "acceptance_cases": list(candidate.acceptance_cases),
+            "primary_write": list(candidate.primary_write),
+            "planned_new": list(candidate.planned_new),
+            "conditional_write": list(candidate.conditional_write),
+            "read_envelope": list(candidate.read_envelope),
+            "verification": dict(candidate.verification_spec),
+        } for candidate in superseded)
         dependency_anchors = [*completed, *preserved_unfinished]
         anchor_names = tuple(candidate.subject for candidate in dependency_anchors)
         if len(set(anchor_names)) != len(anchor_names):
@@ -4082,8 +4754,100 @@ class GoalRunner(threading.Thread):
             root,
             scope_paths=replan_scope_paths,
         )
+        checkpoint_key = self._execution_replan_checkpoint_key(
+            state,
+            task,
+            selected_ids=selected_ids,
+            replacement_scope=replacement_scope,
+            execution_workspace_paths=execution_workspace_paths,
+        )
+        checkpoint_state = state.execution_replan_checkpoint
+        if (
+            isinstance(checkpoint_state, dict)
+            and checkpoint_state.get("goal_id") == state.id
+            and checkpoint_state.get("task_id") == task.id
+            and checkpoint_state.get("key") == checkpoint_key
+            and int(checkpoint_state.get("failure_count") or 0) >= MAX_EXECUTION_REPLAN_ATTEMPTS
+        ):
+            detail = (
+                "Execution replan reached its bounded retry limit after "
+                f"{int(checkpoint_state.get('failure_count') or 0)} rejected attempts. "
+                "Review the saved candidate and reviewer findings before retrying."
+            )
+            self._record_execution_trace(
+                state, "execution_replan_exhausted", task_id=task.id, route="blocked", summary=detail,
+                detail={"failure_count": int(checkpoint_state.get("failure_count") or 0)},
+            )
+            state.last_error = detail
+            self._pause(state, "execution_replan_retry_limit", stop_reason=StopReason.task_blocked.value)
+            return
+        candidate_plan, review_feedback = self._load_execution_replan_checkpoint(
+            state, task, key=checkpoint_key,
+        )
+
+        def checkpoint_candidate(plan: GoalPlan) -> None:
+            candidate = {
+                "tasks": [item.to_dict() for item in plan.tasks],
+                "replacement_coverage": [dict(item) for item in plan.replacement_coverage],
+            }
+            existing = state.execution_replan_checkpoint
+            failure_count = int(existing.get("failure_count") or 0) if isinstance(existing, dict) else 0
+            if (
+                isinstance(existing, dict)
+                and existing.get("key") == checkpoint_key
+                and existing.get("stage") == "repair"
+                and existing.get("candidate") == candidate
+            ):
+                return
+            state.execution_replan_checkpoint = {
+                "version": EXECUTION_REPLAN_CHECKPOINT_VERSION,
+                "goal_id": state.id,
+                "task_id": task.id,
+                "key": checkpoint_key,
+                "stage": "review",
+                "candidate": candidate,
+                "review": {},
+                "created_at": time.time(),
+            }
+            if failure_count:
+                state.execution_replan_checkpoint["failure_count"] = failure_count
+            save_goal(state)
+
+        def checkpoint_review(plan: GoalPlan, review: dict[str, Any]) -> None:
+            existing = state.execution_replan_checkpoint
+            failure_count = int(existing.get("failure_count") or 0) if isinstance(existing, dict) else 0
+            state.execution_replan_checkpoint = {
+                "version": EXECUTION_REPLAN_CHECKPOINT_VERSION,
+                "goal_id": state.id,
+                "task_id": task.id,
+                "key": checkpoint_key,
+                "stage": "repair",
+                "candidate": {
+                    "tasks": [item.to_dict() for item in plan.tasks],
+                    "replacement_coverage": [dict(item) for item in plan.replacement_coverage],
+                },
+                "review": dict(review),
+                "created_at": time.time(),
+            }
+            if failure_count:
+                state.execution_replan_checkpoint["failure_count"] = failure_count
+            save_goal(state)
+
+        if candidate_plan is not None:
+            self._record_execution_trace(
+                state,
+                "execution_replan_checkpoint",
+                task_id=task.id,
+                route="repair" if review_feedback is not None else "review",
+                summary=(
+                    "Resuming the saved replacement Task candidate with reviewer findings."
+                    if review_feedback is not None
+                    else "Resuming the saved replacement Task candidate for independent review."
+                ),
+            )
         adapter = select_adapter(root, state.verification)
         stats = AgentTaskStats()
+        add_usage(state, replan_attempts=1)
         self._phase_in_flight = True
         try:
             compiled = plan_tasks(
@@ -4098,12 +4862,31 @@ class GoalRunner(threading.Thread):
                 human_language=human_language_label((state.goal_contract or {}).get("language")),
                 frozen_contract=dict(state.goal_contract or {}),
                 completed_task_names=anchor_names,
+                replacement_scope=replacement_scope,
                 execution_workspace_paths=execution_workspace_paths,
                 replan_reason=json.dumps(request, ensure_ascii=False, sort_keys=True),
+                candidate_plan=candidate_plan,
+                candidate_callback=checkpoint_candidate,
+                review_feedback=review_feedback,
+                review_callback=checkpoint_review,
             )
         except Exception as exc:
             state.total_llm_rounds += stats.llm_rounds
             detail = f"Execution replan was not accepted: {type(exc).__name__}: {exc}"
+            checkpoint = state.execution_replan_checkpoint
+            if not isinstance(checkpoint, dict):
+                checkpoint = {}
+            previous_failures = int(checkpoint.get("failure_count") or 0)
+            checkpoint.update({
+                "version": EXECUTION_REPLAN_CHECKPOINT_VERSION,
+                "goal_id": state.id,
+                "task_id": task.id,
+                "key": checkpoint_key,
+                "failure_count": previous_failures + 1,
+                "last_error": detail[:4_000],
+                "last_failed_at": time.time(),
+            })
+            state.execution_replan_checkpoint = checkpoint
             self._observe_supervisor(
                 "agent_finished",
                 detail=self._agent_stats_detail("goal_planner", stats, summary=detail, extra={"stage": "execution_replan"}),
@@ -4121,7 +4904,9 @@ class GoalRunner(threading.Thread):
             return
         finally:
             self._phase_in_flight = False
+        self._record_agent_usage(state, stats)
         state.total_llm_rounds += stats.llm_rounds
+        state.execution_replan_checkpoint = {}
         self._observe_supervisor(
             "agent_finished",
             detail=self._agent_stats_detail(
@@ -4140,8 +4925,8 @@ class GoalRunner(threading.Thread):
             return
 
         # The new contracts were fully validated before any existing Task is
-        # superseded. Completed and independent unfinished Tasks remain active
-        # dependency anchors; only the affected dependency closure leaves the
+        # superseded. Completed and retained unfinished Tasks remain active
+        # dependency anchors; only the selected affected Tasks leave the
         # active Goal graph.
         for candidate in superseded:
             candidate.status = "cancelled"
@@ -4170,9 +4955,26 @@ class GoalRunner(threading.Thread):
                 evidence_refs=list(item.evidence_refs),
                 test_strategy=item.test_strategy,
                 discovery_revision=item.discovery_revision,
+                revision=max((int(candidate.revision or 1) for candidate in superseded), default=1) + 1,
             )
             names[item.name] = replacement.id
             replacement_ids.append(replacement.id)
+
+        # Retained downstream Tasks must wait for the reviewed replacements,
+        # not for archived/superseded Task ids. Preserve all other dependency
+        # edges and de-duplicate ids so the active graph remains runnable.
+        superseded_ids = {candidate.id for candidate in superseded}
+        for candidate in preserved_unfinished:
+            if not superseded_ids.intersection(candidate.blockedBy):
+                continue
+            rebound: list[str] = []
+            for dependency_id in candidate.blockedBy:
+                if dependency_id in superseded_ids:
+                    rebound.extend(replacement_ids)
+                elif dependency_id not in rebound:
+                    rebound.append(dependency_id)
+            candidate.blockedBy = list(dict.fromkeys(rebound))
+            save_task(candidate)
 
         first_replaced = min(
             index for index, candidate in enumerate(current_tasks)
@@ -4231,17 +5033,102 @@ class GoalRunner(threading.Thread):
     def _repair_plan(self, state: GoalState) -> None:
         from harness.goal.memory import append_decisions
         from harness.goal.repair import fallback_repair_decision, plan_task_repair
-        from harness.tasks import load_task, record_task_repair, request_task_test_repair
+        from harness.tasks import load_task, record_task_evaluation, record_task_repair, request_task_test_repair, save_task
 
         task = load_task(state.current_task_id)
         evaluation = task.evaluation or {"passed": False, "summary": state.last_error or "Goal verification failed", "route": "implementation_fix"}
         if evaluation.get("route") == "replan":
+            contract_evidence = evaluation.get("verification_contract_evidence")
+            repeated = (
+                int(contract_evidence.get("repeated_count") or 0)
+                if isinstance(contract_evidence, dict) else 0
+            )
+            if (
+                evaluation.get("replan_trigger") == "verification_contract_review"
+                and repeated < 2
+            ):
+                summary = (
+                    "Verification observation gap needs one deterministic recheck before "
+                    "contract review; rerunning the frozen test without another worker turn."
+                )
+                self._record_execution_trace(
+                    state,
+                    "verification_contract_recheck",
+                    task_id=task.id,
+                    route="verify",
+                    summary=summary,
+                    detail={"failure_signature": contract_evidence.get("failure_signature", ""), "repeated_count": repeated},
+                )
+                state.last_error = summary
+                save_goal(state)
+                self._apply(state, GoalPhase.VERIFY, "verification_contract_recheck")
+                return
             self._replan_remaining_tasks(
                 state,
                 task=task,
                 evaluation=evaluation,
                 reason=str(evaluation.get("summary") or state.last_error or "Task boundaries require replanning."),
             )
+            return
+        # A renderer/setup failure before any behavior assertion is not
+        # evidence that product code is wrong. Once this happens, stop the
+        # implementation repair loop and leave an explicit contract-review
+        # checkpoint for the test/renderer boundary. This also protects a
+        # Task that previously used ``test_gap`` from reopening ACT.
+        latest_evidence = task.evidence[-1] if task.evidence else {}
+        latest_diagnostics = latest_evidence.get("diagnostics") if isinstance(latest_evidence, dict) else {}
+        if isinstance(latest_diagnostics, dict) and (
+            latest_diagnostics.get("blocked_before_assertions")
+            or latest_diagnostics.get("verification_contract_invalid")
+            or latest_diagnostics.get("debug_failure_category") == "invalid_verification_contract"
+            or _verification_contract_invalid(latest_evidence)
+        ):
+            detail = (
+                "The bound verification contract is invalid or stopped before a valid behavior assertion; "
+                "review the test/renderer contract before any product implementation repair."
+            )
+            contract_evaluation = {
+                **evaluation,
+                "passed": False,
+                "route": "blocked",
+                "replan_trigger": "verification_contract_review",
+                "summary": detail,
+                "findings": [
+                    *(item for item in (evaluation.get("findings") or []) if isinstance(item, dict)),
+                    {
+                        "issue": str(
+                            latest_diagnostics.get("common_failure")
+                            or "; ".join(
+                                str(item.get("message") or "")
+                                for item in (latest_diagnostics.get("verification_contract_issues") or [])
+                                if isinstance(item, dict)
+                            )
+                            or "renderer/test harness failure before assertions"
+                        ),
+                        "severity": "high",
+                        "evidence": "verification diagnostics blocked_before_assertions=true",
+                    },
+                ][-8:],
+            }
+            task = record_task_evaluation(task.id, contract_evaluation)
+            task.last_error = detail
+            save_task(task)
+            self._record_execution_trace(
+                state,
+                "verification_contract_review",
+                task_id=task.id,
+                route="blocked",
+                summary=detail,
+                detail={
+                    "failure_mode": latest_diagnostics.get("failure_mode"),
+                    "failure_signature": latest_diagnostics.get("failure_signature"),
+                    "common_failure": latest_diagnostics.get("common_failure"),
+                    "blocked_before_assertions": bool(latest_diagnostics.get("blocked_before_assertions")),
+                    "verification_contract_invalid": bool(latest_diagnostics.get("verification_contract_invalid")),
+                },
+            )
+            self._pause(state, "verification_contract_review", stop_reason=StopReason.verification_contract_review.value)
+            save_goal(state)
             return
         if state.repair_epoch > 0:
             repair_count = sum(
@@ -4316,6 +5203,7 @@ class GoalRunner(threading.Thread):
             )
             return
         stats = AgentTaskStats()
+        add_usage(state, repair_attempts=1)
         decision = plan_task_repair(
             state,
             task,
@@ -4325,6 +5213,7 @@ class GoalRunner(threading.Thread):
             deadline=self._deadline(state),
             stats=stats,
         )
+        self._record_agent_usage(state, stats)
         state.total_llm_rounds += stats.llm_rounds
         if self._honor_control_request(state):
             return
@@ -4406,7 +5295,10 @@ class GoalRunner(threading.Thread):
             self._replan_remaining_tasks(state, task=task, evaluation=evaluation, reason=decision.summary or decision.instructions)
             return
         if decision.action == "test_gap":
-            request_task_test_repair(task.id)
+            # This route is selected after a Task already has a machine
+            # binding (typically by the evaluator).  Add evidence, then
+            # verify the existing implementation; do not reopen ACT.
+            request_task_test_repair(task.id, coverage_only=True)
             self._record_execution_trace(
                 state, "repair_routed", task_id=task.id,
                 route="test_gap",
@@ -4532,6 +5424,7 @@ class GoalRunner(threading.Thread):
 
     def _full_verify(self, state: GoalState) -> None:
         for task_id in state.task_ids:
+            add_usage(state, verification_runs=1)
             task = reverify_task_command(
                 task_id,
                 workspace=_execution_workspace(state),
@@ -4562,6 +5455,7 @@ class GoalRunner(threading.Thread):
         }
         save_goal(state)
         _emit_goal("goal_status", state)
+        add_usage(state, verification_runs=1)
         result = run_verification(
             state.verification,
             workspace=Path(_execution_workspace(state)),
@@ -4607,6 +5501,7 @@ class GoalRunner(threading.Thread):
                 return
 
             try:
+                add_usage(state, verification_runs=1)
                 integrated = run_verification(
                     state.verification,
                     workspace=integration.execution_workspace,
@@ -4967,10 +5862,22 @@ class GoalRunner(threading.Thread):
 
     def _progress_snapshot(self, state: GoalState) -> tuple:
         from harness.tasks import load_task
-        from harness.verification.snapshot import capture_code_snapshot
 
         task = load_task(state.current_task_id)
-        return (task.evidence, task.last_error, capture_code_snapshot(_execution_workspace(state)))
+        evidence = [item for item in (task.evidence or []) if isinstance(item, dict)]
+        latest = evidence[-1] if evidence else {}
+        diagnostics = latest.get("diagnostics") if isinstance(latest, dict) else {}
+        summary = (diagnostics or {}).get("result_summary") or {}
+        return (
+            str(task.status or ""),
+            len(evidence),
+            latest.get("exit_code"),
+            str((diagnostics or {}).get("failure_mode") or ""),
+            str((diagnostics or {}).get("failure_signature") or ""),
+            int(summary.get("passed") or 0),
+            int(summary.get("failed") or 0),
+            str(task.last_error or ""),
+        )
 
     @staticmethod
     def _scope_relative_path(state: GoalState, raw_path: str) -> str:

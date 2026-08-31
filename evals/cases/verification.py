@@ -61,10 +61,10 @@ def case_v001_policy_rejects_destructive() -> None:
         "pytest -q &",
         "python check.py `pwd`",
         "python check.py $(ls)",
-        # python -c / -m (arbitrary inline code) — rejected
+        # python -c is arbitrary inline code — rejected. The Goal's explicit
+        # python -m pytest module form is a supported deterministic runner.
         "python -c 'print(1)'",
         "py -c 'import os'",
-        "python -m pytest -q",
         # git mutation subcommands
         "git reset --hard HEAD",
         "git checkout -- .",
@@ -334,7 +334,7 @@ def case_v010_script_must_exist() -> None:
 CASES = [
     EvalCase(
         "v001.policy_rejects_destructive",
-        "V001: verification policy rejects destructive/shell/python -c commands",
+        "V001: verification policy rejects destructive/shell/python -c commands while allowing Goal pytest module runs",
         "verification",
         case_v001_policy_rejects_destructive,
     ),

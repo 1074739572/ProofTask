@@ -211,6 +211,23 @@ def test_store_rejects_prior_goal_schema(tmp_path):
         assert exc.code == "unsupported_schema"
 
 
+def test_store_migrates_v5_goal_with_no_execution_replan_checkpoint(tmp_path):
+    workspace = str(tmp_path / "ws")
+    state = GoalState.new(target="t", verification="v", workspace=workspace)
+    payload = state.to_dict()
+    payload["schema_version"] = 5
+    payload.pop("execution_replan_checkpoint")
+    path = goal_path(workspace)
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    loaded = load_goal(workspace)
+
+    assert loaded is not None
+    assert loaded.schema_version == GOAL_SCHEMA_VERSION
+    assert loaded.execution_replan_checkpoint == {}
+
+
 def test_load_goal_reclassifies_legacy_repair_json_error(tmp_path):
     state = GoalState.new(target="repair", verification="pytest -q", workspace=str(tmp_path))
     state.status = "paused"

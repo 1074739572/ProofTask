@@ -70,7 +70,28 @@ def parse_goal_command(query: str) -> dict[str, Any]:
         return {"action": "usage", "error": f"unparseable arguments: {exc}"}
     if not tokens:
         return {"action": "usage", "error": GOAL_USAGE}
-    if tokens[0] in ("status", "pause", "stop", "resume", "cancel", "preview", "approve", "run", "discard"):
+    if tokens[0] == "resume":
+        # Resuming may explicitly append to (never reset) the durable Goal
+        # envelope.  Keep the ordinary no-argument form unchanged.
+        if len(tokens) == 1:
+            return {"action": "resume", "budget": {}}
+        if len(tokens) % 2 != 1 or any(tokens[i] != "--budget" for i in range(1, len(tokens), 2)):
+            return {"action": "usage", "error": "Usage: /goal resume [--budget key=value ...]"}
+        budget: dict[str, float] = {}
+        for raw in tokens[2::2]:
+            if "=" not in raw:
+                return {"action": "usage", "error": "--budget requires key=value"}
+            key, value = raw.split("=", 1)
+            key = key.strip()
+            try:
+                amount = float(value)
+            except ValueError:
+                return {"action": "usage", "error": f"invalid budget value: {value!r}"}
+            if not key or amount <= 0:
+                return {"action": "usage", "error": "budget amount must be positive"}
+            budget[key] = amount
+        return {"action": "resume", "budget": budget}
+    if tokens[0] in ("status", "pause", "stop", "cancel", "preview", "approve", "run", "discard"):
         if len(tokens) > 1:
             return {"action": "usage", "error": f"/goal {tokens[0]} takes no arguments"}
         return {"action": "pause" if tokens[0] == "stop" else tokens[0]}
@@ -163,7 +184,7 @@ def handle_goal_command(query: str, history: list, context: dict, binding: Any) 
                     return format_draft(resume_draft())
                 except GoalDraftError as exc:
                     return str(exc)
-            return _handle_resume(runner, history, context, binding)
+            return _handle_resume(runner, history, context, binding, cmd.get("budget") or {})
         if action == "preview":
             return _handle_preview()
         if action == "discard":
@@ -214,8 +235,8 @@ def _handle_cancel(runner) -> str:
     )
 
 
-def _handle_resume(runner, history: list, context: dict, binding: Any) -> str:
-    state = runner.resume_goal(history=history, context=context, binding=binding)
+def _handle_resume(runner, history: list, context: dict, binding: Any, budget: dict[str, float] | None = None) -> str:
+    state = runner.resume_goal(history=history, context=context, binding=binding, additional_budget=budget or {})
     return (
         f"Goal resumed: {state.id} [{state.phase}]\n"
         f"  Target: {state.target[:80]}\n"

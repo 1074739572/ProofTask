@@ -7,7 +7,7 @@ import json
 from types import SimpleNamespace
 
 from harness.goal.planner import TaskPlan, discovery_readiness_error, parse_plan
-from harness.goal.models import GoalPhase, GoalState
+from harness.goal.models import GoalPhase, GoalState, StopReason
 from harness.goal.runner import GoalRunner
 from harness.verification.catalog import TestCatalog
 from harness.verification.node_adapter import NodeTestCatalog
@@ -625,6 +625,227 @@ def test_repair_threshold_replans_a_stalled_task_with_repair_and_verification_hi
     assert state.execution_trace[-1]["event"] == "stalled_task_review"
 
 
+def test_repeated_verification_signature_routes_to_contract_review(tmp_path, monkeypatch):
+    import harness.goal.runner as runner_mod
+    import harness.tasks as tasks
+
+    monkeypatch.setattr(tasks, "TASKS_DIR", tmp_path / ".tasks")
+    task = tasks.create_task("overlay", "keep siblings stable", verification_spec={"command": "pytest -q"})
+    task.evidence = [
+        {"exit_code": 1, "diagnostics": {"failure_signature": "same-signature"}},
+        {"exit_code": 1, "diagnostics": {"failure_signature": "same-signature"}},
+    ]
+    task.last_error = "assertion failed"
+    tasks.save_task(task)
+    state = GoalState.new(target="overlay", verification="pytest -q", workspace=str(tmp_path))
+    state.current_task_id = task.id
+
+    route, reason = runner_mod.GoalRunner(
+        state=state, history=[], context={}, binding=None,
+    )._classify_verification_failure(state, task)
+
+    assert route == "replan"
+    assert "failure signature repeated" in reason
+
+
+def test_renderer_observation_gap_routes_to_replan(tmp_path, monkeypatch):
+    import harness.goal.runner as runner_mod
+    import harness.tasks as tasks
+
+    monkeypatch.setattr(tasks, "TASKS_DIR", tmp_path / ".tasks")
+    task = tasks.create_task("ui", "observe toggle", verification_spec={"command": "bun test"})
+    task.evidence = [{"exit_code": 1, "diagnostics": {"failure_mode": "test_observation_gap"}}]
+    task.last_error = "frame_not_observable"
+    tasks.save_task(task)
+    state = GoalState.new(target="ui", verification="bun test", workspace=str(tmp_path))
+    state.current_task_id = task.id
+    route, reason = runner_mod.GoalRunner(state=state, history=[], context={}, binding=None)._classify_verification_failure(state, task)
+    assert route == "replan"
+    assert "observation" in reason
+
+
+def test_evaluator_test_gap_marks_coverage_only(tmp_path, monkeypatch):
+    import harness.tasks as tasks
+
+    monkeypatch.setattr(tasks, "TASKS_DIR", tmp_path / ".tasks")
+    task = tasks.create_task(
+        "ui", "observe toggle",
+        verification_spec={
+            "source": "generated",
+            "selectors": ["tests/test_ui.py::test_toggle"],
+            "test_files": ["tests/test_ui.py"],
+        },
+    )
+    updated = tasks.request_task_test_repair(task.id, coverage_only=True)
+
+    assert updated.verification_state == "needs_generation"
+    assert updated.verification_spec["coverage_only"] is True
+    assert updated.verification_spec["coverage_repair_count"] == 1
+    assert updated.verification_spec["previous_selectors"] == ["tests/test_ui.py::test_toggle"]
+
+
+def test_coverage_only_task_preflight_skips_implementation(tmp_path, monkeypatch):
+    import harness.goal.runner as runner_mod
+    import harness.tasks as tasks
+
+    monkeypatch.setattr(tasks, "TASKS_DIR", tmp_path / ".tasks")
+    monkeypatch.setattr(runner_mod, "save_goal", lambda _state: None)
+    monkeypatch.setattr(runner_mod, "_emit_goal", lambda *args, **kwargs: None)
+    task = tasks.create_task(
+        "ui", "observe toggle",
+        verification_spec={"source": "generated", "coverage_only": True},
+    )
+    task.status = "in_progress"
+    tasks.save_task(task)
+    state = GoalState.new(target="ui", verification="bun test", workspace=str(tmp_path))
+    state.current_task_id = task.id
+    state.task_ids = [task.id]
+    state.phase = GoalPhase.PREPARE_EXECUTION.value
+    runner = runner_mod.GoalRunner(state=state, history=[], context={}, binding=None)
+
+    runner._prepare_execution(state)
+
+    assert state.phase == GoalPhase.VERIFY.value
+    assert state.execution_trace[-1]["event"] == "execution_preflight_coverage_only"
+
+
+def test_pre_assertion_renderer_failure_pauses_for_contract_review(tmp_path, monkeypatch):
+    import harness.goal.runner as runner_mod
+    import harness.tasks as tasks
+
+    monkeypatch.setattr(tasks, "TASKS_DIR", tmp_path / ".tasks")
+    monkeypatch.setattr(runner_mod, "save_goal", lambda _state: None)
+    monkeypatch.setattr(runner_mod, "_emit_goal", lambda *args, **kwargs: None)
+    task = tasks.create_task("ui", "observe toggle", verification_spec={"source": "generated"})
+    task.status = "in_progress"
+    task.verification_state = "failing"
+    task.evidence = [{
+        "exit_code": 1,
+        "diagnostics": {
+            "failure_mode": "common_runtime_error",
+            "common_failure": "Orphan text error",
+            "blocked_before_assertions": True,
+            "failure_signature": "same-renderer-error",
+        },
+    }]
+    task.evaluation = {"passed": False, "route": "implementation_fix"}
+    tasks.save_task(task)
+    state = GoalState.new(target="ui", verification="bun test", workspace=str(tmp_path))
+    state.current_task_id = task.id
+    state.task_ids = [task.id]
+    state.phase = GoalPhase.REPAIR_PLAN.value
+    runner = runner_mod.GoalRunner(state=state, history=[], context={}, binding=None)
+
+    runner._repair_plan(state)
+
+    assert state.phase == GoalPhase.PAUSED.value
+    assert state.stop_reason == StopReason.verification_contract_review.value
+    assert state.execution_trace[-1]["event"] == "verification_contract_review"
+    assert tasks.load_task(task.id).evaluation["route"] == "blocked"
+
+
+def test_execution_replan_accepts_live_worktree_source_evidence(tmp_path):
+    from harness.goal.planner import _parse_plan_result
+
+    manifest = {
+        "repo_files": ["src-open/GoalDetails.tsx"],
+        "evidence": [],
+    }
+    raw = (
+        '{"tasks":[{"name":"repair details","behavior":"make the updated frame observable",'
+        '"acceptance_cases":[{"id":"AC2","given":"toggle","when":"clicked","then":"details appear"}],'
+        '"depends_on":[],"primary_write":["src-open/GoalDetails.tsx"],"planned_new":[],'
+        '"read_envelope":[],"test_strategy":"focused renderer trace"}]}'
+    )
+    plan, error = _parse_plan_result(
+        raw,
+        discovery_manifest=manifest,
+        contract_override={"acceptance_cases": []},
+    )
+    assert plan is not None, error
+
+
+def test_resume_rechecks_before_replan_evidence_guard(tmp_path, monkeypatch):
+    import harness.goal.runner as runner_mod
+    import harness.tasks as tasks
+
+    monkeypatch.setattr(tasks, "TASKS_DIR", tmp_path / ".tasks")
+    task = tasks.create_task("ui", "observe toggle", verification_spec={"command": "bun test"})
+    task.status = "in_progress"
+    task.verification_state = "failing"
+    task.evaluation = {
+        "replan_trigger": "verification_contract_review",
+        "verification_contract_evidence": {"repeated_count": 1},
+    }
+    tasks.save_task(task)
+    state = GoalState.new(target="ui", verification="bun test", workspace=str(tmp_path))
+    state.initialization_complete = True
+    state.execution_approved = True
+    state.current_task_id = task.id
+    state.task_ids = [task.id]
+    state.phase = GoalPhase.PAUSED.value
+    state.resume_phase = GoalPhase.REPAIR_PLAN.value
+    state.stop_reason = StopReason.execution_preflight_failed.value
+    assert runner_mod._resume_target(state) == GoalPhase.VERIFY.value
+
+
+def test_resume_rechecks_stale_scope_omission_before_repair_planning(tmp_path, monkeypatch):
+    import harness.goal.runner as runner_mod
+    import harness.tasks as tasks
+
+    monkeypatch.setattr(tasks, "TASKS_DIR", tmp_path / ".tasks")
+    task = tasks.create_task("ui", "repair renderer", verification_spec={})
+    task.status = "in_progress"
+    task.verification_state = "failing"
+    task.evaluation = {"passed": False, "route": "scope_omission"}
+    tasks.save_task(task)
+    state = GoalState.new(target="ui", verification="bun test", workspace=str(tmp_path))
+    state.initialization_complete = True
+    state.execution_approved = True
+    state.current_task_id = task.id
+    state.task_ids = [task.id]
+    state.phase = GoalPhase.PAUSED.value
+    state.resume_phase = GoalPhase.REPAIR_PLAN.value
+    state.stop_reason = StopReason.execution_preflight_failed.value
+
+    assert runner_mod._resume_target(state) == GoalPhase.VERIFY.value
+    assert "范围遗漏诊断已失效" in state.last_error
+
+
+def test_repair_plan_rechecks_first_observation_gap_without_replanning(tmp_path, monkeypatch):
+    import harness.goal.runner as runner_mod
+    import harness.tasks as tasks
+
+    monkeypatch.setattr(tasks, "TASKS_DIR", tmp_path / ".tasks")
+    monkeypatch.setattr(runner_mod, "save_goal", lambda _state: None)
+    monkeypatch.setattr(runner_mod, "_emit_goal", lambda *args, **kwargs: None)
+    task = tasks.create_task("ui", "observe toggle", verification_spec={})
+    task.status = "in_progress"
+    task.verification_state = "failing"
+    task.evaluation = {
+        "passed": False,
+        "route": "replan",
+        "replan_trigger": "verification_contract_review",
+        "verification_contract_evidence": {
+            "failure_signature": "frame-not-observable",
+            "repeated_count": 1,
+        },
+    }
+    tasks.save_task(task)
+    state = GoalState.new(target="ui", verification="bun test", workspace=str(tmp_path))
+    state.phase = GoalPhase.REPAIR_PLAN.value
+    state.current_task_id = task.id
+    state.task_ids = [task.id]
+    runner = runner_mod.GoalRunner(state=state, history=[], context={}, binding=None)
+    monkeypatch.setattr(runner, "_replan_remaining_tasks", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must recheck first")))
+
+    runner._repair_plan(state)
+
+    assert state.phase == GoalPhase.VERIFY.value
+    assert state.execution_trace[-1]["event"] == "verification_contract_recheck"
+    assert "without another worker turn" in state.last_error
+
+
 def test_repair_replan_without_contract_evidence_stays_on_current_task(tmp_path, monkeypatch):
     import harness.goal.repair as repair_mod
     import harness.goal.runner as runner_mod
@@ -762,6 +983,51 @@ def test_resume_skips_implementation_when_task_verification_and_evaluation_pass(
     state.resume_phase = GoalPhase.ACT.value
 
     assert runner_mod._resume_target(state) == GoalPhase.CLEAN_CHECK.value
+
+
+def test_act_hard_gate_skips_worker_for_passing_task(tmp_path, monkeypatch):
+    import harness.goal.runner as runner_mod
+    import harness.tasks as tasks
+
+    monkeypatch.setattr(tasks, "TASKS_DIR", tmp_path / ".tasks")
+    task = tasks.create_task("already verified", "keep verified behavior", verification_spec={})
+    tasks.claim_task(task.id)
+    task = tasks.load_task(task.id)
+    task.verification_state = "passing"
+    tasks.save_task(task)
+    state = GoalState.new(target="verified", verification="pytest -q", workspace=str(tmp_path))
+    state.current_task_id = task.id
+    state.task_ids = [task.id]
+    state.phase = GoalPhase.ACT.value
+    monkeypatch.setattr(runner_mod, "save_goal", lambda _state: None)
+    monkeypatch.setattr(runner_mod, "_emit_goal", lambda *args, **kwargs: None)
+    monkeypatch.setattr(runner_mod, "run_agent_task", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("worker must not run")))
+
+    GoalRunner(state=state, history=[], context={}, binding=None)._act(state)
+
+    assert state.phase == GoalPhase.CLEAN_CHECK.value
+
+
+def test_prepare_execution_routes_passing_task_without_claiming_worker(tmp_path, monkeypatch):
+    import harness.goal.runner as runner_mod
+    import harness.tasks as tasks
+
+    monkeypatch.setattr(tasks, "TASKS_DIR", tmp_path / ".tasks")
+    task = tasks.create_task("already verified", "keep verified behavior", verification_spec={})
+    tasks.claim_task(task.id)
+    task = tasks.load_task(task.id)
+    task.verification_state = "passing"
+    tasks.save_task(task)
+    state = GoalState.new(target="verified", verification="pytest -q", workspace=str(tmp_path))
+    state.current_task_id = task.id
+    state.task_ids = [task.id]
+    state.phase = GoalPhase.PREPARE_EXECUTION.value
+    monkeypatch.setattr(runner_mod, "save_goal", lambda _state: None)
+    monkeypatch.setattr(runner_mod, "_emit_goal", lambda *args, **kwargs: None)
+
+    GoalRunner(state=state, history=[], context={}, binding=None)._prepare_execution(state)
+
+    assert state.phase == GoalPhase.CLEAN_CHECK.value
 
 
 def test_new_repair_epoch_does_not_count_legacy_task_history(tmp_path, monkeypatch):
@@ -1111,6 +1377,7 @@ def test_node_test_generation_prompt_uses_node_conventions(tmp_path, monkeypatch
     assert "test/**/*.test.tsx" in prompts[0]
     assert "Do not put JSX in a .test.ts file" in prompts[0]
     assert "excludes dependency trees such as node_modules" in prompts[0]
+    assert "without hard-coding the test or production design to this single example" in prompts[0]
     assert "empty selector list is not a valid result" in prompts[0]
     assert ".py" not in prompts[0]
     assert load_task(task.id).verification_spec["adapter"] == "node"
@@ -3019,6 +3286,9 @@ def test_verification_scope_reconciliation_does_not_depend_on_supervisor_availab
     assert state.phase == GoalPhase.ACT.value
     assert updated.scope_paths == ["src/current.py", "src/shared.py"]
     assert "deterministic test evidence" in updated.last_error
+    assert state.supervision["status"] == "observing"
+    assert state.supervision["latest"]["trigger"] == "verification_scope_amended"
+    assert state.supervision["error"] == ""
 
 
 def test_frozen_test_imports_include_multiline_named_imports(tmp_path, monkeypatch):
@@ -3073,6 +3343,36 @@ def test_frozen_test_imports_include_workspace_python_module_imports(tmp_path, m
     runner = GoalRunner(state=state, history=[], context={}, binding=None)
 
     assert runner._frozen_test_imports(state, task) == {"harness/goal/runner.py"}
+
+
+def test_frozen_test_imports_ignore_typescript_type_only_imports(tmp_path, monkeypatch):
+    import harness.tasks as tasks
+
+    monkeypatch.setattr(tasks, "TASKS_DIR", tmp_path / ".tasks")
+    source_dir = tmp_path / "src-open"
+    source_dir.mkdir(parents=True)
+    (source_dir / "goal-state.ts").write_text("export type GoalSnapshot = unknown;\n", encoding="utf-8")
+    (source_dir / "GoalView.tsx").write_text("export const GoalView = () => null;\n", encoding="utf-8")
+    test_path = tmp_path / "test" / "goal.test.tsx"
+    test_path.parent.mkdir(parents=True)
+    test_path.write_text(
+        "import {GoalView} from '../src-open/GoalView.tsx';\n"
+        "import type {GoalSnapshot} from '../src-open/goal-state.ts';\n"
+        "void GoalView; void (null as GoalSnapshot | null);\n",
+        encoding="utf-8",
+    )
+    task = tasks.create_task(
+        "import scan",
+        "keep working",
+        verification_spec={
+            "test_files": ["test/goal.test.tsx"],
+            "test_hashes": {"test/goal.test.tsx": hashlib.sha256(test_path.read_bytes()).hexdigest()},
+        },
+    )
+    state = GoalState.new(target="import scan", verification="npm test", workspace=str(tmp_path))
+    runner = GoalRunner(state=state, history=[], context={}, binding=None)
+
+    assert runner._frozen_test_imports(state, task) == {"src-open/GoalView.tsx"}
 
 
 def test_routine_goal_events_do_not_start_parallel_supervisor_requests(tmp_path, monkeypatch):
@@ -3245,6 +3545,44 @@ def test_invalid_evaluator_output_pauses_for_a_retry(tmp_path, monkeypatch):
     assert "no JSON object" in state.last_error
 
 
+def test_evaluator_provider_connection_failure_uses_verified_machine_fallback(tmp_path, monkeypatch):
+    import harness.goal.runner as runner_mod
+    import harness.tasks as tasks
+
+    monkeypatch.setattr(tasks, "TASKS_DIR", tmp_path / ".tasks")
+    task = tasks.create_task("review task", "keep working", verification_spec={})
+    tasks.claim_task(task.id)
+    task.verification_state = "passing"
+    tasks.save_task(task)
+    state = GoalState.new(target="review task", verification="pytest -q", workspace=str(tmp_path))
+    state.current_task_id = task.id
+    state.task_ids = [task.id]
+    state.phase = GoalPhase.EVALUATE.value
+    monkeypatch.setattr(runner_mod, "save_goal", lambda _state: None)
+    monkeypatch.setattr(runner_mod, "_emit_goal", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        runner_mod,
+        "run_task_evaluation",
+        lambda *args, **kwargs: type(
+            "Task",
+            (),
+            {"evaluation": {
+                "passed": None,
+                "error": "no JSON object found in evaluator output",
+                "raw_output_tail": "APIConnectionError: Connection error (WinError 10013)",
+            }, "verification_state": "passing", "id": task.id},
+        )(),
+    )
+
+    runner_mod.GoalRunner(state=state, history=[], context={}, binding=None)._evaluate(state)
+
+    assert state.phase == GoalPhase.CLEAN_CHECK.value
+    saved = tasks.load_task(task.id)
+    assert saved.evaluation["passed"] is True
+    assert saved.evaluation["fallback"] is True
+    assert saved.evaluation["evaluated_by"] == "deterministic_evidence_fallback"
+
+
 def test_evaluator_replan_bypasses_repair_worker_loop(tmp_path, monkeypatch):
     import harness.goal.runner as runner_mod
     import harness.tasks as tasks
@@ -3277,6 +3615,51 @@ def test_evaluator_replan_bypasses_repair_worker_loop(tmp_path, monkeypatch):
     assert len(replans) == 1
     assert replans[0]["task"].id == task.id
     assert replans[0]["reason"] == "Task scope is too narrow"
+
+
+def test_second_coverage_gap_pauses_for_contract_review_instead_of_looping(tmp_path, monkeypatch):
+    import harness.goal.runner as runner_mod
+    import harness.tasks as tasks
+
+    monkeypatch.setattr(tasks, "TASKS_DIR", tmp_path / ".tasks")
+    monkeypatch.setattr(runner_mod, "save_goal", lambda _state: None)
+    monkeypatch.setattr(runner_mod, "_emit_goal", lambda *args, **kwargs: None)
+    task = tasks.create_task(
+        "ui", "observe toggle",
+        verification_spec={
+            "source": "generated",
+            "coverage_only": True,
+            "coverage_repair_count": 1,
+            "command": "bun test test_ui.ts",
+            "selectors": ["test_ui.ts::test_toggle"],
+            "collected_count": 1,
+        },
+        evaluation_required=True,
+    )
+    task.status = "in_progress"
+    task.verification_state = "passing"
+    tasks.save_task(task)
+    state = GoalState.new(target="ui", verification="bun test", workspace=str(tmp_path), evaluation_required=True)
+    state.phase = GoalPhase.EVALUATE.value
+    state.current_task_id = task.id
+    state.task_ids = [task.id]
+    evaluator_result = tasks.load_task(task.id)
+    evaluator_result.evaluation = {
+        "passed": False,
+        "route": "test_gap",
+        "summary": "The evaluator still wants another interaction assertion.",
+        "findings": [{"issue": "missing second toggle assertion", "severity": "high", "evidence": "evaluator"}],
+    }
+    monkeypatch.setattr(runner_mod, "run_task_evaluation", lambda *args, **kwargs: evaluator_result)
+
+    runner_mod.GoalRunner(state=state, history=[], context={}, binding=None)._evaluate(state)
+
+    saved = tasks.load_task(task.id)
+    assert state.phase == GoalPhase.PAUSED.value
+    assert state.stop_reason == StopReason.verification_contract_review.value
+    assert saved.evaluation["route"] == "blocked"
+    assert saved.evaluation["replan_trigger"] == "verification_contract_review"
+    assert state.execution_trace[-1]["event"] == "coverage_repair_exhausted"
 
 
 def test_persisted_evaluator_replan_bypasses_repair_planner_on_resume(tmp_path, monkeypatch):
@@ -3363,6 +3746,7 @@ def test_act_uses_isolated_goal_worker_with_task_prompt(tmp_path, monkeypatch):
     assert calls[0]["max_rounds"] == state.worker_round_limit
     assert "Work only on this Task" in calls[0]["prompt"]
     assert "Run focused tests before stopping." in calls[0]["prompt"]
+    assert "without hard-coding the implementation or test to this single example" in calls[0]["prompt"]
 
 
 def test_goal_event_snapshot_exposes_task_contract_for_terminal_ui(tmp_path, monkeypatch):

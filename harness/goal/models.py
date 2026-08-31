@@ -13,7 +13,7 @@ from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Any
 
-GOAL_SCHEMA_VERSION = 5
+GOAL_SCHEMA_VERSION = 6
 
 DEFAULT_WORKER_ROUND_LIMIT = 20
 DEFAULT_OPERATION_TIMEOUT_SECONDS = 1800  # one agent operation, not the Goal
@@ -78,6 +78,8 @@ class StopReason(str, Enum):
     merge_conflict = "merge_conflict"
     merge_verification_failed = "merge_verification_failed"
     change_session_unavailable = "change_session_unavailable"
+    verification_contract_review = "verification_contract_review"
+    budget_exhausted = "budget_exhausted"
 
 
 _VALID_PHASES = frozenset(phase.value for phase in GoalPhase)
@@ -129,6 +131,10 @@ class GoalState:
     # UI to infer progress from model prose. Entries are bounded by the runner.
     execution_preflight: dict[str, Any] = field(default_factory=dict)
     execution_trace: list[dict[str, Any]] = field(default_factory=list)
+    # A planner-valid execution replan candidate is retained when its
+    # independent reviewer requests a correction. Resume can then retry only
+    # the correction response rather than recompiling the full Task graph.
+    execution_replan_checkpoint: dict[str, Any] = field(default_factory=dict)
     # Origin Draft id links the two durable files for crash reconciliation.
     draft_id: str = ""
     initialization_complete: bool = False
@@ -139,6 +145,11 @@ class GoalState:
     # external operation are bounded; worker rollover preserves durable state.
     worker_round_limit: int = DEFAULT_WORKER_ROUND_LIMIT
     operation_timeout_seconds: int = DEFAULT_OPERATION_TIMEOUT_SECONDS
+    # Goal-envelope limits are opt-in/configurable.  Keys use the documented
+    # usage-ledger names (active_seconds, llm_input_tokens, ...); absent keys
+    # are intentionally unbounded for backwards-compatible checkpoints.
+    budget_limits: dict[str, float] = field(default_factory=dict)
+    usage_ledger: dict[str, float] = field(default_factory=dict)
 
     attempts: int = 0
     consecutive_failures: int = 0
@@ -174,6 +185,9 @@ class GoalState:
     execution_approved: bool = True
     evaluation_required: bool = False
     transition_log: list[dict[str, Any]] = field(default_factory=list)
+    # Monotonic persistence metadata used by the append-only Goal event log.
+    sequence: int = 0
+    transaction_id: str = ""
 
     @classmethod
     def new(
@@ -201,6 +215,12 @@ class GoalState:
             if hasattr(state, key):
                 setattr(state, key, value)
         return state
+
+    def usage(self, key: str) -> float:
+        try:
+            return float((self.usage_ledger or {}).get(key, 0) or 0)
+        except (TypeError, ValueError):
+            return 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

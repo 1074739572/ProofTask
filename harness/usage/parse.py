@@ -37,22 +37,28 @@ def parse_cache_usage(usage) -> CacheUsage | None:
             return usage.get(name, default)
         return getattr(usage, name, default)
 
-    output = field("output_tokens")
+    def as_int(value):
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    output = as_int(field("output_tokens"))
     if output is None:
-        output = field("completion_tokens")
-    if output is not None:
-        output = int(output)
+        output = as_int(field("completion_tokens"))
 
     # DeepSeek / Anthropic prompt caching (Messages API)
     read = field("cache_read_input_tokens")
     create = field("cache_creation_input_tokens")
     input_tokens = field("input_tokens")
     if read is not None or create is not None:
-        hit = int(read or 0)
-        billed_input = int(input_tokens or 0)
+        hit = as_int(read) or 0
+        billed_input = as_int(input_tokens) or 0
         miss = billed_input
         if hit == 0 and create:
-            miss = max(miss, int(create))
+            miss = max(miss, as_int(create) or 0)
         return CacheUsage(
             hit_tokens=hit,
             miss_tokens=miss,
@@ -64,8 +70,8 @@ def parse_cache_usage(usage) -> CacheUsage | None:
     miss = field("prompt_cache_miss_tokens")
     if hit is not None or miss is not None:
         return CacheUsage(
-            hit_tokens=int(hit or 0),
-            miss_tokens=int(miss or 0),
+            hit_tokens=as_int(hit) or 0,
+            miss_tokens=as_int(miss) or 0,
             output_tokens=output,
             source="prompt_cache_hit_tokens",
         )
@@ -78,18 +84,21 @@ def parse_cache_usage(usage) -> CacheUsage | None:
         details = field("prompt_tokens_details")
         cached_value = details.get("cached_tokens", 0) if isinstance(details, Mapping) else getattr(details, "cached_tokens", 0)
         cached = int(cached_value or 0) if details else 0
-        miss = int(prompt) - cached if cached else int(prompt)
+        prompt_value = as_int(prompt)
+        if prompt_value is None:
+            return None
+        miss = prompt_value - cached if cached else prompt_value
         return CacheUsage(
             hit_tokens=cached,
             miss_tokens=max(0, miss),
-            output_tokens=int(completion) if completion is not None else output,
+            output_tokens=as_int(completion) if completion is not None else output,
             source="openai_prompt_tokens",
         )
 
     if input_tokens is not None:
         return CacheUsage(
             hit_tokens=0,
-            miss_tokens=int(input_tokens),
+            miss_tokens=as_int(input_tokens) or 0,
             output_tokens=output,
             source="input_tokens_only",
         )

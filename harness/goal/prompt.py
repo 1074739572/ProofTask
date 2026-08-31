@@ -113,6 +113,24 @@ def build_goal_act_prompt(
         lines.append(f"Last verification error: {task.last_error}")
     if tail:
         lines += ["Last verification output:", tail[:2000]]
+    diagnostics = evidence.get("diagnostics") if isinstance(evidence, dict) else {}
+    debug_bundle = diagnostics.get("debug_bundle") if isinstance(diagnostics, dict) else None
+    if isinstance(debug_bundle, dict):
+        lines += [
+            "Verification debug bundle (machine-generated; inspect before changing code):",
+            f"  - JSON: {debug_bundle.get('json') or '(missing)'}",
+            f"  - Report: {debug_bundle.get('markdown') or '(missing)' }",
+        ]
+    if isinstance(diagnostics, dict) and diagnostics.get("recheck_required"):
+        lines += [
+            "Required verification recheck before the next implementation slice:",
+            "  - Compare the expected marker/assertion with the observed output.",
+            "  - Determine whether failure occurred before assertions, in event/state delivery, or in rendering.",
+            f"  - Failure signature: {diagnostics.get('failure_signature') or '(none)'}, "
+            f"mode: {diagnostics.get('failure_mode') or '(unknown)'}, "
+            f"workspace: {diagnostics.get('verified_workspace') or '(unknown)'}.",
+            "  - Do not repeat the last repair direction without a changed hypothesis.",
+        ]
     contract = getattr(state, "goal_contract", None) or {}
     if contract:
         lines += ["Frozen Goal Contract:", str(contract)[:4000]]
@@ -161,6 +179,7 @@ def build_goal_act_prompt(
     lines += [
         "Requirements:",
         "- Stay within this Task and its acceptance cases.",
+        "- Fix the observed behavior without hard-coding the implementation or test to this single example; preserve a clear extension point for later compatible Goal upgrades.",
         "- Modify only files in the approved write scope. If the scope is insufficient, stop and report the blocker.",
         "- Do not regress the upstream behavior described in the Cross-Task impact context.",
         "- Do not delete, weaken, skip, or edit a bound test just to pass it.",

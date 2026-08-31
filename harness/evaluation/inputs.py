@@ -135,6 +135,18 @@ class EvaluationInputs:
                 tail = (ev.get("stdout_tail") or "").strip()
                 if tail:
                     lines.append(f"  stdout_tail: {tail[:500]}")
+                diagnostics = ev.get("diagnostics") if isinstance(ev.get("diagnostics"), dict) else {}
+                if diagnostics:
+                    lines.append(
+                        "  diagnostics: "
+                        f"mode={diagnostics.get('failure_mode') or '(unknown)'}; "
+                        f"signature={diagnostics.get('failure_signature') or '(none)'}; "
+                        f"blocked_before_assertions={diagnostics.get('blocked_before_assertions')}"
+                    )
+                    bundle = diagnostics.get("debug_bundle")
+                    if isinstance(bundle, dict):
+                        lines.append(f"  debug_bundle_json: {bundle.get('json') or '(missing)'}")
+                        lines.append(f"  debug_bundle_report: {bundle.get('markdown') or '(missing)'}")
         else:
             lines.append("(无证据 — 该 feature 尚未通过机器验证)")
         lines += ["", "# 绑定测试源码 (bound test sources)"]
