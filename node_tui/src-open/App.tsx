@@ -1559,7 +1559,15 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
     setFocusId(ids[next]);
   };
   const toggleExpand = (id: string) => update(id, x => ({...x, expanded: !x.expanded}));
-  const [phase, setPhase] = createSignal('idle'); const [running, setRunning] = createSignal(false); const [startedAt, setStartedAt] = createSignal(0); const [now, setNow] = createSignal(Date.now()); const [overlay, setOverlay] = createSignal<Overlay | null>(props?.debugOverlay ?? null);
+  // Debug snapshots represent an already-running Goal even when no lifecycle
+  // event stream is attached; seed the shell status from that snapshot so the
+  // Goal page and footer never disagree on the initial frame.
+  const initialGoal = goalSnapshot();
+  const initialDebugRunning = resolveDebugValue(props?.debugRunning);
+  const [phase, setPhase] = createSignal(initialGoal?.phase || 'idle');
+  const [running, setRunning] = createSignal(initialDebugRunning ?? initialGoal?.status === 'running');
+  const [startedAt, setStartedAt] = createSignal(initialDebugRunning || initialGoal?.status === 'running' ? (props?.debugStartedAt ?? Date.now()) : 0);
+  const [now, setNow] = createSignal(Date.now()); const [overlay, setOverlay] = createSignal<Overlay | null>(props?.debugOverlay ?? null);
   const [overlayIndex, setOverlayIndex] = createSignal(0);
   // Input history is durable per workspace and de-duplicates consecutive turns.
   const [inputHistory, setInputHistory] = createSignal<string[]>(loadHistory(repoRoot));
