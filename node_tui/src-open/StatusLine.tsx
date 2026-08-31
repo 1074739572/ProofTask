@@ -1,61 +1,55 @@
-import {footerHint} from './interaction.ts';
 import {C} from './theme.ts';
 import type {UiStatus} from './ui-status.ts';
 
-function connectionLabel(status: UiStatus): string {
-  if (status.backend === 'disconnected') return 'backend disconnected';
-  if (status.backend === 'reconnecting') return 'backend reconnecting';
-  return 'backend connected';
-}
-
-function contextLabel(status: UiStatus): string {
-  if (!status.contextUsed && !status.contextWindow) return '';
-  const used = status.contextUsed >= 1000 ? `${(status.contextUsed / 1000).toFixed(1)}k` : String(status.contextUsed);
-  const window = status.contextWindow >= 1000 ? `${(status.contextWindow / 1000).toFixed(1)}k` : String(status.contextWindow);
-  const ratio = status.contextWindow > 0
-    ? Math.max(0, Math.min(1, status.contextUsed / status.contextWindow))
-    : 0;
-  return ` · ctx ${status.contextWindow > 0 ? `${used}/${window}` : used} ${Math.round(ratio * 100)}%`;
-}
-
 /** 将统一的 UiStatus 快照渲染为真实的终端页脚。 */
 export function statusLineText(status: UiStatus): string {
-  // 权限等待是可恢复状态，优先于普通发送提示展示审批动作。
-  const hint = status.permissionWait
-    ? status.permissionPrompt === 'Permission required: approve or allow to continue'
-      ? '请批准后继续 · Permission approval required · choose Allow or Deny · Esc cancel'
-      : status.permissionPrompt || '请批准后继续 · Permission approval required · choose Allow or Deny · Esc cancel'
-    : status.running && status.backend === 'connected' && !status.completionOpen
-      ? 'Enter queue · Ctrl+K interrupt'
-      : footerHint(status);
-  const run = status.running
-    ? ` · ${status.phase || 'working'}${status.currentTool ? ` · ${status.currentTool}` : ''} · ${status.spinner || '•'} ${status.elapsed}${status.toolsTotal > 0 ? ` · ${status.toolsDone}/${status.toolsTotal} tools` : ''}`
-    : '';
-  const queued = status.queuedMessages > 0 ? ` · ${status.queuedMessages} queued` : '';
-  const full = `${connectionLabel(status)}${run}${queued}${contextLabel(status)} · ${hint}`;
-  // Keep the decision-critical fields visible on an 80-column terminal. The
-  // renderer still truncates as a final guard, but this ordering avoids losing
-  // the activity, queue count, or recovery action at the right edge.
-  if (status.width < 90) {
-    const connection = status.backend === 'connected' ? '●' : status.backend === 'reconnecting' ? '↻' : '×';
-    const activity = status.running ? `${status.phase || 'working'}${status.currentTool ? ` · ${status.currentTool}` : ''} · ${status.elapsed}` : 'idle';
-    const progress = status.toolsTotal > 0 ? ` · ${status.toolsDone}/${status.toolsTotal}` : '';
-    const queue = status.queuedMessages > 0 ? ` · q${status.queuedMessages}` : '';
-    const ctx = contextLabel(status).replace(/^ · /, '');
-    const compactHint = status.permissionWait ? 'approve to continue' : status.running ? 'Enter queue · Ctrl+K' : hint;
-    return `${connection} ${activity}${progress}${queue}${ctx ? ` · ${ctx}` : ''} · ${compactHint}`;
+  // The footer is deliberately a single quiet status row.  Model/mode/context
+  // identity lives in the header; repeating it here made the composer feel
+  // crowded and caused large redraws when a token arrived.
+  const connection = status.backend === 'connected' ? '●' : status.backend === 'reconnecting' ? '↻' : '×';
+  if (status.backend === 'reconnecting') return `${connection} reconnecting…`;
+  if (status.backend === 'disconnected') {
+    const code = status.backendExitCode == null || !Number.isFinite(status.backendExitCode)
+      ? ''
+      : ` · exit ${status.backendExitCode}`;
+    return `${connection} backend unavailable${code} · Enter retry · Ctrl+R reconnect`;
   }
-  return full;
+  if (status.permissionWait) {
+    return `${connection} permission required · Allow / Deny · Esc cancel`;
+  }
+  if (status.completionOpen) return '⌕ suggestions · ↑↓ navigate · Tab/Enter apply · Esc close';
+  if (status.historySearch?.open) {
+    return `⌕ history ${status.historySearch.matches} matches · ↑↓ choose · Enter apply · Esc close`;
+  }
+  if (status.running) {
+    const phase = status.phase || 'working';
+    const tool = status.currentTool ? ` · ${status.currentTool}` : '';
+    const progress = status.toolsTotal > 0 ? ` · ${status.toolsDone}/${status.toolsTotal} tools` : '';
+    const queued = status.queuedMessages > 0 ? ` · q${status.queuedMessages}` : '';
+    return `${connection} ${phase}${tool} · ${status.elapsed}${progress}${queued} · Enter queue · Ctrl+K interrupt`;
+  }
+  if (status.toast) return `✓ ${status.toast}`;
+  // Keep the narrow form useful while avoiding the old multi-clause context
+  // paragraph under every message.
+  return status.width < 76
+    ? 'Enter send · Shift+Enter newline'
+    : 'Enter send · Shift+Enter newline · Ctrl+R history';
 }
 
 export function StatusLine(props: {status: UiStatus | (() => UiStatus)}): any {
   const status = () => typeof props.status === 'function' ? props.status() : props.status;
   const color = () => {
     const current = status();
-    return current.backend === 'connected' && !current.running && !current.permissionWait ? C.textMuted : C.warning;
+    if (current.backend === 'disconnected') return C.error;
+    if (current.permissionWait || current.completionOpen || current.historySearch?.open) return C.warning;
+    if (current.running) return C.info;
+    if (current.toast) return C.success;
+    return C.textMuted;
   };
   // Footer/status content is an interaction hint, not transcript data. Keep
   // it out of mouse selection so dragging across the bottom bar never copies
   // controls instead of the conversation.
-  return <text fg={color()} wrapMode="none" truncate selectable={false} content={statusLineText(status())} />;
+  return <box height={1} flexShrink={0} minWidth={0} paddingX={2} backgroundColor="#151b22">
+    <text fg={color()} wrapMode="none" truncate selectable={false} content={statusLineText(status())} />
+  </box>;
 }

@@ -60,6 +60,10 @@ type OverlayLayerProps = {
   width: Accessor<number>;
   /** Number of rows below the layer's composer anchor. */
   composerRows: Accessor<number>;
+  /** Total number of rows below the popup (composer + status bar + toast).
+   * Keeping this separate from composerRows prevents a popup from landing on
+   * top of the input/status rows when the footer has more than one line. */
+  bottomRows?: Accessor<number>;
   /** Limits the visible choice window without affecting the main viewport. */
   maxOptions?: Accessor<number>;
 
@@ -149,6 +153,7 @@ function OverlayPanel(props: {
   panel: Accessor<ActivePanel>;
   width: Accessor<number>;
   composerRows: Accessor<number>;
+  bottomRows?: Accessor<number>;
   maxOptions?: Accessor<number>;
 }) {
   const panelWidth = createMemo(() => Math.max(1, Math.min(props.width(), 72)));
@@ -227,7 +232,21 @@ function OverlayPanel(props: {
   });
   const title = createMemo(() => textValue(props.panel().title));
   const showHint = createMemo(() => title().length > 0 && visibleOptions().length > 0);
-  return <box position="absolute" left={Math.max(0, props.width() - panelWidth())} bottom={props.composerRows()} width={panelWidth()} maxHeight={Math.max(1, Math.min(23, props.composerRows() + 3))} flexDirection="column" backgroundColor={C.userCard} paddingX={1} zIndex={20}><Show when={title().length > 0}><text fg={C.primary} wrapMode="none" truncate>{title()}</text></Show><For each={panelRows()}>{row => <text fg={row.color} wrapMode={row.wrapMode} truncate={row.truncate}>{row.text}</text>}</For><Show when={showHint()}><text fg={C.textMuted} wrapMode="none" truncate>{props.panel().kind === 'history' ? 'Enter select · Esc cancel' : '↑↓ select · Tab/Enter apply · Esc close'}</text></Show></box>;
+  const panelHeight = createMemo(() => {
+    // A popup is an opaque, bounded card.  Its bottom edge is always above
+    // the complete footer, so neither completion rows nor their hint can
+    // overwrite the textarea or status line.
+    const rows = panelRows().length + (showHint() ? 1 : 0) + (title().length > 0 ? 1 : 0);
+    // Two extra rows account for the rounded border.  Keep enough room for
+    // every row in the bounded completion window while still respecting a
+    // small terminal; overflow is clipped rather than spilling into chrome.
+    return Math.max(3, Math.min(14, rows + 2));
+  });
+  return <box position="absolute" left={Math.max(0, props.width() - panelWidth())} bottom={props.bottomRows ? props.bottomRows() : props.composerRows()} width={panelWidth()} height={panelHeight()} maxHeight={panelHeight()} overflow="hidden" border borderStyle="rounded" borderColor={C.primary} flexDirection="column" backgroundColor="#111820" paddingX={1} zIndex={20}>
+    <Show when={title().length > 0}><text fg={C.primary} wrapMode="none" truncate>{`⌕ ${title()}`}</text></Show>
+    <For each={panelRows()}>{row => <text fg={row.color} wrapMode={row.wrapMode} truncate={row.truncate}>{row.text}</text>}</For>
+    <Show when={showHint()}><text fg={C.textMuted} wrapMode="none" truncate>{props.panel().kind === 'history' ? 'Enter select · Esc cancel' : '↑↓ navigate · Tab/Enter apply · Esc close'}</text></Show>
+  </box>;
 
 }
 
@@ -302,6 +321,6 @@ export function OverlayLayer(props: OverlayLayerProps) {
     return null;
   });
 
-  return <Show when={activePanel()}>{panel => <OverlayPanel panel={() => panel()} width={props.width} composerRows={props.composerRows} maxOptions={props.maxOptions}/>}</Show>;
+  return <Show when={activePanel()}>{panel => <OverlayPanel panel={() => panel()} width={props.width} composerRows={props.composerRows} bottomRows={props.bottomRows} maxOptions={props.maxOptions}/>}</Show>;
 }
 

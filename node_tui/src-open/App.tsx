@@ -40,7 +40,6 @@ import {
 import {
   appendHistory,
   createKillRing,
-  queuedMessagePreview,
   createMessageQueue,
   enterCompletionDirectory,
   foldedPasteLabel,
@@ -233,6 +232,47 @@ export function normalizeTranscriptEntries(entries: unknown[]): unknown[] {
     else delete normalized.output;
     return [normalized];
   });
+}
+
+// Normalization intentionally returns fresh objects, but recreating every row
+// on each streamed token makes OpenTUI tear down/rebuild the whole transcript.
+// Keep identity for rows whose visible data did not change so the native
+// markdown/text renderers can update only the live tail.
+function sameTranscriptValue(left: unknown, right: unknown): boolean {
+  if (left === right) return true;
+  if (Array.isArray(left) && Array.isArray(right)) {
+    return left.length === right.length && left.every((value, index) => sameTranscriptValue(value, right[index]));
+  }
+  // Nested records (task/tool metadata) are normally retained by the producer
+  // when unchanged; comparing their identity avoids a costly deep stringify
+  // on every output tick while still detecting replacement updates.
+  return false;
+}
+
+function sameTranscriptEntry(left: Entry, right: Entry): boolean {
+  const keys = new Set([...Object.keys(left), ...Object.keys(right)]);
+  for (const key of keys) {
+    if (!sameTranscriptValue((left as any)[key], (right as any)[key])) return false;
+  }
+  return true;
+}
+
+function stabilizeTranscriptEntries(entries: Entry[], cache: Map<string, Entry>): Entry[] {
+  const seen = new Map<string, number>();
+  const active = new Set<string>();
+  const result = entries.map(entry => {
+    const base = String(entry.id || 'entry');
+    const occurrence = seen.get(base) || 0;
+    seen.set(base, occurrence + 1);
+    const key = `${base}#${occurrence}`;
+    active.add(key);
+    const previous = cache.get(key);
+    if (previous && sameTranscriptEntry(previous, entry)) return previous;
+    cache.set(key, entry);
+    return entry;
+  });
+  for (const key of cache.keys()) if (!active.has(key)) cache.delete(key);
+  return result;
 }
 
 function SafeText(props: {value: unknown; [key: string]: unknown}) {
@@ -607,6 +647,54 @@ function footerStatusText(width: number, model: string, effort: string, used: nu
   if (width >= 100) return `${model} · ${effort} · ${context} · today ${formatTokens(today)} · Ctrl+Shift+C 复制`;
   if (width >= 76) return `${model} · ${context} · Ctrl+Shift+C 复制`;
   return 'Ctrl+Shift+C 复制 · Ctrl+K 中断';
+}
+
+function shellValue(value: string | (() => string) | undefined): string {
+  const resolved = typeof value === 'function' ? value() : value;
+  return String(resolved || '').trim();
+}
+
+function connectionGlyph(state: string): {icon: string; color: string; label: string} {
+  if (state === 'reconnecting') return {icon: '↻', color: C.warning, label: 'reconnecting'};
+  if (state === 'disconnected') return {icon: '×', color: C.error, label: 'offline'};
+  return {icon: '●', color: C.success, label: 'ready'};
+}
+
+/** Fixed one-row chrome shared by chat, Goal, draft and usage screens. */
+function ShellHeader(props: {
+  width: number | (() => number);
+  cwd: string | (() => string);
+  mode: string | (() => string);
+  model: string | (() => string);
+  effort: string | (() => string);
+  contextUsed: number | (() => number);
+  contextWindow: number | (() => number);
+  backend: string | (() => string);
+}) {
+  const width = () => Number(typeof props.width === 'function' ? props.width() : props.width) || 80;
+  const cwd = () => shellValue(props.cwd);
+  const mode = () => shellValue(props.mode) || 'direct';
+  const model = () => shellValue(props.model) || 'model';
+  const effort = () => shellValue(props.effort) || 'Default';
+  const used = () => Number(typeof props.contextUsed === 'function' ? props.contextUsed() : props.contextUsed) || 0;
+  const window = () => Number(typeof props.contextWindow === 'function' ? props.contextWindow() : props.contextWindow) || 0;
+  const backend = () => connectionGlyph(shellValue(props.backend));
+  const repo = () => repoBase(cwd()) || 'workspace';
+  const context = () => window() > 0 ? `ctx ${formatTokens(used())}/${formatTokens(window())} ${Math.round((used() / window()) * 100)}%` : 'ctx —';
+  const compact = () => width() < 78;
+  const medium = () => width() < 100;
+  return <box height={1} flexShrink={0} minWidth={0} paddingX={1} backgroundColor="#171e26" flexDirection="row">
+    <text fg={C.primary} wrapMode="none" selectable={false}>◆</text>
+    <text fg={C.text} wrapMode="none" selectable={false}> Harness</text>
+    <text fg={C.textMuted} wrapMode="none" truncate flexGrow={1} selectable={false}>{` · ${repo()}`}</text>
+    <box flexDirection="row" minWidth={0} flexShrink={0} gap={1}>
+      <SafeText fg={C.secondary} wrapMode="none" truncate selectable={false} value={() => !compact() ? mode() : ''} />
+      <SafeText fg={C.primary} wrapMode="none" truncate selectable={false} value={model} />
+      <SafeText fg={C.textMuted} wrapMode="none" truncate selectable={false} value={() => !medium() ? `· ${effort()}` : ''} />
+      <SafeText fg={C.textMuted} wrapMode="none" truncate selectable={false} value={() => !compact() ? context() : ''} />
+      <text fg={backend().color} wrapMode="none" selectable={false}>{`${backend().icon} ${backend().label}`}</text>
+    </box>
+  </box>;
 }
 
 function formatElapsed(start?: number, end?: number, now = 0): string {
@@ -1358,13 +1446,17 @@ function TranscriptEntryView(props: {entry: Entry; frame: () => string; now: () 
   const detail = normalizeTranscriptText(entry.detail);
   const shell = (children: any) => <box flexShrink={0} minWidth={0}>{children}</box>;
   if (entry.kind === 'prompt') {
-    return text === null ? <box /> : shell(<box minWidth={0} backgroundColor={C.userCard} paddingLeft={2} paddingRight={1}>
-      <SafeText fg={C.text} wrapMode="word" value={text} />
+    return text === null ? <box /> : shell(<box flexDirection="row" minWidth={0} backgroundColor={C.userCard} paddingLeft={1} paddingRight={1}>
+      <text fg={C.primary} wrapMode="none" selectable={false}>›</text>
+      <SafeText fg={C.text} flexGrow={1} wrapMode="word" value={text} />
     </box>);
   }
   if (entry.kind === 'response') {
-    return text === null ? <box /> : shell(<box minWidth={0} paddingLeft={1}>
-      {props.plainResponse ? <SafeText fg={C.text} wrapMode="word" value={text} /> : <markdown syntaxStyle={getMarkdownSyntax()} streaming={entry.streaming === true} internalBlockMode="top-level" tableOptions={{style: 'grid'}} content={text} fg={C.text} conceal />}
+    return text === null ? <box /> : shell(<box flexDirection="row" minWidth={0} paddingLeft={1} paddingRight={1}>
+      <text fg={C.info} wrapMode="none" selectable={false}>│</text>
+      <box flexGrow={1} minWidth={0} paddingLeft={1}>
+        {props.plainResponse ? <SafeText fg={C.text} wrapMode="word" value={text} /> : <markdown syntaxStyle={getMarkdownSyntax()} streaming={entry.streaming === true} internalBlockMode="top-level" tableOptions={{style: 'grid'}} content={text} fg={C.text} conceal />}
+      </box>
     </box>);
   }
   if (entry.kind === 'log') {
@@ -1401,10 +1493,13 @@ function TranscriptEntryView(props: {entry: Entry; frame: () => string; now: () 
     const name = normalizeTranscriptText(entry.name) || text || 'action';
     const status = normalizeTranscriptText(entry.summary) || detail;
     const summary = status !== null ? `  ${status}` : '';
-    const marker = props.focusId() === entry.id ? '▶' : entry.done ? (entry.ok ? '✓' : '✕') : props.frame();
-    const head = `${marker} ${name}${summary}${formatElapsed(entry.start, entry.end, props.now())}`;
+    const marker = () => props.focusId() === entry.id ? '▶' : entry.done ? (entry.ok ? '✓' : '✕') : props.frame();
+    // Keep the live marker/elapsed expression reactive.  A plain local string
+    // is evaluated only at mount by Solid, which made the old clock appear
+    // frozen even though the timer was running.
+    const head = () => `${marker()} ${name}${summary}${formatElapsed(entry.start, entry.end, props.now())}`;
     return <box flexShrink={0} minWidth={0} flexDirection="column">
-      <SafeText fg={entry.done ? entry.ok ? C.success : C.error : C.warning} wrapMode="word" value={head} />
+      <text fg={entry.done ? entry.ok ? C.success : C.error : C.warning} wrapMode="word">{head()}</text>
       {visible.length === 0 ? <box /> : <For each={visible}>{(line: string) => <box flexDirection="row" minWidth={0} paddingLeft={2}>
         <SafeText fg={C.textMuted} wrapMode="word" value={`│ ${line}`} />
       </box>}</For>}
@@ -1428,6 +1523,7 @@ function TranscriptEntryView(props: {entry: Entry; frame: () => string; now: () 
 function LogView(props: {entries: () => Entry[]; now: () => number; active: () => boolean; composerEmpty: () => boolean; height: number; focusId: () => string | null; onCycleFocus: (dir: 1 | -1) => void; onToggleExpand: (id: string) => void; onClearFocus: () => void; staticRender?: boolean; staticText?: () => string}) {
   let scroll: ScrollBoxRenderable | undefined;
   const [atBottom, setAtBottom] = createSignal(true);
+  const transcriptCache = new Map<string, Entry>();
   // Track scroll position: OpenTUI's ScrollBox natively stops following the
   // bottom when the user scrolls away and re-engages when they return to the
   // bottom (recalculateBarProps -> syncManualScrollState). We mirror that with
@@ -1460,7 +1556,7 @@ function LogView(props: {entries: () => Entry[]; now: () => number; active: () =
   // non-empty, metadata-preserving snapshot path, without relying on an
   // external signal to trigger a test-renderer frame.
   const normalizedEntries = createMemo(() => {
-    const entries = normalizeTranscriptEntries(props.entries()) as Entry[];
+    const entries = stabilizeTranscriptEntries(normalizeTranscriptEntries(props.entries()) as Entry[], transcriptCache);
     // Protect long-running sessions from an unbounded render tree. Keep the
     // newest entries interactive and replace the cold prefix with one explicit
     // divider so users know content was intentionally folded, not lost.
@@ -1512,7 +1608,7 @@ function LogView(props: {entries: () => Entry[]; now: () => number; active: () =
       {renderTranscript()}
     </scrollbox>}
     <box height={1} flexShrink={0} paddingX={1} onMouseUp={(event: any) => { if (event?.button === 0) jumpToBottom(); }}>
-      <text fg={C.info} wrapMode="none" truncate>{atBottom() ? '·' : '↓ 回到底部 (End)'}</text>
+      <SafeText fg={C.info} wrapMode="none" truncate selectable={false} value={atBottom() ? '' : '↓ 回到底部 (End)'} />
     </box>
   </box>;
 }
@@ -1544,6 +1640,15 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
   // displayedEntries 统一规范化。不要用轮询模拟 renderer 不提供的外部 signal 重绘，
   // 这样初始快照和更新快照都经过完全相同的渲染路径，也不会留下未清理的定时器。
   const displayedEntries = createMemo(() => normalizeTranscriptEntries(entries()) as Entry[]);
+  // Debug/preview callers may provide a reactive accessor (the stream
+  // verifier and off-screen design preview do this). Mirror it into the same
+  // signal used by the live backend so both paths exercise identical rendering
+  // and buffering behavior. A plain array runs this effect once and remains
+  // inert afterwards.
+  createEffect(() => {
+    if (props?.debugEntries == null) return;
+    setEntries(debugEntriesAccessor() as Entry[]);
+  });
   const [model, setModel] = createSignal(readDefaultModel()); const [mode, setMode] = createSignal(readDefaultMode()); const [cwd, setCwd] = createSignal(''); const [session, setSession] = createSignal('');
   const [effort, setEffort] = createSignal(props?.debugEffort?.value ?? 'off'); const [effortLabel, setEffortLabel] = createSignal(props?.debugEffort?.label ?? 'Model default'); const [effortOptions, setEffortOptions] = createSignal<OverlayOption[]>(props?.debugEffort?.options ?? []);
   // Welcome panel data mirrored from the CLI startup (daily quote only).
@@ -1757,25 +1862,29 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
   const composerLines = () => {
     const v = input();
     if (!v) return 1;
-    const width = Math.max(20, dims().width - 12);
+    // Mode/model/effort moved into the header, so the editor owns almost the
+    // full terminal width. This also makes East-Asian wrapping predictable.
+    const width = Math.max(20, dims().width - 6);
     return Math.max(1, Math.min(MAX_COMPOSER_LINES, composerVisualLines(v, width)));
   };
-  // Keep queued messages visible directly above the composer. The preview is
-  // capped so a burst of submits never consumes the whole transcript.
-  const queuedPreviewRows = () => Math.min(4, localPendingMessages() > 0 ? localPendingMessages() : 0);
-  const composerReservedRows = () => 1 + composerLines() + queuedPreviewRows();
-  // One 30 FPS tick drives the live tail: spinner/elapsed updates and buffered
-  // text/tool output commit together, so a busy turn produces one coalesced
-  // terminal frame instead of independent flush timers racing each other.
-  const LIVE_TICK_MS = 33;
+  // The composer is a bordered card. Border rows are included in the reserved
+  // height so the editor never collides with the status bar.
+  const composerReservedRows = () => composerLines() + 2;
+  const HEADER_ROWS = 1;
+  // Streaming output is coalesced at a modest cadence. A separate, slow clock
+  // updates elapsed labels; the old 30 FPS global signal invalidated the whole
+  // page even when no new output had arrived and looked like screen flashing.
+  const LIVE_FLUSH_MS = 120;
+  const CLOCK_TICK_MS = 500;
   let nowTimer: ReturnType<typeof setInterval> | null = null;
+  let liveFlushTimer: ReturnType<typeof setTimeout> | null = null;
   let toastTimer: ReturnType<typeof setTimeout> | null = null;
-  // Composer and status occupy the footer; overlays are intentionally absent
-  // from this measurement because they are absolutely positioned.
-  const footerReservedRows = () => composerReservedRows() + 1 + (!running() && toast() ? 1 : 0);
+  // Composer and status occupy the footer; transient toast text shares the
+  // status row instead of creating a second line under the input.
+  const footerReservedRows = () => composerReservedRows() + 1;
   const viewportHeight = () => {
     const h = dims().height;
-    return Math.max(3, h - footerReservedRows());
+    return Math.max(3, h - HEADER_ROWS - footerReservedRows());
   };
   // The welcome panel shows as soon as the TUI opens and stays until the user
   // submits their first prompt (it is not dismissed by backend logs, which may
@@ -1942,7 +2051,8 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
     };
   }));
   // Bash can emit hundreds of output lines per second. Accumulate them until
-  // the next live tick instead of rebuilding the active tool row per line.
+  // a short coalescing window expires instead of rebuilding the active tool
+  // row per line.
   const outputBuffer = new Map<string, string[]>();
   const flushOutputs = () => {
     if (outputBuffer.size === 0) return;
@@ -1958,9 +2068,10 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
     const list = outputBuffer.get(id);
     if (list) list.push(line);
     else outputBuffer.set(id, [line]);
+    scheduleLiveFlush();
   };
-  // Assistant deltas arrive per token/segment. Appending them at the live tick
-  // keeps render work bounded while retaining a smooth visible cadence.
+  // Assistant deltas arrive per token/segment. Appending them at the same
+  // coalescing window keeps render work bounded while retaining a smooth tail.
   let deltaBuffer = '';
   const flushDeltas = () => {
     if (!deltaBuffer || !responseId) return;
@@ -1970,6 +2081,10 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
     setEntries(prev => prev.map(x => (x.id === id && x.kind === 'response' ? {...x, text: x.text + batch} : x)));
   };
   const flushLiveBuffers = () => batch(() => {
+    if (liveFlushTimer) {
+      clearTimeout(liveFlushTimer);
+      liveFlushTimer = null;
+    }
     flushOutputs();
     flushDeltas();
   });
@@ -1978,12 +2093,16 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
   const queueDelta = (text: string) => {
     if (!text) return;
     deltaBuffer += text;
+    scheduleLiveFlush();
   };
-  const runLiveTick = () => batch(() => {
-    flushOutputs();
-    flushDeltas();
-    setNow(Date.now());
-  });
+  function scheduleLiveFlush() {
+    if (liveFlushTimer) return;
+    liveFlushTimer = setTimeout(() => {
+      liveFlushTimer = null;
+      flushLiveBuffers();
+    }, LIVE_FLUSH_MS);
+  }
+  const runClockTick = () => setNow(Date.now());
   createEffect(() => {
     const debugRunning = resolveDebugValue(props?.debugRunning);
     if (debugRunning === undefined) return;
@@ -1998,7 +2117,7 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
   });
   createEffect(() => {
     if (running()) {
-      if (!nowTimer) nowTimer = setInterval(runLiveTick, LIVE_TICK_MS);
+      if (!nowTimer) nowTimer = setInterval(runClockTick, CLOCK_TICK_MS);
     } else if (nowTimer) {
       clearInterval(nowTimer);
       nowTimer = null;
@@ -2006,6 +2125,7 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
   });
   onCleanup(() => {
     if (nowTimer) clearInterval(nowTimer);
+    if (liveFlushTimer) clearTimeout(liveFlushTimer);
     if (toastTimer) clearTimeout(toastTimer);
   });
   // A model round that goes on to call a tool is progress narration, not a
@@ -2691,6 +2811,7 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
       })}
       width={() => dims().width}
       composerRows={composerReservedRows}
+      bottomRows={footerReservedRows}
       maxOptions={() => Math.max(1, Math.min(6, viewportHeight() - 2))}
       onClose={closeOverlayLayer}
       onSelectPermission={selectOverlay}
@@ -2728,27 +2849,74 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
     return lines.join('\n');
   };
   return <box width={dims().width} height={dims().height} flexDirection="column" position="relative">
-    {mainContent()}
-    <box position="relative" height={composerReservedRows()} flexShrink={0} paddingX={1} flexDirection="column">
-      <box height={composerReservedRows()} flexShrink={0} flexDirection="column">
-        <For each={queuedMessagePreview(messageQueue.pending(), dims().width, 3)}>{(line, index) =>
-          <text fg={C.warning} wrapMode="none" truncate selectable={false}>{line}</text>
-        }</For>
-        <box height={composerLines()} flexShrink={0} flexDirection="row">
-          <text fg={C.primary} wrapMode="none" truncate selectable={false}>{mode()}</text>
-          <text fg={C.textMuted} wrapMode="none" selectable={false}> · </text>
-          <text fg={C.primary} wrapMode="none" truncate selectable={false}>{model()}</text>
-          <text fg={C.textMuted} wrapMode="none" selectable={false}> · </text>
-          <text fg={C.info} wrapMode="none" truncate selectable={false} onMouseUp={(event: any) => { if (event?.button === 0) openEffortPicker(); }}>{effortShortLabel(effortLabel(), effort())} ▾</text>
-          <text fg={C.primary} selectable={false}> › </text>
-          <textarea flexGrow={1} focused height={composerLines()} placeholder={running() ? 'working…' : 'Ask anything…'} initialValue={input()} keyBindings={textareaBindings as any} onContentChange={() => { const v = textareaRef?.plainText ?? ''; const nowValue = Date.now(); const elapsedMs = lastBufferChangedAt ? nowValue - lastBufferChangedAt : 0; if (suppressContentChange) { lastBufferValue = v; lastBufferChangedAt = nowValue; return; } if (v !== input() && likelyPaste(lastBufferValue, v, elapsedMs)) { const paste = makePasteSnapshot(v); setPastedContent(paste); const folded = foldedPasteLabel(paste); setInput(folded); textareaRef?.setText?.(folded); showToast(`Pasted ${paste.lines} lines · ${paste.bytes} bytes · Ctrl+O expand`); lastBufferValue = folded; lastBufferChangedAt = nowValue; return; } if (v !== input()) { setInput(v); refreshCompletion(v); } lastBufferValue = v; lastBufferChangedAt = nowValue; }} onSubmit={submit as any} ref={el => { textareaRef = el as any; }} />
+    <ShellHeader
+      width={() => dims().width}
+      cwd={cwd}
+      mode={mode}
+      model={model}
+      effort={() => effortShortLabel(effortLabel(), effort())}
+      contextUsed={contextUsed}
+      contextWindow={contextWindow}
+      backend={backendState}
+    />
+    <box height={viewportHeight()} flexGrow={1} minHeight={0} flexDirection="column">
+      {mainContent()}
+    </box>
+    <box height={composerReservedRows()} flexShrink={0} minWidth={0} paddingX={1}>
+      <box
+        height={composerReservedRows()}
+        width="100%"
+        minWidth={0}
+        border
+        borderStyle="rounded"
+        borderColor={overlay()?.kind === 'permission' ? C.warning : running() ? C.info : C.textMuted}
+        backgroundColor="#111820"
+        flexDirection="column"
+      >
+        <box height={composerLines()} flexShrink={0} minWidth={0} flexDirection="row" paddingX={1}>
+          <text fg={running() ? C.info : C.primary} wrapMode="none" selectable={false}>{running() ? '» ' : '› '}</text>
+          <textarea
+            flexGrow={1}
+            minWidth={0}
+            focused
+            height={composerLines()}
+            placeholder={running() ? 'Queue a message…' : 'Ask anything…'}
+            initialValue={input()}
+            keyBindings={textareaBindings as any}
+            onContentChange={() => {
+              const v = textareaRef?.plainText ?? '';
+              const nowValue = Date.now();
+              const elapsedMs = lastBufferChangedAt ? nowValue - lastBufferChangedAt : 0;
+              if (suppressContentChange) {
+                lastBufferValue = v;
+                lastBufferChangedAt = nowValue;
+                return;
+              }
+              if (v !== input() && likelyPaste(lastBufferValue, v, elapsedMs)) {
+                const paste = makePasteSnapshot(v);
+                setPastedContent(paste);
+                const folded = foldedPasteLabel(paste);
+                setInput(folded);
+                textareaRef?.setText?.(folded);
+                showToast(`Pasted ${paste.lines} lines · ${paste.bytes} bytes · Ctrl+O expand`);
+                lastBufferValue = folded;
+                lastBufferChangedAt = nowValue;
+                return;
+              }
+              if (v !== input()) {
+                setInput(v);
+                refreshCompletion(v);
+              }
+              lastBufferValue = v;
+              lastBufferChangedAt = nowValue;
+            }}
+            onSubmit={submit as any}
+            ref={el => { textareaRef = el as any; }}
+          />
         </box>
       </box>
     </box>
     {activeOverlayDescriptor() !== null ? <OverlayBoundary /> : null}
-    <box height={(() => !running() && toast() ? 1 : 0) as any} flexShrink={0}>
-      <SafeText fg={C.success} wrapMode="none" truncate value={toast()?.text} />
-    </box>
     <StatusLine status={uiStatus} />
   </box>;
 }

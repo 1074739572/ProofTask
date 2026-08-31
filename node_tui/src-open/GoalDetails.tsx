@@ -1,6 +1,7 @@
 import {For, Show} from 'solid-js';
 import type {GoalDraftSnapshot, GoalSnapshot, GoalTaskSnapshot} from './goal-state.ts';
 import {eventCoordinates, type InteractionTrace} from './interaction-trace.ts';
+import {C} from './theme.ts';
 
 type GoalLike = GoalSnapshot | GoalDraftSnapshot;
 
@@ -66,6 +67,20 @@ function detailsForTask(task: GoalTaskSnapshot): string[] {
   return lines.filter((line): line is string => typeof line === 'string' && line.length > 0);
 }
 
+function taskColor(task: GoalTaskSnapshot): string {
+  if (task.verification_state === 'passing' || /^(done|completed)$/i.test(task.status)) return C.success;
+  if (task.verification_state === 'failing' || task.status === 'failed') return C.error;
+  if (/^(in_progress|active|running)$/i.test(task.status)) return C.primary;
+  return C.textMuted;
+}
+
+function taskIcon(task: GoalTaskSnapshot): string {
+  if (task.verification_state === 'passing' || /^(done|completed)$/i.test(task.status)) return '✓';
+  if (task.verification_state === 'failing' || task.status === 'failed') return '×';
+  if (/^(in_progress|active|running)$/i.test(task.status)) return '●';
+  return '○';
+}
+
 export function GoalDetails(props: GoalDetailsProps) {
   const isExpanded = () => typeof props.expanded === 'function' ? props.expanded() : props.expanded;
   const tasks = () => taskRows(props.goal);
@@ -90,7 +105,7 @@ export function GoalDetails(props: GoalDetailsProps) {
   };
 
   return (
-    <box flexDirection="column" width="100%">
+    <box flexDirection="column" flexGrow={1} flexShrink={0} minWidth={0} paddingX={1}>
       <box
         width="100%"
         height={1}
@@ -98,38 +113,42 @@ export function GoalDetails(props: GoalDetailsProps) {
         onMouseUp={(event: any) => toggle('mouse', event)}
         onKeyDown={activateToggle}
       >
-        <text selectable={false} content={`详情面板：${isExpanded() ? '已展开' : '已折叠'} · GOAL_DETAILS_TOGGLE`} />
+        <text fg={C.secondary} selectable={false} content={`${isExpanded() ? '▾' : '▸'} 详情面板 · ${isExpanded() ? '任务图与证据' : '按 Enter 展开'} · GOAL_DETAILS_TOGGLE`} />
       </box>
       <Show when={isExpanded()} fallback={<box />}>
-        <box flexDirection="column">
-          <text content={`任务图：DETAIL_TASK_GRAPH · ${tasks().length} 个任务`} />
-          <Show when={tasks().length > 0} fallback={<box />}>
+        <box flexDirection="column" marginTop={1} minWidth={0}>
+          <box border borderStyle="rounded" borderColor={C.textMuted} flexDirection="column" minWidth={0} paddingX={1}>
+            <text fg={C.secondary}>TASK GRAPH · {tasks().length} 个任务</text>
             <For each={tasks()}>
-              {task => (
-                <box flexDirection="column">
+              {task => <box flexDirection="row" minWidth={0}>
+                <text fg={taskColor(task)} wrapMode="none">{taskIcon(task)} </text>
+                <text fg={taskColor(task)} wrapMode="none" truncate>{task.subject}</text>
+                <text fg={C.textMuted} wrapMode="none" truncate> · {task.status} · {task.verification_state}</text>
+              </box>}
+            </For>
+          </box>
+          <Show when={tasks().length > 0} fallback={<box />}>
+            <box flexDirection="column" minWidth={0} marginTop={1}>
+              <For each={tasks()}>
+                {task => (
+                <box border borderStyle="rounded" borderColor={taskColor(task)} flexDirection="column" minWidth={0} paddingX={1} marginBottom={1}>
+                  <text fg={taskColor(task)} wrapMode="none" truncate>{taskIcon(task)} {task.subject}</text>
                   <For each={detailsForTask(task)}>
-                    {line => <text content={line} />}
+                    {line => <text fg={line.startsWith('Error') ? C.error : C.textMuted} wrapMode="word">{line}</text>}
                   </For>
                 </box>
-              )}
-            </For>
+                )}
+              </For>
+            </box>
           </Show>
-          <Show when={contract()} fallback={<box />}>
-            <text content={`Contract：${contract()}`} />
-          </Show>
-          <Show when={verification()} fallback={<box />}>
-            <text content={`Verification：${verification()}`} />
-          </Show>
-          <Show when={tasks().some(task => task.evidence_count !== undefined)} fallback={<box />}>
-            <text content="Regression：执行链路与既有状态回归记录" />
-          </Show>
-          <Show when={evidence()} fallback={<box />}>
-            <text content={`Evidence：${evidence()}`} />
-          </Show>
-          <Show when={error()} fallback={<box />}>
-            <text content={`Error：${error()}`} />
-          </Show>
-          <text content="验收条件 · 测试绑定 · 最近一次机器证据" />
+          <box border borderStyle="rounded" borderColor={C.info} flexDirection="column" minWidth={0} paddingX={1}>
+            <text fg={C.secondary}>MACHINE EVIDENCE</text>
+            <Show when={contract()} fallback={<text fg={C.textMuted}>Contract：暂无</text>}><text fg={C.text} wrapMode="word">Contract：{contract()}</text></Show>
+            <Show when={verification()} fallback={<text fg={C.textMuted}>Verification：暂无</text>}><text fg={C.text} wrapMode="word">Verification：{verification()}</text></Show>
+            <Show when={tasks().some(task => task.evidence_count !== undefined)}><text fg={C.success}>Regression：执行链路与既有状态回归记录</text></Show>
+            <Show when={evidence()}><text fg={C.success} wrapMode="word">Evidence：{evidence()}</text></Show>
+            <Show when={error()}><text fg={C.error} wrapMode="word">Error：{error()}</text></Show>
+          </box>
         </box>
       </Show>
     </box>

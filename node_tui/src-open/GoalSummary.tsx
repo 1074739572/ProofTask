@@ -1,5 +1,6 @@
 import {Show} from 'solid-js';
 import type {GoalDraftSnapshot, GoalDraftTaskSummary, GoalSnapshot, GoalTaskSnapshot} from './goal-state.ts';
+import {C} from './theme.ts';
 
 type GoalLike = GoalSnapshot | GoalDraftSnapshot;
 type TaskLike = GoalTaskSnapshot | GoalDraftTaskSummary;
@@ -103,6 +104,40 @@ function nextAction(goal: GoalLike): string {
   return '/goal pause';
 }
 
+function statusColor(status: string): string {
+  if (status === 'done' || status === 'completed') return C.success;
+  if (status === 'failed') return C.error;
+  if (status === 'paused' || status === 'pausing' || status === 'permission_wait') return C.warning;
+  return C.primary;
+}
+
+function statusIcon(status: string): string {
+  if (status === 'done' || status === 'completed') return '✓';
+  if (status === 'failed') return '×';
+  if (status === 'paused' || status === 'pausing' || status === 'permission_wait') return 'Ⅱ';
+  return '●';
+}
+
+function progressFor(goal: GoalLike): {done: number; total: number; percent: number} {
+  const tasks = goal.tasks || [];
+  const done = tasks.filter(task => 'status' in task && /^(done|completed|passing)$/i.test(task.status)).length;
+  const total = tasks.length;
+  return {done, total, percent: total > 0 ? Math.round(done / total * 100) : 0};
+}
+
+function progressBar(percent: number, width: number): string {
+  const filled = Math.max(0, Math.min(width, Math.round(percent / 100 * width)));
+  return `${'━'.repeat(filled)}${'─'.repeat(Math.max(0, width - filled))}`;
+}
+
+function Metric(props: {label: string; value: string; detail?: string; color?: string}) {
+  return <box border borderStyle="rounded" borderColor={props.color || C.textMuted} flexDirection="column" flexGrow={1} minWidth={0} paddingX={1}>
+    <text fg={C.textMuted} wrapMode="none" truncate>{props.label}</text>
+    <text fg={props.color || C.text} wrapMode="none" truncate>{props.value}</text>
+    <Show when={props.detail}><text fg={C.textMuted} wrapMode="none" truncate>{props.detail}</text></Show>
+  </box>;
+}
+
 const TRACK: readonly [string, string][] = [
   ['intake', '需求'], ['prepare_tests', '测试准备'], ['planning', '规划'],
   ['discovering', '发现'], ['act', '实现'], ['verify', '验证'], ['completed', '完成'],
@@ -139,22 +174,40 @@ export function GoalSummary(props: GoalSummaryProps) {
     if (!isSnapshot(props.goal) && tasks.length > 0) return `共 ${tasks.length} 个阶段任务`;
     return '暂无当前任务';
   };
+  const progress = () => progressFor(props.goal);
+  const metricWidth = () => narrow() ? 12 : 22;
 
-  return <box flexDirection="column" width="100%">
-    <text content={`Goal · ${clip(props.goal.target, 68)}`} />
-    <text content={`状态：${statusLabel(displayStatus())}  ·  当前阶段：${phaseLabel(phase())}`} />
-    <text content={`执行链路：${track()}`} />
-    <text content={`当前 Agent：${clip(currentAgentFor(props.goal, props.decisions), 56)}`} />
-    <text content={`当前 Task：${taskLabel()}`} />
-    <text content={`Agent 动作：${clip(currentDecision()?.text, 54)}`} />
+  return <box flexDirection="column" flexGrow={1} flexShrink={0} minWidth={0} paddingX={1} paddingTop={1}>
+    <box border borderStyle="rounded" borderColor={statusColor(displayStatus())} flexDirection="column" flexShrink={0} paddingX={1} minWidth={0}>
+      <box flexDirection={narrow() ? 'column' : 'row'} justifyContent="space-between" minWidth={0} flexShrink={1}>
+        <text fg={C.primary} wrapMode="none" truncate flexGrow={1} flexShrink={1}>GOAL · {clip(props.goal.target, narrow() ? 38 : 74)}</text>
+        <text fg={statusColor(displayStatus())} wrapMode="none" truncate flexShrink={0}>{statusIcon(displayStatus())} {statusLabel(displayStatus())}</text>
+      </box>
+      <text fg={C.textMuted} wrapMode="none" truncate flexShrink={1}>ID {clip(props.goal.id, narrow() ? 28 : 52)} · 阶段 {phaseLabel(phase())}</text>
+      <box flexDirection="row" minWidth={0} marginTop={1}>
+        <text fg={C.success} wrapMode="none" flexShrink={0}>{progressBar(progress().percent, narrow() ? 14 : 34)}</text>
+        <text fg={C.text} wrapMode="none" truncate flexGrow={1} flexShrink={1}>  {progress().total ? `${progress().done}/${progress().total} Tasks · ${progress().percent}%` : '任务图准备中'}</text>
+      </box>
+      <text fg={C.secondary} wrapMode="none" truncate flexShrink={1}>流程  {track()}</text>
+    </box>
+    <box flexDirection={narrow() ? 'column' : 'row'} gap={1} minWidth={0} flexShrink={0} marginTop={1}>
+      <Metric label="当前 Task" value={clip(taskLabel(), metricWidth())} detail={isSnapshot(props.goal) ? `${progress().total} 个任务` : '草案阶段'} color={C.info} />
+      <Metric label="当前 Agent" value={clip(currentAgentFor(props.goal, props.decisions), metricWidth())} detail={clip(currentDecision()?.text, narrow() ? 22 : 34)} color={C.secondary} />
+      <Metric label="下一步" value={clip(nextAction(props.goal), metricWidth())} detail="按命令继续" color={permissionWaiting() ? C.warning : C.success} />
+    </box>
+    <Show when={currentDecision()?.text}>
+      <box border borderStyle="rounded" borderColor={C.textMuted} flexDirection="column" minWidth={0} marginTop={1} paddingX={1}>
+        <text fg={C.secondary}>LIVE ACTION · Agent 正在做什么</text>
+        <text fg={C.text} wrapMode="word">{clip(currentDecision()?.text, narrow() ? 60 : 120)}</text>
+      </box>
+    </Show>
     <Show when={!narrow() || permissionWaiting()}>
-      <text content={`权限：${permissionWaiting() ? '等待工具权限批准，可批准后恢复' : '无需批准'}`} />
+      <text fg={permissionWaiting() ? C.warning : C.textMuted} wrapMode="none" truncate>权限：{permissionWaiting() ? '等待工具权限批准，可批准后恢复' : '无需批准'}</text>
     </Show>
     <Show when={!narrow() || showRecovery()}>
-      <text content={`状态说明：${permissionWaiting() ? '等待批准后可恢复执行' : showRecovery() ? clip(errorFor(props.goal), 60) : '正在按阶段轨道执行'}`} />
+      <text fg={showRecovery() ? C.warning : C.textMuted} wrapMode="word">状态说明：{permissionWaiting() ? '等待批准后可恢复执行' : showRecovery() ? clip(errorFor(props.goal), 60) : '正在按阶段轨道执行'}</text>
     </Show>
-    <text content={`下一步：${nextAction(props.goal)}`} />
-    <Show when={!narrow()}><text content="详情默认折叠，按需展开查看完整信息" /></Show>
+    <Show when={!narrow()}><text fg={C.textMuted} wrapMode="none">详情默认折叠 · Enter / Space 展开任务图与机器证据</text></Show>
   </box>;
 }
 
