@@ -1,3 +1,4 @@
+import {Show} from 'solid-js';
 import type {GoalDraftSnapshot, GoalDraftTaskSummary, GoalSnapshot, GoalTaskSnapshot} from './goal-state.ts';
 
 type GoalLike = GoalSnapshot | GoalDraftSnapshot;
@@ -14,6 +15,8 @@ export type GoalSummaryProps = {
   goal: GoalLike;
   decisions?: readonly DecisionLike[];
   onExpandDetails?: () => void;
+  /** Terminal width used to keep the first screen readable on narrow TTYs. */
+  width?: number;
 };
 
 function safeText(value: unknown, fallback = '暂无'): string {
@@ -123,13 +126,14 @@ export function GoalSummary(props: GoalSummaryProps) {
   const permissionWaiting = () => permissionIsWaiting(props.goal);
   const displayStatus = () => permissionWaiting() ? 'permission_wait' : status();
   const showRecovery = () => status() === 'paused' || status() === 'failed';
+  const narrow = () => (props.width ?? 120) < 90;
   const track = () => TRACK.map(([key, label], index) => `${index <= activePhase() ? '●' : '○'}${label}`).join(' → ');
   const taskLabel = () => {
     const task = currentTask();
     const tasks = props.goal.tasks;
     if (task && tasks.length <= 1) return clip('subject' in task ? task.subject : task.name, 54);
     if (isSnapshot(props.goal) && tasks.length > 0) {
-      const index = task ? tasks.findIndex(item => item.id === task.id) + 1 : 0;
+      const index = task ? tasks.findIndex((item: any) => item.id === (task as any).id) + 1 : 0;
       return index > 0 ? `第 ${index} 个任务（共 ${tasks.length} 个）` : `共 ${tasks.length} 个任务，当前任务待分配`;
     }
     if (!isSnapshot(props.goal) && tasks.length > 0) return `共 ${tasks.length} 个阶段任务`;
@@ -143,10 +147,14 @@ export function GoalSummary(props: GoalSummaryProps) {
     <text content={`当前 Agent：${clip(currentAgentFor(props.goal, props.decisions), 56)}`} />
     <text content={`当前 Task：${taskLabel()}`} />
     <text content={`Agent 动作：${clip(currentDecision()?.text, 54)}`} />
-    <text content={`权限：${permissionWaiting() ? '等待工具权限批准，可批准后恢复' : '无需批准'}`} />
-    <text content={`状态说明：${permissionWaiting() ? '等待批准后可恢复执行' : showRecovery() ? clip(errorFor(props.goal), 60) : '正在按阶段轨道执行'}`} />
+    <Show when={!narrow() || permissionWaiting()}>
+      <text content={`权限：${permissionWaiting() ? '等待工具权限批准，可批准后恢复' : '无需批准'}`} />
+    </Show>
+    <Show when={!narrow() || showRecovery()}>
+      <text content={`状态说明：${permissionWaiting() ? '等待批准后可恢复执行' : showRecovery() ? clip(errorFor(props.goal), 60) : '正在按阶段轨道执行'}`} />
+    </Show>
     <text content={`下一步：${nextAction(props.goal)}`} />
-    <text content="详情默认折叠，按需展开查看完整信息" />
+    <Show when={!narrow()}><text content="详情默认折叠，按需展开查看完整信息" /></Show>
   </box>;
 }
 

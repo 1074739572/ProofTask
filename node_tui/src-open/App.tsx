@@ -40,6 +40,7 @@ import {
 import {
   appendHistory,
   createKillRing,
+  queuedMessagePreview,
   createMessageQueue,
   enterCompletionDirectory,
   foldedPasteLabel,
@@ -1727,7 +1728,10 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
     const width = Math.max(20, dims().width - 12);
     return Math.max(1, Math.min(MAX_COMPOSER_LINES, composerVisualLines(v, width)));
   };
-  const composerReservedRows = () => 1 + composerLines();
+  // Keep queued messages visible directly above the composer. The preview is
+  // capped so a burst of submits never consumes the whole transcript.
+  const queuedPreviewRows = () => Math.min(4, localPendingMessages() > 0 ? localPendingMessages() : 0);
+  const composerReservedRows = () => 1 + composerLines() + queuedPreviewRows();
   // One 30 FPS tick drives the live tail: spinner/elapsed updates and buffered
   // text/tool output commit together, so a busy turn produces one coalesced
   // terminal frame instead of independent flush timers racing each other.
@@ -2680,6 +2684,9 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
     {mainContent()}
     <box position="relative" height={composerReservedRows()} flexShrink={0} paddingX={1} flexDirection="column">
       <box height={composerReservedRows()} flexShrink={0} flexDirection="column">
+        <For each={queuedMessagePreview(messageQueue.pending(), dims().width, 3)}>{(line, index) =>
+          <text fg={C.warning} wrapMode="none" truncate selectable={false}>{line}</text>
+        }</For>
         <box height={composerLines()} flexShrink={0} flexDirection="row">
           <text fg={C.primary} wrapMode="none" truncate selectable={false}>{mode()}</text>
           <text fg={C.textMuted} wrapMode="none" selectable={false}> · </text>

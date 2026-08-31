@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import {footerHint} from '../src-open/interaction.ts';
+import {footerHint, queuedMessagePreview} from '../src-open/interaction.ts';
 
 // 前端消息队列自动排空（frontend message queue with auto-drain）：
 // agent 忙碌时，用户提交的消息不立即发送，而是进入客户端本地待发队列；
@@ -102,4 +102,17 @@ test('页脚渲染本地待发数量与队列状态', async () => {
   // then：页脚展示本地待发数量与队列状态（明确标注本地队列，而非仅后端 queue 事件）
   assert.match(footer, /2/);
   assert.match(footer, /本地队列|local queue|local pending/i);
+});
+
+test('队列预览展示消息内容并在窄屏安全截断', () => {
+  const rows = queuedMessagePreview([
+    {text: '第一条待处理消息 内容很多很多很多'},
+    {text: 'second'},
+    {text: 'third'},
+    {text: 'fourth'},
+  ], 24, 3);
+  assert.equal(rows.length, 4);
+  assert.match(rows[0], /QUEUED 1/);
+  assert.match(rows[0], /…/);
+  assert.match(rows[3], /1 more queued/);
 });

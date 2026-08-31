@@ -126,6 +126,22 @@ export type MessageQueue = {
   pending: () => Record<string, unknown>[];
 };
 
+/** Format a compact, width-safe preview of locally queued messages. */
+export function queuedMessagePreview(
+  pending: readonly Record<string, unknown>[],
+  width: number,
+  limit = 3,
+): string[] {
+  const max = Math.max(12, Math.floor(width) - 14);
+  const rows = pending.slice(0, Math.max(0, limit)).map((command, index) => {
+    const text = String(command.text ?? '').replace(/\s+/g, ' ').trim();
+    const clipped = text.length > max ? `${text.slice(0, Math.max(1, max - 1))}…` : text;
+    return `⏳ QUEUED ${index + 1}  ${clipped || '(empty)'}`;
+  });
+  if (pending.length > rows.length) rows.push(`… ${pending.length - rows.length} more queued`);
+  return rows;
+}
+
 export function createMessageQueue(send: (command: Record<string, unknown>) => boolean): MessageQueue {
   let busy = false;
   const queue: Record<string, unknown>[] = [];

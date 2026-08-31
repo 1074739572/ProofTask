@@ -126,13 +126,13 @@ export function GoalView(props: GoalViewProps) {
     props.onExpandDetails?.();
   };
 
-  return <box flexDirection="column" width="100%" height="100%"><GoalSummary goal={selectedGoal()} decisions={props.decisions} onExpandDetails={toggleFromSummary} /><GoalDetails goal={selectedGoal()} expanded={detailsExpanded} onToggle={toggleDetails} interactionTrace={props.interactionTrace} /></box>;
+  return <box flexDirection="column" width="100%" height="100%"><GoalSummary goal={selectedGoal()} decisions={props.decisions} width={typeof props.width === 'number' ? props.width : undefined} onExpandDetails={toggleFromSummary} /><GoalDetails goal={selectedGoal()} expanded={detailsExpanded} onToggle={toggleDetails} interactionTrace={props.interactionTrace} /></box>;
 }
 
 export function GoalDraftView(props: {draft: GoalDraftSnapshot; now?: number; width: number; height: number}) {
   const draft = props.draft;
   return <box flexDirection="column" width="100%" height="100%">
-    <GoalSummary goal={draft} decisions={[]} onExpandDetails={() => {}} />
+    <GoalSummary goal={draft} decisions={[]} width={props.width} onExpandDetails={() => {}} />
     <box flexDirection="column">
       <text content={`草稿阶段：${draft.stage || '准备中'} · ${draft.task_count || draft.tasks?.length || 0} 个任务`} />
       <Show when={draft.question}><text content={`待回答：${draft.question}`} /></Show>
