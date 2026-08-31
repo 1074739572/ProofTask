@@ -144,6 +144,12 @@ function normalizeActionOutput(value: unknown): string[] {
   return materializeTranscriptLines(value).lines;
 }
 
+/** Bound expanded tool output so one command cannot monopolize the viewport. */
+export function actionOutputPreview(output: readonly string[], expanded: boolean, maxExpanded = 100): string[] {
+  if (!expanded || output.length <= maxExpanded) return output.slice(0, expanded ? maxExpanded : 3);
+  return [...output.slice(0, Math.max(1, maxExpanded - 1)), `… ${output.length - maxExpanded + 1} more lines · output capped`];
+}
+
 function normalizeTranscriptMetadata(value: unknown): string | null {
   if (typeof value === 'number' && Number.isFinite(value)) return String(value);
   return normalizeTranscriptText(value);
@@ -1388,9 +1394,7 @@ function TranscriptEntryView(props: {entry: Entry; frame: () => string; now: () 
     // than the tail: the title/status line identifies the action, while the
     // first output lines provide a useful, stable preview without rendering
     // the end of a large paste into the terminal frame.
-    const visible = expanded || !isLongOutput
-      ? output
-      : [];
+    const visible = expanded ? actionOutputPreview(output, true) : (!isLongOutput ? output : []);
     const name = normalizeTranscriptText(entry.name) || text || 'action';
     const status = normalizeTranscriptText(entry.summary) || detail;
     const summary = status !== null ? `  ${status}` : '';
@@ -2693,7 +2697,7 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
         const summary = status !== null ? `  ${status}` : '';
         const marker = entry.done ? (entry.ok ? '✓' : '✕') : ['|', '/', '-', '\\'][Math.floor(now() / 180) % 4];
         lines.push(`${marker} ${name}${summary}${formatElapsed(entry.start, entry.end, now())}`);
-        const visible = expanded || output.length <= 3 ? output : [];
+        const visible = expanded ? actionOutputPreview(output, true) : (output.length <= 3 ? output : []);
         for (const line of visible) lines.push(`  │ ${line}`);
         if (!expanded && output.length > 3) lines.push(`${name}${summary} · … ${output.length} lines · Enter to expand`);
         continue;
