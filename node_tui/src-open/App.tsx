@@ -1564,9 +1564,12 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
   // Goal page and footer never disagree on the initial frame.
   const initialGoal = goalSnapshot();
   const initialDebugRunning = resolveDebugValue(props?.debugRunning);
-  const [phase, setPhase] = createSignal(initialGoal?.phase || 'idle');
-  const [running, setRunning] = createSignal(initialDebugRunning ?? initialGoal?.status === 'running');
-  const [startedAt, setStartedAt] = createSignal(initialDebugRunning || initialGoal?.status === 'running' ? (props?.debugStartedAt ?? Date.now()) : 0);
+  const initialDraftBusy = initialDebugDraft ? goalDraftIsBusy(initialDebugDraft) : false;
+  const initialActivity = initialGoal?.phase || initialDebugDraft?.stage || 'idle';
+  const initialActive = initialDebugRunning ?? (initialGoal?.status === 'running' || initialDraftBusy);
+  const [phase, setPhase] = createSignal(initialActivity);
+  const [running, setRunning] = createSignal(initialActive);
+  const [startedAt, setStartedAt] = createSignal(initialActive ? (props?.debugStartedAt ?? Date.now()) : 0);
   const [now, setNow] = createSignal(Date.now()); const [overlay, setOverlay] = createSignal<Overlay | null>(props?.debugOverlay ?? null);
   const [overlayIndex, setOverlayIndex] = createSignal(0);
   // Input history is durable per workspace and de-duplicates consecutive turns.
