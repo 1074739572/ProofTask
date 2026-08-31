@@ -32,7 +32,20 @@ export function statusLineText(status: UiStatus): string {
     ? ` · ${status.phase || 'working'}${status.currentTool ? ` · ${status.currentTool}` : ''} · ${status.spinner || '•'} ${status.elapsed}${status.toolsTotal > 0 ? ` · ${status.toolsDone}/${status.toolsTotal} tools` : ''}`
     : '';
   const queued = status.queuedMessages > 0 ? ` · ${status.queuedMessages} queued` : '';
-  return `${connectionLabel(status)}${run}${queued}${contextLabel(status)} · ${hint}`;
+  const full = `${connectionLabel(status)}${run}${queued}${contextLabel(status)} · ${hint}`;
+  // Keep the decision-critical fields visible on an 80-column terminal. The
+  // renderer still truncates as a final guard, but this ordering avoids losing
+  // the activity, queue count, or recovery action at the right edge.
+  if (status.width < 90) {
+    const connection = status.backend === 'connected' ? '●' : status.backend === 'reconnecting' ? '↻' : '×';
+    const activity = status.running ? `${status.phase || 'working'}${status.currentTool ? ` · ${status.currentTool}` : ''} · ${status.elapsed}` : 'idle';
+    const progress = status.toolsTotal > 0 ? ` · ${status.toolsDone}/${status.toolsTotal}` : '';
+    const queue = status.queuedMessages > 0 ? ` · q${status.queuedMessages}` : '';
+    const ctx = contextLabel(status).replace(/^ · /, '');
+    const compactHint = status.permissionWait ? 'approve to continue' : status.running ? 'Enter queue · Ctrl+K' : hint;
+    return `${connection} ${activity}${progress}${queue}${ctx ? ` · ${ctx}` : ''} · ${compactHint}`;
+  }
+  return full;
 }
 
 export function StatusLine(props: {status: UiStatus | (() => UiStatus)}): any {
