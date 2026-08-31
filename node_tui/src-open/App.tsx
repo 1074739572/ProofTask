@@ -1374,7 +1374,10 @@ function TranscriptEntryView(props: {entry: Entry; frame: () => string; now: () 
     </box>;
   }
   if (entry.kind === 'intent') {
-    return text === null ? <box /> : shell(<SafeText fg={C.textMuted} wrapMode="word" value={`• ${text}`} />);
+    // Thinking notes stay collapsed to a single muted line in the transcript;
+    // the turn summary remains the explicit affordance for expanding the full
+    // sequence of reasoning/tool steps.
+    return text === null ? <box /> : shell(<SafeText fg={C.textMuted} wrapMode="word" value={`∴ Thinking · ${text}`} />);
   }
   if (entry.kind === 'blocked') {
     return shell(<box flexDirection="column" minWidth={0}>
@@ -2704,7 +2707,7 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
       }
       const text = normalizeTranscriptText(entry.text);
       if (text === null) continue;
-      if (entry.kind === 'intent') lines.push(`• ${text}`);
+      if (entry.kind === 'intent') lines.push(`∴ Thinking · ${text}`);
       else lines.push(text);
     }
     return lines.join('\n');
