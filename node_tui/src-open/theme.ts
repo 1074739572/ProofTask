@@ -11,6 +11,11 @@ export const C = {
   warning: '#e6b566',
   success: '#72d6a2',
   info: '#5ac8fa',
+  toolExec: '#e6b566',
+  toolRead: '#9dd9ee',
+  toolWrite: '#5ac8fa',
+  toolWeb: '#c4a7e7',
+  toolAgent: '#d6ad82',
   textMuted: '#8b949e',
   text: '#e6edf3',
 } as const;

@@ -42,6 +42,7 @@ test('completion footer exposes navigation and selection hints', () => {
 
 test('idle footer keeps the normal send hint', () => {
   assert.match(footerHint(base), /Enter send/);
+  assert.match(statusLineText(base), /\/effort/);
 });
 
 test('disconnected footer keeps retry and reconnect hints', () => {
@@ -65,4 +66,30 @@ test('narrow status line keeps activity and queue visible in compact form', () =
   assert.match(text, /read_file/);
   assert.match(text, /q2/);
   assert.match(text, /Enter queue/);
+});
+
+test('running status line exposes compact context meter and decode rate', () => {
+  const text = statusLineText({
+    width: 120, backend: 'connected', running: true, phase: 'responding', elapsed: '4s',
+    currentTool: 'read_file', toolsDone: 1, toolsTotal: 2, queuedMessages: 0,
+    pending: 0, permissionWait: false, completionOpen: false, composerLines: 1,
+    contextUsed: 13100, contextWindow: 16000, contextUsage: 13100 / 16000,
+    permissionPrompt: null, tokensPerSecond: 35,
+  });
+  assert.match(text, /ctx .*82%/);
+  assert.match(text, /S.*T.*M.*F/);
+  assert.match(text, /35 t\/s/);
+});
+
+test('full-screen draft footer exposes an unambiguous exit hint', () => {
+  const text = statusLineText({
+    width: 120, backend: 'connected', running: false, phase: 'idle', elapsed: '0s',
+    currentTool: undefined, toolsDone: 0, toolsTotal: 0, queuedMessages: 0,
+    pending: 0, permissionWait: false, completionOpen: false, composerLines: 1,
+    contextUsed: 0, contextWindow: 0, contextUsage: 0, permissionPrompt: null,
+    editorFullscreen: true,
+  });
+  assert.match(text, /full-screen draft/);
+  assert.match(text, /Enter send/);
+  assert.match(text, /Esc exit editor/);
 });

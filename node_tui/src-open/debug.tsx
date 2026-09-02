@@ -37,7 +37,7 @@ const fakeEntries: Entry[] = [
   {id: 'f1', kind: 'files', text: 'Files Changed', detail: 'backend/app.py\nbackend/routes.py'},
   {id: 'r1b', kind: 'response', text: '问题定位到了：`routes.py` 的异常处理把 404 也包成了 500。已修复。'},
   {id: 's1', kind: 'summary', text: '已完成 3 项操作', start: nowMs - 23000, end: nowMs - 19000, toolCount: 3, paths: ['backend/app.py', 'backend/routes.py'], tokens: {inp: 12400, out: 2100, cache: 8000}, expanded: false},
-  {id: 'b1', kind: 'blocked', text: '需要权限：运行 npm install -g xxx', detail: 'Blocked'},
+  {id: 'b1', kind: 'blocked', text: '需要权限：运行 npm install -g xxx'},
   {id: 'l1', kind: 'log', text: 'Backend', detail: 'warn: token usage 1234'},
   // Turn 2: running tools with output + a merged pair + a failure, then the
   // final answer; summary left EXPANDED to preview the numbered step list.
@@ -211,6 +211,7 @@ console.log(`===== FRAME ${width}x${height}${withOverlay ? ' +overlay' : ''} ===
 console.log(setup.captureCharFrame().replace(/\s+$/gm, '').replace(/\n+$/, ''));
 if (testScroll) {
   await setup.mockMouse.scroll(Math.floor(width / 2), Math.floor(height / 2), 'up');
+  await new Promise(resolve => setTimeout(resolve, 160));
   await setup.flush({maxPasses: 5});
   await setup.renderOnce();
   console.log('===== AFTER WHEEL UP =====');
@@ -218,6 +219,7 @@ if (testScroll) {
 }
 if (process.argv.includes('scrolltop')) {
   for (let n = 0; n < 30; n++) await setup.mockMouse.scroll(Math.floor(width / 2), Math.floor(height / 2), 'up');
+  await new Promise(resolve => setTimeout(resolve, 160));
   await setup.flush({maxPasses: 5});
   await setup.renderOnce();
   console.log('===== AFTER SCROLL TO TOP =====');

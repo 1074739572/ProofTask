@@ -7,7 +7,8 @@
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.ink.json --noEmit",
     "test": ".\\node_modules\\@oven\\bun-windows-x64\\bin\\bun.exe test test",
     "debug": ".\\node_modules\\@oven\\bun-windows-x64\\bin\\bun.exe src-open/debug.tsx",
-    "debug:goal": ".\\node_modules\\@oven\\bun-windows-x64\\bin\\bun.exe src-open/debug.tsx 120 36 goal-draft",
+    "debug:goal": ".\\node_modules\\@oven\\bun-windows-x64\\bin\\bun.exe src-open/debug.tsx 120 36 goal-run",
+    "debug:goal-draft": ".\\node_modules\\@oven\\bun-windows-x64\\bin\\bun.exe src-open/debug.tsx 120 36 goal-draft",
     "debug:measure": ".\\node_modules\\@oven\\bun-windows-x64\\bin\\bun.exe src-open/measure_flash.tsx",
     "debug:sections": ".\\node_modules\\@oven\\bun-windows-x64\\bin\\bun.exe src-open/check_sections.tsx",
     "probe:color": ".\\node_modules\\@oven\\bun-windows-x64\\bin\\bun.exe src-open/probe_color.tsx"

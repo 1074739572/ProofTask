@@ -143,3 +143,43 @@ def test_unknown_policy_name_falls_back_to_default_rules(tmp_path, monkeypatch):
     rules = _load_named_policy(tmp_path, monkeypatch, "not-a-real-policy")
 
     assert rules == DEFAULT_PERMISSIONS
+
+
+def test_low_friction_policy_allows_routine_workspace_edits(tmp_path, monkeypatch):
+    rules = _load_named_policy(tmp_path, monkeypatch, "low-friction")
+
+    assert _effect(rules, "write_file", {"path": "src/app.py"}) == "allow"
+    assert _effect(rules, "edit_file", {"path": "README.md"}) == "allow"
+    assert _effect(rules, "patch_file", {"path": "tests/test_app.py"}) == "allow"
+
+
+@pytest.mark.parametrize("path", (".env", ".env.local", ".features/f001.json", ".project/goal.json"))
+def test_low_friction_policy_keeps_sensitive_paths_blocked(tmp_path, monkeypatch, path):
+    rules = _load_named_policy(tmp_path, monkeypatch, "low-friction")
+
+    tool = "read_file" if path.startswith(".env") else "write_file"
+    assert _effect(rules, tool, {"path": path}) == "deny"
+
+
+@pytest.mark.parametrize(
+    "command",
+    ("npm test", "npm run typecheck", "npm run build", "pytest -q", "python -m pytest tests/test_permissions.py"),
+)
+def test_low_friction_policy_allows_common_validation_commands(tmp_path, monkeypatch, command):
+    rules = _load_named_policy(tmp_path, monkeypatch, "low-friction")
+
+    assert _effect(rules, "bash", {"command": command}) == "allow"
+
+
+def test_low_friction_policy_still_asks_for_unlisted_or_compound_commands(tmp_path, monkeypatch):
+    rules = _load_named_policy(tmp_path, monkeypatch, "low-friction")
+
+    assert _effect(rules, "bash", {"command": "python deploy.py"}) == "ask"
+    assert _effect(rules, "bash", {"command": "npm test & del important.txt"}) == "ask"
+
+
+def test_low_friction_policy_can_be_selected_per_session_with_environment(monkeypatch):
+    monkeypatch.setenv("HARNESS_PERMISSION_PRESET", "low-friction")
+    rules = load_permission_rules()
+
+    assert _effect(rules, "write_file", {"path": "src/app.py"}) == "allow"

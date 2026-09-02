@@ -83,6 +83,7 @@ __all__ = [
     "NodeTestAdapter",
     "NodeTestCatalog",
     "select_adapter",
+    "debug_task_selector",
 ]
 
 
@@ -331,3 +332,99 @@ def _run_task_verification(
             if evidence is not None:
                 evidence.setdefault("diagnostics", {})["debug_bundle_error"] = f"{type(exc).__name__}: {exc}"
     return result.passed, evidence, error
+
+
+def debug_task_selector(
+    task_id: str,
+    selector: str,
+    *,
+    workspace: str | Path | None = None,
+    timeout_ms: int | None = None,
+) -> dict[str, Any]:
+    """Run one exact frozen selector for a Goal worker's diagnostics.
+
+    This is intentionally advisory: it never changes Task verification state,
+    never accepts a command/cwd from the model, and never treats a zero exit
+    as formal proof. The command is built by the registered adapter.
+    """
+    from harness.tasks import load_task
+    from harness.verification.snapshot import capture_code_snapshot
+
+    task = load_task(task_id)
+    spec = task.verification_spec if isinstance(task.verification_spec, dict) else {}
+    selectors = [str(item).replace("\\", "/").strip() for item in (spec.get("selectors") or []) if str(item).strip()]
+    requested = str(selector or "").replace("\\", "/").strip()
+    if not requested:
+        return {"ok": False, "error": "selector is required", "task_id": task_id}
+    if requested not in selectors:
+        return {
+            "ok": False,
+            "error": "selector is not part of the frozen Task verification contract",
+            "selector": requested,
+            "allowed_selectors": selectors[:100],
+            "task_id": task_id,
+        }
+    root = Path(workspace).expanduser().resolve() if workspace else None
+    if root is None:
+        from harness.settings import get_workdir
+        root = get_workdir().resolve()
+    expected_hashes = spec.get("test_hashes") if isinstance(spec.get("test_hashes"), dict) else {}
+    for rel, expected in expected_hashes.items():
+        try:
+            actual = hashlib.sha256((root / str(rel)).read_bytes()).hexdigest()
+        except OSError as exc:
+            return {"ok": False, "error": f"bound test file unavailable: {rel}: {exc}", "task_id": task_id}
+        if actual != str(expected):
+            return {"ok": False, "error": f"bound test file changed after approval: {rel}", "task_id": task_id}
+    adapter = select_adapter(root, spec.get("command") or "")
+    try:
+        command = adapter.build_command([requested])
+    except Exception as exc:
+        return {"ok": False, "error": f"cannot build debug command: {type(exc).__name__}: {exc}", "task_id": task_id}
+    before = capture_code_snapshot(root)
+    result = run_verification(
+        command,
+        workspace=root,
+        timeout_s=max(1.0, min(float(timeout_ms or 120000) / 1000.0, 120.0)),
+        controller_authorized=False,
+    )
+    after = capture_code_snapshot(root)
+    try:
+        from harness.verification.debug import build_debug_bundle, write_debug_bundle
+
+        bundle = build_debug_bundle(
+            result,
+            workspace=root,
+            goal_id=str(getattr(task, "goal_id", "") or ""),
+            task_id=str(task.id),
+            phase="worker_debug",
+            selectors=[requested],
+            test_files=spec.get("test_files") or [],
+            acceptance_ids=[str(case.get("id")) for case in (task.acceptance_cases or []) if isinstance(case, dict) and case.get("id")],
+            approved_paths=[*(task.primary_write or []), *(task.planned_new or [])],
+            snapshot_before=before,
+            snapshot_after=after,
+        )
+        paths = write_debug_bundle(bundle, workspace=root)
+    except Exception as exc:  # diagnostics must never crash the worker
+        bundle = {"failure": {"category": "diagnostics_error", "reason": str(exc)}}
+        paths = {}
+    failure = bundle.get("failure") if isinstance(bundle, dict) else {}
+    diagnostics = bundle.get("diagnostics") if isinstance(bundle, dict) else {}
+    return {
+        "ok": True,
+        "task_id": task_id,
+        "selector": requested,
+        "command": command,
+        "passed": bool(result.passed),
+        "exit_code": result.exit_code,
+        "timed_out": bool(result.timed_out),
+        "error": result.error,
+        "failure_category": str((failure or {}).get("category") or ""),
+        "failure_signature": str((failure or {}).get("signature") or (diagnostics or {}).get("failure_signature") or ""),
+        "failed_cases": list((diagnostics or {}).get("failed_cases") or [])[:20],
+        "expected_actual": dict((diagnostics or {}).get("expected_actual") or {}),
+        "output_tail": str(result.stdout or "")[-4000:],
+        "debug_bundle": paths,
+        "formal_verification": False,
+    }

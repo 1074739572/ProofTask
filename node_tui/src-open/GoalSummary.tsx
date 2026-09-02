@@ -18,6 +18,9 @@ export type GoalSummaryProps = {
   onExpandDetails?: () => void;
   /** Terminal width used to keep the first screen readable on narrow TTYs. */
   width?: number;
+  /** Animation frame counter (~80ms). Drives the progress-bar head pulse;
+   * optional so off-screen previews stay static. */
+  tick?: () => number;
 };
 
 function safeText(value: unknown, fallback = '暂无'): string {
@@ -125,9 +128,8 @@ function progressFor(goal: GoalLike): {done: number; total: number; percent: num
   return {done, total, percent: total > 0 ? Math.round(done / total * 100) : 0};
 }
 
-function progressBar(percent: number, width: number): string {
-  const filled = Math.max(0, Math.min(width, Math.round(percent / 100 * width)));
-  return `${'━'.repeat(filled)}${'─'.repeat(Math.max(0, width - filled))}`;
+function progressFilled(percent: number, width: number): number {
+  return Math.max(0, Math.min(width, Math.round(percent / 100 * width)));
 }
 
 function Metric(props: {label: string; value: string; detail?: string; color?: string}) {
@@ -176,6 +178,18 @@ export function GoalSummary(props: GoalSummaryProps) {
   };
   const progress = () => progressFor(props.goal);
   const metricWidth = () => narrow() ? 12 : 22;
+  // Progress light-band: the bar renders in three segments — done (success),
+  // a pulsing head cell at the frontier (primary), and the remainder (muted).
+  // The head breathes on the animation clock while the goal is incomplete.
+  const barWidth = () => narrow() ? 14 : 34;
+  const barFilled = () => progressFilled(progress().percent, barWidth());
+  const barHasHead = () => progress().total > 0 && barFilled() < barWidth();
+  const barHead = () => {
+    if (!barHasHead()) return '';
+    const t = props.tick?.() ?? 0;
+    return t % 6 < 3 ? '╸' : '─';
+  };
+  const barRest = () => '─'.repeat(Math.max(0, barWidth() - barFilled() - (barHasHead() ? 1 : 0)));
 
   return <box flexDirection="column" flexGrow={1} flexShrink={0} minWidth={0} paddingX={1} paddingTop={1}>
     <box border borderStyle="rounded" borderColor={statusColor(displayStatus())} flexDirection="column" flexShrink={0} paddingX={1} minWidth={0}>
@@ -185,7 +199,9 @@ export function GoalSummary(props: GoalSummaryProps) {
       </box>
       <text fg={C.textMuted} wrapMode="none" truncate flexShrink={1}>ID {clip(props.goal.id, narrow() ? 28 : 52)} · 阶段 {phaseLabel(phase())}</text>
       <box flexDirection="row" minWidth={0} marginTop={1}>
-        <text fg={C.success} wrapMode="none" flexShrink={0}>{progressBar(progress().percent, narrow() ? 14 : 34)}</text>
+        <text fg={C.success} wrapMode="none" flexShrink={0}>{'━'.repeat(barFilled())}</text>
+        <text fg={C.primary} wrapMode="none" flexShrink={0}>{barHead()}</text>
+        <text fg={C.textMuted} wrapMode="none" flexShrink={0}>{barRest()}</text>
         <text fg={C.text} wrapMode="none" truncate flexGrow={1} flexShrink={1}>  {progress().total ? `${progress().done}/${progress().total} Tasks · ${progress().percent}%` : '任务图准备中'}</text>
       </box>
       <text fg={C.secondary} wrapMode="none" truncate flexShrink={1}>流程  {track()}</text>

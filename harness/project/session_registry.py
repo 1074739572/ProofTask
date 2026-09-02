@@ -274,8 +274,14 @@ def ensure_active_session(*, fresh: bool) -> SessionBinding:
     return create_session()
 
 
-def list_session_summaries(*, limit: int = 20) -> list[dict]:
-    """Newest-first summaries for /resume status (not a full picker yet)."""
+def list_session_summaries(*, limit: int = 20, hide_empty: bool = False) -> list[dict]:
+    """Newest-first summaries for /resume status.
+
+    ``hide_empty`` skips shell sessions (no messages, no real title, not
+    active).  Filtering happens BEFORE the ``limit`` truncation so that a
+    pile of freshly-created empty shells can never push real conversations
+    out of the picker list.
+    """
     sessions_dir = _active_sessions_dir()
     if not sessions_dir.exists():
         return []
@@ -301,14 +307,22 @@ def list_session_summaries(*, limit: int = 20) -> list[dict]:
                         msg_count += 1
             except OSError:
                 msg_count = 0
+        title = meta.get("title") or "(untitled)"
+        active_row = path.name == active
+        if hide_empty and not (
+            active_row
+            or msg_count > 0
+            or (title not in ("(untitled)", "(migrated)", "") and title)
+        ):
+            continue
         rows.append(
             {
                 "id": path.name,
-                "title": meta.get("title") or "(untitled)",
+                "title": title,
                 "created_at": int(meta.get("created_at") or 0),
                 "updated_at": int(meta.get("updated_at") or 0),
                 "messages": msg_count,
-                "active": path.name == active,
+                "active": active_row,
                 "has_todos": sp.todos_json.exists(),
             }
         )
@@ -321,16 +335,7 @@ def list_session_summaries(*, limit: int = 20) -> list[dict]:
 
 def visible_session_summaries(*, limit: int = 20, hide_empty: bool = True) -> list[dict]:
     """Same filter/order as the /resume list (1-based index maps to this)."""
-    rows = list_session_summaries(limit=limit * 3)
-    if hide_empty:
-        rows = [
-            r
-            for r in rows
-            if r["active"]
-            or r["messages"] > 0
-            or (r["title"] not in ("(untitled)", "(migrated)", "") and r["title"])
-        ]
-    return rows[:limit]
+    return list_session_summaries(limit=limit, hide_empty=hide_empty)
 
 
 def format_session_list_block(*, limit: int = 20, hide_empty: bool = True) -> str:

@@ -257,6 +257,26 @@ function sameTranscriptEntry(left: Entry, right: Entry): boolean {
   return true;
 }
 
+function sameTranscriptEntryExcept(left: Entry, right: Entry, ignored: ReadonlySet<string>): boolean {
+  const keys = new Set([...Object.keys(left), ...Object.keys(right)]);
+  for (const key of keys) {
+    if (ignored.has(key)) continue;
+    if (!sameTranscriptValue((left as any)[key], (right as any)[key])) return false;
+  }
+  return true;
+}
+
+// Fields that stream in place through LogView's liveEntry accessor. Keeping
+// the row's object identity stable for these avoids remounting the renderer
+// on every 32ms flush (the flicker root cause).
+const LIVE_RESPONSE_FIELDS: ReadonlySet<string> = new Set(['text', 'streaming']);
+const LIVE_ACTION_FIELDS: ReadonlySet<string> = new Set(['output']);
+
+// Braille spinner frames, one per animation tick (80ms): a smooth 10-frame
+// rotation at ~12fps, replacing the old 4-frame ASCII cycle that the 500ms
+// clock could only advance twice per second.
+const BRAILLE_SPINNER = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
 function stabilizeTranscriptEntries(entries: Entry[], cache: Map<string, Entry>): Entry[] {
   const seen = new Map<string, number>();
   const active = new Set<string>();
@@ -268,6 +288,23 @@ function stabilizeTranscriptEntries(entries: Entry[], cache: Map<string, Entry>)
     active.add(key);
     const previous = cache.get(key);
     if (previous && sameTranscriptEntry(previous, entry)) return previous;
+    // A streaming response row must keep its render identity: remounting the
+    // markdown renderer on every flush tore down the native stable-block
+    // cache and repainted the whole block — the visible flicker. text and
+    // streaming reach the row through the live accessor instead; the cached
+    // object only pins identity. The streaming -> false transition also stays
+    // in place so the renderer finalizes the trailing block natively.
+    if (previous && previous.kind === 'response' && entry.kind === 'response'
+        && (previous as any).streaming === true
+        && sameTranscriptEntryExcept(previous, entry, LIVE_RESPONSE_FIELDS)) {
+      return previous;
+    }
+    // Same treatment for tool rows whose output is still appending: only the
+    // output array streams; done/ok/name transitions still remount normally.
+    if (previous && previous.kind === 'action' && entry.kind === 'action'
+        && sameTranscriptEntryExcept(previous, entry, LIVE_ACTION_FIELDS)) {
+      return previous;
+    }
     cache.set(key, entry);
     return entry;
   });
@@ -279,13 +316,15 @@ function SafeText(props: {value: unknown; [key: string]: unknown}) {
   const readText = () => normalizeRenderableText(
     typeof props.value === 'function' ? (props.value as () => unknown)() : props.value,
   );
-  const text = readText();
+  // Keep function-valued text reactive. This is used by the scroll affordance
+  // and elapsed/tool labels, which must update after the initial mount.
+  const text = createMemo(readText);
   // OpenTUI's reconciler may materialize a component returning null as a
   // bare text node. An empty box is inert, but remains a legal child.
-  if (text === null) return <box />;
+  if (text() === null) return <box />;
   const attributes = {...props};
   delete attributes.value;
-  return <text {...attributes}>{text}</text>;
+  return <text {...attributes}>{text()}</text>;
 }
 
 /** A false branch must disappear without manufacturing an in-flow wrapper. */
@@ -649,6 +688,18 @@ function footerStatusText(width: number, model: string, effort: string, used: nu
   return 'Ctrl+Shift+C 复制 · Ctrl+K 中断';
 }
 
+/** dsh-TUI-inspired segmented context meter. Kept as text so it remains
+ * cheap to repaint and works in dumb terminals as well as the native renderer. */
+function contextSegments(used: number, window: number, width: number): string {
+  if (window <= 0) return 'ctx ─────── —';
+  const ratio = Math.max(0, Math.min(1, used / window));
+  const cells = Math.max(4, Math.min(12, width >= 120 ? 12 : width >= 100 ? 9 : 6));
+  const filled = Math.round(ratio * cells);
+  const bar = `${'█'.repeat(filled)}${'░'.repeat(cells - filled)}`;
+  const percent = `${Math.round(ratio * 100)}%`;
+  return `ctx ${bar} ${percent}`;
+}
+
 function shellValue(value: string | (() => string) | undefined): string {
   const resolved = typeof value === 'function' ? value() : value;
   return String(resolved || '').trim();
@@ -670,6 +721,8 @@ function ShellHeader(props: {
   contextUsed: number | (() => number);
   contextWindow: number | (() => number);
   backend: string | (() => string);
+  /** Click affordance on the effort label: opens the reasoning-effort picker. */
+  onEffortClick?: () => void;
 }) {
   const width = () => Number(typeof props.width === 'function' ? props.width() : props.width) || 80;
   const cwd = () => shellValue(props.cwd);
@@ -680,7 +733,7 @@ function ShellHeader(props: {
   const window = () => Number(typeof props.contextWindow === 'function' ? props.contextWindow() : props.contextWindow) || 0;
   const backend = () => connectionGlyph(shellValue(props.backend));
   const repo = () => repoBase(cwd()) || 'workspace';
-  const context = () => window() > 0 ? `ctx ${formatTokens(used())}/${formatTokens(window())} ${Math.round((used() / window()) * 100)}%` : 'ctx —';
+  const context = () => contextSegments(used(), window(), width());
   const compact = () => width() < 78;
   const medium = () => width() < 100;
   return <box height={1} flexShrink={0} minWidth={0} paddingX={1} backgroundColor="#171e26" flexDirection="row">
@@ -690,7 +743,9 @@ function ShellHeader(props: {
     <box flexDirection="row" minWidth={0} flexShrink={0} gap={1}>
       <SafeText fg={C.secondary} wrapMode="none" truncate selectable={false} value={() => !compact() ? mode() : ''} />
       <SafeText fg={C.primary} wrapMode="none" truncate selectable={false} value={model} />
-      <SafeText fg={C.textMuted} wrapMode="none" truncate selectable={false} value={() => !medium() ? `· ${effort()}` : ''} />
+      <box minWidth={0} flexShrink={0} onMouseUp={(event: any) => { if (event?.button === 0) props.onEffortClick?.(); }}>
+        <SafeText fg={C.textMuted} wrapMode="none" truncate selectable={false} value={() => !medium() ? `· ${effort()}▾` : ''} />
+      </box>
       <SafeText fg={C.textMuted} wrapMode="none" truncate selectable={false} value={() => !compact() ? context() : ''} />
       <text fg={backend().color} wrapMode="none" selectable={false}>{`${backend().icon} ${backend().label}`}</text>
     </box>
@@ -754,6 +809,20 @@ function subagentIcon(status?: SubagentStatus, frame = '|'): string {
   if (status === 'failed') return 'x';
   if (status === 'done') return '✓';
   return frame;
+}
+
+// Keep settled tools quiet while a semantic tint makes reads, writes,
+// execution, web calls, and subagents scannable at a glance.
+function toolCategoryColor(name: unknown, done: boolean, ok?: boolean, focused = false): string {
+  if (focused) return C.primary;
+  if (done) return ok ? C.success : C.error;
+  const value = String(name || '').toLowerCase();
+  if (/^(bash|shell|powershell|pwsh|command|exec|run)/.test(value)) return C.toolExec;
+  if (/^(read|grep|glob|search|file|list|stat)/.test(value)) return C.toolRead;
+  if (/^(edit|write|patch|replace|multi)/.test(value)) return C.toolWrite;
+  if (/(web|http|browser|fetch)/.test(value)) return C.toolWeb;
+  if (/(agent|task|job|workflow)/.test(value)) return C.toolAgent;
+  return C.toolExec;
 }
 
 function SubagentCard(props: {agent: Entry; frame: () => string; compact?: boolean}) {
@@ -1440,10 +1509,52 @@ function StableSectionView(props: {section: Section; frame: () => string; now: (
   return empty();
 }
 
-function TranscriptEntryView(props: {entry: Entry; frame: () => string; now: () => number; focusId: () => string | null; onToggleExpand: (id: string) => void; plainResponse?: boolean}) {
+/**
+ * Height clamp for live markdown. Block reclassification while streaming
+ * (paragraph -> heading, list splitting, table normalization) can briefly
+ * shrink the measured height; in a bottom-pinned scroll view every shrink
+ * yanks the rows below upward, which reads as a flash. While `active()` the
+ * wrapper's minHeight only ratchets upward; the clamp releases on stream end
+ * and on width changes (when old measurements stop being meaningful).
+ */
+function StreamingClamp(props: {active: () => boolean; children: any}) {
+  let max = 0;
+  let lastWidth = -1;
+  return <box flexShrink={0} minWidth={0} ref={(element: BoxRenderable) => {
+    element.onLifecyclePass = () => {
+      if (element.width !== lastWidth) {
+        lastWidth = element.width;
+        max = 0;
+        if (element.minHeight !== 0) element.minHeight = 0;
+      }
+      if (!props.active()) {
+        if (max !== 0) {
+          max = 0;
+          if (element.minHeight !== 0) element.minHeight = 0;
+        }
+        return;
+      }
+      const h = element.height;
+      if (h > max) {
+        max = h;
+        const minH = typeof element.minHeight === 'number' ? element.minHeight : 0;
+        if (minH < h) element.minHeight = h;
+      }
+    };
+  }}>{props.children}</box>;
+}
+
+function TranscriptEntryView(props: {entry: Entry; liveEntry?: (id: string) => Entry | undefined; frame: () => string; now: () => number; tick: () => number; focusId: () => string | null; onToggleExpand: (id: string) => void; plainResponse?: boolean; latest?: () => boolean}) {
   const entry: any = props.entry;
   const text = normalizeTranscriptText(entry.text);
   const detail = normalizeTranscriptText(entry.detail);
+  // The cached entry pins render identity between flushes; streamed text,
+  // the streaming flag, and tool output flow through this fresh lookup so the
+  // mounted renderer updates in place instead of being remounted per flush.
+  const liveOf = () => {
+    const found = props.liveEntry?.(entry.id);
+    return found && found.kind === entry.kind ? found : undefined;
+  };
   const shell = (children: any) => <box flexShrink={0} minWidth={0}>{children}</box>;
   if (entry.kind === 'prompt') {
     return text === null ? <box /> : shell(<box flexDirection="row" minWidth={0} backgroundColor={C.userCard} paddingLeft={1} paddingRight={1}>
@@ -1452,10 +1563,20 @@ function TranscriptEntryView(props: {entry: Entry; frame: () => string; now: () 
     </box>);
   }
   if (entry.kind === 'response') {
+    const liveText = () => normalizeTranscriptText(liveOf()?.text) ?? text;
+    const liveStreaming = () => {
+      const found = liveOf();
+      return found ? found.streaming === true : entry.streaming === true;
+    };
+    // Streaming gutter pulse: while tokens are flowing the rail breathes
+    // between ▌ and │ on the animation clock, then settles back to the plain
+    // rail once the stream finalizes. Single cell, zero layout impact.
+    const gutterChar = () => liveStreaming() ? (props.tick() % 5 < 4 ? '▌' : '│') : '│';
+    const gutterColor = () => liveStreaming() && props.tick() % 5 < 4 ? C.primary : C.info;
     return text === null ? <box /> : shell(<box flexDirection="row" minWidth={0} paddingLeft={1} paddingRight={1}>
-      <text fg={C.info} wrapMode="none" selectable={false}>│</text>
+      <text fg={gutterColor()} wrapMode="none" selectable={false}>{gutterChar()}</text>
       <box flexGrow={1} minWidth={0} paddingLeft={1}>
-        {props.plainResponse ? <SafeText fg={C.text} wrapMode="word" value={text} /> : <markdown syntaxStyle={getMarkdownSyntax()} streaming={entry.streaming === true} internalBlockMode="top-level" tableOptions={{style: 'grid'}} content={text} fg={C.text} conceal />}
+        {props.plainResponse ? <SafeText fg={C.text} wrapMode="word" value={text} /> : <StreamingClamp active={liveStreaming}><markdown syntaxStyle={getMarkdownSyntax()} streaming={liveStreaming()} internalBlockMode="top-level" tableOptions={{style: 'grid'}} content={liveText() ?? ''} fg={C.text} conceal /></StreamingClamp>}
       </box>
     </box>);
   }
@@ -1468,28 +1589,39 @@ function TranscriptEntryView(props: {entry: Entry; frame: () => string; now: () 
   if (entry.kind === 'intent') {
     // Thinking notes stay collapsed to a single muted line in the transcript;
     // the turn summary remains the explicit affordance for expanding the full
-    // sequence of reasoning/tool steps.
-    return text === null ? <box /> : shell(<SafeText fg={C.textMuted} wrapMode="word" value={`∴ Thinking · ${text}`} />);
+    // sequence of reasoning/tool steps. While the intent is the latest row the
+    // ∴ marker spins on the animation clock; it freezes into the static glyph
+    // as soon as a newer row arrives or the run ends (the clock stops).
+    if (text === null) return <box />;
+    const active = () => props.latest?.() === true;
+    const marker = () => active() ? BRAILLE_SPINNER[props.tick() % BRAILLE_SPINNER.length] : '∴';
+    const markerColor = () => active() ? C.info : C.textMuted;
+    return shell(<box flexDirection="row" minWidth={0}>
+      <text fg={markerColor()} wrapMode="none" selectable={false}>{marker()}</text>
+      <SafeText fg={C.textMuted} wrapMode="word" flexShrink={1} value={` Thinking · ${text}`} />
+    </box>);
   }
   if (entry.kind === 'blocked') {
+    // The header already states the kind; a detail that merely repeats the
+    // header (or the body) would paint the same word twice on screen.
+    const extra = detail !== null && detail !== 'Blocked' && detail !== text ? detail : null;
     return shell(<box flexDirection="column" minWidth={0}>
       <SafeText fg={C.error} value="Blocked" />
       {text === null ? <box /> : <SafeText fg={C.error} wrapMode="word" value={text} />}
-      {detail === null ? <box /> : <SafeText fg={C.error} wrapMode="word" value={detail} />}
+      {extra === null ? <box /> : <SafeText fg={C.error} wrapMode="word" value={extra} />}
     </box>);
   }
   if (entry.kind === 'action') {
-    // `output` was normalized in LogView's snapshot. Keep this local array as
-    // a read-only render snapshot as well, so folding does not consume pasted
-    // multi-line input during Solid reconciliation.
-    const output = normalizeActionOutput(entry.output);
+    // Output streams in place through the live lookup: the cached entry pins
+    // render identity between flushes, while appended lines flow via this memo.
+    const liveOutput = createMemo(() => normalizeActionOutput(liveOf()?.output ?? entry.output));
     const expanded = entry.expanded === true;
-    const isLongOutput = output.length > 3;
+    const isLongOutput = () => liveOutput().length > 3;
     // A folded transcript must remain bounded. Keep a short prefix rather
     // than the tail: the title/status line identifies the action, while the
     // first output lines provide a useful, stable preview without rendering
     // the end of a large paste into the terminal frame.
-    const visible = expanded ? actionOutputPreview(output, true) : (!isLongOutput ? output : []);
+    const visible = () => expanded ? actionOutputPreview(liveOutput(), true) : (!isLongOutput() ? liveOutput() : []);
     const name = normalizeTranscriptText(entry.name) || text || 'action';
     const status = normalizeTranscriptText(entry.summary) || detail;
     const summary = status !== null ? `  ${status}` : '';
@@ -1497,16 +1629,89 @@ function TranscriptEntryView(props: {entry: Entry; frame: () => string; now: () 
     // Keep the live marker/elapsed expression reactive.  A plain local string
     // is evaluated only at mount by Solid, which made the old clock appear
     // frozen even though the timer was running.
-    const head = () => `${marker()} ${name}${summary}${formatElapsed(entry.start, entry.end, props.now())}`;
+    const head = () => `${marker()} ${name}${summary}`;
+    const elapsedText = () => formatElapsed(entry.start, entry.end, props.now());
+    // Elapsed tick-pop: the counter flashes bright for ~3 animation ticks
+    // (240ms) right after its value changes, then settles back to muted.
+    let lastElapsed = elapsedText();
+    let lastChangeTick = -99;
+    const elapsedColor = () => {
+      const cur = elapsedText();
+      const t = props.tick();
+      if (cur !== lastElapsed) { lastElapsed = cur; lastChangeTick = t; }
+      return t - lastChangeTick <= 3 ? C.warning : C.textMuted;
+    };
     return <box flexShrink={0} minWidth={0} flexDirection="column">
-      <text fg={entry.done ? entry.ok ? C.success : C.error : C.warning} wrapMode="word">{head()}</text>
-      {visible.length === 0 ? <box /> : <For each={visible}>{(line: string) => <box flexDirection="row" minWidth={0} paddingLeft={2}>
+      <box flexDirection="row" minWidth={0}>
+        <text fg={toolCategoryColor(name, Boolean(entry.done), entry.ok, props.focusId() === entry.id)} wrapMode="word" flexShrink={1}>{head()}</text>
+        <text fg={elapsedColor()} wrapMode="none">{elapsedText()}</text>
+      </box>
+      {visible().length === 0 ? <box /> : <For each={visible()}>{(line: string) => <box flexDirection="row" minWidth={0} paddingLeft={2}>
         <SafeText fg={C.textMuted} wrapMode="word" value={`│ ${line}`} />
       </box>}</For>}
-      {!expanded && isLongOutput ? <box flexDirection="row" minWidth={0} paddingLeft={2}>
-        <SafeText fg={C.textMuted} wrapMode="none" truncate value={`${name}${summary} · … ${output.length} lines · Enter to expand`} />
+      {!expanded && isLongOutput() ? <box flexDirection="row" minWidth={0} paddingLeft={2}>
+        <SafeText fg={C.textMuted} wrapMode="none" truncate value={`${name}${summary} · … ${liveOutput().length} lines · Enter to expand`} />
       </box> : <box />}
     </box>;
+  }
+  if (entry.kind === 'subagent') {
+    return shell(<SubagentCard agent={entry} frame={props.frame} />);
+  }
+  if (entry.kind === 'tasks') {
+    const tasks = Array.isArray(entry.tasks) ? entry.tasks : [];
+    if (tasks.length === 0) return <box />;
+    const expanded = entry.expanded === true;
+    const active = tasks.find((task: any) => task.status === 'in_progress') || tasks.find((task: any) => task.status === 'pending');
+    const activeLabel = normalizeTranscriptText(active?.activeForm || active?.content) || 'Complete';
+    const doneCount = tasks.filter((task: any) => task.status === 'completed').length;
+    return shell(<box flexDirection="column" minWidth={0} paddingLeft={1}>
+      <box flexDirection="row" minWidth={0} gap={1} onMouseUp={(event: any) => {
+        if (event?.button === 0) props.onToggleExpand(entry.id);
+      }}>
+        <SafeText fg={props.focusId() === entry.id ? C.primary : C.info} value={expanded ? 'v' : '>'} />
+        <SafeText fg={C.info} value="Todo" />
+        <SafeText fg={C.textMuted} value={`${doneCount}/${tasks.length}`} />
+        {expanded ? <box /> : <SafeText fg={C.warning} flexGrow={1} wrapMode="none" truncate value={activeLabel} />}
+        <SafeText fg={C.textMuted} value="Tab / Enter" />
+      </box>
+      {expanded ? <box flexDirection="column" minWidth={0} paddingLeft={2}>
+        <For each={tasks}>{(task: any) => {
+          const completed = task.status === 'completed';
+          const activeTask = task.status === 'in_progress';
+          const label = normalizeTranscriptText(activeTask ? task.activeForm || task.content : task.content);
+          return <box flexDirection="row" minWidth={0} gap={1}>
+            <SafeText fg={completed ? C.textMuted : activeTask ? C.warning : C.text} value={completed ? '[x]' : activeTask ? '[~]' : '[ ]'} />
+            {label === null ? <box /> : <SafeText fg={completed ? C.textMuted : activeTask ? C.warning : C.text} flexGrow={1} wrapMode="word" value={label} />}
+          </box>;
+        }}</For>
+      </box> : <box />}
+    </box>);
+  }
+  if (entry.kind === 'summary') {
+    if (text === null) return <box />;
+    const expanded = entry.expanded === true;
+    const paths = Array.isArray(entry.paths)
+      ? entry.paths.map(normalizeTranscriptText).filter((path: string | null): path is string => path !== null)
+      : [];
+    const tokens = entry.tokens;
+    const elapsed = formatElapsed(entry.start, entry.end, props.now()).trim();
+    const tokenText = tokens && (tokens.inp > 0 || tokens.out > 0)
+      ? `in ${formatTokens(tokens.inp)} · out ${formatTokens(tokens.out)} · cache ${formatTokens(tokens.cache)}`
+      : '';
+    return shell(<box flexDirection="column" minWidth={0}>
+      <box flexDirection="row" minWidth={0} gap={1} onMouseUp={(event: any) => {
+        if (event?.button === 0) props.onToggleExpand(entry.id);
+      }}>
+        <SafeText fg={props.focusId() === entry.id ? C.primary : C.info} value={expanded ? '▾' : '▸'} />
+        <SafeText fg={C.success} wrapMode="word" flexShrink={1} value={text} />
+        {(entry.toolCount || 0) > 0 ? <SafeText fg={C.textMuted} value={`· ${entry.toolCount} 工具`} /> : <box />}
+        {elapsed ? <SafeText fg={C.textMuted} value={elapsed} /> : <box />}
+      </box>
+      {expanded ? <box flexDirection="column" minWidth={0} paddingLeft={2}>
+        {tokenText ? <SafeText fg={C.textMuted} wrapMode="none" truncate value={tokenText} /> : <box />}
+        <For each={paths}>{(path: string) => <SafeText fg={C.secondary} wrapMode="word" value={`· ${path}`} />}</For>
+      </box> : <box />}
+    </box>);
   }
   if (entry.kind === 'files') {
     const paths = Array.isArray(entry.paths)
@@ -1520,7 +1725,19 @@ function TranscriptEntryView(props: {entry: Entry; frame: () => string; now: () 
   return <box />;
 }
 
-function LogView(props: {entries: () => Entry[]; now: () => number; active: () => boolean; composerEmpty: () => boolean; height: number; focusId: () => string | null; onCycleFocus: (dir: 1 | -1) => void; onToggleExpand: (id: string) => void; onClearFocus: () => void; staticRender?: boolean; staticText?: () => string}) {
+/** A lightweight conversation rail borrowed from dsh-TUI's TimelineRail.
+ * It intentionally carries no interaction state: the scrollbox remains the
+ * source of truth, while the gutter gives prompt turns a stable visual spine. */
+function TimelineRail(props: {entry: Entry; turn: number}) {
+  const prompt = props.entry.kind === 'prompt';
+  const marker = prompt ? '●' : '│';
+  const label = prompt ? String(props.turn).padStart(2, '0') : ' ';
+  return <box width={4} flexShrink={0} flexDirection="column" alignItems="center">
+    <text fg={prompt ? C.primary : C.textMuted} wrapMode="none" selectable={false}>{`${marker}${label}`}</text>
+  </box>;
+}
+
+function LogView(props: {entries: () => Entry[]; now: () => number; tick: () => number; active: () => boolean; composerEmpty: () => boolean; height: number; width?: number; focusId: () => string | null; onCycleFocus: (dir: 1 | -1) => void; onToggleExpand: (id: string) => void; onClearFocus: () => void; staticRender?: boolean; staticText?: () => string}) {
   let scroll: ScrollBoxRenderable | undefined;
   const [atBottom, setAtBottom] = createSignal(true);
   const transcriptCache = new Map<string, Entry>();
@@ -1534,7 +1751,13 @@ function LogView(props: {entries: () => Entry[]; now: () => number; active: () =
     const max = Math.max(0, s.scrollHeight - s.viewport.height);
     setAtBottom(s.scrollTop >= max - 1);
   };
-  const frame = () => ['|', '/', '-', '\\'][Math.floor(props.now() / 180) % 4];
+  // ScrollBox does not expose a public onScroll callback. A low-frequency
+  // probe keeps the "back to bottom" affordance correct for both mouse-wheel
+  // and programmatic/mock scrolling without tying transcript paints to a
+  // high-frequency animation clock.
+  const scrollPoll = setInterval(updateAtBottom, 120);
+  onCleanup(() => clearInterval(scrollPoll));
+  const frame = () => BRAILLE_SPINNER[props.tick() % BRAILLE_SPINNER.length];
   const scrollBy = (rows: number) => { scroll?.scrollBy(rows); updateAtBottom(); };
   useKeyboard((event: any) => {
     if (!props.active()) return;
@@ -1555,8 +1778,13 @@ function LogView(props: {entries: () => Entry[]; now: () => number; active: () =
   // calculations. This keeps every static mount and live render on the same
   // non-empty, metadata-preserving snapshot path, without relying on an
   // external signal to trigger a test-renderer frame.
+  // freshEntries is the unstabilized latest snapshot: streaming text and tool
+  // output reach pinned rows through the liveEntry lookup below, so the
+  // mounted markdown renderer updates in place instead of remounting.
+  const freshEntries = createMemo(() => normalizeTranscriptEntries(props.entries()) as Entry[]);
+  const liveEntry = (id: string) => freshEntries().find(e => String(e?.id ?? '') === String(id));
   const normalizedEntries = createMemo(() => {
-    const entries = stabilizeTranscriptEntries(normalizeTranscriptEntries(props.entries()) as Entry[], transcriptCache);
+    const entries = stabilizeTranscriptEntries(freshEntries(), transcriptCache);
     // Protect long-running sessions from an unbounded render tree. Keep the
     // newest entries interactive and replace the cold prefix with one explicit
     // divider so users know content was intentionally folded, not lost.
@@ -1570,9 +1798,32 @@ function LogView(props: {entries: () => Entry[]; now: () => number; active: () =
       detail: '长会话保护',
     } as Entry, ...entries.slice(-MAX_RENDERED_ENTRIES)];
   });
-  const TranscriptBody = () => <box flexDirection="column" minWidth={0}>
-    <For each={normalizedEntries()}>{(entry: Entry) => <TranscriptEntryView entry={entry} frame={frame} now={props.now} focusId={props.focusId} onToggleExpand={props.onToggleExpand} plainResponse={props.staticRender} />}</For>
-  </box>;
+  // The plan panel is a live snapshot, not history: only the newest task list
+  // renders, pinned AFTER the message flow so it never floats to the top of
+  // the transcript (matching the original buildSections contract).
+  const orderedEntries = createMemo(() => {
+    const entries = normalizedEntries();
+    let latestTasks: Entry | null = null;
+    const rest: Entry[] = [];
+    for (const entry of entries) {
+      if (entry.kind === 'tasks') { latestTasks = entry; continue; }
+      rest.push(entry);
+    }
+    return latestTasks ? [...rest, latestTasks] : rest;
+  });
+  const TranscriptBody = () => {
+    let turn = 0;
+    return <box flexDirection="column" minWidth={0}>
+      <For each={orderedEntries()}>{(entry: Entry, index: () => number) => {
+        if (entry.kind === 'prompt') turn += 1;
+        const latest = () => index() === orderedEntries().length - 1;
+        const row = <TranscriptEntryView entry={entry} liveEntry={liveEntry} frame={frame} now={props.now} tick={props.tick} focusId={props.focusId} onToggleExpand={props.onToggleExpand} plainResponse={props.staticRender} latest={latest} />;
+        return props.width != null && props.width >= 100
+          ? <box flexDirection="row" minWidth={0}><TimelineRail entry={entry} turn={turn} /><box flexGrow={1} minWidth={0}>{row}</box></box>
+          : row;
+      }}</For>
+    </box>;
+  };
   const staticNeedsScroll = () => normalizedEntries().length > props.height;
   const renderTranscript = () => <TranscriptBody />;
   return <box flexDirection="column">
@@ -1590,8 +1841,10 @@ function LogView(props: {entries: () => Entry[]; now: () => number; active: () =
       minHeight={0}
       stickyScroll
       stickyStart="bottom"
+      viewportCulling
       viewportOptions={{paddingRight: 1}}
       verticalScrollbarOptions={{visible: false}}
+      onMouseScroll={() => { updateAtBottom(); queueMicrotask(updateAtBottom); }}
     >
       {renderTranscript()}
     </scrollbox> : <scrollbox
@@ -1601,14 +1854,17 @@ function LogView(props: {entries: () => Entry[]; now: () => number; active: () =
       minHeight={0}
       stickyScroll
       stickyStart="bottom"
+      viewportCulling
       viewportOptions={{paddingRight: 1}}
       verticalScrollbarOptions={{visible: true}}
-      onMouseScroll={() => { setTimeout(updateAtBottom, 0); }}
+      onMouseScroll={() => { updateAtBottom(); queueMicrotask(updateAtBottom); }}
     >
       {renderTranscript()}
     </scrollbox>}
     <box height={1} flexShrink={0} paddingX={1} onMouseUp={(event: any) => { if (event?.button === 0) jumpToBottom(); }}>
-      <SafeText fg={C.info} wrapMode="none" truncate selectable={false} value={atBottom() ? '' : '↓ 回到底部 (End)'} />
+      <SolidShow when={() => !atBottom()}>
+        <text fg={C.info} wrapMode="none" truncate selectable={false}>↓ 回到底部 (End)</text>
+      </SolidShow>
     </box>
   </box>;
 }
@@ -1624,7 +1880,7 @@ function resolveDebugValue<T>(value: T | (() => T) | undefined): T | undefined {
   return typeof value === 'function' ? (value as () => T)() : value;
 }
 
-export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal; debugDraft?: DebugDraft; debugDecisions?: DebugDecisions; debugRunning?: DebugFlag; debugStartedAt?: number; debugOverlay?: Overlay; debugUsage?: {input: number; output: number; cacheRead: number; contextUsed?: number; contextWindow?: number}; debugEffort?: {value: string; label: string; options: OverlayOption[]}; debugWelcome?: {quote: string; art: string[]}; debugUsageOpen?: boolean; debugUsageRange?: UsageRange}) {
+export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal; debugDraft?: DebugDraft; debugDecisions?: DebugDecisions; debugRunning?: DebugFlag; debugStartedAt?: number; debugOverlay?: Overlay; debugUsage?: {input: number; output: number; cacheRead: number; contextUsed?: number; contextWindow?: number}; debugEffort?: {value: string; label: string; options: OverlayOption[]}; debugWelcome?: {quote: string; art: string[]}; debugUsageOpen?: boolean; debugUsageRange?: UsageRange; debugLiveMarkdown?: boolean}) {
   const dims = useTerminalDimensions();
   const renderer = useRenderer();
   const copySelection = (selection: any) => {
@@ -1728,8 +1984,10 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
   const [currentTool, setCurrentTool] = createSignal<string | null>(null);
   const [toolDone, setToolDone] = createSignal(0);
   const [toolTotal, setToolTotal] = createSignal(0);
+  const [turnOutputTokens, setTurnOutputTokens] = createSignal(0);
   const [draftStatus, setDraftStatus] = createSignal<GoalDraftSnapshot | null>(initialDebugDraft);
   const [pastedContent, setPastedContent] = createSignal<PasteSnapshot | null>(null);
+  const [fullscreenEditor, setFullscreenEditor] = createSignal(false);
   const messageQueue = createMessageQueue(command => send(command));
   let lastBufferValue = '';
   let lastBufferChangedAt = 0;
@@ -1869,13 +2127,21 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
   };
   // The composer is a bordered card. Border rows are included in the reserved
   // height so the editor never collides with the status bar.
-  const composerReservedRows = () => composerLines() + 2;
+  const composerReservedRows = () => fullscreenEditor()
+    ? Math.max(3, dims().height - HEADER_ROWS - 1)
+    : composerLines() + 2;
+  const editorRows = () => fullscreenEditor()
+    ? Math.max(1, composerReservedRows() - 2)
+    : composerLines();
   const HEADER_ROWS = 1;
   // Streaming output is coalesced at a modest cadence. A separate, slow clock
   // updates elapsed labels; the old 30 FPS global signal invalidated the whole
   // page even when no new output had arrived and looked like screen flashing.
-  const LIVE_FLUSH_MS = 120;
+  // dsh-TUI aligns stream commits to a short frame window. 32ms keeps the
+  // tail fluid while still coalescing token/tool bursts into one render pass.
+  const LIVE_FLUSH_MS = 32;
   const CLOCK_TICK_MS = 500;
+  const ANIM_TICK_MS = 80;
   let nowTimer: ReturnType<typeof setInterval> | null = null;
   let liveFlushTimer: ReturnType<typeof setTimeout> | null = null;
   let toastTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1884,6 +2150,7 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
   const footerReservedRows = () => composerReservedRows() + 1;
   const viewportHeight = () => {
     const h = dims().height;
+    if (fullscreenEditor()) return 0;
     return Math.max(3, h - HEADER_ROWS - footerReservedRows());
   };
   // The welcome panel shows as soon as the TUI opens and stays until the user
@@ -2103,6 +2370,12 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
     }, LIVE_FLUSH_MS);
   }
   const runClockTick = () => setNow(Date.now());
+  // Animation clock: an 80ms frame counter driving spinners, cursors, and
+  // pulses. Kept separate from `now` (500ms) so elapsed labels keep their
+  // low-frequency cadence while motion stays smooth. Runs only while busy,
+  // same lifecycle as the elapsed clock.
+  const [tick, setTick] = createSignal(0);
+  let animTimer: ReturnType<typeof setInterval> | null = null;
   createEffect(() => {
     const debugRunning = resolveDebugValue(props?.debugRunning);
     if (debugRunning === undefined) return;
@@ -2118,13 +2391,16 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
   createEffect(() => {
     if (running()) {
       if (!nowTimer) nowTimer = setInterval(runClockTick, CLOCK_TICK_MS);
+      if (!animTimer) animTimer = setInterval(() => setTick(t => t + 1), ANIM_TICK_MS);
     } else if (nowTimer) {
       clearInterval(nowTimer);
       nowTimer = null;
+      if (animTimer) { clearInterval(animTimer); animTimer = null; }
     }
   });
   onCleanup(() => {
     if (nowTimer) clearInterval(nowTimer);
+    if (animTimer) clearInterval(animTimer);
     if (liveFlushTimer) clearTimeout(liveFlushTimer);
     if (toastTimer) clearTimeout(toastTimer);
   });
@@ -2160,7 +2436,7 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
     }
   };
   const elapsed = () => startedAt() ? `${Math.floor((now() - startedAt()) / 1000)}s` : '0s';
-  const spinner = () => ['|', '/', '-', '\\'][Math.floor(now() / 180) % 4];
+  const spinner = () => BRAILLE_SPINNER[tick() % BRAILLE_SPINNER.length];
   reportDiagnostic = (text: string) => add({id: `log-${Date.now()}`, kind: 'log', text: 'Backend', detail: text});
   const handleBackendEvent = (event: any) => {
     try {
@@ -2360,6 +2636,7 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
         turnTokens.inp += Number(event.input_tokens || 0);
         turnTokens.out += output;
         turnTokens.cache += Number(event.cache_read_tokens || 0);
+        setTurnOutputTokens(total => total + output);
         const runId = value(event, 'agent_run_id');
         if (runId) update(runId, entry => {
           if (entry.kind !== 'subagent') return entry;
@@ -2377,7 +2654,7 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
         break;
       }
       case 'user_message': if (!event.silent) { const prompt = value(event, 'text'); responseId = ''; const pendingIndex = pendingPrompts.indexOf(prompt); if (pendingIndex >= 0) pendingPrompts = pendingPrompts.filter((_, i) => i !== pendingIndex); else add({id: `prompt-${Date.now()}`, kind: 'prompt', text: prompt}); } break;
-      case 'agent_start': begin(value(event, 'phase') || 'thinking'); setCurrentTool(null); setToolDone(0); setToolTotal(0); turnStart = Date.now(); turnToolCount = 0; turnFiles = []; turnTokens = {inp: 0, out: 0, cache: 0}; lastIntentText = ''; break;
+      case 'agent_start': begin(value(event, 'phase') || 'thinking'); setCurrentTool(null); setToolDone(0); setToolTotal(0); setTurnOutputTokens(0); turnStart = Date.now(); turnToolCount = 0; turnFiles = []; turnTokens = {inp: 0, out: 0, cache: 0}; lastIntentText = ''; break;
       case 'assistant_intent': { const text = value(event, 'text'); if (text) promoteResponseToIntent(text); break; }
       case 'thinking_start': if (!responseId) begin(value(event, 'phase') || 'thinking'); else setPhase(value(event, 'phase') || 'thinking'); break;
       case 'thinking_end': if (running()) setPhase('working'); break;
@@ -2439,7 +2716,7 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
         break;
       }
       case 'files_changed': { const paths = (event.paths || []).filter(Boolean); turnFiles = [...new Set([...turnFiles, ...paths])]; add({id: `files-${Date.now()}`, kind: 'files', text: 'Files Changed', detail: paths.join('\n')}); break; }
-      case 'error': clearDeltas(); add({id: `blocked-${Date.now()}`, kind: 'blocked', text: value(event, 'text'), detail: 'Blocked'}); setRunning(false); setPhase('blocked'); setStartedAt(0); responseId = ''; break;
+      case 'error': clearDeltas(); add({id: `blocked-${Date.now()}`, kind: 'blocked', text: value(event, 'text')}); setRunning(false); setPhase('blocked'); setStartedAt(0); responseId = ''; break;
       case 'agent_end': {
         flushDeltasNow();
         const interrupted = value(event, 'status') === 'interrupted';
@@ -2601,6 +2878,11 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
   useKeyboard((event: any) => {
     const name = String(event?.name || '').toLowerCase();
     const action = resolveComposerKeyBinding(event);
+    if (fullscreenEditor() && name === 'escape') {
+      setFullscreenEditor(false);
+      event.preventDefault?.();
+      return;
+    }
     if (event?.ctrl && name === 'q') { send({type: 'exit'}); try { backendClient?.stop(); } catch { /* best effort */ } process.exit(0); }
     if (action === 'interrupt') { send({type: 'interrupt'}); event.preventDefault?.(); return; }
     if (action === 'history-search') {
@@ -2661,7 +2943,15 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
       }
       return;
     }
-    if (action === 'open-effort') { openEffortPicker(); event.preventDefault?.(); return; }
+    if (action === 'open-effort') {
+      // Reuse the existing binding without stealing it from effort selection:
+      // a non-empty draft benefits more from dsh-TUI's full-screen editor,
+      // while an empty composer keeps the original effort picker behavior.
+      if (input().trim()) setFullscreenEditor(true);
+      else openEffortPicker();
+      event.preventDefault?.();
+      return;
+    }
     if (action === 'beginning-of-line' || action === 'end-of-line' || action === 'delete-char-forward'
       || action === 'kill-line-backward' || action === 'kill-word-backward' || action === 'yank') {
       applyComposerEditAction(action);
@@ -2709,6 +2999,20 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
       closeCompletion();
       recordHistory(text);
       setHistoryIdx(-1);
+      return;
+    }
+    // `/effort` with no argument opens the picker locally from the cached
+    // session_status options: instant, and never blocked behind a running
+    // turn. With an argument it stays a backend control command.
+    const effortCommand = /^\/effort(?:\s+(.*))?$/i.exec(text);
+    if (effortCommand) {
+      const arg = (effortCommand[1] || '').trim();
+      setComposerText('');
+      closeCompletion();
+      recordHistory(text);
+      setHistoryIdx(-1);
+      if (!arg) openEffortPicker();
+      else send({type: 'user_message', text, silent: true});
       return;
     }
     const isGoalControl = /^\/goal\s+(?:status|pause|stop|cancel)\s*$/i.test(text);
@@ -2774,6 +3078,9 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
     model: model(),
     effort: effortShortLabel(effortLabel(), effort()),
     spinner: spinner(),
+    outputTokens: turnOutputTokens(),
+    tokensPerSecond: running() && startedAt() ? Math.round(turnOutputTokens() / Math.max(1, (now() - startedAt()) / 1000)) : 0,
+    editorFullscreen: fullscreenEditor(),
   });
   const showGoalPage = () => Boolean(goalSnapshot() && (lifecycleView() === 'goal' || goalIsActive(goalSnapshot())));
   const showDraftPage = () => Boolean(draftStatus() && lifecycleView() === 'draft' && !showGoalPage());
@@ -2782,7 +3089,7 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
 
     const goal = goalSnapshot();
     if (goal && showGoalPage()) {
-      return <GoalView goal={goal} decisions={goalDecisions()} now={now()} width={dims().width} height={viewportHeight()} />;
+      return <GoalView goal={goal} decisions={goalDecisions()} now={now()} tick={tick} width={dims().width} height={viewportHeight()} />;
     }
 
     const draft = draftStatus();
@@ -2790,8 +3097,9 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
       return <GoalDraftView draft={draft} now={now()} width={dims().width} height={viewportHeight()} />;
     }
 
+    if (fullscreenEditor()) return <box height={0} />;
     if (showWelcome()) return <WelcomeView width={dims().width} height={viewportHeight()} quote={welcomeQuote()} />;
-    return <LogView entries={entries} now={now} height={viewportHeight()} active={() => !hasActiveOverlay()} composerEmpty={() => !hasActiveOverlay() && input() === ''} focusId={focusId} onCycleFocus={cycleFocus} onToggleExpand={toggleExpand} onClearFocus={() => setFocusId(null)} staticRender={props?.debugEntries != null} />;
+    return <LogView entries={entries} now={now} tick={tick} width={dims().width} height={viewportHeight()} active={() => !hasActiveOverlay()} composerEmpty={() => !hasActiveOverlay() && input() === ''} focusId={focusId} onCycleFocus={cycleFocus} onToggleExpand={toggleExpand} onClearFocus={() => setFocusId(null)} staticRender={props?.debugEntries != null && props?.debugLiveMarkdown !== true} />;
   };
   const OverlayBoundary = () => {
     return <OverlayLayer
@@ -2813,6 +3121,7 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
       composerRows={composerReservedRows}
       bottomRows={footerReservedRows}
       maxOptions={() => Math.max(1, Math.min(6, viewportHeight() - 2))}
+      tick={tick}
       onClose={closeOverlayLayer}
       onSelectPermission={selectOverlay}
       onSelectPicker={selectOverlay}
@@ -2858,6 +3167,7 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
       contextUsed={contextUsed}
       contextWindow={contextWindow}
       backend={backendState}
+      onEffortClick={openEffortPicker}
     />
     <box height={viewportHeight()} flexGrow={1} minHeight={0} flexDirection="column">
       {mainContent()}
@@ -2869,18 +3179,18 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
         minWidth={0}
         border
         borderStyle="rounded"
-        borderColor={overlay()?.kind === 'permission' ? C.warning : running() ? C.info : C.textMuted}
+        borderColor={fullscreenEditor() ? C.primary : overlay()?.kind === 'permission' ? C.warning : running() ? C.info : C.textMuted}
         backgroundColor="#111820"
         flexDirection="column"
       >
-        <box height={composerLines()} flexShrink={0} minWidth={0} flexDirection="row" paddingX={1}>
+        <box height={editorRows()} flexShrink={0} minWidth={0} flexDirection="row" paddingX={1}>
           <text fg={running() ? C.info : C.primary} wrapMode="none" selectable={false}>{running() ? '» ' : '› '}</text>
           <textarea
             flexGrow={1}
             minWidth={0}
             focused
-            height={composerLines()}
-            placeholder={running() ? 'Queue a message…' : 'Ask anything…'}
+            height={editorRows()}
+            placeholder={fullscreenEditor() ? 'Full-screen draft…' : running() ? 'Queue a message…' : 'Ask anything…'}
             initialValue={input()}
             keyBindings={textareaBindings as any}
             onContentChange={() => {

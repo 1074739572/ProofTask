@@ -100,6 +100,16 @@ _task_outputs/
 harness-engineering-review-*.png
 preview_harness_review.jpg
 
+# Smoke-test workspace artifacts
+.goal-smoke/
+
+# Downloaded SWE-bench datasets (large JSON data, not source)
+benchmarks/
+
+# FY-4 satellite extrapolation scripts (separate draw_fy4_h8 project)
+run_3to1_extrap.py
+run_realtime_recog.py
+
 # Personal / third-party reference material (not part of this repo)
 resume/
 resume_source.pdf

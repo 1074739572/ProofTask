@@ -126,7 +126,7 @@ export function GoalView(props: GoalViewProps) {
     props.onExpandDetails?.();
   };
 
-  return <box flexDirection="column" flexGrow={1} flexShrink={0} minWidth={0} height="100%"><GoalSummary goal={selectedGoal()} decisions={props.decisions} width={typeof props.width === 'number' ? props.width : undefined} onExpandDetails={toggleFromSummary} /><GoalDetails goal={selectedGoal()} expanded={detailsExpanded} onToggle={toggleDetails} interactionTrace={props.interactionTrace} /></box>;
+  return <box flexDirection="column" flexGrow={1} flexShrink={0} minWidth={0} height="100%"><GoalSummary goal={selectedGoal()} decisions={props.decisions} width={typeof props.width === 'number' ? props.width : undefined} tick={typeof props.tick === 'function' ? props.tick as () => number : undefined} onExpandDetails={toggleFromSummary} /><GoalDetails goal={selectedGoal()} expanded={detailsExpanded} onToggle={toggleDetails} interactionTrace={props.interactionTrace} /></box>;
 }
 
 export function GoalDraftView(props: {draft: GoalDraftSnapshot; now?: number; width: number; height: number}) {

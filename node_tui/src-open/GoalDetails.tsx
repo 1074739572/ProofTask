@@ -120,7 +120,8 @@ export function GoalDetails(props: GoalDetailsProps) {
           <box border borderStyle="rounded" borderColor={C.textMuted} flexDirection="column" minWidth={0} paddingX={1}>
             <text fg={C.secondary}>TASK GRAPH · {tasks().length} 个任务</text>
             <For each={tasks()}>
-              {task => <box flexDirection="row" minWidth={0}>
+              {(task, index) => <box flexDirection="row" minWidth={0}>
+                <text fg={C.textMuted} wrapMode="none">{index() === tasks().length - 1 ? '┗' : '┣'} </text>
                 <text fg={taskColor(task)} wrapMode="none">{taskIcon(task)} </text>
                 <text fg={taskColor(task)} wrapMode="none" truncate>{task.subject}</text>
                 <text fg={C.textMuted} wrapMode="none" truncate> · {task.status} · {task.verification_state}</text>

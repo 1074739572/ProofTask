@@ -40,7 +40,7 @@ from harness.goal.store import (
 from harness.settings import get_workdir, workspace_generation
 from harness.verification import (
     VerificationContext, build_pytest_command, collect_pytest_catalog,
-    reverify_task_command, run_verification, select_adapter, verify_task_command,
+    debug_task_selector, reverify_task_command, run_verification, select_adapter, verify_task_command,
 )
 from harness.verification.evidence import evidence_from_result
 
@@ -57,6 +57,7 @@ class GoalBusyError(Exception):
 TEST_WRITER_MAX_ROUNDS = 8
 TEST_WRITER_MAX_IDLE_CHUNKS = 3
 MAX_PERMISSION_BOUNDARY_RETRIES = 3
+MAX_DEBUG_TEST_CALLS_PER_WORKER = 6
 # The planner receives this evidence as JSON inside an already substantial
 # prompt. Keep it below this limit before serializing the replan request so
 # it can be consumed whole; never slice serialized JSON at the prompt edge.
@@ -1227,6 +1228,7 @@ class GoalRunner(threading.Thread):
             "write_outcomes": list(dict.fromkeys(str(item) for item in stats.write_outcomes))[-12:],
             "write_audits": list(dict.fromkeys(str(item) for item in stats.write_audits))[-12:],
             "tool_errors": [str(item)[:500] for item in stats.tool_errors[-6:]],
+            "debug_results": list(getattr(stats, "debug_results", [])[-8:]),
             **dict(extra or {}),
         }
 
@@ -3783,12 +3785,32 @@ class GoalRunner(threading.Thread):
                 save_goal(state)
                 return
             clear_goal_permission_flags()
+            debug_calls = 0
+
+            def debug_test_handler(*, selector: str, timeout_ms: int = 120000) -> str:
+                nonlocal debug_calls
+                if debug_calls >= MAX_DEBUG_TEST_CALLS_PER_WORKER:
+                    return json.dumps({
+                        "ok": False,
+                        "error": f"debug_test call limit reached ({MAX_DEBUG_TEST_CALLS_PER_WORKER})",
+                        "formal_verification": False,
+                    }, ensure_ascii=False)
+                debug_calls += 1
+                result = debug_task_selector(
+                    task.id,
+                    selector,
+                    workspace=_execution_workspace(state),
+                    timeout_ms=timeout_ms,
+                )
+                return json.dumps(result, ensure_ascii=False)
+
             with goal_authority(
                 goal_id=state.id,
                 task_id=task.id,
                 phase=GoalPhase.ACT.value,
                 workspace=_execution_workspace(state),
                 write_roots=tuple(task.scope_paths),
+                forbidden_roots=tuple(str(path) for path in (spec.get("test_files") or [])),
             ) as authority:
                 set_goal_noninteractive(True)
                 clear_cancel()
@@ -3806,6 +3828,7 @@ class GoalRunner(threading.Thread):
                     write_roots=tuple(str(path) for path in authority.write_roots) or None,
                     read_roots=tuple(read_roots),
                     read_paths=tuple(read_paths),
+                    debug_test_handler=debug_test_handler,
                 )
         finally:
             set_goal_noninteractive(False)
@@ -5939,10 +5962,6 @@ class GoalRunner(threading.Thread):
             GoalRunner._scope_relative_path(state, str(path)): str(digest)
             for path, digest in (task.start_dirty_hashes or {}).items()
         }
-        # Generated verification files are part of the Task contract even
-        # when the planner's production scope only names source directories.
-        # Without this allowance, a successful test-generation step is later
-        # rejected as an autonomy violation by the worker scope gate.
         verification_spec = task.verification_spec if isinstance(task.verification_spec, dict) else {}
         test_scope = {
             GoalRunner._scope_relative_path(state, str(path))
@@ -5958,20 +5977,20 @@ class GoalRunner(threading.Thread):
         }
         prohibited = sorted(
             path for path in changed
-            if path in forbidden or any(path.startswith(item.rstrip("/") + "/") for item in forbidden)
+            if path in test_scope
+            or any(path.startswith(item.rstrip("/") + "/") for item in test_scope)
+            or path in forbidden
+            or any(path.startswith(item.rstrip("/") + "/") for item in forbidden)
         )
         if prohibited:
+            if any(path in test_scope or any(path.startswith(item.rstrip("/") + "/") for item in test_scope) for path in prohibited):
+                return "goal_worker changed bound test files (tests are read-only): " + ", ".join(prohibited[:12])
             return "worker changed forbidden Task paths: " + ", ".join(prohibited[:12])
         outside = sorted(
             path
             for path in changed
-            if path not in test_scope
-            and path not in scope
+            if path not in scope
             and not any(path.startswith(item.rstrip("/") + "/") for item in scope)
-            and not any(
-                part.lower() in {"test", "tests", "__tests__"}
-                for part in Path(path).parts
-            )
         )
         if outside:
             return "worker changed files outside Task scope: " + ", ".join(outside[:12])

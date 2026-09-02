@@ -21,6 +21,7 @@ class GoalAuthority:
     phase: str
     workspace: Path
     write_roots: tuple[Path, ...]
+    forbidden_roots: tuple[Path, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -46,6 +47,7 @@ def goal_authority(
     phase: str,
     workspace: str | Path,
     write_roots: tuple[str, ...] | list[str],
+    forbidden_roots: tuple[str, ...] | list[str] = (),
 ) -> Iterator[GoalAuthority]:
     root = Path(workspace).expanduser().resolve()
     allowed_roots: list[Path] = []
@@ -58,12 +60,26 @@ def goal_authority(
         candidate = candidate.resolve()
         if candidate.is_relative_to(root):
             allowed_roots.append(candidate)
+    forbidden: list[Path] = []
+    for item in forbidden_roots:
+        if not str(item).strip():
+            continue
+        try:
+            candidate = Path(item).expanduser()
+            if not candidate.is_absolute():
+                candidate = root / candidate
+            candidate = candidate.resolve()
+            if candidate.is_relative_to(root):
+                forbidden.append(candidate)
+        except OSError:
+            continue
     authority = GoalAuthority(
         goal_id=str(goal_id),
         task_id=str(task_id),
         phase=str(phase),
         workspace=root,
         write_roots=tuple(dict.fromkeys(allowed_roots)),
+        forbidden_roots=tuple(dict.fromkeys(forbidden)),
     )
     previous = getattr(_local, "authority", None)
     _local.authority = authority
@@ -100,6 +116,8 @@ def evaluate_goal_authority(tool_name: str, tool_input: dict[str, Any] | None) -
         relative = candidate.relative_to(authority.workspace).as_posix()
     except ValueError:
         return GoalAuthorityDecision(False, "requested path is outside the Goal workspace", raw_path)
+    if any(candidate == forbidden or candidate.is_relative_to(forbidden) for forbidden in authority.forbidden_roots):
+        return GoalAuthorityDecision(False, "requested path is explicitly read-only for this Goal phase", relative)
     if any(candidate == allowed or candidate.is_relative_to(allowed) for allowed in authority.write_roots):
         return GoalAuthorityDecision(
             True,

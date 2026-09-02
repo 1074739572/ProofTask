@@ -98,7 +98,7 @@ def test_worker_scope_gate_normalizes_nested_execution_workspace_paths(monkeypat
     assert runner_mod.GoalRunner._validate_task_scope(state, task) is None
 
 
-def test_worker_scope_gate_allows_task_bound_generated_test_files(monkeypatch, tmp_path):
+def test_worker_scope_gate_rejects_task_bound_test_file_changes(monkeypatch, tmp_path):
     from harness.goal import runner as runner_mod
     from harness.tasks import Task
 
@@ -117,7 +117,9 @@ def test_worker_scope_gate_allows_task_bound_generated_test_files(monkeypatch, t
         },
     )
 
-    assert runner_mod.GoalRunner._validate_task_scope(state, task) is None
+    error = runner_mod.GoalRunner._validate_task_scope(state, task)
+    assert error is not None
+    assert "bound test files" in error
 
 
 def test_keybinding_task_requires_a_pure_logic_test_boundary():

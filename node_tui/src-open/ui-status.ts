@@ -32,6 +32,10 @@ export type UiStatus = {
   model?: string;
   effort?: string;
   spinner?: string;
+  /** Output token count and decode rate for the active turn, when known. */
+  outputTokens?: number;
+  tokensPerSecond?: number;
+  editorFullscreen?: boolean;
 };
 
 export type UiStatusInput = Partial<UiStatus> &
@@ -78,5 +82,8 @@ export function deriveUiStatus(input: UiStatusInput): UiStatus {
     model: input.model ? String(input.model) : undefined,
     effort: input.effort ? String(input.effort) : undefined,
     spinner: input.spinner ? String(input.spinner) : undefined,
+    outputTokens: Math.max(0, Number(input.outputTokens) || 0),
+    tokensPerSecond: Math.max(0, Number(input.tokensPerSecond) || 0),
+    editorFullscreen: Boolean(input.editorFullscreen),
   };
 }

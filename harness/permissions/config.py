@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 from typing import Literal, TypeAlias
 
 from harness.settings import get_permissions_config_path
@@ -181,8 +182,83 @@ SANDBOX_PERMISSIONS: dict[str, PermissionRule] = {
     },
 }
 
+# A lower-friction interactive policy for normal development work.  It keeps
+# the same workspace and sensitive-path boundaries as ``sandbox`` but removes
+# the prompt for routine edits and explicitly allow-listed test/build commands.
+# Commands outside this small list (including compound shell commands) still
+# require approval through the normal engine safety checks.
+LOW_FRICTION_PERMISSIONS: dict[str, PermissionRule] = copy.deepcopy(SANDBOX_PERMISSIONS)
+LOW_FRICTION_PERMISSIONS.update(
+    {
+        "write_file": {
+            "*": "allow",
+            ".features": "deny",
+            ".features/*": "deny",
+            "**/.features": "deny",
+            "**/.features/*": "deny",
+            ".project/goal.json": "deny",
+            ".project/goal*": "deny",
+            ".project/goal-history/*": "deny",
+            "**/.project/goal.json": "deny",
+            "**/.project/goal*": "deny",
+            "**/.project/goal-history/*": "deny",
+        },
+        "edit_file": {
+            "*": "allow",
+            ".features": "deny",
+            ".features/*": "deny",
+            "**/.features": "deny",
+            "**/.features/*": "deny",
+            ".project/goal.json": "deny",
+            ".project/goal*": "deny",
+            ".project/goal-history/*": "deny",
+            "**/.project/goal.json": "deny",
+            "**/.project/goal*": "deny",
+            "**/.project/goal-history/*": "deny",
+        },
+        "patch_file": {
+            "*": "allow",
+            ".features": "deny",
+            ".features/*": "deny",
+            "**/.features": "deny",
+            "**/.features/*": "deny",
+            ".project/goal.json": "deny",
+            ".project/goal*": "deny",
+            ".project/goal-history/*": "deny",
+            "**/.project/goal.json": "deny",
+            "**/.project/goal*": "deny",
+            "**/.project/goal-history/*": "deny",
+        },
+        "bash": {
+            "*": "ask",
+            "dir *": "allow",
+            "type *": "allow",
+            "where *": "allow",
+            "git status*": "allow",
+            "git diff*": "allow",
+            "git log*": "allow",
+            "npm test*": "allow",
+            "npm run test*": "allow",
+            "npm run typecheck*": "allow",
+            "npm run build*": "allow",
+            "pytest*": "allow",
+            "python -m pytest*": "allow",
+            "python -m unittest*": "allow",
+            "*.features*": "deny",
+            "*.project/goal.json*": "deny",
+            "*.project/goal-history*": "deny",
+            "rm *": "deny",
+            "sudo *": "deny",
+            "shutdown*": "deny",
+            "reboot*": "deny",
+        },
+    }
+)
+
 PERMISSION_PRESETS: dict[str, dict[str, PermissionRule]] = {
     "sandbox": SANDBOX_PERMISSIONS,
+    "low-friction": LOW_FRICTION_PERMISSIONS,
+    "low_friction": LOW_FRICTION_PERMISSIONS,
 }
 
 
@@ -252,6 +328,14 @@ def _normalize_rules(raw: object) -> dict[str, PermissionRule]:
 
 
 def load_permission_rules() -> dict[str, PermissionRule]:
+    # An explicit environment override is useful for local sessions and does
+    # not modify the checked-in policy file.  Unknown values are ignored so a
+    # typo cannot accidentally broaden permissions.
+    env_preset = os.getenv("HARNESS_PERMISSION_PRESET", "").strip().lower()
+    if env_preset:
+        preset = PERMISSION_PRESETS.get(env_preset)
+        if preset is not None:
+            return copy.deepcopy(preset)
     path = get_permissions_config_path()
     if not path.exists():
         return dict(DEFAULT_PERMISSIONS)

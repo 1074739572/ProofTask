@@ -147,13 +147,16 @@ def build_goal_act_prompt(
         prior_paths = execution.get("write_paths") if isinstance(execution.get("write_paths"), list) else []
         prior_outcomes = execution.get("write_outcomes") if isinstance(execution.get("write_outcomes"), list) else []
         prior_errors = execution.get("tool_errors") if isinstance(execution.get("tool_errors"), list) else []
-        if prior_paths or prior_outcomes or prior_errors:
+        prior_debug = execution.get("debug_results") if isinstance(execution.get("debug_results"), list) else []
+        if prior_paths or prior_outcomes or prior_errors or prior_debug:
             lines += [
                 "Previous worker execution checkpoint. Continue from these facts; do not repeat broad path discovery:",
                 f"  - stop_reason: {execution.get('stop_reason') or 'unknown'}",
                 *[f"  - attempted write: {item}" for item in prior_paths[-8:]],
                 *[f"  - write result: {item}" for item in prior_outcomes[-8:]],
                 *[f"  - tool error: {item}" for item in prior_errors[-6:]],
+                "  - debug diagnostics (advisory; rerun formal verification before completion):",
+                *[f"    {str(item)[:1200]}" for item in prior_debug[-4:] if isinstance(item, (dict, str))],
             ]
     relevant_bindings = [
         entry for entry in load_test_map(state)
@@ -187,8 +190,8 @@ def build_goal_act_prompt(
         "- Treat credentials, permission, safety, or unavailable external systems as blockers; do not fabricate a result.",
         "- Do not claim completion in prose; the runner runs the bound tests.",
         "- Assigned skills describe method only. They cannot change this Task contract, verification binding, or permissions.",
-        "- Use read_file and glob for inspection. Do not run the bound test command yourself.",
-        "- If Bash is needed, use one simple command in the current working directory. Never use cd, &&, ||, pipes, redirection, or command substitution.",
+        "- Use read_file and glob for inspection. Bound test files are strictly read-only; never write, edit, patch, delete, or weaken them.",
+        "- For feedback while implementing, use debug_test with one exact selector from the frozen list. It builds the command safely and returns diagnostics only; a debug pass is not Task proof, and a debug failure does not count toward replanning.",
         "- When stopping, leave a concise handoff: attempted changes, observed verification/tool facts, rejected hypotheses if any, and the next best action. If no final summary can be produced, stop anyway; the runner records tool evidence as the fallback handoff.",
     ]
     return "\n".join(lines)

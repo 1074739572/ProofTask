@@ -157,6 +157,18 @@ _BASE_TOOL_DEFS = {
         "description": "Show local RAG index status.",
         "input_schema": {"type": "object", "properties": {}, "required": []},
     },
+    "debug_test": {
+        "name": "debug_test",
+        "description": "Run one frozen Task test selector and return bounded diagnostics. This never changes test files or Task pass/fail state.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "selector": {"type": "string"},
+                "timeout_ms": {"type": "integer", "minimum": 1000, "maximum": 120000},
+            },
+            "required": ["selector"],
+        },
+    },
 }
 
 
@@ -204,6 +216,9 @@ class AgentTaskStats:
     # These remain zero when a provider omits usage metadata.
     input_tokens: int = 0
     output_tokens: int = 0
+    # Advisory worker diagnostics, kept separate from formal verification
+    # evidence so debug attempts cannot affect pass/fail or replan counters.
+    debug_results: list[dict[str, Any]] = field(default_factory=list)
 
     def record_tool(self, name: str, tool_input: Any, output: object) -> None:
         self.tool_count += 1
@@ -215,6 +230,17 @@ class AgentTaskStats:
             elif name in {"write_file", "edit_file", "patch_file"}:
                 self.write_paths.append(path)
         detail = str(output)
+        if name == "debug_test":
+            try:
+                import json
+                parsed = json.loads(detail)
+                if isinstance(parsed, dict):
+                    parsed = dict(parsed)
+                    parsed["output_tail"] = str(parsed.get("output_tail") or "")[-2000:]
+                    parsed["failed_cases"] = list(parsed.get("failed_cases") or [])[:12]
+                self.debug_results.append(parsed if isinstance(parsed, dict) else {"summary": detail[:1000]})
+            except (TypeError, ValueError):
+                self.debug_results.append({"summary": detail[:1000]})
         if name in {"write_file", "edit_file", "patch_file"}:
             audit = re.search(r"sha256\s+([0-9a-f]{12,64})\s*->\s*([0-9a-f]{12,64})", detail, re.IGNORECASE)
             if audit:
@@ -262,6 +288,7 @@ class AgentTaskConversation:
 def _tools_for_agent(
     allowed: list[str], cwd: Path | None = None, write_roots: tuple[str, ...] | None = None,
     read_roots: tuple[str, ...] | None = None, read_paths: tuple[str, ...] | None = None,
+    debug_test_handler: Callable[..., str] | None = None,
 ) -> tuple[list[dict], dict]:
     unknown = sorted(set(allowed) - set(_BASE_TOOL_DEFS))
     if unknown:
@@ -403,6 +430,10 @@ def _tools_for_agent(
         from harness.rag.tools import run_rag_status
 
         handlers["rag_status"] = run_rag_status
+    if "debug_test" in allowed:
+        handlers["debug_test"] = debug_test_handler or (
+            lambda **_: '{"error":"debug_test is unavailable outside a bound Goal Task"}'
+        )
     handlers = {name: handlers[name] for name in allowed}
     return tools, handlers
 
@@ -456,6 +487,7 @@ def run_agent_task(
     request_read_timeout_seconds: float | None = None,
     max_request_attempts: int | None = None,
     conversation: AgentTaskConversation | None = None,
+    debug_test_handler: Callable[..., str] | None = None,
 ) -> str:
     error = validate_agent_model(agent_type, reasoning_effort=reasoning_effort_override)
     if error:
@@ -478,6 +510,7 @@ def run_agent_task(
         tools, handlers = _tools_for_agent(
             allowed_tools, agent_cwd, write_roots=write_roots,
             read_roots=read_roots, read_paths=read_paths,
+            debug_test_handler=debug_test_handler,
         )
     except ValueError as exc:
         if stats is not None:
