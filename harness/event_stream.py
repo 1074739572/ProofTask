@@ -122,13 +122,18 @@ def _status_payload(context: dict, binding, history: list) -> dict:
     from harness.models import get_model, get_reasoning_effort, list_efforts
     from harness.modes import get_mode
     from harness.settings import get_workdir
-    from harness.usage.context import current_context_tokens
+    from harness.usage.context import current_context_tokens, scaled_context_breakdown
     from harness.usage.store import totals_for_day
 
     usage = totals_for_day()
     effort_items = list_efforts()
     effort_id = get_reasoning_effort() or "off"
     effort_label = next((item.get("label") for item in effort_items if item.get("current")), "Model default")
+    session_id = str(getattr(binding, "session_id", "") or "")
+    # The API prompt count includes system instructions and tool schemas,
+    # which history-only estimation cannot see. Use it once available.
+    ctx_tokens = current_context_tokens(session_id, estimate_tokens(history or []))
+    ctx_breakdown = scaled_context_breakdown(session_id, ctx_tokens)
     return {
         "model": get_model(),
         "mode": get_mode(),
@@ -143,13 +148,11 @@ def _status_payload(context: dict, binding, history: list) -> dict:
         "today_output_tokens": usage.out,
         "today_cache_read_tokens": usage.hit,
         "today_cache_hit_rate": usage.hit_rate,
-        # The API prompt count includes system instructions and tool schemas,
-        # which history-only estimation cannot see. Use it once available.
-        "ctx_tokens": current_context_tokens(
-            str(getattr(binding, "session_id", "") or ""),
-            estimate_tokens(history or []),
-        ),
+        "ctx_tokens": ctx_tokens,
         "ctx_window": model_context_window(),
+        "ctx_system": ctx_breakdown["system"],
+        "ctx_tools": ctx_breakdown["tools"],
+        "ctx_messages": ctx_breakdown["messages"],
     }
 
 

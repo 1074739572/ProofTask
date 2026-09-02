@@ -13,6 +13,7 @@ const withOverlay = process.argv.includes('overlay');
 const testScroll = process.argv.includes('scroll');
 const emptyMode = process.argv.includes('empty');
 const usageMode = process.argv.includes('usage');
+const ctxMode = process.argv.includes('ctx');
 const goalDraftMode = process.argv.includes('goal-draft');
 const goalRunMode = process.argv.includes('goal-run');
 
@@ -201,8 +202,9 @@ const setup = await testRender(() => <App
   debugRunning={goalDraftMode || goalRunMode ? true : undefined}
   debugStartedAt={goalDraftMode || goalRunMode ? nowMs - 194_000 : undefined}
   debugOverlay={debugOverlay}
-  debugUsage={emptyMode ? {input: 0, output: 0, cacheRead: 0} : {input: 96100, output: 32300, cacheRead: 70153}}
+  debugUsage={emptyMode ? {input: 0, output: 0, cacheRead: 0} : {input: 96100, output: 32300, cacheRead: 70153, contextUsed: 49800, contextWindow: 128000, contextSystem: 6200, contextTools: 3800, contextMessages: 39800}}
   debugUsageOpen={usageMode}
+  debugContextInfo={ctxMode}
 />, {width, height});
 await setup.flush({maxPasses: 5});
 await setup.renderOnce();

@@ -48,30 +48,30 @@ export function statusLineText(status: UiStatus): string {
 }
 
 export type ContextMeterCells = {
-  system: number;
-  tools: number;
-  messages: number;
+  used: number;
   free: number;
   percent: number;
 };
 
-/** Apportion the used context window into S(ystem)/T(ools)/M(essages) cells.
- * The backend currently reports aggregate context usage only, so the split
- * is a heuristic derived from observed tool/output activity — the meter
- * shows the truthful used/free ratio plus an estimated composition. Once the
- * backend reports real per-category tokens, only this function changes. */
+/** Used/free cells for the single-fill context bar. Composition lives in the
+ * click-open breakdown popup; the bar itself only shows how full the window
+ * is, so its colored length always equals the reported percentage. */
 export function contextMeterCells(
-  status: Pick<UiStatus, 'contextUsage' | 'toolsDone' | 'toolsTotal' | 'outputTokens'>,
+  status: Pick<UiStatus, 'contextUsage'>,
   cells = 12,
 ): ContextMeterCells {
   const usage = Math.max(0, Math.min(1, Number(status.contextUsage) || 0));
   const used = Math.round(usage * cells);
-  const toolShare = status.toolsTotal > 0 ? Math.min(0.4, 0.12 + (status.toolsDone / status.toolsTotal) * 0.2) : 0.1;
-  const messageShare = (status.outputTokens ?? 0) > 0 ? 0.55 : 0.45;
-  const tools = Math.min(used, Math.round(used * toolShare));
-  const messages = Math.min(used - tools, Math.round(used * messageShare));
-  const system = Math.max(0, used - tools - messages);
-  return {system, tools, messages, free: cells - used, percent: Math.round(usage * 100)};
+  return {used, free: cells - used, percent: Math.round(usage * 100)};
+}
+
+/** One color at a time, shifting with fullness: brand cyan while healthy,
+ * amber past 60%, red past 85% (aligned with the 0.835 auto-compact line). */
+export function contextMeterColor(usage: number): string {
+  const value = Math.max(0, Math.min(1, Number(usage) || 0));
+  if (value >= 0.85) return C.error;
+  if (value >= 0.6) return C.warning;
+  return C.primary;
 }
 
 function connectionOf(status: UiStatus): {icon: string; color: string} {
@@ -81,43 +81,40 @@ function connectionOf(status: UiStatus): {icon: string; color: string} {
 }
 
 /** Persistent identity row: connection, model · mode · effort (clickable),
- * and the single segmented context meter on the right. Replaces the old
- * header bar so the transcript owns every row above the composer. */
-function IdentityRow(props: {status: () => UiStatus; onEffortClick?: () => void}) {
+ * and the single-fill context meter on the right. Replaces the old header
+ * bar so the transcript owns every row above the composer. Clicking the
+ * meter toggles the per-category breakdown popup. */
+function IdentityRow(props: {status: () => UiStatus; onEffortClick?: () => void; onContextClick?: () => void}) {
   const status = () => props.status();
   const conn = () => connectionOf(status());
-  const meter = () => contextMeterCells(status());
-  const wide = () => status().width >= 100;
+  const meter = () => contextMeterCells(status(), status().width >= 76 ? 12 : 8);
+  const meterColor = () => contextMeterColor(status().contextUsage);
   const medium = () => status().width >= 76 && status().width < 100;
   return <box height={1} flexShrink={0} minWidth={0} paddingX={2} flexDirection="row">
     <text fg={conn().color} wrapMode="none" selectable={false}>{`${conn().icon} `}</text>
     <text fg={C.primary} wrapMode="none" selectable={false}>{status().model || 'model'}</text>
-    {medium() || wide() ? <text fg={C.textMuted} wrapMode="none" selectable={false}>{' · '}</text> : null}
-    {medium() || wide() ? <text fg={C.secondary} wrapMode="none" selectable={false}>{status().mode || 'direct'}</text> : null}
+    {medium() || status().width >= 100 ? <text fg={C.textMuted} wrapMode="none" selectable={false}>{' · '}</text> : null}
+    {medium() || status().width >= 100 ? <text fg={C.secondary} wrapMode="none" selectable={false}>{status().mode || 'direct'}</text> : null}
     <text fg={C.textMuted} wrapMode="none" selectable={false}>{' · '}</text>
     <box minWidth={0} flexShrink={0} onMouseUp={(event: any) => { if (event?.button === 0) props.onEffortClick?.(); }}>
       <text fg={C.textMuted} wrapMode="none" selectable={false}>{`${status().effort || 'Default'}▾`}</text>
     </box>
     <box flexGrow={1} />
     {status().contextWindow > 0 ? (
-      <text wrapMode="none" selectable={false}>
-        <Sp fg={C.textMuted}>{'ctx '}</Sp>
-        {wide() ? <span>
-          {meter().system > 0 ? <span><Sp fg={C.secondary}>S</Sp><Sp fg={C.secondary}>{'█'.repeat(meter().system)}</Sp><Sp fg={C.textMuted}>{' '}</Sp></span> : null}
-          {meter().tools > 0 ? <span><Sp fg={C.toolExec}>T</Sp><Sp fg={C.toolExec}>{'█'.repeat(meter().tools)}</Sp><Sp fg={C.textMuted}>{' '}</Sp></span> : null}
-          {meter().messages > 0 ? <span><Sp fg={C.primary}>M</Sp><Sp fg={C.primary}>{'█'.repeat(meter().messages)}</Sp><Sp fg={C.textMuted}>{' '}</Sp></span> : null}
+      <box minWidth={0} flexShrink={0} onMouseUp={(event: any) => { if (event?.button === 0) props.onContextClick?.(); }}>
+        <text wrapMode="none" selectable={false}>
+          <Sp fg={C.textMuted}>{'ctx '}</Sp>
+          <Sp fg={meterColor()}>{'█'.repeat(meter().used)}</Sp>
           <Sp fg={C.textMuted}>{'░'.repeat(meter().free)}</Sp>
-        </span> : <span>
-          <Sp fg={C.primary}>{'█'.repeat(meter().system + meter().tools + meter().messages)}</Sp>
-          <Sp fg={C.textMuted}>{'░'.repeat(meter().free)}</Sp>
-        </span>}
-        <Sp fg={C.textMuted}>{` ${meter().percent}%`}</Sp>
-      </text>
+          <Sp fg={meterColor()}>{` ${meter().percent}%`}</Sp>
+          <Sp fg={C.textMuted}>{'▾'}</Sp>
+        </text>
+      </box>
     ) : null}
   </box>;
 }
 
-export function StatusLine(props: {status: UiStatus | (() => UiStatus); onEffortClick?: () => void}): any {
+export function StatusLine(props: {status: UiStatus | (() => UiStatus); onEffortClick?: () => void; onContextClick?: () => void}): any {
   const status = () => typeof props.status === 'function' ? props.status() : props.status;
   const color = () => {
     const current = status();
@@ -134,6 +131,6 @@ export function StatusLine(props: {status: UiStatus | (() => UiStatus); onEffort
     <box height={1} flexShrink={0} minWidth={0} paddingX={2}>
       <text fg={color()} wrapMode="none" truncate selectable={false} content={statusLineText(status())} />
     </box>
-    <IdentityRow status={status} onEffortClick={props.onEffortClick} />
+    <IdentityRow status={status} onEffortClick={props.onEffortClick} onContextClick={props.onContextClick} />
   </box>;
 }

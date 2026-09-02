@@ -27,6 +27,7 @@ const selectOverlayDescriptor = (OverlayLayerModule as any).selectOverlayDescrip
 const OverlayLayer = OverlayLayerModule.OverlayLayer;
 import {UsageView, type UsageRange} from './UsageView.tsx';
 import {StatusLine} from './StatusLine.tsx';
+import {ContextBreakdown} from './ContextBreakdown.tsx';
 import * as OverlayLayerModule from './OverlayLayer.tsx';
 import {deriveUiStatus} from './ui-status.ts';
 import {
@@ -1781,7 +1782,7 @@ function resolveDebugValue<T>(value: T | (() => T) | undefined): T | undefined {
   return typeof value === 'function' ? (value as () => T)() : value;
 }
 
-export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal; debugDraft?: DebugDraft; debugDecisions?: DebugDecisions; debugRunning?: DebugFlag; debugStartedAt?: number; debugOverlay?: Overlay; debugUsage?: {input: number; output: number; cacheRead: number; contextUsed?: number; contextWindow?: number}; debugEffort?: {value: string; label: string; options: OverlayOption[]}; debugWelcome?: {quote: string; art: string[]}; debugUsageOpen?: boolean; debugUsageRange?: UsageRange; debugLiveMarkdown?: boolean}) {
+export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal; debugDraft?: DebugDraft; debugDecisions?: DebugDecisions; debugRunning?: DebugFlag; debugStartedAt?: number; debugOverlay?: Overlay; debugUsage?: {input: number; output: number; cacheRead: number; contextUsed?: number; contextWindow?: number; contextSystem?: number; contextTools?: number; contextMessages?: number}; debugEffort?: {value: string; label: string; options: OverlayOption[]}; debugWelcome?: {quote: string; art: string[]}; debugUsageOpen?: boolean; debugUsageRange?: UsageRange; debugLiveMarkdown?: boolean; debugContextInfo?: boolean}) {
   const dims = useTerminalDimensions();
   const renderer = useRenderer();
   const copySelection = (selection: any) => {
@@ -1812,6 +1813,8 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
   const [welcomeQuote, setWelcomeQuote] = createSignal(props?.debugWelcome?.quote ?? '');
   const [todayInput, setTodayInput] = createSignal(props?.debugUsage?.input ?? 0); const [todayOutput, setTodayOutput] = createSignal(props?.debugUsage?.output ?? 0); const [todayCacheRead, setTodayCacheRead] = createSignal(props?.debugUsage?.cacheRead ?? 0);
   const [contextUsed, setContextUsed] = createSignal(props?.debugUsage?.contextUsed ?? 0); const [contextWindow, setContextWindow] = createSignal(props?.debugUsage?.contextWindow ?? 0);
+  const [contextSystem, setContextSystem] = createSignal(props?.debugUsage?.contextSystem ?? 0); const [contextTools, setContextTools] = createSignal(props?.debugUsage?.contextTools ?? 0); const [contextMessages, setContextMessages] = createSignal(props?.debugUsage?.contextMessages ?? 0);
+  const [contextInfoOpen, setContextInfoOpen] = createSignal(props?.debugContextInfo ?? false);
   const [goalSnapshot, setGoalSnapshot] = createSignal<GoalSnapshot | null>(resolveDebugValue(props?.debugGoal) ?? null);
   const initialDebugDraft = resolveDebugValue(props?.debugDraft) ?? null;
   const [lifecycleView, setLifecycleView] = createSignal<'goal' | 'draft' | 'chat'>(goalSnapshot() ? 'goal' : initialDebugDraft ? 'draft' : 'chat');
@@ -2339,6 +2342,10 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
       send({type: 'user_message', text: '/effort', silent: true});
     }
   };
+  const toggleContextInfo = () => { if (contextWindow() > 0) setContextInfoOpen(open => !open); };
+  // The breakdown card shares z-space with picker/permission panels; never
+  // let the two stack — an incoming overlay dismisses the passive card.
+  createEffect(() => { if (overlay()) setContextInfoOpen(false); });
   const elapsed = () => startedAt() ? `${Math.floor((now() - startedAt()) / 1000)}s` : '0s';
   const spinner = () => BRAILLE_SPINNER[tick() % BRAILLE_SPINNER.length];
   reportDiagnostic = (text: string) => add({id: `log-${Date.now()}`, kind: 'log', text: 'Backend', detail: text});
@@ -2374,6 +2381,7 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
         setEffortOptions((event.reasoning_effort_options || []).map((x: any) => ({name: x.label || x.id, description: x.detail || '', value: x.id || 'off'})));
         setTodayInput(Number(event.today_input_tokens || 0)); setTodayOutput(Number(event.today_output_tokens || 0)); setTodayCacheRead(Number(event.today_cache_read_tokens || 0));
         setContextUsed(Number(event.ctx_tokens || 0)); setContextWindow(Number(event.ctx_window || 0));
+        setContextSystem(Number(event.ctx_system || 0)); setContextTools(Number(event.ctx_tools || 0)); setContextMessages(Number(event.ctx_messages || 0));
         if (event.running) { setRunning(true); setPhase(value(event, 'phase') || 'running'); if (!startedAt()) setStartedAt(Date.now()); }
         break;
       }
@@ -2536,6 +2544,9 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
         setTodayCacheRead(total => total + Number(event.cache_read_tokens || 0));
         if (event.context_tokens !== null && event.context_tokens !== undefined) {
           setContextUsed(Math.max(0, Number(event.context_tokens) || 0));
+          setContextSystem(Math.max(0, Number(event.context_system) || 0));
+          setContextTools(Math.max(0, Number(event.context_tools) || 0));
+          setContextMessages(Math.max(0, Number(event.context_messages) || 0));
         }
         turnTokens.inp += Number(event.input_tokens || 0);
         turnTokens.out += output;
@@ -2812,6 +2823,13 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
       event.preventDefault?.();
       return;
     }
+    if (contextInfoOpen() && name === 'escape') {
+      // Passive info card: only Escape is intercepted; typing keeps flowing
+      // into the composer while the breakdown is visible.
+      setContextInfoOpen(false);
+      event.preventDefault?.();
+      return;
+    }
     const current = overlay();
     if (current) {
       if (name === 'up') { setOverlayIndex(i => Math.max(0, i - 1)); event.preventDefault?.(); }
@@ -2979,6 +2997,9 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
     historySearch: {open: historySearchOpen(), matches: historyMatches().length},
     contextUsed: contextUsed(),
     contextWindow: contextWindow(),
+    contextSystem: contextSystem(),
+    contextTools: contextTools(),
+    contextMessages: contextMessages(),
     model: model(),
     mode: mode(),
     effort: effortShortLabel(effortLabel(), effort()),
@@ -3144,6 +3165,7 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
       </box>
     </box>
     {activeOverlayDescriptor() !== null ? <OverlayBoundary /> : null}
-    <StatusLine status={uiStatus} onEffortClick={openEffortPicker} />
+    {contextInfoOpen() ? <ContextBreakdown status={uiStatus} bottomRows={2} width={dims().width} onClose={() => setContextInfoOpen(false)} /> : null}
+    <StatusLine status={uiStatus} onEffortClick={openEffortPicker} onContextClick={toggleContextInfo} />
   </box>;
 }

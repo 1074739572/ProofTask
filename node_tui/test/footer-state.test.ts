@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {footerHint} from '../src-open/interaction.ts';
-import {statusLineText, contextMeterCells} from '../src-open/StatusLine.tsx';
+import {statusLineText, contextMeterCells, contextMeterColor} from '../src-open/StatusLine.tsx';
+import {contextBreakdownRows} from '../src-open/ContextBreakdown.tsx';
+import {C} from '../src-open/theme.ts';
 
 const base = {
   width: 120,
@@ -81,24 +83,52 @@ test('running status line keeps decode rate while the meter stays in the identit
   assert.match(text, /35 t\/s/);
 });
 
-test('context meter apportions S/T/M cells and keeps the free remainder', () => {
-  const cells = contextMeterCells({
-    contextUsage: 13100 / 16000,
-    toolsDone: 1,
-    toolsTotal: 2,
-    outputTokens: 500,
-  });
+test('context meter is a single fill whose length matches the percentage', () => {
+  const cells = contextMeterCells({contextUsage: 13100 / 16000});
   assert.equal(cells.percent, 82);
-  assert.equal(cells.system + cells.tools + cells.messages + cells.free, 12);
-  assert.ok(cells.system > 0 && cells.tools > 0 && cells.messages > 0);
-  assert.equal(cells.free, 12 - Math.round((13100 / 16000) * 12));
+  assert.equal(cells.used + cells.free, 12);
+  assert.equal(cells.used, Math.round((13100 / 16000) * 12));
+  assert.equal(cells.free, 12 - cells.used);
 });
 
-test('context meter degrades to a plain used/free split without activity', () => {
-  const cells = contextMeterCells({contextUsage: 0.5, toolsDone: 0, toolsTotal: 0, outputTokens: 0});
-  assert.equal(cells.percent, 50);
-  assert.equal(cells.system + cells.tools + cells.messages, 6);
-  assert.equal(cells.free, 6);
+test('context meter clamps out-of-range usage into the bar', () => {
+  assert.deepEqual(contextMeterCells({contextUsage: 1.4}), {used: 12, free: 0, percent: 100});
+  assert.deepEqual(contextMeterCells({contextUsage: -0.2}), {used: 0, free: 12, percent: 0});
+});
+
+test('context meter color shifts with fullness thresholds', () => {
+  assert.equal(contextMeterColor(0.42), C.primary);
+  assert.equal(contextMeterColor(0.6), C.warning);
+  assert.equal(contextMeterColor(0.84), C.warning);
+  assert.equal(contextMeterColor(0.85), C.error);
+});
+
+test('breakdown rows measure categories against the whole window', () => {
+  const rows = contextBreakdownRows({
+    contextSystem: 1200, contextTools: 800, contextMessages: 6000,
+    contextUsed: 8000, contextWindow: 16000,
+  });
+  assert.equal(rows.length, 4);
+  const [system, tools, messages, free] = rows;
+  assert.equal(system.label, '系统提示');
+  assert.equal(system.percent, 8);
+  assert.equal(tools.percent, 5);
+  assert.equal(messages.percent, 38);
+  assert.equal(free.free, true);
+  assert.equal(free.tokens, 8000);
+  assert.equal(free.percent, 50);
+  // Each row owns an independent 10-cell bar measured against the window.
+  assert.equal(system.filled, 1);
+  assert.equal(tools.filled, 1);
+  assert.equal(messages.filled, 4);
+  assert.equal(free.filled, 5);
+});
+
+test('breakdown rows render nothing without a known window', () => {
+  assert.deepEqual(contextBreakdownRows({
+    contextSystem: 0, contextTools: 0, contextMessages: 0,
+    contextUsed: 0, contextWindow: 0,
+  }), []);
 });
 
 test('full-screen draft footer exposes an unambiguous exit hint', () => {

@@ -37,6 +37,11 @@ def _log_cache_usage(response, *, model_id: str, usage_context: dict[str, str] |
         renderer.warn(f"usage ledger write failed: {exc}")
     from harness.ui.events import emit, is_enabled
     if is_enabled():
+        context_breakdown: dict[str, int] | None = None
+        if is_primary_turn and session_id:
+            from harness.usage.context import scaled_context_breakdown
+
+            context_breakdown = scaled_context_breakdown(session_id, parsed.input_tokens)
         emit(
             "usage_update",
             input_tokens=parsed.input_tokens,
@@ -44,6 +49,9 @@ def _log_cache_usage(response, *, model_id: str, usage_context: dict[str, str] |
             output_tokens_known=parsed.output_tokens is not None,
             cache_read_tokens=parsed.hit_tokens,
             context_tokens=parsed.input_tokens if is_primary_turn and session_id else None,
+            context_system=context_breakdown["system"] if context_breakdown else None,
+            context_tools=context_breakdown["tools"] if context_breakdown else None,
+            context_messages=context_breakdown["messages"] if context_breakdown else None,
             **metadata,
         )
     if not hooks_verbose():
@@ -84,6 +92,24 @@ def create_message(
     # non-streaming request must finish its whole response before the read
     # timeout expires. Keep that traffic out of the user-facing event stream.
     on_delta = _delta_callback if _is_enabled() else (lambda _text, _kind: None) if force_stream else None
+
+    # Measure the request composition for the context breakdown meter. Only
+    # primary turns shape the session context the footer reports on; subagent
+    # calls run in their own scratch context.
+    _meta = dict(usage_context or {})
+    _session_id = str(_meta.get("session_id") or "")
+    if _session_id and not _meta.get("agent_type"):
+        import json as _json
+
+        from harness.agent.compact.sizing import estimate_tokens as _estimate_tokens
+        from harness.usage.context import record_context_breakdown
+
+        record_context_breakdown(
+            _session_id,
+            system_tokens=len(system or "") // 4,
+            tools_tokens=len(_json.dumps(tools, default=str)) // 4 if tools else 0,
+            messages_tokens=_estimate_tokens(messages or []),
+        )
 
     with renderer.llm_busy(_format_llm_tag(profile)):
         response = create_provider_message(

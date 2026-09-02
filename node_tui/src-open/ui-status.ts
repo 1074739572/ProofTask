@@ -25,6 +25,10 @@ export type UiStatus = {
   contextWindow: number;
   /** contextUsed/contextWindow；窗口为零时为 0。 */
   contextUsage: number;
+  /** Provider-total-scaled composition of the used context window. */
+  contextSystem: number;
+  contextTools: number;
+  contextMessages: number;
   /** 与 pending 相同的语义化别名，便于其他视图直接消费队列状态。 */
   queuedMessages: number;
   /** 等待权限时显示的可恢复审批提示；无需审批时为空。 */
@@ -80,6 +84,9 @@ export function deriveUiStatus(input: UiStatusInput): UiStatus {
     contextUsed,
     contextWindow,
     contextUsage: contextWindow > 0 ? contextUsed / contextWindow : 0,
+    contextSystem: Math.max(0, Number(input.contextSystem) || 0),
+    contextTools: Math.max(0, Number(input.contextTools) || 0),
+    contextMessages: Math.max(0, Number(input.contextMessages) || 0),
     model: input.model ? String(input.model) : undefined,
     mode: input.mode ? String(input.mode) : undefined,
     effort: input.effort ? String(input.effort) : undefined,
