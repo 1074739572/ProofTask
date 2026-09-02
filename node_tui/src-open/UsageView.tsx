@@ -218,13 +218,16 @@ export function UsageView(props: {width: number; height: number; range: () => Us
 
       <box border borderStyle="rounded" borderColor={C.textMuted} flexDirection="column" minWidth={0} marginTop={1} paddingX={1}>
         <text fg={C.secondary}>By model</text>
-        <Show when={!compact()}><box flexDirection="row" minWidth={0}>
+        {/* Ternary, not <Show>: solid-js's server build (bun test) evaluates
+            fallback-less Show to the string "", which the universal renderer
+            rejects as an orphan text node under a box. */}
+        {!compact() ? <box flexDirection="row" minWidth={0}>
           <text fg={C.textMuted} width={modelWidth()} wrapMode="none">Model</text>
           <text fg={C.textMuted} width={11} wrapMode="none">Input</text>
           <text fg={C.textMuted} width={10} wrapMode="none">Hit</text>
           <text fg={C.textMuted} width={9} wrapMode="none">Output</text>
           <text fg={C.textMuted} width={8} wrapMode="none">Calls</text>
-        </box></Show>
+        </box> : null}
         <For each={dashboard().models.slice(0, compact() ? 5 : 8)}>{row => <box flexDirection={compact() ? 'column' : 'row'} minWidth={0}>
           <text fg={C.text} width={compact() ? undefined : modelWidth()} wrapMode="none" truncate>{row.model}</text>
           <Show when={compact()} fallback={<>

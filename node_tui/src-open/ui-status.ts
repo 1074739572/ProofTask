@@ -30,6 +30,7 @@ export type UiStatus = {
   /** 等待权限时显示的可恢复审批提示；无需审批时为空。 */
   permissionPrompt: string | null;
   model?: string;
+  mode?: string;
   effort?: string;
   spinner?: string;
   /** Output token count and decode rate for the active turn, when known. */
@@ -80,6 +81,7 @@ export function deriveUiStatus(input: UiStatusInput): UiStatus {
     contextWindow,
     contextUsage: contextWindow > 0 ? contextUsed / contextWindow : 0,
     model: input.model ? String(input.model) : undefined,
+    mode: input.mode ? String(input.mode) : undefined,
     effort: input.effort ? String(input.effort) : undefined,
     spinner: input.spinner ? String(input.spinner) : undefined,
     outputTokens: Math.max(0, Number(input.outputTokens) || 0),

@@ -31,3 +31,27 @@ export const BRIGHT = {
 } as const;
 
 export const BRIGHT_CYCLE = [BRIGHT.yellow, BRIGHT.aqua, BRIGHT.mint, BRIGHT.coral, BRIGHT.lilac, BRIGHT.peach] as const;
+
+// Brand gradient (welcome wordmark/logo ONLY — everywhere else color carries
+// status, never decoration). Three stops in the cyan family around the
+// primary accent; dsh-tui used the same recipe (#4D6BFE→#3982FF→#2498FF)
+// for its DEEPSEEK HARNESS banner. Foreground-only, so it stays readable on
+// both dark and light terminals; OpenTUI downsamples hex when the terminal
+// lacks truecolor.
+const BRAND_STOPS: readonly (readonly [number, number, number])[] = [
+  [0x2f, 0x8f, 0xe8], // deep azure
+  [0x5a, 0xc8, 0xfa], // primary cyan (C.primary)
+  [0xa5, 0xe3, 0xff], // ice
+];
+
+/** Piecewise-linear interpolation across BRAND_STOPS; t in [0,1] → hex color. */
+export function brandColorAt(t: number): string {
+  const x = Math.max(0, Math.min(1, Number(t) || 0));
+  const scaled = x * (BRAND_STOPS.length - 1);
+  const i = Math.min(BRAND_STOPS.length - 2, Math.floor(scaled));
+  const f = scaled - i;
+  const a = BRAND_STOPS[i];
+  const b = BRAND_STOPS[i + 1];
+  const channel = (k: number) => Math.round(a[k] + (b[k] - a[k]) * f);
+  return `#${([channel(0), channel(1), channel(2)] as number[]).map(v => v.toString(16).padStart(2, '0')).join('')}`;
+}

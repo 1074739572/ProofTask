@@ -1,5 +1,5 @@
 import {BoxRenderable, ScrollBoxRenderable, SyntaxStyle, CliRenderEvents} from '@opentui/core';
-import {batch, createSignal, createMemo, createEffect, For, Show as SolidShow, onCleanup} from 'solid-js';
+import {batch, createSignal, createMemo, createEffect, For, Show as SolidShow, Switch, Match, onCleanup} from 'solid-js';
 import {useTerminalDimensions, useKeyboard, useRenderer} from '@opentui/solid';
 import {startBackend, type Backend} from '../src/backend.ts';
 import {alwaysSeparate, setPreLayoutSiblingMargin} from './layout.ts';
@@ -645,21 +645,6 @@ function formatPercent(hit: number, total: number): string {
   return `${Math.round((hit / total) * 100)}%`;
 }
 
-function contextHeader(width: number, used: number, window: number, today: number, cacheRead: number, input: number): string {
-  const ratio = window > 0 ? Math.max(0, Math.min(1, used / window)) : 0;
-  const percent = `${Math.round(ratio * 100)}%`;
-  const innerWidth = Math.max(12, width - 4);
-  const todayText = `Today ${formatTokens(today)}`;
-  const cacheText = `Cache ${formatPercent(cacheRead, input)}`;
-  const usageText = window > 0 ? `${formatTokens(used)}/${formatTokens(window)}` : formatTokens(used);
-  const fixed = `${todayText} · ${cacheText} · Context  ${usageText}  ${percent}`;
-  const barWidth = Math.max(4, Math.min(20, innerWidth - fixed.length - 3));
-  const filled = Math.round(ratio * barWidth);
-  const bar = `${'█'.repeat(filled)}${'░'.repeat(barWidth - filled)}`;
-  if (innerWidth >= fixed.length + 7) return `${todayText} · ${cacheText} · Context ${bar} ${usageText} ${percent}`;
-  if (innerWidth >= 38) return `Context ${bar} ${percent} · ${todayText}`;
-  return `Ctx ${bar} ${percent}`;
-}
 
 function effortShortLabel(label: string, value: string): string {
   const text = (label || '').trim();
@@ -667,90 +652,6 @@ function effortShortLabel(label: string, value: string): string {
   return value && value !== 'off' ? value : 'Default';
 }
 
-function repoBase(cwd: string): string {
-  if (!cwd) return '';
-  return cwd.split(/[\\/]/).filter(Boolean).pop() || cwd;
-}
-
-// Usage header text. Wide terminals get the product + workspace identity up
-// front; narrow ones keep the usage-only line so nothing important is clipped.
-function headerText(width: number, used: number, window: number, today: number, cacheRead: number, input: number, cwd: string): string {
-  const prefix = width >= 90 ? (cwd ? `Harness · ${repoBase(cwd)} · ` : 'Harness · ') : '';
-  const context = contextHeader(Math.max(20, width - prefix.length), used, window, today, cacheRead, input);
-  return prefix + context;
-}
-
-// Codex keeps passive status deliberately terse: a footer is orientation, not a dashboard.
-function footerStatusText(width: number, model: string, effort: string, used: number, window: number, today: number): string {
-  const context = window > 0 ? `ctx ${formatTokens(used)}/${formatTokens(window)} ${Math.round((used / window) * 100)}%` : `ctx ${formatTokens(used)}`;
-  if (width >= 100) return `${model} · ${effort} · ${context} · today ${formatTokens(today)} · Ctrl+Shift+C 复制`;
-  if (width >= 76) return `${model} · ${context} · Ctrl+Shift+C 复制`;
-  return 'Ctrl+Shift+C 复制 · Ctrl+K 中断';
-}
-
-/** dsh-TUI-inspired segmented context meter. Kept as text so it remains
- * cheap to repaint and works in dumb terminals as well as the native renderer. */
-function contextSegments(used: number, window: number, width: number): string {
-  if (window <= 0) return 'ctx ─────── —';
-  const ratio = Math.max(0, Math.min(1, used / window));
-  const cells = Math.max(4, Math.min(12, width >= 120 ? 12 : width >= 100 ? 9 : 6));
-  const filled = Math.round(ratio * cells);
-  const bar = `${'█'.repeat(filled)}${'░'.repeat(cells - filled)}`;
-  const percent = `${Math.round(ratio * 100)}%`;
-  return `ctx ${bar} ${percent}`;
-}
-
-function shellValue(value: string | (() => string) | undefined): string {
-  const resolved = typeof value === 'function' ? value() : value;
-  return String(resolved || '').trim();
-}
-
-function connectionGlyph(state: string): {icon: string; color: string; label: string} {
-  if (state === 'reconnecting') return {icon: '↻', color: C.warning, label: 'reconnecting'};
-  if (state === 'disconnected') return {icon: '×', color: C.error, label: 'offline'};
-  return {icon: '●', color: C.success, label: 'ready'};
-}
-
-/** Fixed one-row chrome shared by chat, Goal, draft and usage screens. */
-function ShellHeader(props: {
-  width: number | (() => number);
-  cwd: string | (() => string);
-  mode: string | (() => string);
-  model: string | (() => string);
-  effort: string | (() => string);
-  contextUsed: number | (() => number);
-  contextWindow: number | (() => number);
-  backend: string | (() => string);
-  /** Click affordance on the effort label: opens the reasoning-effort picker. */
-  onEffortClick?: () => void;
-}) {
-  const width = () => Number(typeof props.width === 'function' ? props.width() : props.width) || 80;
-  const cwd = () => shellValue(props.cwd);
-  const mode = () => shellValue(props.mode) || 'direct';
-  const model = () => shellValue(props.model) || 'model';
-  const effort = () => shellValue(props.effort) || 'Default';
-  const used = () => Number(typeof props.contextUsed === 'function' ? props.contextUsed() : props.contextUsed) || 0;
-  const window = () => Number(typeof props.contextWindow === 'function' ? props.contextWindow() : props.contextWindow) || 0;
-  const backend = () => connectionGlyph(shellValue(props.backend));
-  const repo = () => repoBase(cwd()) || 'workspace';
-  const context = () => contextSegments(used(), window(), width());
-  const compact = () => width() < 78;
-  const medium = () => width() < 100;
-  return <box height={1} flexShrink={0} minWidth={0} paddingX={1} backgroundColor="#171e26" flexDirection="row">
-    <text fg={C.primary} wrapMode="none" selectable={false}>◆</text>
-    <text fg={C.text} wrapMode="none" selectable={false}> Harness</text>
-    <text fg={C.textMuted} wrapMode="none" truncate flexGrow={1} selectable={false}>{` · ${repo()}`}</text>
-    <box flexDirection="row" minWidth={0} flexShrink={0} gap={1}>
-      <SafeText fg={C.secondary} wrapMode="none" truncate selectable={false} value={() => !compact() ? mode() : ''} />
-      <SafeText fg={C.primary} wrapMode="none" truncate selectable={false} value={model} />
-      <box minWidth={0} flexShrink={0} onMouseUp={(event: any) => { if (event?.button === 0) props.onEffortClick?.(); }}>
-        <SafeText fg={C.textMuted} wrapMode="none" truncate selectable={false} value={() => !medium() ? `· ${effort()}▾` : ''} />
-      </box>
-      <SafeText fg={C.textMuted} wrapMode="none" truncate selectable={false} value={() => !compact() ? context() : ''} />
-      <text fg={backend().color} wrapMode="none" selectable={false}>{`${backend().icon} ${backend().label}`}</text>
-    </box>
-  </box>;
-}
 
 function formatElapsed(start?: number, end?: number, now = 0): string {
   if (start == null) return '';
@@ -2133,7 +2034,9 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
   const editorRows = () => fullscreenEditor()
     ? Math.max(1, composerReservedRows() - 2)
     : composerLines();
-  const HEADER_ROWS = 1;
+  // No header bar: model/mode/effort identity and the context meter live in
+  // the two-row footer, so the transcript owns every row above the composer.
+  const HEADER_ROWS = 0;
   // Streaming output is coalesced at a modest cadence. A separate, slow clock
   // updates elapsed labels; the old 30 FPS global signal invalidated the whole
   // page even when no new output had arrived and looked like screen flashing.
@@ -2146,8 +2049,9 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
   let liveFlushTimer: ReturnType<typeof setTimeout> | null = null;
   let toastTimer: ReturnType<typeof setTimeout> | null = null;
   // Composer and status occupy the footer; transient toast text shares the
-  // status row instead of creating a second line under the input.
-  const footerReservedRows = () => composerReservedRows() + 1;
+  // status row instead of creating a second line under the input. The footer
+  // is two rows: transient status + persistent identity (model/mode/effort/ctx).
+  const footerReservedRows = () => composerReservedRows() + 2;
   const viewportHeight = () => {
     const h = dims().height;
     if (fullscreenEditor()) return 0;
@@ -3076,6 +2980,7 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
     contextUsed: contextUsed(),
     contextWindow: contextWindow(),
     model: model(),
+    mode: mode(),
     effort: effortShortLabel(effortLabel(), effort()),
     spinner: spinner(),
     outputTokens: turnOutputTokens(),
@@ -3084,23 +2989,46 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
   });
   const showGoalPage = () => Boolean(goalSnapshot() && (lifecycleView() === 'goal' || goalIsActive(goalSnapshot())));
   const showDraftPage = () => Boolean(draftStatus() && lifecycleView() === 'draft' && !showGoalPage());
-  const mainContent = () => {
-    if (usageOpen()) return <UsageView width={dims().width} height={dims().height} range={usageRange} revision={usageRevision} />;
+  // Branch selection goes through Switch/Match instead of a plain `{fn()}`
+  // child. Solid re-executes a plain function child whenever ANY signal read
+  // during its last run changes, disposing and recreating the entire subtree —
+  // startup events (welcome quote, goal/draft hydration, session_status) used
+  // to remount WelcomeView mid-sweep and replay the reveal ("logo 刷两遍"),
+  // and the 500ms `now()` tick kept resetting GoalView's local expand state.
+  // Switch keeps the matched branch alive until the selection itself flips;
+  // prop updates flow into the persistent view reactively.
+  const mainContent = () => <Switch fallback={
+    <LogView entries={entries} now={now} tick={tick} width={dims().width} height={viewportHeight()} active={() => !hasActiveOverlay()} composerEmpty={() => !hasActiveOverlay() && input() === ''} focusId={focusId} onCycleFocus={cycleFocus} onToggleExpand={toggleExpand} onClearFocus={() => setFocusId(null)} staticRender={props?.debugEntries != null && props?.debugLiveMarkdown !== true} />
+  }>
+    {/* Branch children stay one-arg functions: bun test runs solid-js's
+        server build WITHOUT the OpenTUI transform, so plain JSX children of
+        Match are evaluated eagerly (every branch mounts on every pass, and
+        UsageView's fallback-less <Show> then crashes on an orphan ""). A
+        one-arg callback is only invoked by Switch when the branch matches
+        (server build), and is treated as the canonical callback child by the
+        reactive build — zero-arg arrows would instead be resolved eagerly by
+        the server build's resolveChildren(). */}
+    <Match when={usageOpen()}>
+      {(_matched: unknown) => <UsageView width={dims().width} height={dims().height} range={usageRange} revision={usageRevision} />}
+    </Match>
 
-    const goal = goalSnapshot();
-    if (goal && showGoalPage()) {
-      return <GoalView goal={goal} decisions={goalDecisions()} now={now()} tick={tick} width={dims().width} height={viewportHeight()} />;
-    }
+    <Match when={showGoalPage()}>
+      {(_matched: unknown) => <GoalView goal={goalSnapshot()!} decisions={goalDecisions()} now={now()} tick={tick} width={dims().width} height={viewportHeight()} />}
+    </Match>
 
-    const draft = draftStatus();
-    if (draft && showDraftPage()) {
-      return <GoalDraftView draft={draft} now={now()} width={dims().width} height={viewportHeight()} />;
-    }
+    <Match when={showDraftPage()}>
+      {(_matched: unknown) => <GoalDraftView draft={draftStatus()!} now={now()} width={dims().width} height={viewportHeight()} />}
+    </Match>
 
-    if (fullscreenEditor()) return <box height={0} />;
-    if (showWelcome()) return <WelcomeView width={dims().width} height={viewportHeight()} quote={welcomeQuote()} />;
-    return <LogView entries={entries} now={now} tick={tick} width={dims().width} height={viewportHeight()} active={() => !hasActiveOverlay()} composerEmpty={() => !hasActiveOverlay() && input() === ''} focusId={focusId} onCycleFocus={cycleFocus} onToggleExpand={toggleExpand} onClearFocus={() => setFocusId(null)} staticRender={props?.debugEntries != null && props?.debugLiveMarkdown !== true} />;
-  };
+    <Match when={fullscreenEditor()}>
+      {(_matched: unknown) => <box height={0} />}
+    </Match>
+    <Match when={showWelcome()}>
+      {/* Debug harnesses render the welcome's final frame: the 360ms sweep
+          would otherwise make offscreen snapshots nondeterministic. */}
+      {(_matched: unknown) => <WelcomeView width={dims().width} height={viewportHeight()} quote={welcomeQuote()} animate={props?.debugEntries == null} />}
+    </Match>
+  </Switch>;
   const OverlayBoundary = () => {
     return <OverlayLayer
       permission={() => {
@@ -3158,17 +3086,6 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
     return lines.join('\n');
   };
   return <box width={dims().width} height={dims().height} flexDirection="column" position="relative">
-    <ShellHeader
-      width={() => dims().width}
-      cwd={cwd}
-      mode={mode}
-      model={model}
-      effort={() => effortShortLabel(effortLabel(), effort())}
-      contextUsed={contextUsed}
-      contextWindow={contextWindow}
-      backend={backendState}
-      onEffortClick={openEffortPicker}
-    />
     <box height={viewportHeight()} flexGrow={1} minHeight={0} flexDirection="column">
       {mainContent()}
     </box>
@@ -3227,6 +3144,6 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
       </box>
     </box>
     {activeOverlayDescriptor() !== null ? <OverlayBoundary /> : null}
-    <StatusLine status={uiStatus} />
+    <StatusLine status={uiStatus} onEffortClick={openEffortPicker} />
   </box>;
 }

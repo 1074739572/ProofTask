@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {footerHint} from '../src-open/interaction.ts';
-import {statusLineText} from '../src-open/StatusLine.tsx';
+import {statusLineText, contextMeterCells} from '../src-open/StatusLine.tsx';
 
 const base = {
   width: 120,
@@ -68,7 +68,7 @@ test('narrow status line keeps activity and queue visible in compact form', () =
   assert.match(text, /Enter queue/);
 });
 
-test('running status line exposes compact context meter and decode rate', () => {
+test('running status line keeps decode rate while the meter stays in the identity row', () => {
   const text = statusLineText({
     width: 120, backend: 'connected', running: true, phase: 'responding', elapsed: '4s',
     currentTool: 'read_file', toolsDone: 1, toolsTotal: 2, queuedMessages: 0,
@@ -76,9 +76,29 @@ test('running status line exposes compact context meter and decode rate', () => 
     contextUsed: 13100, contextWindow: 16000, contextUsage: 13100 / 16000,
     permissionPrompt: null, tokensPerSecond: 35,
   });
-  assert.match(text, /ctx .*82%/);
-  assert.match(text, /S.*T.*M.*F/);
+  // Single context meter only: the transient row must not repeat it.
+  assert.doesNotMatch(text, /ctx/);
   assert.match(text, /35 t\/s/);
+});
+
+test('context meter apportions S/T/M cells and keeps the free remainder', () => {
+  const cells = contextMeterCells({
+    contextUsage: 13100 / 16000,
+    toolsDone: 1,
+    toolsTotal: 2,
+    outputTokens: 500,
+  });
+  assert.equal(cells.percent, 82);
+  assert.equal(cells.system + cells.tools + cells.messages + cells.free, 12);
+  assert.ok(cells.system > 0 && cells.tools > 0 && cells.messages > 0);
+  assert.equal(cells.free, 12 - Math.round((13100 / 16000) * 12));
+});
+
+test('context meter degrades to a plain used/free split without activity', () => {
+  const cells = contextMeterCells({contextUsage: 0.5, toolsDone: 0, toolsTotal: 0, outputTokens: 0});
+  assert.equal(cells.percent, 50);
+  assert.equal(cells.system + cells.tools + cells.messages, 6);
+  assert.equal(cells.free, 6);
 });
 
 test('full-screen draft footer exposes an unambiguous exit hint', () => {

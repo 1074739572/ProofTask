@@ -130,12 +130,14 @@ export function GoalView(props: GoalViewProps) {
 }
 
 export function GoalDraftView(props: {draft: GoalDraftSnapshot; now?: number; width: number; height: number}) {
-  const draft = props.draft;
+  // The parent keeps this branch mounted across draft updates (Switch/Match),
+  // so the snapshot must be read reactively instead of captured once.
+  const draft = () => props.draft;
   return <box flexDirection="column" flexGrow={1} flexShrink={0} minWidth={0} height="100%">
-    <GoalSummary goal={draft} decisions={[]} width={props.width} onExpandDetails={() => {}} />
+    <GoalSummary goal={draft()} decisions={[]} width={props.width} onExpandDetails={() => {}} />
     <box flexDirection="column" minWidth={0} flexShrink={1} paddingX={1}>
-      <text wrapMode="word" truncate content={`草稿阶段：${draft.stage || '准备中'} · ${draft.task_count || draft.tasks?.length || 0} 个任务`} />
-      <Show when={draft.question}><text wrapMode="word" truncate content={`待回答：${draft.question}`} /></Show>
+      <text wrapMode="word" truncate content={`草稿阶段：${draft().stage || '准备中'} · ${draft().task_count || draft().tasks?.length || 0} 个任务`} />
+      <Show when={draft().question}><text wrapMode="word" truncate content={`待回答：${draft().question}`} /></Show>
     </box>
   </box>;
 }
