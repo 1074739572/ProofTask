@@ -1470,12 +1470,14 @@ function TranscriptEntryView(props: {entry: Entry; liveEntry?: (id: string) => E
       const found = liveOf();
       return found ? found.streaming === true : entry.streaming === true;
     };
+    // Give each assistant segment a clear visual breath after the user's
+    // prompt. Tool rows intentionally do not inherit this spacing.
     // Streaming gutter pulse: while tokens are flowing the rail breathes
     // between ▌ and │ on the animation clock, then settles back to the plain
     // rail once the stream finalizes. Single cell, zero layout impact.
     const gutterChar = () => liveStreaming() ? (props.tick() % 5 < 4 ? '▌' : '│') : '│';
     const gutterColor = () => liveStreaming() && props.tick() % 5 < 4 ? C.primary : C.info;
-    return text === null ? <box /> : shell(<box flexDirection="row" minWidth={0} paddingLeft={1} paddingRight={1}>
+    return text === null ? <box /> : shell(<box flexDirection="row" minWidth={0} paddingTop={1} paddingLeft={1} paddingRight={1}>
       <text fg={gutterColor()} wrapMode="none" selectable={false}>{gutterChar()}</text>
       <box flexGrow={1} minWidth={0} paddingLeft={1}>
         {props.plainResponse ? <SafeText fg={C.text} wrapMode="word" value={text} /> : <StreamingClamp active={liveStreaming}><markdown syntaxStyle={getMarkdownSyntax()} streaming={liveStreaming()} internalBlockMode="top-level" tableOptions={{style: 'grid'}} content={liveText() ?? ''} fg={C.text} conceal /></StreamingClamp>}
@@ -1518,20 +1520,14 @@ function TranscriptEntryView(props: {entry: Entry; liveEntry?: (id: string) => E
     // render identity between flushes, while appended lines flow via this memo.
     const liveOutput = createMemo(() => normalizeActionOutput(liveOf()?.output ?? entry.output));
     const expanded = entry.expanded === true;
-    const isLongOutput = () => liveOutput().length > 3;
-    // A folded transcript must remain bounded. Keep a short prefix rather
-    // than the tail: the title/status line identifies the action, while the
-    // first output lines provide a useful, stable preview without rendering
-    // the end of a large paste into the terminal frame.
-    const visible = () => expanded ? actionOutputPreview(liveOutput(), true) : (!isLongOutput() ? liveOutput() : []);
     const name = normalizeTranscriptText(entry.name) || text || 'action';
     const status = normalizeTranscriptText(entry.summary) || detail;
+    const count = Number(entry.count || 0);
     const summary = status !== null ? `  ${status}` : '';
     const marker = () => props.focusId() === entry.id ? '▶' : entry.done ? (entry.ok ? '✓' : '✕') : props.frame();
-    // Keep the live marker/elapsed expression reactive.  A plain local string
-    // is evaluated only at mount by Solid, which made the old clock appear
-    // frozen even though the timer was running.
-    const head = () => `${marker()} ${name}${summary}`;
+    // Keep the collapsed state to one compact, actionable row. Mouse click and
+    // the existing focused Enter binding both use the same toggle callback.
+    const head = () => `${marker()} ${name}${count > 1 ? ` · ${count} 次` : ''}${summary}`;
     const elapsedText = () => formatElapsed(entry.start, entry.end, props.now());
     // Elapsed tick-pop: the counter flashes bright for ~3 animation ticks
     // (240ms) right after its value changes, then settles back to muted.
@@ -1544,15 +1540,17 @@ function TranscriptEntryView(props: {entry: Entry; liveEntry?: (id: string) => E
       return t - lastChangeTick <= 3 ? C.warning : C.textMuted;
     };
     return <box flexShrink={0} minWidth={0} flexDirection="column">
-      <box flexDirection="row" minWidth={0}>
+      <box flexDirection="row" minWidth={0} onMouseUp={(event: any) => {
+        if (event?.button === 0) props.onToggleExpand(entry.id);
+      }}>
         <text fg={toolCategoryColor(name, Boolean(entry.done), entry.ok, props.focusId() === entry.id)} wrapMode="word" flexShrink={1}>{head()}</text>
         <text fg={elapsedColor()} wrapMode="none">{elapsedText()}</text>
       </box>
-      {visible().length === 0 ? <box /> : <For each={visible()}>{(line: string) => <box flexDirection="row" minWidth={0} paddingLeft={2}>
+      {expanded ? <For each={actionOutputPreview(liveOutput(), true)}>{(line: string) => <box flexDirection="row" minWidth={0} paddingLeft={2}>
         <SafeText fg={C.textMuted} wrapMode="word" value={`│ ${line}`} />
-      </box>}</For>}
-      {!expanded && isLongOutput() ? <box flexDirection="row" minWidth={0} paddingLeft={2}>
-        <SafeText fg={C.textMuted} wrapMode="none" truncate value={`${name}${summary} · … ${liveOutput().length} lines · Enter to expand`} />
+      </box>}</For> : <box />}
+      {!expanded && (liveOutput().length > 0 || !entry.done) ? <box flexDirection="row" minWidth={0} paddingLeft={2}>
+        <SafeText fg={C.textMuted} wrapMode="none" truncate value={entry.done ? 'Enter 展开输出' : '运行中 · 输出随时更新 · Enter 展开'} />
       </box> : <box />}
     </box>;
   }
@@ -1627,15 +1625,14 @@ function TranscriptEntryView(props: {entry: Entry; liveEntry?: (id: string) => E
   return <box />;
 }
 
-/** A lightweight conversation rail borrowed from dsh-TUI's TimelineRail.
- * It intentionally carries no interaction state: the scrollbox remains the
- * source of truth, while the gutter gives prompt turns a stable visual spine. */
-function TimelineRail(props: {entry: Entry; turn: number}) {
-  const prompt = props.entry.kind === 'prompt';
-  const marker = prompt ? '●' : '│';
-  const label = prompt ? String(props.turn).padStart(2, '0') : ' ';
+/** A lightweight conversation rail with non-numeric role markers. It keeps
+ * the wide-layout alignment without turning the transcript into a numbered
+ * timeline. */
+function TimelineRail(props: {entry: Entry}) {
+  const role = props.entry.kind === 'prompt' ? '你' : props.entry.kind === 'response' ? 'AI' : '·';
+  const color = props.entry.kind === 'prompt' ? C.primary : props.entry.kind === 'response' ? C.info : C.textMuted;
   return <box width={4} flexShrink={0} flexDirection="column" alignItems="center">
-    <text fg={prompt ? C.primary : C.textMuted} wrapMode="none" selectable={false}>{`${marker}${label}`}</text>
+    <text fg={color} wrapMode="none" selectable={false}>{role}</text>
   </box>;
 }
 
@@ -1714,14 +1711,12 @@ function LogView(props: {entries: () => Entry[]; now: () => number; tick: () => 
     return latestTasks ? [...rest, latestTasks] : rest;
   });
   const TranscriptBody = () => {
-    let turn = 0;
     return <box flexDirection="column" minWidth={0}>
       <For each={orderedEntries()}>{(entry: Entry, index: () => number) => {
-        if (entry.kind === 'prompt') turn += 1;
         const latest = () => index() === orderedEntries().length - 1;
         const row = <TranscriptEntryView entry={entry} liveEntry={liveEntry} frame={frame} now={props.now} tick={props.tick} focusId={props.focusId} onToggleExpand={props.onToggleExpand} plainResponse={props.staticRender} latest={latest} />;
         return props.width != null && props.width >= 100
-          ? <box flexDirection="row" minWidth={0}><TimelineRail entry={entry} turn={turn} /><box flexGrow={1} minWidth={0}>{row}</box></box>
+          ? <box flexDirection="row" minWidth={0}><TimelineRail entry={entry} /><box flexGrow={1} minWidth={0}>{row}</box></box>
           : row;
       }}</For>
     </box>;
