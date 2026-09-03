@@ -4,12 +4,12 @@ export type EntryKind = 'prompt' | 'response' | 'action' | 'blocked' | 'files' |
 export type SubagentStatus = 'running' | 'done' | 'failed';
 export type SubagentToolRow = {id: string; name: string; summary: string; status: SubagentStatus};
 export type TokenUsage = {inp: number; out: number; cache: number; outputKnown?: boolean};
-export type Entry = {id: string; kind: EntryKind; text: string; detail?: string; done?: boolean; ok?: boolean; start?: number; end?: number; output?: string[]; expanded?: boolean; streaming?: boolean; toolCount?: number; paths?: string[]; tasks?: TodoItem[]; tokens?: TokenUsage; agentType?: string; model?: string; status?: SubagentStatus; rounds?: string[]; tools?: SubagentToolRow[]; summary?: string; elapsed?: number};
+export type Entry = {id: string; kind: EntryKind; text: string; detail?: string; done?: boolean; ok?: boolean; start?: number; end?: number; output?: string[]; expanded?: boolean; streaming?: boolean; toolCount?: number; count?: number; calls?: ActionCall[]; paths?: string[]; tasks?: TodoItem[]; tokens?: TokenUsage; agentType?: string; model?: string; status?: SubagentStatus; rounds?: string[]; tools?: SubagentToolRow[]; summary?: string; elapsed?: number};
 // One recorded invocation inside a merged action row. Consecutive same-name
 // calls collapse into a single live row ("Called N times", Claude Code style),
-// but each call keeps its own summary/timing so the expanded turn summary can
-// still list every step individually.
-export type ActionCall = {summary: string; start?: number; end?: number; done: boolean; ok: boolean};
+// but each call keeps its own summary/timing/output so the expanded turn summary
+// can still list every step individually.
+export type ActionCall = {summary: string; start?: number; end?: number; done: boolean; ok: boolean; output?: string[]};
 export type ActionRow = {id: string; name: string; summary: string; done: boolean; ok: boolean; start?: number; end?: number; count?: number; output?: string[]; expanded?: boolean; calls?: ActionCall[]};
 // A turn summary unfolds into chronologically ordered steps (thinking, one tool
 // call, subagent — in the order they actually happened), never grouped by type.
@@ -32,7 +32,7 @@ export type Section =
 // A merged row unfolds back into one step per recorded call, in call order.
 function toolSteps(row: ActionRow): SummaryStep[] {
   if (!row.calls || row.calls.length <= 1) return [{type: 'tool', row}];
-  return row.calls.map(call => ({type: 'tool', row: {...row, count: 1, summary: call.summary, start: call.start, end: call.end, done: call.done, ok: call.ok, calls: undefined}}));
+  return row.calls.map(call => ({type: 'tool', row: {...row, count: 1, summary: call.summary, start: call.start, end: call.end, done: call.done, ok: call.ok, output: call.output, calls: undefined}}));
 }
 
 // Transcript items are grouped into semantic sections (Prompt / Response / Actions /
@@ -66,19 +66,20 @@ export function buildSections(entries: Entry[]): Section[] {
       case 'action': {
         flushFiles();
         const row: ActionRow = {id: entry.id, name: entry.text, summary: entry.detail || '', done: Boolean(entry.done), ok: Boolean(entry.ok), start: entry.start, end: entry.end, output: entry.output, expanded: entry.expanded};
+        const call: ActionCall = {summary: row.summary, start: row.start, end: row.end, done: row.done, ok: row.ok, output: row.output};
         // Collapse consecutive same-name calls into one row ("Called N times"),
         // matching Claude Code's dedup behaviour for repeated tool calls. Each
         // call is recorded in `calls` so nothing is lost for the expanded view.
         const last = pendingActions[pendingActions.length - 1];
         if (last && last.name === row.name) {
-          if (!last.calls) last.calls = [{summary: last.summary, start: last.start, end: last.end, done: last.done, ok: last.ok}];
+          if (!last.calls) last.calls = [{summary: last.summary, start: last.start, end: last.end, done: last.done, ok: last.ok, output: last.output}];
           last.count = (last.count || 1) + 1;
           last.done = last.done && row.done;
           last.ok = last.ok && row.ok;
           if (row.start != null && (last.start == null || row.start < last.start)) last.start = row.start;
           if (row.end != null && (last.end == null || row.end > last.end)) last.end = row.end;
           if (row.summary) last.summary = row.summary;
-          last.calls.push({summary: row.summary, start: row.start, end: row.end, done: row.done, ok: row.ok});
+          last.calls.push(call);
         } else {
           pendingActions.push(row);
         }

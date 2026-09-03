@@ -24,8 +24,8 @@ test('merged same-name tool calls unfold into individual numbered steps', () => 
   const sections = buildSections([
     {id: 'p1', kind: 'prompt', text: 'run tests'},
     {id: 'i1', kind: 'intent', text: '先跑一遍测试'},
-    {id: 'a1', kind: 'action', text: 'bash', detail: 'pytest -x', done: true, ok: true},
-    {id: 'a2', kind: 'action', text: 'bash', detail: 'pytest tests/e2e', done: true, ok: false},
+    {id: 'a1', kind: 'action', text: 'bash', detail: 'pytest -x', done: true, ok: true, output: ['first output']},
+    {id: 'a2', kind: 'action', text: 'bash', detail: 'pytest tests/e2e', done: true, ok: false, output: ['second output']},
     {id: 'sum1', kind: 'summary', text: 'Turn complete', toolCount: 2, paths: [], tokens: {inp: 0, out: 0, cache: 0}, expanded: true},
   ]);
 
@@ -36,8 +36,10 @@ test('merged same-name tool calls unfold into individual numbered steps', () => 
   // "bash · Called 2 times".
   assert.equal(summary.steps[1].row.summary, 'pytest -x');
   assert.equal(summary.steps[1].row.ok, true);
+  assert.deepEqual(summary.steps[1].row.output, ['first output']);
   assert.equal(summary.steps[2].row.summary, 'pytest tests/e2e');
   assert.equal(summary.steps[2].row.ok, false);
+  assert.deepEqual(summary.steps[2].row.output, ['second output']);
 });
 
 test('live actions view still collapses consecutive same-name calls', () => {
@@ -52,6 +54,7 @@ test('live actions view still collapses consecutive same-name calls', () => {
   assert.equal(rows.length, 1);
   assert.equal(rows[0].count, 2);
   assert.equal(rows[0].calls.length, 2);
+  assert.deepEqual(rows[0].calls.map((call: any) => call.output), [undefined, undefined]);
 });
 
 test('live action group keeps its id while matching calls are appended', () => {

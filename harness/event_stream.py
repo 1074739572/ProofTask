@@ -13,6 +13,7 @@ import json
 import queue
 import sys
 import threading
+import time
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -628,6 +629,21 @@ def _run_user_turn(
     return context, interrupted, binding
 
 
+def _startup_session_picker_items(*, limit: int = 20) -> list[dict[str, str]]:
+    """Build startup rows from the same visible sessions as ``/resume``."""
+    from harness.project.session_registry import visible_session_summaries
+
+    items: list[dict[str, str]] = []
+    for summary in visible_session_summaries(limit=limit):
+        title_value = str(summary.get("title") or "(untitled)")
+        if int(summary.get("messages") or 0) <= 0 and title_value in {"(untitled)", "(migrated)", ""}:
+            continue
+        timestamp = int(summary.get("updated_at") or summary.get("created_at") or 0)
+        detail = time.strftime("%Y-%m-%d %H:%M", time.localtime(timestamp)) if timestamp else "—"
+        items.append({"id": str(summary.get("id") or ""), "label": title_value[:60], "detail": detail})
+    return items or [{"id": "__empty__", "label": "暂无历史会话", "detail": "输入消息开始新会话"}]
+
+
 def run_event_stream() -> None:
     # Redirect ALL stdout to stderr at the very start, before any imports
     # that may print (MCP servers, etc.). JSON events use events.emit()
@@ -696,6 +712,12 @@ def run_event_stream() -> None:
 
     _emit_status(context, binding, history, running=False)
     _emit_history_replay(history)
+    # On launch, reuse the /resume picker protocol so users can immediately
+    # choose a persisted conversation without typing a command first.
+    from harness.project.session_registry import visible_session_summaries
+
+    session_items = _startup_session_picker_items(limit=20)
+    emit("show_picker", id="startup_history", title="历史会话", items=session_items, startup=True)
     # Restore a paused/in-progress Goal after a TUI restart. Terminal Goals stay
     # out of the startup view, but `/goal status` can still request them.
     from harness.goal.runner import emit_current_goal_status

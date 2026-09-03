@@ -47,7 +47,7 @@ export type UiEvent =
   | { type: 'assistant_delta'; seq?: number; ts?: number; text: string; model?: string }
   | { type: 'agent_start'; seq?: number; ts?: number; phase?: RunPhase }
   | { type: 'agent_end'; seq?: number; ts?: number; status?: string }
-  | { type: 'show_picker'; seq?: number; ts?: number; id: string; title: string; items: PickerItem[] }
+  | { type: 'show_picker'; seq?: number; ts?: number; id: string; title: string; items: PickerItem[]; startup?: boolean }
   | { type: 'picker_up'; seq?: number; ts?: number }
   | { type: 'picker_down'; seq?: number; ts?: number }
   | { type: 'picker_close'; seq?: number; ts?: number }

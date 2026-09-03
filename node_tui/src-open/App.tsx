@@ -97,7 +97,7 @@ export function completionMenuIsOpen(
 }
 
 export type OverlayOption = {name: string; description: string; value: string};
-export type Overlay = {kind: 'permission' | 'picker'; id: string; title: string; pickerId?: string; options: OverlayOption[]};
+export type Overlay = {kind: 'permission' | 'picker'; id: string; title: string; pickerId?: string; options: OverlayOption[]; startup?: boolean};
 
 /**
  * OpenTUI accepts text only when it has actual content. Keep the original
@@ -142,6 +142,17 @@ function materializeTranscriptLines(value: unknown): {lines: string[]; supported
 
 function normalizeActionOutput(value: unknown): string[] {
   return materializeTranscriptLines(value).lines;
+}
+
+function mergedActionOutput(entry: any): string[] {
+  const calls = Array.isArray(entry?.calls) ? entry.calls : [];
+  const perCall = calls.flatMap((call: any) => normalizeActionOutput(call?.output));
+  return perCall.length > 0 ? perCall : normalizeActionOutput(entry?.output);
+}
+
+export function promptPaddingTop(entries: readonly Entry[], index: number): number {
+  if (index <= 0 || entries[index]?.kind !== 'prompt') return 0;
+  return entries.slice(0, index).some(entry => normalizeRenderableText(entry.text) !== null || normalizeRenderableText(entry.detail) !== null || (entry.kind === 'action' && (entry.done !== undefined || normalizeActionOutput(entry.output).length > 0))) ? 1 : 0;
 }
 
 /** Bound expanded tool output so one command cannot monopolize the viewport. */
@@ -231,6 +242,9 @@ export function normalizeTranscriptEntries(entries: unknown[]): unknown[] {
     else if (summary !== null) normalized.summary = summary;
     if (materializedOutput.supported) normalized.output = output;
     else delete normalized.output;
+    if (Array.isArray(source.calls)) {
+      normalized.calls = source.calls.map((call: any) => ({...call, output: materializeTranscriptLines(call?.output).lines}));
+    }
     return [normalized];
   });
 }
@@ -271,7 +285,7 @@ function sameTranscriptEntryExcept(left: Entry, right: Entry, ignored: ReadonlyS
 // the row's object identity stable for these avoids remounting the renderer
 // on every 32ms flush (the flicker root cause).
 const LIVE_RESPONSE_FIELDS: ReadonlySet<string> = new Set(['text', 'streaming']);
-const LIVE_ACTION_FIELDS: ReadonlySet<string> = new Set(['output']);
+const LIVE_ACTION_FIELDS: ReadonlySet<string> = new Set(['output', 'done', 'ok', 'summary', 'detail']);
 
 // Braille spinner frames, one per animation tick (80ms): a smooth 10-frame
 // rotation at ~12fps, replacing the old 4-frame ASCII cycle that the 500ms
@@ -1518,13 +1532,16 @@ function TranscriptEntryView(props: {entry: Entry; liveEntry?: (id: string) => E
   if (entry.kind === 'action') {
     // Output streams in place through the live lookup: the cached entry pins
     // render identity between flushes, while appended lines flow via this memo.
-    const liveOutput = createMemo(() => normalizeActionOutput(liveOf()?.output ?? entry.output));
+    const liveOutput = createMemo(() => {
+      const live = liveOf();
+      return mergedActionOutput(live || entry);
+    });
     const expanded = entry.expanded === true;
     const name = normalizeTranscriptText(entry.name) || text || 'action';
     const status = normalizeTranscriptText(entry.summary) || detail;
     const count = Number(entry.count || 0);
     const summary = status !== null ? `  ${status}` : '';
-    const marker = () => props.focusId() === entry.id ? '▶' : entry.done ? (entry.ok ? '✓' : '✕') : props.frame();
+    const marker = () => props.focusId() === entry.id ? '▶' : entry.done ? (entry.ok ? '✓' : '✕') : '◌';
     // Keep the collapsed state to one compact, actionable row. Mouse click and
     // the existing focused Enter binding both use the same toggle callback.
     const head = () => `${marker()} ${name}${count > 1 ? ` · ${count} 次` : ''}${summary}`;
@@ -1546,12 +1563,16 @@ function TranscriptEntryView(props: {entry: Entry; liveEntry?: (id: string) => E
         <text fg={toolCategoryColor(name, Boolean(entry.done), entry.ok, props.focusId() === entry.id)} wrapMode="word" flexShrink={1}>{head()}</text>
         <text fg={elapsedColor()} wrapMode="none">{elapsedText()}</text>
       </box>
-      {expanded ? <For each={actionOutputPreview(liveOutput(), true)}>{(line: string) => <box flexDirection="row" minWidth={0} paddingLeft={2}>
-        <SafeText fg={C.textMuted} wrapMode="word" value={`│ ${line}`} />
-      </box>}</For> : <box />}
-      {!expanded && (liveOutput().length > 0 || !entry.done) ? <box flexDirection="row" minWidth={0} paddingLeft={2}>
-        <SafeText fg={C.textMuted} wrapMode="none" truncate value={entry.done ? 'Enter 展开输出' : '运行中 · 输出随时更新 · Enter 展开'} />
-      </box> : <box />}
+      <Show when={expanded && liveOutput().length > 0}>
+        <For each={actionOutputPreview(liveOutput(), true)}>{(line: string) => <box flexDirection="row" minWidth={0} paddingLeft={2}>
+          <SafeText fg={C.textMuted} wrapMode="word" value={`│ ${line}`} />
+        </box>}</For>
+      </Show>
+      <Show when={!expanded && (liveOutput().length > 0 || !entry.done)}>
+        <box flexDirection="row" minWidth={0} paddingLeft={2}>
+          <SafeText fg={C.textMuted} wrapMode="none" truncate value={entry.done ? 'Enter 展开输出' : '运行中 · 输出随时更新 · Enter 展开'} />
+        </box>
+      </Show>
     </box>;
   }
   if (entry.kind === 'subagent') {
@@ -1715,9 +1736,10 @@ function LogView(props: {entries: () => Entry[]; now: () => number; tick: () => 
       <For each={orderedEntries()}>{(entry: Entry, index: () => number) => {
         const latest = () => index() === orderedEntries().length - 1;
         const row = <TranscriptEntryView entry={entry} liveEntry={liveEntry} frame={frame} now={props.now} tick={props.tick} focusId={props.focusId} onToggleExpand={props.onToggleExpand} plainResponse={props.staticRender} latest={latest} />;
+        const paddingTop = promptPaddingTop(orderedEntries(), index());
         return props.width != null && props.width >= 100
-          ? <box flexDirection="row" minWidth={0}><TimelineRail entry={entry} /><box flexGrow={1} minWidth={0}>{row}</box></box>
-          : row;
+          ? <box flexDirection="row" minWidth={0} paddingTop={paddingTop}><TimelineRail entry={entry} /><box flexGrow={1} minWidth={0}>{row}</box></box>
+          : <box flexDirection="column" minWidth={0} paddingTop={paddingTop}>{row}</box>;
       }}</For>
     </box>;
   };
@@ -2656,7 +2678,7 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
       }
       case 'log': if (event.level === 'warn' || event.level === 'plain') add({id: `log-${Date.now()}`, kind: 'log', text: value(event, 'text')}); break;
       case 'completion_result': handleCompletionResult(event); break;
-      case 'show_picker': setOverlay({kind: 'picker', id: event.id, pickerId: event.id, title: event.title, options: (event.items || []).map((x: any) => ({name: x.label, description: x.detail || '', value: x.id}))}); setOverlayIndex(0); break;
+      case 'show_picker': setOverlay({kind: 'picker', id: event.id, pickerId: event.id, title: event.title, options: (event.items || []).map((x: any) => ({name: x.label, description: x.detail || '', value: x.id})), startup: event.startup === true}); setOverlayIndex(0); break;
       case 'permission_request': setOverlay({kind: 'permission', id: event.id, title: event.title || `Allow ${event.tool}?`, options: [{name: 'Allow once', description: event.resource || '', value: 'allow'}, {name: 'Allow session', description: 'Remember until this TUI exits', value: 'session'}, {name: 'Deny', description: 'Block this tool call', value: 'deny'}]}); setOverlayIndex(0); break;
       case 'permission_timed_out': {
         if (overlay()?.kind === 'permission' && overlay()?.id === event.id) { setOverlay(null); setOverlayIndex(0); }
@@ -2778,7 +2800,10 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
       send({type: 'permission_response', id: current.id, decision: option.value});
       showToast(option.name);
     } else {
-      const command = current.pickerId === 'model' ? `/model ${option.value}` : current.pickerId === 'resume' ? `/resume ${option.value}` : current.pickerId === 'effort' ? `/effort ${option.value}` : `/mode ${option.value}`;
+      const command = current.pickerId === 'model' ? `/model ${option.value}` : (current.pickerId === 'resume' || current.pickerId === 'startup_history') ? `/resume ${option.value}` : current.pickerId === 'effort' ? `/effort ${option.value}` : `/mode ${option.value}`;
+      if (current.pickerId === 'startup_history' && option.value === '__empty__') {
+        setOverlay(null); setOverlayIndex(0); showToast('暂无历史会话'); return;
+      }
       if (current.pickerId === 'effort') { setEffort(String(option.value || 'off')); setEffortLabel(option.name || 'Model default'); }
       send({type: 'user_message', text: command, silent: true});
       showToast(`Switched: ${option.name}`);
@@ -2829,7 +2854,7 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
     if (current) {
       if (name === 'up') { setOverlayIndex(i => Math.max(0, i - 1)); event.preventDefault?.(); }
       else if (name === 'down') { setOverlayIndex(i => Math.min(current.options.length - 1, i + 1)); event.preventDefault?.(); }
-      else if (name === 'return') selectOverlay();
+      else if (name === 'return' || name === 'enter') selectOverlay();
       else if (name === 'escape') {
         if (current.kind === 'permission') send({type: 'permission_response', id: current.id, decision: 'deny'});
         setOverlay(null);

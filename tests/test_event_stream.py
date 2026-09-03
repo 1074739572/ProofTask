@@ -21,7 +21,24 @@ def fake_workdir(tmp_path, monkeypatch):
     return root
 
 
-# ---------- /open workspace switch ----------
+def test_startup_history_picker_uses_durable_session_ids(monkeypatch):
+    from harness.event_stream import _startup_session_picker_items
+
+    monkeypatch.setattr("harness.project.session_registry.visible_session_summaries", lambda **_: [
+        {"id": "sid-1", "title": "旧会话", "messages": 2, "updated_at": 1700000000},
+    ])
+    items = _startup_session_picker_items()
+    assert items[0]["id"] == "sid-1"
+    assert items[0]["label"] == "旧会话"
+
+
+def test_startup_history_picker_empty_state(monkeypatch):
+    from harness.event_stream import _startup_session_picker_items
+
+    monkeypatch.setattr("harness.project.session_registry.visible_session_summaries", lambda **_: [])
+    assert _startup_session_picker_items() == [{"id": "__empty__", "label": "暂无历史会话", "detail": "输入消息开始新会话"}]
+
+
 
 def test_open_resolves_directory(tmp_path):
     target = tmp_path / "proj"
