@@ -1,0 +1,98 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1400 820" role="img" aria-labelledby="title desc">
+  <title id="title">Meteo Agent cloud logo concepts</title>
+  <desc id="desc">Four cloud-based logo directions for a meteorology agent.</desc>
+  <style>
+    text { font-family:"Inter","Noto Sans SC","Microsoft YaHei",sans-serif; }
+    .card { fill:#111a2c; stroke:#263858; stroke-width:2; }
+    .kicker { fill:#7e91b4; font-size:14px; font-weight:700; letter-spacing:3px; }
+    .name { fill:#f1f6ff; font-size:28px; font-weight:700; }
+    .sub { fill:#a9bedb; font-size:18px; }
+    .note { fill:#687d9e; font-size:15px; }
+    .line { fill:none; stroke-linecap:round; stroke-linejoin:round; }
+    .orbit { transform-box:view-box; transform-origin:170px 306px; animation:spin 6s linear infinite; }
+    .probe { transform-box:view-box; transform-origin:850px 306px; animation:spin-rev 5s linear infinite; }
+    .beat { transform-box:fill-box; transform-origin:center; animation:beat 1.8s ease-in-out infinite; }
+    .stream { stroke-dasharray:120 46; animation:dash 3s linear infinite; }
+    @keyframes spin { to { transform:rotate(360deg); } }
+    @keyframes spin-rev { to { transform:rotate(-360deg); } }
+    @keyframes beat { 0%,100% { transform:scale(.82); opacity:.72; } 50% { transform:scale(1.12); opacity:1; } }
+    @keyframes dash { to { stroke-dashoffset:-166; } }
+    @media (prefers-reduced-motion:reduce) { .orbit,.probe,.beat,.stream { animation:none; } }
+  </style>
+  <rect width="1400" height="820" fill="#080d19"/>
+  <text x="56" y="62" fill="#f1f6ff" font-size="30" font-weight="700" letter-spacing="1">METEO AGENT</text>
+  <text x="56" y="94" fill="#6f83a4" font-size="15" letter-spacing="4">CLOUD DIRECTIONS  /  4 LOGO STUDIES</text>
+  <text x="1344" y="72" text-anchor="end" fill="#2498ff" font-size="15" letter-spacing="2">先选气质，再做定稿</text>
+
+  <!-- 01 Cloud Orbit -->
+  <g transform="translate(50 140)">
+    <rect class="card" width="630" height="300" rx="18" fill="#111a2c" stroke="#263858" stroke-width="2"/>
+    <g transform="translate(10 6)">
+      <g class="orbit">
+        <path d="M40 148 A104 70 0 1 1 216 205" class="line" fill="none" stroke="#4d6bfe" stroke-width="9" stroke-linecap="round" stroke-dasharray="390 150"/>
+        <circle cx="128" cy="41" r="7" fill="#2498ff"/>
+      </g>
+      <path d="M55 145 C55 121 74 103 97 103 C103 78 125 61 151 61 C179 61 201 80 206 106 C226 106 241 121 241 141 C241 162 224 177 202 177 H91 C70 177 55 164 55 145 Z" fill="#132a4b" stroke="#e7f8ff" stroke-width="7" stroke-linejoin="round"/>
+      <path d="M82 160 H198" class="line" stroke="#2498ff" stroke-width="5" opacity=".8"/>
+      <circle class="beat" cx="140" cy="127" r="8" fill="#dff6ff"/>
+      <circle cx="128" cy="41" r="3" fill="#fff"/>
+    </g>
+    <g transform="translate(330 56)">
+      <text class="kicker" fill="#7e91b4" font-size="14" font-weight="700" letter-spacing="3" x="0" y="0">01 / CLOUD ORBIT</text><text class="name" fill="#f1f6ff" font-size="28" font-weight="700" x="0" y="46">云环</text><text class="sub" fill="#a9bedb" font-size="18" x="0" y="78">云场 · 感知 · 循环</text>
+      <text class="note" fill="#687d9e" font-size="15" x="0" y="126">最像一个“在工作”的 Agent</text><text class="note" fill="#687d9e" font-size="15" x="0" y="151">适合：终端头像、加载状态</text>
+      <rect x="0" y="184" width="90" height="3" fill="#4d6bfe"/><rect x="98" y="184" width="52" height="3" fill="#2498ff"/>
+    </g>
+  </g>
+
+  <!-- 02 Cloud Core -->
+  <g transform="translate(720 140)">
+    <rect class="card" width="630" height="300" rx="18" fill="#111a2c" stroke="#263858" stroke-width="2"/>
+    <g transform="translate(10 6)">
+      <path d="M42 151 C42 127 61 109 84 109 C91 82 114 64 141 64 C170 64 193 83 198 110 C220 110 236 126 236 147 C236 168 218 183 196 183 H77 C56 183 42 170 42 151 Z" fill="#132a4b" stroke="#76e3c4" stroke-width="7" stroke-linejoin="round"/>
+      <path d="M42 137 H22 V116 H10 M236 137 H246 V116 H258 M77 183 V205 H56 M196 183 V205 H216" class="line" stroke="#2498ff" stroke-width="4"/>
+      <circle cx="10" cy="116" r="6" fill="#ffcc66"/><circle cx="258" cy="116" r="6" fill="#ffcc66"/><circle cx="56" cy="205" r="6" fill="#2498ff"/><circle cx="216" cy="205" r="6" fill="#2498ff"/>
+      <path class="beat" d="M141 96 L174 115 V153 L141 172 L108 153 V115 Z" fill="#0b1930" stroke="#e7f8ff" stroke-width="4"/>
+      <path d="M141 112 L130 137 H141 L136 155 L156 130 H145 L151 112 Z" fill="#ffcc66"/><circle cx="141" cy="137" r="4" fill="#e7f8ff"/>
+    </g>
+    <g transform="translate(330 56)">
+      <text class="kicker" fill="#7e91b4" font-size="14" font-weight="700" letter-spacing="3" x="0" y="0">02 / CLOUD CORE</text><text class="name" fill="#f1f6ff" font-size="28" font-weight="700" x="0" y="46">云核</text><text class="sub" fill="#a9bedb" font-size="18" x="0" y="78">云里有一台小机器</text>
+      <text class="note" fill="#687d9e" font-size="15" x="0" y="126">科技感最强，识别度高</text><text class="note" fill="#687d9e" font-size="15" x="0" y="151">适合：产品 Logo、机器人头像</text>
+      <rect x="0" y="184" width="74" height="3" fill="#76e3c4"/><rect x="82" y="184" width="52" height="3" fill="#ffcc66"/>
+    </g>
+  </g>
+
+  <!-- 03 Cloud Eye -->
+  <g transform="translate(50 480)">
+    <rect class="card" width="630" height="300" rx="18" fill="#111a2c" stroke="#263858" stroke-width="2"/>
+    <g transform="translate(10 6)">
+      <path d="M42 144 C42 120 61 102 85 102 C91 77 114 59 142 59 C171 59 195 78 200 104 C222 104 239 120 239 142 C239 164 221 179 198 179 H82 C59 179 42 166 42 144 Z" fill="#0f2342" stroke="#dff6ff" stroke-width="7" stroke-linejoin="round"/>
+      <path d="M90 145 C103 122 125 110 145 110 C165 110 184 122 197 145 C184 168 165 180 145 180 C125 180 103 168 90 145 Z" fill="#162f54" stroke="#38c6ff" stroke-width="5"/>
+      <circle cx="145" cy="145" r="20" fill="#0b1930" stroke="#dff6ff" stroke-width="4"/>
+      <path d="M145 145 L145 122 M145 145 L164 157" class="line" stroke="#ffcc66" stroke-width="4" opacity=".8"/>
+      <circle class="beat" cx="145" cy="145" r="7" fill="#ffcc66"/>
+      <path d="M70 199 H205" class="line" stroke="#2498ff" stroke-width="4" stroke-dasharray="16 12"/>
+    </g>
+    <g transform="translate(330 56)">
+      <text class="kicker" fill="#7e91b4" font-size="14" font-weight="700" letter-spacing="3" x="0" y="0">03 / CLOUD EYE</text><text class="name" fill="#f1f6ff" font-size="28" font-weight="700" x="0" y="46">云眼</text><text class="sub" fill="#a9bedb" font-size="18" x="0" y="78">云是外壳，眼是观测</text>
+      <text class="note" fill="#687d9e" font-size="15" x="0" y="126">气象含义最直观</text><text class="note" fill="#687d9e" font-size="15" x="0" y="151">适合：气象研究、数据产品</text>
+      <rect x="0" y="184" width="78" height="3" fill="#dff6ff"/><rect x="86" y="184" width="52" height="3" fill="#ffcc66"/>
+    </g>
+  </g>
+
+  <!-- 04 Cloud Stream -->
+  <g transform="translate(720 480)">
+    <rect class="card" width="630" height="300" rx="18" fill="#111a2c" stroke="#263858" stroke-width="2"/>
+    <g transform="translate(10 6)">
+      <path d="M33 145 C53 106 85 88 119 92 C153 95 170 118 164 140 C158 162 130 171 108 158 C89 147 89 125 105 113 C119 102 139 107 145 121" class="line stream" fill="none" stroke="#4d6bfe" stroke-width="12"/>
+      <path d="M40 181 C77 207 126 212 171 194 C197 184 215 168 225 146" class="line stream" fill="none" stroke="#38c6ff" stroke-width="6"/>
+      <path d="M53 204 C90 225 133 230 174 218" class="line stream" fill="none" stroke="#9cffbe" stroke-width="4" opacity=".85"/>
+      <path d="M204 132 L230 132 L220 122 M230 132 L220 142" class="line" stroke="#ffcc66" stroke-width="5"/>
+      <circle class="beat" cx="74" cy="105" r="7" fill="#dff6ff"/><circle class="beat" cx="178" cy="193" r="6" fill="#9cffbe"/>
+    </g>
+    <g transform="translate(330 56)">
+      <text class="kicker" fill="#7e91b4" font-size="14" font-weight="700" letter-spacing="3" x="0" y="0">04 / CLOUD STREAM</text><text class="name" fill="#f1f6ff" font-size="28" font-weight="700" x="0" y="46">云脉</text><text class="sub" fill="#a9bedb" font-size="18" x="0" y="78">风场 · 流动 · 出发</text>
+      <text class="note" fill="#687d9e" font-size="15" x="0" y="126">最适合做连续动效</text><text class="note" fill="#687d9e" font-size="15" x="0" y="151">适合：网页、启动页、动图</text>
+      <rect x="0" y="184" width="78" height="3" fill="#7de4ff"/><rect x="86" y="184" width="52" height="3" fill="#9cffbe"/>
+    </g>
+  </g>
+</svg>

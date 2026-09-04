@@ -2,7 +2,7 @@ import {BoxRenderable, ScrollBoxRenderable, SyntaxStyle, CliRenderEvents} from '
 import {batch, createSignal, createMemo, createEffect, For, Show as SolidShow, Switch, Match, onCleanup} from 'solid-js';
 import {useTerminalDimensions, useKeyboard, useRenderer} from '@opentui/solid';
 import {startBackend, type Backend} from '../src/backend.ts';
-import {alwaysSeparate, setPreLayoutSiblingMargin} from './layout.ts';
+import {alwaysSeparate, layoutBudget, layoutMode, setPreLayoutSiblingMargin, type LayoutBudget} from './layout.ts';
 import {buildSections} from './sections.ts';
 import type {ActionRow, Entry, Section, SubagentStatus} from './sections.ts';
 import {C} from './theme.ts';
@@ -44,7 +44,6 @@ import {
   createMessageQueue,
   enterCompletionDirectory,
   foldedPasteLabel,
-  footerHint,
   killRingPush,
   killRingYank,
   likelyPaste,
@@ -55,6 +54,7 @@ import {
   type BackendConnectionState,
   type KillRing,
   type PasteSnapshot,
+  queuedMessagePreview,
 } from './interaction.ts';
 
 export type CompletionInputHandlers = {
@@ -1460,7 +1460,7 @@ function StreamingClamp(props: {active: () => boolean; children: any}) {
   }}>{props.children}</box>;
 }
 
-function TranscriptEntryView(props: {entry: Entry; liveEntry?: (id: string) => Entry | undefined; frame: () => string; now: () => number; tick: () => number; focusId: () => string | null; onToggleExpand: (id: string) => void; plainResponse?: boolean; latest?: () => boolean}) {
+function TranscriptEntryView(props: {entry: Entry; liveEntry?: (id: string) => Entry | undefined; frame: () => string; now: () => number; tick: () => number; focusId: () => string | null; onToggleExpand: (id: string) => void; plainResponse?: boolean; latest?: () => boolean; compactRole?: boolean}) {
   const entry: any = props.entry;
   const text = normalizeTranscriptText(entry.text);
   const detail = normalizeTranscriptText(entry.detail);
@@ -1474,7 +1474,11 @@ function TranscriptEntryView(props: {entry: Entry; liveEntry?: (id: string) => E
   const shell = (children: any) => <box flexShrink={0} minWidth={0}>{children}</box>;
   if (entry.kind === 'prompt') {
     return text === null ? <box /> : shell(<box flexDirection="row" minWidth={0} backgroundColor={C.userCard} paddingLeft={1} paddingRight={1}>
-      <text fg={C.primary} wrapMode="none" selectable={false}>›</text>
+      {/* Keep the compact role marker visually explicit without adding a
+       * wide non-selectable gutter before the actual prompt text.  This also
+       * makes the first prompt characters reachable by a mouse drag on small
+       * terminals. */}
+      <text fg={C.primary} wrapMode="none" selectable={false}>{props.compactRole ? '你:' : '›'}</text>
       <SafeText fg={C.text} flexGrow={1} wrapMode="word" value={text} />
     </box>);
   }
@@ -1492,7 +1496,7 @@ function TranscriptEntryView(props: {entry: Entry; liveEntry?: (id: string) => E
     const gutterChar = () => liveStreaming() ? (props.tick() % 5 < 4 ? '▌' : '│') : '│';
     const gutterColor = () => liveStreaming() && props.tick() % 5 < 4 ? C.primary : C.info;
     return text === null ? <box /> : shell(<box flexDirection="row" minWidth={0} paddingTop={1} paddingLeft={1} paddingRight={1}>
-      <text fg={gutterColor()} wrapMode="none" selectable={false}>{gutterChar()}</text>
+      <text fg={gutterColor()} wrapMode="none" selectable={false}>{props.compactRole ? `AI ${gutterChar()}` : gutterChar()}</text>
       <box flexGrow={1} minWidth={0} paddingLeft={1}>
         {props.plainResponse ? <SafeText fg={C.text} wrapMode="word" value={text} /> : <StreamingClamp active={liveStreaming}><markdown syntaxStyle={getMarkdownSyntax()} streaming={liveStreaming()} internalBlockMode="top-level" tableOptions={{style: 'grid'}} content={liveText() ?? ''} fg={C.text} conceal /></StreamingClamp>}
       </box>
@@ -1515,7 +1519,7 @@ function TranscriptEntryView(props: {entry: Entry; liveEntry?: (id: string) => E
     const marker = () => active() ? BRAILLE_SPINNER[props.tick() % BRAILLE_SPINNER.length] : '∴';
     const markerColor = () => active() ? C.info : C.textMuted;
     return shell(<box flexDirection="row" minWidth={0}>
-      <text fg={markerColor()} wrapMode="none" selectable={false}>{marker()}</text>
+      <text fg={markerColor()} wrapMode="none" selectable={false}>{props.compactRole ? `思考 ${marker()} ` : marker()}</text>
       <SafeText fg={C.textMuted} wrapMode="word" flexShrink={1} value={` Thinking · ${text}`} />
     </box>);
   }
@@ -1576,7 +1580,7 @@ function TranscriptEntryView(props: {entry: Entry; liveEntry?: (id: string) => E
     </box>;
   }
   if (entry.kind === 'subagent') {
-    return shell(<SubagentCard agent={entry} frame={props.frame} />);
+    return shell(<SubagentCard agent={entry} frame={props.frame} compact={props.compactRole} />);
   }
   if (entry.kind === 'tasks') {
     const tasks = Array.isArray(entry.tasks) ? entry.tasks : [];
@@ -1585,12 +1589,12 @@ function TranscriptEntryView(props: {entry: Entry; liveEntry?: (id: string) => E
     const active = tasks.find((task: any) => task.status === 'in_progress') || tasks.find((task: any) => task.status === 'pending');
     const activeLabel = normalizeTranscriptText(active?.activeForm || active?.content) || 'Complete';
     const doneCount = tasks.filter((task: any) => task.status === 'completed').length;
-    return shell(<box flexDirection="column" minWidth={0} paddingLeft={1}>
+    return shell(<box flexDirection="column" minWidth={0} paddingLeft={1} backgroundColor="#182028">
       <box flexDirection="row" minWidth={0} gap={1} onMouseUp={(event: any) => {
         if (event?.button === 0) props.onToggleExpand(entry.id);
       }}>
-        <SafeText fg={props.focusId() === entry.id ? C.primary : C.info} value={expanded ? 'v' : '>'} />
-        <SafeText fg={C.info} value="Todo" />
+        <SafeText fg={props.focusId() === entry.id ? C.primary : C.info} value={expanded ? '▾' : '▸'} />
+        <SafeText fg={C.info} value={props.compactRole ? 'TASKS' : 'Todo'} />
         <SafeText fg={C.textMuted} value={`${doneCount}/${tasks.length}`} />
         {expanded ? <box /> : <SafeText fg={C.warning} flexGrow={1} wrapMode="none" truncate value={activeLabel} />}
         <SafeText fg={C.textMuted} value="Tab / Enter" />
@@ -1735,7 +1739,7 @@ function LogView(props: {entries: () => Entry[]; now: () => number; tick: () => 
     return <box flexDirection="column" minWidth={0}>
       <For each={orderedEntries()}>{(entry: Entry, index: () => number) => {
         const latest = () => index() === orderedEntries().length - 1;
-        const row = <TranscriptEntryView entry={entry} liveEntry={liveEntry} frame={frame} now={props.now} tick={props.tick} focusId={props.focusId} onToggleExpand={props.onToggleExpand} plainResponse={props.staticRender} latest={latest} />;
+        const row = <TranscriptEntryView entry={entry} liveEntry={liveEntry} frame={frame} now={props.now} tick={props.tick} focusId={props.focusId} onToggleExpand={props.onToggleExpand} plainResponse={props.staticRender} latest={latest} compactRole={props.width != null && props.width < 100} />;
         const paddingTop = promptPaddingTop(orderedEntries(), index());
         return props.width != null && props.width >= 100
           ? <box flexDirection="row" minWidth={0} paddingTop={paddingTop}><TimelineRail entry={entry} /><box flexGrow={1} minWidth={0}>{row}</box></box>
@@ -1786,6 +1790,18 @@ function LogView(props: {entries: () => Entry[]; now: () => number; tick: () => 
       </SolidShow>
     </box>
   </box>;
+}
+
+/** Local FIFO preview. It is intentionally placed immediately above the
+ * composer, where queued work is actionable and cannot be confused with the
+ * historical transcript. The caller reserves exactly these rows in its
+ * layout budget. */
+function QueuePreview(props: {rows: () => string[]}) {
+  return <SolidShow when={() => props.rows().length > 0} fallback={<box height={0} />}>
+    <box flexDirection="column" minWidth={0} flexShrink={0} paddingX={2} backgroundColor="#151b22">
+      <For each={props.rows()}>{row => <text fg={C.warning} wrapMode="none" truncate selectable={false}>{row}</text>}</For>
+    </box>
+  </SolidShow>;
 }
 
 type DebugEntries = Entry[] | (() => Entry[]);
@@ -1901,6 +1917,7 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
   const [backendExitCode, setBackendExitCode] = createSignal<number | null>(null);
   const [queuedMessages, setQueuedMessages] = createSignal(0);
   const [localPendingMessages, setLocalPendingMessages] = createSignal(0);
+  const [queuedCommands, setQueuedCommands] = createSignal<Record<string, unknown>[]>([]);
   const [offlineMessages, setOfflineMessages] = createSignal<OfflineMessage[]>([]);
   const [currentTool, setCurrentTool] = createSignal<string | null>(null);
   const [toolDone, setToolDone] = createSignal(0);
@@ -1910,6 +1927,10 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
   const [pastedContent, setPastedContent] = createSignal<PasteSnapshot | null>(null);
   const [fullscreenEditor, setFullscreenEditor] = createSignal(false);
   const messageQueue = createMessageQueue(command => send(command));
+  const syncMessageQueueState = () => {
+    setLocalPendingMessages(messageQueue.pendingCount());
+    setQueuedCommands(messageQueue.pending());
+  };
   let lastBufferValue = '';
   let lastBufferChangedAt = 0;
   let suppressContentChange = false;
@@ -1964,6 +1985,7 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
       '/models': 'List available models',
       '/effort': 'Set reasoning effort',
       '/mode': 'Switch mode',
+      '/new': 'Start a new session',
       '/compact': 'Compress context',
       '/status': 'Show status',
       '/clear': 'Clear screen',
@@ -2041,22 +2063,32 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
   const composerLines = () => {
     const v = input();
     if (!v) return 1;
-    // Mode/model/effort moved into the header, so the editor owns almost the
-    // full terminal width. This also makes East-Asian wrapping predictable.
+    // The editor owns almost the full terminal width; model/mode/effort stay
+    // in the footer identity row (the top Header is intentionally absent).
+    // This also makes East-Asian wrapping predictable.
     const width = Math.max(20, dims().width - 6);
     return Math.max(1, Math.min(MAX_COMPOSER_LINES, composerVisualLines(v, width)));
   };
+  const queuePreviewLimit = () => layoutMode(dims().width, dims().height) === 'short' ? 1 : 3;
+  const queuePreview = () => queuedMessagePreview(queuedCommands(), dims().width, queuePreviewLimit());
+  const queuePreviewRows = () => queuePreview().length;
+  const layout = createMemo<LayoutBudget>(() => layoutBudget(
+    dims().width,
+    dims().height,
+    composerLines(),
+    queuePreviewRows(),
+  ));
   // The composer is a bordered card. Border rows are included in the reserved
   // height so the editor never collides with the status bar.
   const composerReservedRows = () => fullscreenEditor()
-    ? Math.max(3, dims().height - HEADER_ROWS - 1)
-    : composerLines() + 2;
+    ? Math.max(3, dims().height - layout().statusRows - 1)
+    : layout().composerRows;
   const editorRows = () => fullscreenEditor()
     ? Math.max(1, composerReservedRows() - 2)
     : composerLines();
   // No header bar: model/mode/effort identity and the context meter live in
   // the two-row footer, so the transcript owns every row above the composer.
-  const HEADER_ROWS = 0;
+  // P0-2 is intentionally skipped: no new top header is reserved.
   // Streaming output is coalesced at a modest cadence. A separate, slow clock
   // updates elapsed labels; the old 30 FPS global signal invalidated the whole
   // page even when no new output had arrived and looked like screen flashing.
@@ -2071,11 +2103,10 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
   // Composer and status occupy the footer; transient toast text shares the
   // status row instead of creating a second line under the input. The footer
   // is two rows: transient status + persistent identity (model/mode/effort/ctx).
-  const footerReservedRows = () => composerReservedRows() + 2;
+  const footerReservedRows = () => composerReservedRows() + layout().statusRows + queuePreviewRows();
   const viewportHeight = () => {
-    const h = dims().height;
     if (fullscreenEditor()) return 0;
-    return Math.max(3, h - HEADER_ROWS - footerReservedRows());
+    return layout().mainRows;
   };
   // The welcome panel shows as soon as the TUI opens and stays until the user
   // submits their first prompt (it is not dismissed by backend logs, which may
@@ -2307,10 +2338,34 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
     if (debugRunning && !startedAt()) setStartedAt(props?.debugStartedAt ?? Date.now());
     if (!debugRunning && startedAt()) setStartedAt(0);
   });
+  // Off-screen/debug callers may provide live accessors instead of a single
+  // snapshot. Mirror those values into the same signals used by backend
+  // events; otherwise Switch keeps the Goal branch mounted but its summary
+  // would remain stuck on the first frame. In the normal app these props are
+  // absent, so the effects are inert.
+  createEffect(() => {
+    if (props?.debugGoal === undefined) return;
+    const nextGoal = resolveDebugValue(props.debugGoal) ?? null;
+    setGoalSnapshot(nextGoal);
+    if (nextGoal) {
+      setLifecycleView('goal');
+      setPhase(nextGoal.phase || 'working');
+    }
+  });
+  createEffect(() => {
+    if (props?.debugDraft === undefined) return;
+    const nextDraft = resolveDebugValue(props.debugDraft) ?? null;
+    setDraftStatus(nextDraft);
+    if (nextDraft && !goalSnapshot()) setLifecycleView('draft');
+  });
+  createEffect(() => {
+    if (props?.debugDecisions === undefined) return;
+    setGoalDecisions(resolveDebugValue(props.debugDecisions) ?? []);
+  });
   createEffect(() => {
     const busy = running();
     messageQueue.setBusy(busy);
-    setLocalPendingMessages(messageQueue.pendingCount());
+    syncMessageQueueState();
   });
   createEffect(() => {
     if (running()) {
@@ -2378,14 +2433,43 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
       }
       switch (event.type) {
       case 'history_replay': {
-        if (entries().length > 0 || !Array.isArray(event.messages)) break;
+        // Startup replay is ignored once local entries exist. Explicit
+        // session switches/new-chat replays are authoritative and replace the
+        // viewport, otherwise `/resume` changes the backend while the old
+        // conversation remains visible in the TUI.
+        const replacing = event.replace === true;
+        if (event.session_id) setSession(String(event.session_id));
+        const hasConversation = entries().some(entry => entry.kind === 'prompt' || entry.kind === 'response');
+        if (!replacing && (hasConversation || !Array.isArray(event.messages))) break;
+        if (!Array.isArray(event.messages)) {
+          if (replacing) {
+            setEntries([]);
+            setUserStarted(false);
+          }
+          break;
+        }
         const replay = event.messages.flatMap((item: any, index: number) => {
           const text = normalizeRenderableText(item?.text);
           if (!text) return [];
           const role = item?.role === 'assistant' ? 'response' : 'prompt';
           return [{id: String(item?.id || `history-${index}`), kind: role, text}];
         });
-        if (replay.length > 0) {
+        if (replacing) {
+          const prefix = event.truncated
+            ? [{id: 'history-replay-divider', kind: 'log', text: '… 已折叠更早的历史消息 · 最近 300 条'} as Entry]
+            : [];
+          setEntries(replay.length > 0 ? [...prefix, ...replay] as Entry[] : []);
+          setUserStarted(replay.length > 0);
+          responseId = '';
+          pendingPrompts = [];
+          clearDeltas();
+          if (event.new_session) {
+            setGoalSnapshot(null);
+            setDraftStatus(null);
+            setGoalDecisions([]);
+            setLifecycleView('chat');
+          }
+        } else if (replay.length > 0) {
           const prefix = event.truncated ? [{id: 'history-replay-divider', kind: 'log', text: '… 已折叠更早的历史消息 · 最近 300 条'} as Entry] : [];
           setEntries([...prefix, ...replay] as Entry[]);
           setUserStarted(true);
@@ -2643,6 +2727,12 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
       case 'task_update': {
         const tasks = Array.isArray(event.tasks) ? event.tasks : [];
         const existing = entries().find(entry => entry.id === 'tasks:current');
+        // An empty startup snapshot is state metadata, not a transcript row.
+        // Do not let it block the first history_replay event.
+        if (tasks.length === 0) {
+          if (existing) setEntries(prev => prev.filter(entry => entry.id !== 'tasks:current'));
+          break;
+        }
         if (existing) update(existing.id, entry => ({...entry, tasks}));
         else add({id: 'tasks:current', kind: 'tasks', text: '计划', tasks, expanded: true});
         break;
@@ -2733,7 +2823,7 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
             // press. The queue itself remains busy-aware and will defer them
             // when an agent run is already active.
             messageQueue.setBusy(running());
-            setLocalPendingMessages(messageQueue.pendingCount());
+            syncMessageQueueState();
             const pending = offlineMessages();
             if (pending.length) {
               const remaining: OfflineMessage[] = [];
@@ -2800,7 +2890,7 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
       send({type: 'permission_response', id: current.id, decision: option.value});
       showToast(option.name);
     } else {
-      const command = current.pickerId === 'model' ? `/model ${option.value}` : (current.pickerId === 'resume' || current.pickerId === 'startup_history') ? `/resume ${option.value}` : current.pickerId === 'effort' ? `/effort ${option.value}` : `/mode ${option.value}`;
+      const command = current.pickerId === 'model' ? `/model ${option.value}` : (current.pickerId === 'resume' || current.pickerId === 'startup_history') ? `/resume ${option.value}` : current.pickerId === 'effort' ? `/effort ${option.value}` : current.pickerId === 'permission' ? `/permission ${option.value}` : `/mode ${option.value}`;
       if (current.pickerId === 'startup_history' && option.value === '__empty__') {
         setOverlay(null); setOverlayIndex(0); showToast('暂无历史会话'); return;
       }
@@ -2921,7 +3011,7 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
       if (backendState() === 'disconnected') reconnectBackend();
       return;
     }
-    const isCommand = text.startsWith('/');
+    const isCommand = text.startsWith('/') || /^(?:\/)?new(?:\s|$)/i.test(text);
     const draftAnswerCheckpoint = draftStatus()?.status === 'clarifying' && Boolean(draftStatus()?.question);
     const goalContext = !isCommand && lifecycleView() === 'draft' && draftAnswerCheckpoint;
     if (backendState() === 'disconnected') {
@@ -2983,7 +3073,7 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
     // chat messages. Ordinary messages use the local FIFO while the agent is
     // busy and drain on the next running -> idle transition.
     const sent = isCommand ? send(command) : messageQueue.submit(command);
-    setLocalPendingMessages(messageQueue.pendingCount());
+    syncMessageQueueState();
     if (!sent) {
       if (!isCommand) pendingPrompts = pendingPrompts.filter(item => item !== text);
       setOfflineMessages(previous => [...previous, {text, goalContext}].slice(-32));
@@ -3054,11 +3144,11 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
     </Match>
 
     <Match when={showGoalPage()}>
-      {(_matched: unknown) => <GoalView goal={goalSnapshot()!} decisions={goalDecisions()} now={now()} tick={tick} width={dims().width} height={viewportHeight()} />}
+      {(_matched: unknown) => <GoalView goal={goalSnapshot} decisions={goalDecisions} now={now} tick={tick} width={() => dims().width} height={() => dims().height} composerEmpty={() => !hasActiveOverlay() && input() === ''} />}
     </Match>
 
     <Match when={showDraftPage()}>
-      {(_matched: unknown) => <GoalDraftView draft={draftStatus()!} now={now()} width={dims().width} height={viewportHeight()} />}
+      {(_matched: unknown) => <GoalDraftView draft={draftStatus} now={now} width={() => dims().width} height={() => dims().height} />}
     </Match>
 
     <Match when={fullscreenEditor()}>
@@ -3098,38 +3188,11 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
       onSelectHistory={chooseHistoryMatch}
     />;
   };
-  const renderStaticTranscript = () => {
-    const lines: string[] = [];
-    for (const entry of displayedEntries() as any[]) {
-      if (entry.kind === 'log') {
-        const value = transcriptLogText(entry);
-        if (value !== null) lines.push(value);
-        continue;
-      }
-      if (entry.kind === 'action') {
-        const output = normalizeActionOutput(entry.output);
-        const expanded = entry.expanded === true;
-        const name = normalizeTranscriptText(entry.name) || normalizeTranscriptText(entry.text) || 'action';
-        const status = normalizeTranscriptText(entry.summary) || normalizeTranscriptText(entry.detail);
-        const summary = status !== null ? `  ${status}` : '';
-        const marker = entry.done ? (entry.ok ? '✓' : '✕') : ['|', '/', '-', '\\'][Math.floor(now() / 180) % 4];
-        lines.push(`${marker} ${name}${summary}${formatElapsed(entry.start, entry.end, now())}`);
-        const visible = expanded ? actionOutputPreview(output, true) : (output.length <= 3 ? output : []);
-        for (const line of visible) lines.push(`  │ ${line}`);
-        if (!expanded && output.length > 3) lines.push(`${name}${summary} · … ${output.length} lines · Enter to expand`);
-        continue;
-      }
-      const text = normalizeTranscriptText(entry.text);
-      if (text === null) continue;
-      if (entry.kind === 'intent') lines.push(`∴ Thinking · ${text}`);
-      else lines.push(text);
-    }
-    return lines.join('\n');
-  };
   return <box width={dims().width} height={dims().height} flexDirection="column" position="relative">
     <box height={viewportHeight()} flexGrow={1} minHeight={0} flexDirection="column">
       {mainContent()}
     </box>
+    {queuePreviewRows() > 0 ? <QueuePreview rows={queuePreview} /> : null}
     <box height={composerReservedRows()} flexShrink={0} minWidth={0} paddingX={1}>
       <box
         height={composerReservedRows()}

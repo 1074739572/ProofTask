@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">Checkbot static mark</title>
+  <desc id="desc">A minimal smiling robot whose left eye is a checkmark.</desc>
+  <rect x="123" y="34" width="10" height="31" rx="5" fill="#14233d"/>
+  <circle cx="128" cy="30" r="10" fill="#14233d"/>
+  <rect x="28" y="58" width="200" height="148" rx="56" fill="#14233d"/>
+  <path d="M67 120l17 17 29-34" fill="none" stroke="#22b9e7" stroke-width="10" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="171" cy="120" r="8" fill="#f7f9ff"/>
+  <path d="M91 160c18 20 56 20 74 0" fill="none" stroke="#f7f9ff" stroke-width="9" stroke-linecap="round"/>
+</svg>

@@ -2,6 +2,7 @@ import {existsSync, readdirSync, readFileSync} from 'node:fs';
 import {join} from 'node:path';
 import {createMemo, For, Show} from 'solid-js';
 import {C} from './theme.ts';
+import {layoutMode} from './layout.ts';
 
 export type UsageRange = 7 | 30 | 90;
 
@@ -143,7 +144,9 @@ function MetricBox(props: {label: string; value: string; detail: string; color?:
 }
 
 export function UsageView(props: {width: number; height: number; range: () => UsageRange; revision: () => number}) {
-  const compact = () => props.width < 86;
+  const mode = () => layoutMode(props.width, props.height);
+  const compact = () => mode() !== 'wide';
+  const short = () => mode() === 'short';
   const dashboard = createMemo(() => {
     props.revision();
     return summarize(props.range());
@@ -206,15 +209,13 @@ export function UsageView(props: {width: number; height: number; range: () => Us
         </box>}</For>
       </box>
 
-      <box border borderStyle="rounded" borderColor={C.textMuted} flexDirection="column" minWidth={0} marginTop={1} paddingX={1}>
-        <text fg={C.secondary}>API balances</text>
-        <For each={providerRows()}>{provider => <box flexDirection={compact() ? 'column' : 'row'} minWidth={0}>
-          <text fg={C.text} width={compact() ? undefined : modelWidth()} wrapMode="none" truncate>{provider.label}</text>
-          <text fg={provider.id === 'xiaomi-mimo' ? C.warning : C.textMuted} wrapMode="none" truncate>
-            {provider.id === 'xiaomi-mimo' ? 'Token quota: pending API integration' : 'Balance: pending API integration'}
-          </text>
-        </box>}</For>
-      </box>
+      <Show when={!short()} fallback={<box height={0} />}>
+        <box border borderStyle="rounded" borderColor={C.textMuted} flexDirection="column" minWidth={0} marginTop={1} paddingX={1}>
+          <text fg={C.secondary}>API balances</text>
+          <text fg={C.textMuted} wrapMode="word">Provider balances are not connected; the local ledger above is authoritative.</text>
+          <For each={providerRows()}>{provider => <text fg={C.textMuted} wrapMode="none" truncate>· {provider.label} · unavailable</text>}</For>
+        </box>
+      </Show>
 
       <box border borderStyle="rounded" borderColor={C.textMuted} flexDirection="column" minWidth={0} marginTop={1} paddingX={1}>
         <text fg={C.secondary}>By model</text>
@@ -236,7 +237,7 @@ export function UsageView(props: {width: number; height: number; range: () => Us
             <text fg={C.textMuted} width={9} wrapMode="none">{formatTokens(row.out)}</text>
             <text fg={C.textMuted} width={8} wrapMode="none">{String(row.calls)}</text>
           </>}>
-            <text fg={C.textMuted} wrapMode="none" truncate>{row.provider} · {formatTokens(inputTokens(row))} in · hit {formatPercent(row.hit, inputTokens(row))} · {row.calls} calls · cost pending</text>
+            <text fg={C.textMuted} wrapMode="none" truncate>{row.provider} · {formatTokens(inputTokens(row))} in · hit {formatPercent(row.hit, inputTokens(row))} · {row.calls} calls</text>
           </Show>
         </box>}</For>
       </box>
@@ -250,7 +251,7 @@ export function UsageView(props: {width: number; height: number; range: () => Us
         </box>}</For>
       </box>
 
-      <text fg={C.textMuted} marginTop={1} wrapMode="word">Prices, provider balances, and call charges are intentionally pending until their APIs and a versioned pricing table are connected.</text>
+      <text fg={C.textMuted} marginTop={1} wrapMode="word">数据来自本地 usage ledger；价格和余额将在接入对应 API 后显示。</text>
     </box>
   </scrollbox>;
 }

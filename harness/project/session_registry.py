@@ -274,11 +274,12 @@ def ensure_active_session(*, fresh: bool) -> SessionBinding:
     return create_session()
 
 
-def list_session_summaries(*, limit: int = 20, hide_empty: bool = False) -> list[dict]:
+def list_session_summaries(*, limit: int = 20, hide_empty: bool = True) -> list[dict]:
     """Newest-first summaries for /resume status.
 
     ``hide_empty`` skips shell sessions (no messages, no real title, not
-    active).  Filtering happens BEFORE the ``limit`` truncation so that a
+    active).  It defaults to ``True`` for the user-facing summary/picker:
+    filtering happens BEFORE the ``limit`` truncation so that a
     pile of freshly-created empty shells can never push real conversations
     out of the picker list.
     """

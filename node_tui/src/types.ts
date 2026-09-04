@@ -34,7 +34,7 @@ export type UiEvent =
   | { type: 'ui_clear'; seq?: number; ts?: number }
   | { type: 'welcome'; seq?: number; ts?: number; art?: string[]; quote?: string; date?: string }
   | { type: 'session_status'; seq?: number; ts?: number; model?: string; mode?: string; cwd?: string; session_id?: string; running?: boolean; session_source?: string }
-  | { type: 'history_replay'; seq?: number; ts?: number; messages: Array<{id?: string; role: 'user' | 'assistant'; text: string}>; truncated?: boolean }
+  | { type: 'history_replay'; seq?: number; ts?: number; messages: Array<{id?: string; role: 'user' | 'assistant'; text: string}>; truncated?: boolean; replace?: boolean; new_session?: boolean; session_id?: string }
   | { type: 'queue_status'; seq?: number; ts?: number; pending: number; running: boolean; capacity?: number }
   | { type: 'message_queued'; seq?: number; ts?: number; text: string; position: number; pending: number }
   | { type: 'backend_state'; seq?: number; ts?: number; state: 'connected' | 'disconnected' | 'reconnecting'; code?: number | null; signal?: string | null; error?: string }

@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">Airflow Cloud</title>
+  <desc id="desc">Cloud outline with a moving airflow stroke.</desc>
+  <style>
+    .cloud{fill:none;stroke:#13233d;stroke-width:20;stroke-linecap:round;stroke-linejoin:round}
+    .flow{fill:none;stroke:#22b9e7;stroke-width:10;stroke-linecap:round;stroke-dasharray:70 90;animation:run 2.6s linear infinite}
+    @keyframes run{to{stroke-dashoffset:-160}}
+    @media(prefers-reduced-motion:reduce){.flow{animation:none}}
+  </style>
+  <path class="cloud" d="M48 158C40 121 63 87 97 76C108 48 137 34 167 41C197 48 216 68 219 94C243 99 255 121 248 142C241 162 223 172 203 169C185 166 173 155 158 148C141 140 126 143 111 155C93 169 68 176 48 158"/>
+  <path class="flow" d="M80 131C99 112 123 107 145 115C160 121 172 131 180 144"/>
+</svg>

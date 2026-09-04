@@ -34,25 +34,9 @@
       "context_window": 1000000
     },
     {
-      "id": "mimo-v2.5-pro",
-      "provider": "xiaomi-mimo",
-      "label": "mimo-v2.5-pro",
-      "api_model": "mimo-v2.5-pro",
-      "context_window": 1000000
-    },
-    {
-      "id": "gpt-5.6-sol(jiaweisi)",
-      "provider": "anzhiyu",
-      "label": "GPT-5.6 sol",
-      "api_model": "gpt-5.6-sol",
-      "context_window": 1000000,
-      "reasoning_effort": "high",
-      "effort_options": ["medium", "high", "xhigh", "max"]
-    },
-    {
       "id": "gpt-5.6-sol",
-      "provider": "anzhiyu",
-      "label": "GPT-5.6 Sol (supervisor alias)",
+      "provider": "kapibala",
+      "label": "GPT-5.6 sol",
       "api_model": "gpt-5.6-sol",
       "context_window": 1000000,
       "reasoning_effort": "high",

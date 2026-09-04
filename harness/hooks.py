@@ -6,6 +6,12 @@ import re
 
 from harness.mcp.pool import mcp_tool_meta
 from harness.messages.blocks import block_field
+from harness.permission_policy import (
+    PermissionPolicyConfigError,
+    auto_approve_levels,
+    classify_tool,
+)
+from harness.permission_session import get_permission_mode, get_permission_session
 from harness.permissions.engine import evaluate_permission
 from harness.permissions.state import (
     add_persistent_rule,
@@ -15,7 +21,17 @@ from harness.permissions.state import (
 from harness.settings import WORKDIR, get_workdir
 from harness.tools.filesystem import safe_path
 from harness.ui import events
-from harness.ui.permission_prompt import PermissionResponse, ask_permission
+from harness.ui.permission_prompt import (
+    PermissionResponse,
+    ask_allow as _DEFAULT_ASK_ALLOW,
+    ask_permission,
+)
+
+# Keep the legacy boolean seam available for embedders/tests that used the
+# earlier ``ask_allow`` prompt API.  Normal production flow below continues to
+# use structured ``ask_permission`` so session/always remembering remains
+# available.
+ask_allow = _DEFAULT_ASK_ALLOW
 
 HOOKS: dict[str, list] = {
     "UserPromptSubmit": [],
@@ -60,19 +76,48 @@ def _hook_print(message: str, *, warn: bool = False) -> None:
         print(f"\033[90m{message}\033[0m" if message.startswith("[HOOK]") else message)
 
 
-def permission_hook(block):
+def _safe_audit(event: dict) -> None:
+    """Best-effort audit helper; permission decisions must never crash a turn."""
+    try:
+        audit_permission(event)
+    except Exception:
+        pass
+
+
+def permission_hook(block, session=None):
     name = block_field(block, "name", "")
+    if not isinstance(name, str):
+        name = str(name or "")
     tool_input = block_field(block, "input", {}) or {}
+    if not isinstance(tool_input, dict):
+        # Malformed provider blocks are denied/handled conservatively rather
+        # than crashing the main loop while trying to inspect ``.get``.
+        tool_input = {}
+
+    def hard_deny(message: str) -> str:
+        """Record and return a non-overridable process/safety denial."""
+        _safe_audit(
+            {
+                "event": "blocked",
+                "tool": name,
+                "resource": "",
+                "reason": message,
+                "source": "safety",
+            }
+        )
+        return message
 
     if name == "bash":
         if "cwd" in tool_input:
-            return "Permission denied: bash working directory is execution-owned and cannot be set by the model"
-        command = tool_input.get("command", "")
+            return hard_deny(
+                "Permission denied: bash working directory is execution-owned and cannot be set by the model"
+            )
+        command = str(tool_input.get("command", "") or "")
         for pattern in DENY_LIST:
             if pattern in command:
-                return f"Permission denied: '{pattern}' is on the deny list"
+                return hard_deny(f"Permission denied: '{pattern}' is on the deny list")
         if _NESTED_AGENT_RE.search(command):
-            return (
+            return hard_deny(
                 "Permission denied: do not spawn a nested interactive agent "
                 "(python main.py / run_cli / start cmd). Run the user's target "
                 "script or service in-process with a finite command; if it needs "
@@ -84,14 +129,69 @@ def permission_hook(block):
         try:
             safe_path(path)
         except Exception:
-            return f"Permission denied: path escapes workspace: {path}"
+            return hard_deny(f"Permission denied: path escapes workspace: {path}")
 
-    decision = evaluate_permission(
-        name,
-        tool_input if isinstance(tool_input, dict) else {},
-        mcp_meta=mcp_tool_meta.get(name),
+    # Goal workers have their own thread-local authority and supervisor
+    # boundary.  Resolve this before applying the interactive mode overlay so
+    # a user's /permission choice can never widen a Goal contract.
+    from harness.goal.runner import is_goal_noninteractive, mark_goal_permission_pending
+
+    # Test harnesses/embedded callers may carry the Goal marker directly on a
+    # serialized block.  The runner's thread-local flag remains authoritative
+    # for production execution paths.
+    explicit_goal = any(
+        block_field(block, key, False) is True
+        for key in ("goal_context", "goal_noninteractive", "supervisor_boundary")
     )
-    audit_permission(
+    if isinstance(tool_input, dict):
+        explicit_goal = explicit_goal or any(
+            tool_input.get(key) is True
+            for key in ("goal_context", "goal_noninteractive", "supervisor_boundary", "_goal_context")
+        )
+    goal_noninteractive = is_goal_noninteractive() or explicit_goal
+
+    # The static risk classifier is deliberately separate from the allow/ask/
+    # deny engine.  ``blocked`` is a hard red line and is handled before any
+    # mode can auto-approve it.  A malformed policy is fail-closed.
+    risk: str | None = None
+    session_mode = None
+    if not goal_noninteractive:
+        try:
+            # Read the live holder for every ordinary request (including
+            # already-allowed low-risk tools) so a mode change between tool
+            # calls is observed deterministically.
+            if session is None:
+                session_mode = get_permission_mode()
+            else:
+                session_mode = (
+                    session.get_mode() if hasattr(session, "get_mode") else session.mode
+                )
+            risk = classify_tool(
+                name,
+                tool_input if isinstance(tool_input, dict) else {},
+            )
+        except (PermissionPolicyConfigError, OSError, ValueError) as exc:
+            return hard_deny(f"Permission denied: permission policy unavailable ({exc})")
+        except Exception as exc:
+            return hard_deny(f"Permission denied: permission policy unavailable ({exc})")
+        if risk == "blocked":
+            return hard_deny(
+                f"Permission denied: {name} is classified as blocked by the safety policy"
+            )
+        if risk not in {"low", "medium", "high"}:
+            # Third-party classifiers must not accidentally introduce a new
+            # auto-approvable level.  Unknown values are treated conservatively.
+            risk = "high"
+
+    try:
+        decision = evaluate_permission(
+            name,
+            tool_input if isinstance(tool_input, dict) else {},
+            mcp_meta=mcp_tool_meta.get(name),
+        )
+    except Exception as exc:
+        return hard_deny(f"Permission denied: permission engine unavailable ({exc})")
+    _safe_audit(
         {
             "event": "decision",
             "tool": name,
@@ -101,10 +201,12 @@ def permission_hook(block):
             "source": decision.source,
             "save_tool": decision.save_tool,
             "save_resource": decision.save_resource,
+            "risk": risk or "goal",
+            "mode": session_mode or "goal",
         }
     )
     if decision.effect == "deny":
-        audit_permission(
+        _safe_audit(
             {
                 "event": "blocked",
                 "tool": name,
@@ -121,9 +223,6 @@ def permission_hook(block):
     # enforce them even when the generic policy says ``allow``. Other allowed
     # tools keep their normal policy behavior; unresolved ``ask`` decisions
     # become supervisor boundaries instead of interactive prompts.
-    from harness.goal.runner import is_goal_noninteractive, mark_goal_permission_pending
-
-    goal_noninteractive = is_goal_noninteractive()
     if goal_noninteractive and (
         name in {"write_file", "edit_file", "patch_file"} or decision.effect != "allow"
     ):
@@ -134,7 +233,7 @@ def permission_hook(block):
             tool_input if isinstance(tool_input, dict) else {},
         )
         if scoped.allowed:
-            audit_permission(
+            _safe_audit(
                 {
                     "event": "goal_scope_allow",
                     "tool": name,
@@ -156,7 +255,7 @@ def permission_hook(block):
         if name == "bash":
             request["command"] = str(tool_input.get("command") or "")[:2_000]
         mark_goal_permission_pending(request)
-        audit_permission({"event": "goal_supervisor_boundary", **request})
+        _safe_audit({"event": "goal_supervisor_boundary", **request})
         return (
             f"Permission deferred: {name} on {decision.resource!r} is outside the current Goal capability. "
             "The global supervisor will analyze this request at the next safe checkpoint."
@@ -164,6 +263,41 @@ def permission_hook(block):
 
     if decision.effect == "allow":
         return None
+
+    # Apply the selected session mode only to ordinary interactive ``ask``
+    # decisions.  Explicit safety/external-directory asks remain prompts even
+    # in full-access mode; those gates protect boundaries that a convenience
+    # mode must not silently remove.  Saved explicit approvals still arrive as
+    # ``allow`` above and therefore retain their existing semantics.
+    if not goal_noninteractive and decision.effect == "ask" and risk is not None:
+        try:
+            mode = session_mode
+            if mode is None:
+                mode = get_permission_mode()
+            auto_levels = set(auto_approve_levels(mode))
+        except (PermissionPolicyConfigError, OSError, ValueError) as exc:
+            return hard_deny(f"Permission denied: permission policy unavailable ({exc})")
+        except Exception as exc:
+            return hard_deny(f"Permission denied: permission policy unavailable ({exc})")
+        boundary_ask = (
+            decision.source == "safety"
+            or decision.save_tool == "external_directory"
+            or bool(decision.external_resource)
+        )
+        if risk in auto_levels and not boundary_ask:
+            _safe_audit(
+                {
+                    "event": "auto_approved",
+                    "tool": name,
+                    "resource": decision.resource,
+                    "effect": "allow",
+                    "risk": risk,
+                    "mode": mode,
+                    "reason": f"{mode} auto-approves {risk}",
+                    "source": "session_mode",
+                }
+            )
+            return None
 
     _hook_print(f"[permission] {name} requires approval", warn=True)
     if decision.resource and decision.resource != "*":
@@ -181,14 +315,37 @@ def permission_hook(block):
         )
         response = PermissionResponse("jsonl-permission", choice, decision.resource or name)
     else:
-        response = ask_permission(
-            "  Allow? [y/N] ",
-            detail=decision.resource or name,
-            title=f"Allow {name}?",
-            editable=name == "bash",
-            remember=True,
-        )
-    audit_permission(
+        # ``ask_allow`` is retained as a compatibility seam.  It is only used
+        # when a caller explicitly replaces that legacy symbol; otherwise use
+        # the structured prompt with session/always choices.
+        if ask_allow is not _DEFAULT_ASK_ALLOW:
+            try:
+                choice = ask_allow(
+                    "  Allow? [y/N] ",
+                    detail=decision.resource or name,
+                    title=f"Allow {name}?",
+                )
+            except TypeError:
+                # A minimal test/embedding callback may accept no keyword
+                # arguments; keep the compatibility path forgiving.
+                choice = ask_allow("  Allow? [y/N] ")
+            if isinstance(choice, PermissionResponse):
+                response = choice
+            else:
+                response = PermissionResponse(
+                    "classic-permission",
+                    "cancel" if choice is None else ("allow" if bool(choice) else "deny"),
+                    decision.resource or name,
+                )
+        else:
+            response = ask_permission(
+                "  Allow? [y/N] ",
+                detail=decision.resource or name,
+                title=f"Allow {name}?",
+                editable=name == "bash",
+                remember=True,
+            )
+    _safe_audit(
         {
             "event": "reply",
             "tool": name,

@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">云环 Cloud Orbit</title>
+  <desc id="desc">A cloud wrapped by an orbiting sensing point.</desc>
+  <style>
+    .orbit { fill:none; stroke-linecap:round; transform-box:view-box; transform-origin:50% 50%; animation:spin 5.4s linear infinite; }
+    .sensor { transform-box:view-box; transform-origin:50% 50%; animation:spin 5.4s linear infinite; }
+    .core { transform-box:fill-box; transform-origin:center; animation:breathe 2s ease-in-out infinite; }
+    .halo { transform-box:fill-box; transform-origin:center; animation:ping 2s ease-out infinite; }
+    .intro { stroke-dashoffset:0; animation:intro 900ms ease-out forwards, spin 5.4s 900ms linear infinite; }
+    @keyframes intro { from { stroke-dashoffset:540; } to { stroke-dashoffset:0; } }
+    @keyframes spin { to { transform:rotate(360deg); } }
+    @keyframes breathe { 0%,100% { transform:scale(.82); opacity:.7; } 50% { transform:scale(1.12); opacity:1; } }
+    @keyframes ping { 0%,100% { transform:scale(.55); opacity:.25; } 55% { transform:scale(1.8); opacity:0; } }
+    @media (prefers-reduced-motion:reduce) { .orbit,.sensor,.core,.halo { animation:none; } .intro { stroke-dashoffset:0; } }
+  </style>
+  <path class="orbit intro" d="M40 148 A104 70 0 1 1 216 205" fill="none" stroke="#4d6bfe" stroke-width="9" stroke-linecap="round" stroke-dasharray="390 150" stroke-dashoffset="0"/>
+  <path d="M55 145 C55 121 74 103 97 103 C103 78 125 61 151 61 C179 61 201 80 206 106 C226 106 241 121 241 141 C241 162 224 177 202 177 H91 C70 177 55 164 55 145 Z" fill="#132a4b" stroke="#e7f8ff" stroke-width="7" stroke-linejoin="round"/>
+  <path d="M82 160 H198" fill="none" stroke="#2498ff" stroke-width="5" stroke-linecap="round" opacity=".8"/>
+  <circle class="core" cx="140" cy="127" r="8" fill="#dff6ff"/>
+  <g class="sensor"><circle class="halo" cx="128" cy="41" r="14" fill="#2498ff" opacity=".22"/><circle cx="128" cy="41" r="5.5" fill="#ffffff"/></g>
+</svg>

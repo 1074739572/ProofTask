@@ -1,0 +1,62 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">Checkbot</title>
+  <desc id="desc">A minimal smiling robot whose left eye is a checkmark.</desc>
+  <style>
+    .head, .antenna { fill: #14233d; }
+    .feature {
+      fill: none;
+      stroke: #f7f9ff;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+    .check-base {
+      fill: none;
+      stroke: #22b9e7;
+      stroke-width: 10;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+      opacity: .22;
+    }
+    .check-draw {
+      fill: none;
+      stroke: #22b9e7;
+      stroke-width: 10;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+      stroke-dasharray: 72;
+      animation: approve 3.4s cubic-bezier(.22,.8,.22,1) infinite;
+    }
+    .eye {
+      fill: #f7f9ff;
+      transform-box: fill-box;
+      transform-origin: center;
+      animation: blink 3.4s ease-in-out infinite;
+    }
+    @keyframes approve {
+      0%, 10% { stroke-dashoffset: 72; opacity: 0; }
+      14% { opacity: 1; }
+      34%, 100% { stroke-dashoffset: 0; opacity: 1; }
+    }
+    @keyframes blink {
+      0%, 42%, 48%, 100% { transform: scaleY(1); }
+      45% { transform: scaleY(.14); }
+    }
+    @media (prefers-color-scheme: dark) {
+      .head, .antenna { fill: #f7f9ff; }
+      .feature, .eye { stroke: #101827; fill: #101827; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      .check-draw, .eye { animation: none; }
+      .check-draw { stroke-dashoffset: 0; }
+    }
+  </style>
+
+  <rect class="antenna" x="123" y="34" width="10" height="31" rx="5"/>
+  <circle class="antenna" cx="128" cy="30" r="10"/>
+  <rect class="head" x="28" y="58" width="200" height="148" rx="56"/>
+
+  <path class="check-base" d="M67 120l17 17 29-34"/>
+  <path class="check-draw" d="M67 120l17 17 29-34"/>
+  <circle class="eye" cx="171" cy="120" r="8"/>
+  <path class="feature" d="M91 160c18 20 56 20 74 0" stroke-width="9"/>
+</svg>

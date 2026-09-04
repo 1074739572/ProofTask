@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">Meteo Agent 风眼（深色版）</title>
+  <desc id="desc">Minimal animated weather-agent mark for a dark terminal.</desc>
+  <style>
+    .flow { fill:none; stroke-linecap:round; stroke-linejoin:round; transform-box:view-box; transform-origin:50% 50%; }
+    .flow-a { stroke:#78a1ff; stroke-width:12; stroke-dasharray:430 120; animation:intro 900ms cubic-bezier(.2,.8,.2,1) forwards, flow 5.6s 900ms linear infinite; }
+    .flow-b { stroke:#38c6ff; stroke-width:6; stroke-dasharray:168 116; animation:flow-reverse 4.2s linear infinite; opacity:.9; }
+    .core { fill:#ffffff; transform-box:fill-box; transform-origin:center; animation:breathe 1.9s ease-in-out infinite; }
+    .halo { fill:#38c6ff; opacity:.24; transform-box:fill-box; transform-origin:center; animation:ping 1.9s ease-out infinite; }
+    .sensor-orbit { transform-box:view-box; transform-origin:50% 50%; animation:orbit 5.6s linear infinite; }
+    .sensor { fill:#ffffff; }
+    .south { fill:#38c6ff; }
+    .intro { stroke-dashoffset:0; }
+    @keyframes intro { from { stroke-dashoffset:620; } to { stroke-dashoffset:0; } }
+    @keyframes flow { to { transform:rotate(360deg); } }
+    @keyframes flow-reverse { to { transform:rotate(-360deg); } }
+    @keyframes orbit { to { transform:rotate(360deg); } }
+    @keyframes breathe { 0%,100% { transform:scale(.78); opacity:.72; } 50% { transform:scale(1.12); opacity:1; } }
+    @keyframes ping { 0%,100% { transform:scale(.55); opacity:.28; } 58% { transform:scale(1.8); opacity:0; } }
+    @media (prefers-reduced-motion:reduce) { .flow,.core,.halo,.sensor-orbit { animation:none; } .intro { stroke-dashoffset:0; } }
+  </style>
+  <path class="flow flow-a intro" d="M48 157 C34 111 59 64 103 47 C151 29 205 53 218 99 C232 148 201 196 154 208 C108 220 66 195 62 157 C58 122 81 92 111 85 C143 78 172 98 171 125 C170 149 150 162 128 158" fill="none" stroke="#78a1ff" stroke-width="12" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="430 120" stroke-dashoffset="0"/>
+  <path class="flow flow-b" d="M42 183 C77 218 138 231 190 204 C216 191 231 172 238 149" fill="none" stroke="#38c6ff" stroke-width="6" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="168 116" opacity=".9"/>
+  <path class="south" d="M128 224 l-8 -14 h16 z" fill="#38c6ff"/>
+  <g class="sensor-orbit"><circle class="halo" cx="128" cy="37" r="14" fill="#38c6ff"/><circle class="sensor" cx="128" cy="37" r="5.5" fill="#ffffff"/></g>
+  <circle class="core" cx="128" cy="128" r="8" fill="#ffffff"/>
+</svg>

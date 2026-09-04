@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">云眼 Cloud Eye</title>
+  <desc id="desc">A cloud-shaped observatory with a rotating radar eye.</desc>
+  <style>
+    .scan { transform-box:view-box; transform-origin:50% 50%; animation:scan 2.8s linear infinite; }
+    .pupil { transform-box:fill-box; transform-origin:center; animation:pupil 1.7s ease-in-out infinite; }
+    .signal { stroke-dasharray:16 12; animation:signal 1.8s linear infinite; }
+    @keyframes scan { to { transform:rotate(360deg); } }
+    @keyframes pupil { 0%,100% { transform:scale(.78); opacity:.72; } 50% { transform:scale(1.1); opacity:1; } }
+    @keyframes signal { to { stroke-dashoffset:-56; } }
+    @media (prefers-reduced-motion:reduce) { .scan,.pupil,.signal { animation:none; } }
+  </style>
+  <path d="M42 144 C42 120 61 102 85 102 C91 77 114 59 142 59 C171 59 195 78 200 104 C222 104 239 120 239 142 C239 164 221 179 198 179 H82 C59 179 42 166 42 144 Z" fill="#0f2342" stroke="#dff6ff" stroke-width="7" stroke-linejoin="round"/>
+  <path d="M90 145 C103 122 125 110 145 110 C165 110 184 122 197 145 C184 168 165 180 145 180 C125 180 103 168 90 145 Z" fill="#162f54" stroke="#38c6ff" stroke-width="5"/>
+  <circle cx="145" cy="145" r="20" fill="#0b1930" stroke="#dff6ff" stroke-width="4"/>
+  <g class="scan"><path d="M145 145 L145 122" fill="none" stroke="#ffcc66" stroke-width="4" stroke-linecap="round"/><path d="M145 145 L164 157" fill="none" stroke="#ffcc66" stroke-width="3" stroke-linecap="round" opacity=".45"/></g>
+  <circle class="pupil" cx="145" cy="145" r="7" fill="#ffcc66"/>
+  <path class="signal" d="M70 199 H205" fill="none" stroke="#2498ff" stroke-width="4" stroke-linecap="round"/>
+</svg>

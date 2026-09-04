@@ -296,3 +296,12 @@ def classify_tool(tool_name: str, tool_input: Optional[Mapping[str, Any]] = None
     if risk is None:
         return UNKNOWN_TOOL_RISK
     return risk
+
+
+def auto_approve_levels(mode: str) -> FrozenSet[str]:
+    """Return the static policy's auto-approval levels for ``mode``.
+
+    This small functional facade mirrors :func:`classify_tool` and keeps
+    runtime integrations from reaching into the policy object's internals.
+    """
+    return default_policy().auto_approve_levels(mode)

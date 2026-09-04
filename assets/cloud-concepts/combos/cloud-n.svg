@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">Cloud N</title>
+  <desc id="desc">Cloud silhouette with N negative space.</desc>
+  <style>
+    .n{fill:none;stroke:#fff;stroke-width:13;stroke-linecap:round;stroke-linejoin:round}
+    .sig{fill:#22b9e7;transform-box:fill-box;transform-origin:center;animation:pulse 1.8s ease-in-out infinite}
+    @keyframes pulse{0%,100%{transform:scaleX(.65);opacity:.45}50%{transform:scaleX(1.2);opacity:1}}
+    @media(prefers-reduced-motion:reduce){.sig{animation:none}}
+  </style>
+  <path fill="#13233d" d="M24 137C32 101 61 76 98 75C108 45 137 31 166 41C191 32 222 48 229 78C248 83 259 101 259 119C259 137 248 150 234 157C223 163 214 161 204 157C190 151 181 145 166 142C150 139 137 144 123 156C107 169 92 181 73 180C47 178 27 162 24 137Z"/>
+  <path class="n" d="M76 153V101L181 154V102"/>
+  <rect class="sig" x="226" y="159" width="14" height="7" rx="3.5"/>
+</svg>

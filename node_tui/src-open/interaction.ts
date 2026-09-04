@@ -1,6 +1,7 @@
 import {existsSync, mkdirSync, readFileSync} from 'node:fs';
 import {writeFile} from 'node:fs/promises';
 import path from 'node:path';
+import {clipTerminalText} from './layout.ts';
 
 export const MAX_HISTORY_ITEMS = 50;
 export const PASTE_DETECTION_THRESHOLD = 100;
@@ -135,7 +136,7 @@ export function queuedMessagePreview(
   const max = Math.max(12, Math.floor(width) - 14);
   const rows = pending.slice(0, Math.max(0, limit)).map((command, index) => {
     const text = String(command.text ?? '').replace(/\s+/g, ' ').trim();
-    const clipped = text.length > max ? `${text.slice(0, Math.max(1, max - 1))}…` : text;
+    const clipped = clipTerminalText(text, max);
     return `⏳ QUEUED ${index + 1}  ${clipped || '(empty)'}`;
   });
   if (pending.length > rows.length) rows.push(`… ${pending.length - rows.length} more queued`);

@@ -1,0 +1,134 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1400 820" role="img" aria-labelledby="title desc">
+  <title id="title">Meteo Agent logo concept board</title>
+  <desc id="desc">Four cybernetic weather-agent logo directions: Radar Core, Weather Probe, Storm Node, and Cyber Wind.</desc>
+  <style>
+    text { font-family: "Inter", "Noto Sans SC", "Microsoft YaHei", sans-serif; }
+    .card { fill:#111a2c; stroke:#233454; stroke-width:2; }
+    .kicker { fill:#7e91b4; font-size:14px; letter-spacing:3px; font-weight:700; }
+    .name { fill:#f1f6ff; font-size:28px; font-weight:700; }
+    .cn { fill:#a9bedb; font-size:18px; }
+    .note { fill:#687d9e; font-size:15px; }
+    .a { stroke:#4d6bfe; }
+    .a2 { stroke:#2498ff; }
+    .b { stroke:#5be0c0; }
+    .b2 { stroke:#ffcc66; }
+    .c { stroke:#b07cff; }
+    .c2 { stroke:#ff6f91; }
+    .d { stroke:#7de4ff; }
+    .d2 { stroke:#9cffbe; }
+    .line { fill:none; stroke-linecap:round; stroke-linejoin:round; }
+    .spin-a { transform-box:view-box; transform-origin:170px 306px; animation:spin-a 7s linear infinite; }
+    .spin-b { transform-box:view-box; transform-origin:850px 306px; animation:spin-b 5s linear infinite; }
+    .pulse { transform-box:fill-box; transform-origin:center; animation:pulse 1.8s ease-in-out infinite; }
+    .dash { stroke-dasharray:90 34; animation:dash 3.2s linear infinite; }
+    @keyframes spin-a { to { transform:rotate(360deg); } }
+    @keyframes spin-b { to { transform:rotate(-360deg); } }
+    @keyframes pulse { 0%,100% { transform:scale(.82); opacity:.7; } 50% { transform:scale(1.15); opacity:1; } }
+    @keyframes dash { to { stroke-dashoffset:-248; } }
+    @media (prefers-reduced-motion:reduce) { .spin-a,.spin-b,.pulse,.dash { animation:none; } }
+  </style>
+
+  <rect width="1400" height="820" fill="#080d19"/>
+  <text x="56" y="62" fill="#f1f6ff" font-size="30" font-weight="700" letter-spacing="1">METEO AGENT</text>
+  <text x="56" y="94" fill="#6f83a4" font-size="15" letter-spacing="4">CONCEPT BOARD  /  WEATHER × MACHINE × MOTION</text>
+  <text x="1344" y="72" text-anchor="end" fill="#2498ff" font-size="15" letter-spacing="2">PICK A DIRECTION</text>
+
+  <!-- A / Radar Core -->
+  <g transform="translate(50 140)">
+    <rect class="card" width="630" height="300" rx="18"/>
+    <g transform="translate(10 6)">
+      <g class="spin-a">
+        <circle cx="160" cy="160" r="104" class="line a" stroke="#4d6bfe" stroke-width="8" stroke-dasharray="160 44" fill="none"/>
+        <circle cx="160" cy="160" r="78" class="line a2" stroke="#2498ff" stroke-width="5" stroke-dasharray="96 36" fill="none"/>
+        <path d="M160 48v18M160 254v18M48 160h18M254 160h18" class="line a2" fill="none" stroke="#2498ff" stroke-width="4"/>
+      </g>
+      <path d="M160 84 L205 112 L205 188 L160 216 L115 188 L115 112 Z" fill="#0c1730" stroke="#dff6ff" stroke-width="4"/>
+      <path d="M160 115 L181 150 L163 150 L175 181 L139 141 L156 141 Z" fill="#2498ff"/>
+      <circle cx="160" cy="160" r="9" class="pulse" fill="#dff6ff"/>
+      <circle cx="232" cy="91" r="7" fill="#5be0c0"/>
+      <path d="M232 91 L253 70" class="line" fill="none" stroke="#5be0c0" stroke-width="3" stroke-dasharray="4 5"/>
+    </g>
+    <g transform="translate(330 56)">
+      <text class="kicker" fill="#7e91b4" font-size="14" font-weight="700" letter-spacing="3" x="0" y="0">01 / RADAR CORE</text>
+      <text class="name" fill="#f1f6ff" font-size="28" font-weight="700" x="0" y="46">雷达机芯</text>
+      <text class="cn" fill="#a9bedb" font-size="18" x="0" y="78">观测 · 推理 · 响应</text>
+      <text class="note" fill="#687d9e" font-size="15" x="0" y="126">最像 Agent 状态标记</text>
+      <text class="note" fill="#687d9e" font-size="15" x="0" y="151">适合：终端、头像、加载动画</text>
+      <rect x="0" y="184" width="90" height="3" fill="#4d6bfe"/>
+      <rect x="98" y="184" width="52" height="3" fill="#2498ff"/>
+      <rect x="158" y="184" width="26" height="3" fill="#5be0c0"/>
+    </g>
+  </g>
+
+  <!-- B / Weather Probe -->
+  <g transform="translate(720 140)">
+    <rect class="card" width="630" height="300" rx="18"/>
+    <g transform="translate(10 6)">
+      <g class="spin-b">
+        <ellipse cx="160" cy="160" rx="111" ry="53" class="line b" stroke="#5be0c0" stroke-width="5" stroke-dasharray="118 36" fill="none" transform="rotate(-24 160 160)"/>
+        <circle cx="258" cy="126" r="7" fill="#ffcc66"/>
+        <path d="M258 126 L278 115" class="line b2" fill="none" stroke="#ffcc66" stroke-width="3" stroke-dasharray="4 5"/>
+      </g>
+      <path d="M160 62v28M160 62v-17" class="line b2" fill="none" stroke="#ffcc66" stroke-width="4"/>
+      <circle cx="160" cy="42" r="8" fill="#ffcc66"/>
+      <rect x="108" y="90" width="104" height="143" rx="48" fill="#0c1730" stroke="#dff6ff" stroke-width="4"/>
+      <path d="M108 126 H83 L67 145 L83 164 H108 M212 126 H237 L253 145 L237 164 H212" class="line b" fill="none" stroke="#5be0c0" stroke-width="5"/>
+      <circle cx="160" cy="145" r="30" fill="#132745" stroke="#5be0c0" stroke-width="5"/>
+      <circle cx="160" cy="145" r="11" class="pulse" fill="#dff6ff"/>
+      <path d="M138 207 H182" class="line b2" fill="none" stroke="#ffcc66" stroke-width="5"/>
+    </g>
+    <g transform="translate(330 56)">
+      <text class="kicker" fill="#7e91b4" font-size="14" font-weight="700" letter-spacing="3" x="0" y="0">02 / WEATHER PROBE</text>
+      <text class="name" fill="#f1f6ff" font-size="28" font-weight="700" x="0" y="46">气象探针</text>
+      <text class="cn" fill="#a9bedb" font-size="18" x="0" y="78">感知 · 定位 · 连接</text>
+      <text class="note" fill="#687d9e" font-size="15" x="0" y="126">更像一台在工作的机器</text>
+      <text class="note" fill="#687d9e" font-size="15" x="0" y="151">适合：个人头像、机器人角色</text>
+      <rect x="0" y="184" width="70" height="3" fill="#5be0c0"/>
+      <rect x="78" y="184" width="52" height="3" fill="#ffcc66"/>
+    </g>
+  </g>
+
+  <!-- C / Storm Node -->
+  <g transform="translate(50 480)">
+    <rect class="card" width="630" height="300" rx="18"/>
+    <g transform="translate(10 6)">
+      <path d="M160 48 L245 97 L245 194 L160 242 L75 194 L75 97 Z" fill="#151329" stroke="#b07cff" stroke-width="7"/>
+      <path d="M160 76 L214 108 V171 L160 202 L106 171 V108 Z" fill="none" stroke="#593e91" stroke-width="3"/>
+      <path d="M160 93 L137 147 H158 L147 184 L188 130 H166 L179 93 Z" fill="#ff6f91"/>
+      <path d="M75 121 H42 V101 H22 M245 121 H278 V101 H298 M75 176 H42 V196 H22 M245 176 H278 V196 H298" class="line c" fill="none" stroke="#b07cff" stroke-width="4"/>
+      <circle cx="22" cy="101" r="6" fill="#7de4ff"/><circle cx="298" cy="101" r="6" fill="#7de4ff"/>
+      <circle cx="22" cy="196" r="6" fill="#ff6f91"/><circle cx="298" cy="196" r="6" fill="#ff6f91"/>
+      <circle cx="160" cy="220" r="8" class="pulse" fill="#f5eaff"/>
+    </g>
+    <g transform="translate(330 56)">
+      <text class="kicker" fill="#7e91b4" font-size="14" font-weight="700" letter-spacing="3" x="0" y="0">03 / STORM NODE</text>
+      <text class="name" fill="#f1f6ff" font-size="28" font-weight="700" x="0" y="46">风暴节点</text>
+      <text class="cn" fill="#a9bedb" font-size="18" x="0" y="78">数据 · 能量 · 行动</text>
+      <text class="note" fill="#687d9e" font-size="15" x="0" y="126">最有赛博 / 机器感</text>
+      <text class="note" fill="#687d9e" font-size="15" x="0" y="151">适合：产品 Logo、深色界面</text>
+      <rect x="0" y="184" width="74" height="3" fill="#b07cff"/>
+      <rect x="82" y="184" width="52" height="3" fill="#ff6f91"/>
+    </g>
+  </g>
+
+  <!-- D / Cyber Wind -->
+  <g transform="translate(720 480)">
+    <rect class="card" width="630" height="300" rx="18"/>
+    <g transform="translate(10 6)">
+      <path d="M48 117 C82 74 127 66 168 89 C206 110 222 151 202 181 C179 216 130 220 98 193 C74 173 75 140 98 121 C118 105 149 108 160 127" class="line d dash" fill="none" stroke="#7de4ff" stroke-width="11"/>
+      <path d="M48 189 C78 220 125 235 175 218 C206 207 229 186 243 158" class="line d2" fill="none" stroke="#9cffbe" stroke-width="5" stroke-dasharray="74 24"/>
+      <path d="M161 127 L186 127 L176 148 L196 148 L163 185 L169 159 L150 159 Z" fill="#9cffbe"/>
+      <circle cx="57" cy="107" r="8" fill="#7de4ff"/><circle cx="238" cy="146" r="8" fill="#9cffbe"/>
+      <circle cx="160" cy="150" r="7" class="pulse" fill="#f4ffff"/>
+    </g>
+    <g transform="translate(330 56)">
+      <text class="kicker" fill="#7e91b4" font-size="14" font-weight="700" letter-spacing="3" x="0" y="0">04 / CYBER WIND</text>
+      <text class="name" fill="#f1f6ff" font-size="28" font-weight="700" x="0" y="46">赛博风场</text>
+      <text class="cn" fill="#a9bedb" font-size="18" x="0" y="78">流动 · 学习 · 出发</text>
+      <text class="note" fill="#687d9e" font-size="15" x="0" y="126">最轻、最容易做成动效</text>
+      <text class="note" fill="#687d9e" font-size="15" x="0" y="151">适合：网页、启动页、动图</text>
+      <rect x="0" y="184" width="76" height="3" fill="#7de4ff"/>
+      <rect x="84" y="184" width="52" height="3" fill="#9cffbe"/>
+    </g>
+  </g>
+</svg>

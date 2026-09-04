@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">Full Cloud System</title>
+  <desc id="desc">Cloud silhouette combining airflow and N node.</desc>
+  <style>
+    .n{fill:none;stroke:#fff;stroke-width:12;stroke-linecap:round;stroke-linejoin:round}
+    .flow{fill:none;stroke:#22b9e7;stroke-width:8;stroke-linecap:round;stroke-dasharray:70 100;animation:run 2.8s linear infinite}
+    @keyframes run{to{stroke-dashoffset:-170}}
+    @media(prefers-reduced-motion:reduce){.flow{animation:none}}
+  </style>
+  <path fill="#13233d" d="M24 137C32 101 61 76 98 75C108 45 137 31 166 41C191 32 222 48 229 78C248 83 259 101 259 119C259 137 248 150 234 157C223 163 214 161 204 157C190 151 181 145 166 142C150 139 137 144 123 156C107 169 92 181 73 180C47 178 27 162 24 137Z"/>
+  <path class="n" d="M76 153V101L181 154V102"/>
+  <path class="flow" d="M72 171C109 184 143 175 165 155"/>
+</svg>

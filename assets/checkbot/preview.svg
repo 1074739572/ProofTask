@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1400 760" role="img" aria-labelledby="title desc">
+  <title id="title">Checkbot logo preview</title>
+  <desc id="desc">The same minimal check-eye robot logo shown on light and dark backgrounds and at small sizes.</desc>
+  <defs>
+    <g id="robot-light">
+      <rect x="123" y="34" width="10" height="31" rx="5" fill="#14233d"/>
+      <circle cx="128" cy="30" r="10" fill="#14233d"/>
+      <rect x="28" y="58" width="200" height="148" rx="56" fill="#14233d"/>
+      <path d="M67 120l17 17 29-34" fill="none" stroke="#22b9e7" stroke-width="10" stroke-linecap="round" stroke-linejoin="round"/>
+      <circle cx="171" cy="120" r="8" fill="#f7f9ff"/>
+      <path d="M91 160c18 20 56 20 74 0" fill="none" stroke="#f7f9ff" stroke-width="9" stroke-linecap="round"/>
+    </g>
+    <g id="robot-dark">
+      <rect x="123" y="34" width="10" height="31" rx="5" fill="#f7f9ff"/>
+      <circle cx="128" cy="30" r="10" fill="#f7f9ff"/>
+      <rect x="28" y="58" width="200" height="148" rx="56" fill="#f7f9ff"/>
+      <path d="M67 120l17 17 29-34" fill="none" stroke="#22b9e7" stroke-width="10" stroke-linecap="round" stroke-linejoin="round"/>
+      <circle cx="171" cy="120" r="8" fill="#101827"/>
+      <path d="M91 160c18 20 56 20 74 0" fill="none" stroke="#101827" stroke-width="9" stroke-linecap="round"/>
+    </g>
+    <style>
+      .eyebrow { font: 600 16px Arial, sans-serif; letter-spacing: 3px; fill: #6f7f98; }
+      .title { font: 700 28px Arial, sans-serif; letter-spacing: 5px; fill: #14233d; }
+      .body { font: 16px Arial, sans-serif; fill: #7a889e; }
+      .dark-eyebrow { font: 600 16px Arial, sans-serif; letter-spacing: 3px; fill: #8ea0ba; }
+      .dark-title { font: 700 28px Arial, sans-serif; letter-spacing: 5px; fill: #f7f9ff; }
+      .dark-body { font: 16px Arial, sans-serif; fill: #93a4bd; }
+    </style>
+  </defs>
+
+  <rect width="1400" height="760" fill="#eef2f7"/>
+  <text class="title" x="70" y="66">CHECKBOT</text>
+  <text class="body" x="70" y="96">one face · one check · one motion</text>
+
+  <rect x="70" y="130" width="590" height="550" rx="30" fill="#fff" stroke="#dce4ef" stroke-width="2"/>
+  <text class="eyebrow" x="110" y="180">LIGHT</text>
+  <use href="#robot-light" transform="translate(220 218) scale(1.15)"/>
+  <text class="title" x="226" y="545">CHECKBOT</text>
+  <text class="body" x="230" y="579">左眼通过 · 右眼在线 · 保持微笑</text>
+
+  <rect x="720" y="130" width="610" height="550" rx="30" fill="#0c1423"/>
+  <text class="dark-eyebrow" x="760" y="180">DARK</text>
+  <use href="#robot-dark" transform="translate(884 218) scale(1.15)"/>
+  <text class="dark-title" x="888" y="545">CHECKBOT</text>
+  <text class="dark-body" x="893" y="579">只让对勾被画出来，其他部分不乱动</text>
+
+  <g transform="translate(1010 615)">
+    <use href="#robot-dark" transform="scale(.18)"/>
+    <use href="#robot-dark" transform="translate(72 10) scale(.13)"/>
+    <use href="#robot-dark" transform="translate(128 18) scale(.09)"/>
+  </g>
+</svg>

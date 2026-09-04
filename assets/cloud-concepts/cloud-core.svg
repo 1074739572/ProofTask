@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">云核 Cloud Core</title>
+  <desc id="desc">A geometric cloud containing a pulsing machine core and circuit nodes.</desc>
+  <style>
+    .node { transform-box:fill-box; transform-origin:center; animation:node 1.8s ease-in-out infinite; }
+    .chip { transform-box:fill-box; transform-origin:center; animation:chip 2.1s ease-in-out infinite; }
+    .trace { stroke-dasharray:28 14; animation:dash 2.4s linear infinite; }
+    @keyframes node { 0%,100% { transform:scale(.75); opacity:.45; } 50% { transform:scale(1.2); opacity:1; } }
+    @keyframes chip { 0%,100% { transform:scale(.94); } 50% { transform:scale(1.04); } }
+    @keyframes dash { to { stroke-dashoffset:-84; } }
+    @media (prefers-reduced-motion:reduce) { .node,.chip,.trace { animation:none; } }
+  </style>
+  <path d="M42 151 C42 127 61 109 84 109 C91 82 114 64 141 64 C170 64 193 83 198 110 C220 110 236 126 236 147 C236 168 218 183 196 183 H77 C56 183 42 170 42 151 Z" fill="#132a4b" stroke="#76e3c4" stroke-width="7" stroke-linejoin="round"/>
+  <path class="trace" d="M42 137 H22 V116 H10 M236 137 H246 V116 H258 M77 183 V205 H56 M196 183 V205 H216" fill="none" stroke="#2498ff" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle class="node" cx="10" cy="116" r="6" fill="#ffcc66"/><circle class="node" cx="258" cy="116" r="6" fill="#ffcc66"/>
+  <circle class="node" cx="56" cy="205" r="6" fill="#2498ff"/><circle class="node" cx="216" cy="205" r="6" fill="#2498ff"/>
+  <path class="chip" d="M141 96 L174 115 V153 L141 172 L108 153 V115 Z" fill="#0b1930" stroke="#e7f8ff" stroke-width="4"/>
+  <path d="M141 112 L130 137 H141 L136 155 L156 130 H145 L151 112 Z" fill="#ffcc66"/>
+  <circle cx="141" cy="137" r="4" fill="#e7f8ff"/>
+</svg>

@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">Flow Mass</title>
+  <desc id="desc">Cloud silhouette with a simple airflow stroke.</desc>
+  <style>
+    .flow{fill:none;stroke:#22b9e7;stroke-width:10;stroke-linecap:round;stroke-dasharray:80 100;animation:run 2.8s linear infinite}
+    @keyframes run{to{stroke-dashoffset:-180}}
+    @media(prefers-reduced-motion:reduce){.flow{animation:none}}
+  </style>
+  <path fill="#13233d" d="M24 137C32 101 61 76 98 75C108 45 137 31 166 41C191 32 222 48 229 78C248 83 259 101 259 119C259 137 248 150 234 157C223 163 214 161 204 157C190 151 181 145 166 142C150 139 137 144 123 156C107 169 92 181 73 180C47 178 27 162 24 137Z"/>
+  <path class="flow" d="M80 131C99 112 123 107 145 115C160 121 172 131 180 144"/>
+</svg>

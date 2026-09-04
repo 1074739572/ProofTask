@@ -77,6 +77,31 @@ export function reduceEvent(state: AppState, event: UiEvent): AppState {
       };
     case 'ui_clear':
       return {...state, items: [], tools: [], phase: 'idle'};
+    case 'history_replay': {
+      // Startup replay fills an empty viewport; an explicit /resume or /new
+      // replay is authoritative and replaces whatever conversation is shown.
+      if (!event.replace && state.items.some(item => item.kind === 'user' || item.kind === 'assistant')) return state;
+      const replay = (event.messages || []).flatMap((message): ChatItem[] => {
+        const text = String(message.text ?? '').trim();
+        if (!text) return [];
+        return [{
+          kind: message.role === 'assistant' ? 'assistant' : 'user',
+          text,
+          ts: event.ts,
+        } as ChatItem];
+      });
+      const visible = event.truncated && replay.length > 0
+        ? [{kind: 'log', level: 'muted', text: '… earlier history folded · showing the latest 300 messages', ts: event.ts} as ChatItem, ...replay]
+        : replay;
+      return {
+        ...state,
+        items: visible,
+        tools: event.replace ? [] : state.tools,
+        tasks: event.replace ? [] : state.tasks,
+        sessionId: event.session_id ?? state.sessionId,
+        phase: 'idle',
+      };
+    }
     case 'session_status':
       return {
         ...state,
@@ -231,6 +256,9 @@ export function reduceEvent(state: AppState, event: UiEvent): AppState {
         {kind: 'log', level: 'plain', text: `Goal ${event.id} ${event.status}${event.stop_reason ? `: ${event.stop_reason}` : ''}`, ts: event.ts},
       );
     case 'task_update':
+      if (!event.tasks || event.tasks.length === 0) {
+        return {...state, tasks: []};
+      }
       return pushItem({...state, tasks: event.tasks}, {kind: 'tasks', tasks: event.tasks, ts: event.ts});
     case 'files_changed':
       return pushItem(state, {kind: 'files', paths: event.paths, ts: event.ts});

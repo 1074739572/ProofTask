@@ -22,8 +22,11 @@ from harness.ui.mode_picker import run_mode_picker
 from harness.project.resume import (
     checkpoint_history,
     inject_project_context,
+    is_new_session_command,
+    new_session_title,
     run_resume_command,
     should_auto_inject_project_on_startup,
+    start_new_session,
 )
 from harness.project.session_registry import SessionBinding, touch_session_title_from_query
 from harness.project.session_store import bootstrap_session
@@ -86,6 +89,59 @@ def _match_cli_command(query: str, command: str) -> bool:
     return text == command or text.startswith(command + " ")
 
 
+def handle_permission_command(query: str, session=None) -> str:
+    """Handle the in-memory ``/permission`` session-mode command.
+
+    The command intentionally lives beside the shared CLI matcher so both the
+    classic terminal and the JSONL/TUI bridge can use exactly the same parsing
+    and wording.  A caller may pass a :class:`PermissionSession` for isolated
+    tests/embedded sessions; normal callers use the active process holder.
+    """
+    from harness.permission_session import (
+        PERMISSION_MODES,
+        get_permission_session,
+    )
+
+    active = session if session is not None else get_permission_session()
+    raw = (query or "").strip()
+    parts = raw.split()
+    # Keep this helper useful when called directly with just an argument while
+    # still treating a malformed command as a usage error.
+    if not parts or parts[0].lower() != "/permission":
+        return "Usage: /permission [default|auto-review|full-access]"
+    args = parts[1:]
+    if not args:
+        current = active.get_mode() if hasattr(active, "get_mode") else active.mode
+        return (
+            f"Permission mode: {current}\n"
+            "Available modes: default, auto-review, full-access\n"
+            "Usage: /permission <mode>"
+        )
+    if len(args) != 1:
+        current = active.get_mode() if hasattr(active, "get_mode") else active.mode
+        return (
+            "Usage: /permission <default|auto-review|full-access>\n"
+            f"Current mode: {current}"
+        )
+    requested = args[0].strip().lower()
+    try:
+        selected = active.set_mode(requested)
+    except (TypeError, ValueError):
+        current = active.get_mode() if hasattr(active, "get_mode") else active.mode
+        return (
+            f"Unknown permission mode '{args[0]}'.\n"
+            "Available modes: " + ", ".join(PERMISSION_MODES) + "\n"
+            "Usage: /permission <mode>\n"
+            f"Current mode: {current}"
+        )
+    return f"Permission mode set to: {selected}"
+
+
+def _handle_permission_command(query: str, session=None) -> str:
+    """Private compatibility alias used by command-routing tests."""
+    return handle_permission_command(query, session=session)
+
+
 def _resolve_open_directory(query: str) -> tuple[Path | None, str]:
     raw_path = query.strip()[len("/open") :].strip()
     if not raw_path:
@@ -103,6 +159,7 @@ def _resolve_open_directory(query: str) -> tuple[Path | None, str]:
 def _help_text() -> str:
     return """Commands:
   /open <directory>        switch workspace in-process (instant, no restart)
+  /permission [mode]       view/set session permissions: default|auto-review|full-access
   /goal --verify "<cmd>" -- <target>   start an autonomous goal
   /goal status|pause|stop|resume|cancel control the running goal
   /init                    scan repo & create/improve HARNESS.md handbook
@@ -120,6 +177,8 @@ def _help_text() -> str:
   /resume delete <N>        delete session N from list
   /resume delete project    delete long-task state.json
   /resume project           inject thesis state.json (long workflow)
+  new [title]               start a new chat (keeps old history for /resume)
+  /new [title]              same as new
   /skill                    list skills
   /skill <name>             inject skill full text into this session (then ask)
   /clear [session]          end session (keep dir); default also deletes state.json
@@ -207,6 +266,13 @@ def bootstrap_cli_session(
     this process — other windows changing active_session.json don't affect it.
     """
     terminal_state.CLI_ACTIVE = cli_active
+
+    # Permission mode is a runtime choice, never restored from a persisted
+    # conversation or configuration file.  Every fresh process/session starts
+    # safely in ``default``.
+    from harness.permission_session import reset_permission_session
+
+    reset_permission_session()
 
     history, binding, session_source = bootstrap_session()
     todos_set_binding(binding)
@@ -332,6 +398,9 @@ def run_cli() -> None:
             history.clear()
             context = update_context({}, [])
             apply_project_instructions(context)
+            from harness.permission_session import reset_permission_session
+
+            reset_permission_session()
             renderer.plain(result)
             print()
             continue
@@ -341,6 +410,36 @@ def run_cli() -> None:
                 renderer.plain(run_model_picker())
             else:
                 renderer.plain(handle_model_command(query))
+            print()
+            continue
+        if is_new_session_command(query):
+            from harness.goal.runner import is_goal_running as _goal_running
+
+            if _goal_running():
+                renderer.warn(
+                    "Cannot /new while a goal is running — use /goal pause or /goal cancel first."
+                )
+                print()
+                continue
+            with agent_lock:
+                binding, note = start_new_session(
+                    history,
+                    binding=binding,
+                    title=new_session_title(query),
+                )
+                context = update_context({}, history)
+                apply_project_instructions(context)
+            renderer.plain(note)
+            print()
+            continue
+        if _match_cli_command(query, "/permission"):
+            parts = query.strip().split(maxsplit=1)
+            if len(parts) == 1:
+                from harness.ui.permission_picker import run_permission_picker
+
+                renderer.plain(run_permission_picker())
+            else:
+                renderer.plain(handle_permission_command(query))
             print()
             continue
         if _match_cli_command(query, "/mode"):
@@ -407,10 +506,20 @@ def run_cli() -> None:
                     if choice is not None and choice < len(sessions):
                         sub = str(choice + 1)
             with agent_lock:
+                previous_binding = binding
                 note, new_binding = run_resume_command(sub, messages=history, binding=binding)
                 if new_binding is not None:
                     binding = new_binding
                     todos_set_binding(binding)
+                    # ``/resume status`` returns the current binding and must
+                    # not reset a mode; selecting/deleting into a different
+                    # session starts a fresh runtime permission context.
+                    previous_id = getattr(previous_binding, "session_id", None)
+                    new_id = getattr(new_binding, "session_id", None)
+                    if new_binding is not previous_binding and new_id != previous_id:
+                        from harness.permission_session import reset_permission_session
+
+                        reset_permission_session()
                 repair_tool_pairing(history)
                 context = update_context(context, history)
                 renderer.plain(note)
@@ -445,6 +554,9 @@ def run_cli() -> None:
             # Start a new session binding
             from harness.project.session_registry import create_session
             binding = create_session()
+            from harness.permission_session import reset_permission_session
+
+            reset_permission_session()
             todos_set_binding(binding)
             load_todos_from_disk(binding=binding)
             context = update_context({}, [])
@@ -508,6 +620,9 @@ def run_cli() -> None:
                 run_project_import_transcript(path=path_arg, mode=mode, merge=merge)
             )
             history[:], binding, _source = bootstrap_session()
+            from harness.permission_session import reset_permission_session
+
+            reset_permission_session()
             todos_set_binding(binding)
             load_todos_from_disk(binding=binding)
             context = update_context(context, history)

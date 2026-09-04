@@ -32,6 +32,38 @@ RESUME_CONTEXT_PREFIX = "[Resume context]"
 LEGACY_SESSION_PREFIX = "[Session resumed]"
 
 
+def is_new_session_command(query: str) -> bool:
+    """Return ``True`` when *query* is the explicit new-chat command.
+
+    The interactive clients historically used slash commands, while a few
+    users naturally type ``new`` without the slash.  Accept both spellings,
+    but only when ``new`` is the first complete token so ordinary prose such
+    as ``new API endpoint`` is not accidentally intercepted by a prefix match.
+    An optional title may follow the command and is handled by
+    :func:`start_new_session`'s caller.
+    """
+    text = (query or "").strip().lower()
+    if not text:
+        return False
+    head = text.split(None, 1)[0]
+    return head in {"new", "/new"}
+
+
+def new_session_title(query: str) -> str:
+    """Extract an optional human-readable title from ``new [title]``."""
+    text = (query or "").strip()
+    if not is_new_session_command(text):
+        return ""
+    parts = text.split(None, 1)
+    title = parts[1].strip() if len(parts) > 1 else ""
+    # Metadata titles are shown in compact pickers; keep them bounded and
+    # normalize line breaks so a pasted title cannot break the list layout.
+    title = " ".join(title.split())
+    if len(title) > 80:
+        title = title[:79] + "…"
+    return title
+
+
 def auto_resume_mode() -> str:
     """
     off (default): reload session.jsonl only — no project/thesis injection.
@@ -192,6 +224,63 @@ def switch_to_session(session_id: str, messages: list, *, binding: SessionBindin
     return target_binding, "\n".join(lines)
 
 
+def start_new_session(
+    messages: list | None = None,
+    *,
+    binding: SessionBinding | None = None,
+    title: str = "",
+) -> tuple[SessionBinding, str]:
+    """Archive the current chat and return a fresh session binding.
+
+    ``/new`` is deliberately a chat operation, not a project reset: the old
+    session directory (including its transcript and todos) remains available
+    to ``/resume`` and the long-running ``state.json`` is untouched.  The
+    in-memory message list is cleared in place so all frontends retain their
+    existing reference, then the process-wide todo binding is pointed at the
+    new session.
+    """
+    from harness.project.session_registry import create_session, ensure_active_session
+    from harness.project.session_store import append_checkpoint, clear_session
+    from harness.todos.state import clear_todos, load_todos_from_disk, set_binding
+
+    current = binding
+    if current is None:
+        current = ensure_active_session(fresh=False)
+
+    # Persist any completed/queued messages that have not reached the normal
+    # end-of-turn checkpoint before moving away from the old binding.
+    if messages:
+        append_checkpoint(messages, binding=current)
+    old_path = clear_session(binding=current, archive=True)
+
+    clean_title = " ".join((title or "").strip().split())
+    if len(clean_title) > 80:
+        clean_title = clean_title[:79] + "…"
+    new_binding = create_session(title=clean_title)
+
+    if messages is not None:
+        messages.clear()
+    # Keep the archived todo file intact, but reset the process cache and load
+    # the (normally empty) file belonging to the newly-created session.
+    clear_todos(delete_file=False)
+    set_binding(new_binding)
+    load_todos_from_disk(binding=new_binding)
+    try:
+        from harness.permission_session import reset_permission_session
+
+        reset_permission_session()
+    except Exception:
+        # The session store is also used by minimal/embedded callers where
+        # the optional permission facade may not be imported.
+        pass
+
+    title_text = clean_title or "(untitled)"
+    lines = [f"已开启新会话：{title_text}（{new_binding.session_id}）"]
+    if old_path:
+        lines.append(f"上一会话已保留，可用 /resume 查看：{old_path}")
+    return new_binding, "\n".join(lines)
+
+
 def format_resume_status(*, include_project: bool = True) -> str:
     """Minimal /resume: numbered sessions + created time (+ workflow one-liner)."""
     from harness.project.session_registry import format_session_list_block
@@ -260,6 +349,22 @@ def run_resume_command(
 
     raw = (args or "").strip()
     sub = raw.lower()
+
+    # Keep the command helper itself aware of the ``new`` alias.  Most callers
+    # route ``new`` before reaching ``run_resume_command`` (the classic CLI
+    # and JSONL bridge do this), but embedded integrations and older adapters
+    # may pass commands through this function directly.  Handling it here
+    # guarantees the alias never falls through to title/ID lookup and is
+    # consistent with the interactive routing semantics.
+    if is_new_session_command(raw):
+        if messages is None:
+            return "请在 CLI 中执行 new 以开启新会话。", binding
+        new_binding, note = start_new_session(
+            messages,
+            binding=binding,
+            title=new_session_title(raw),
+        )
+        return note, new_binding
 
     if sub.startswith("delete "):
         target = raw[7:].strip()

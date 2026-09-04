@@ -23,6 +23,7 @@ from harness.cli import (
     _match_cli_command,
     _resolve_open_directory,
     bootstrap_cli_session,
+    handle_permission_command,
     print_turn_assistants,
 )
 from harness.context import update_context
@@ -30,6 +31,7 @@ from harness.hooks import trigger_hooks
 from harness.loop import agent_loop, agent_lock
 from harness.messages.repair import repair_tool_pairing
 from harness.project.resume import checkpoint_history
+from harness.project.resume import is_new_session_command
 from harness.project.session_undo import abort_inflight_turn
 from harness.project.session_registry import touch_session_title_from_query
 from harness.prompts.lookup import is_lookup_active
@@ -48,7 +50,15 @@ def _json_dumps(payload: Any) -> str:
 #: instantly (no LLM round, no context/history/binding mutation) and therefore
 #: must be executable while the agent is running — never flip the UI into the
 #: "running" state, never print "Agent is already running".
-_INSTANT_SLASH_PREFIXES = ("/model", "/effort", "/mode", "/models", "/usage", "/help")
+_INSTANT_SLASH_PREFIXES = (
+    "/model",
+    "/effort",
+    "/mode",
+    "/models",
+    "/usage",
+    "/help",
+    "/permission",
+)
 MAX_PENDING_TURNS = 32
 _ACTIVE_GOAL_DRAFT_STAGES = frozenset({"preflight", "catalog", "intake", "discovering", "planning"})
 
@@ -122,6 +132,7 @@ def _status_payload(context: dict, binding, history: list) -> dict:
     from harness.agent.compact.sizing import estimate_tokens, model_context_window
     from harness.models import get_model, get_reasoning_effort, list_efforts
     from harness.modes import get_mode
+    from harness.permission_session import get_permission_mode
     from harness.settings import get_workdir
     from harness.usage.context import current_context_tokens, scaled_context_breakdown
     from harness.usage.store import totals_for_day
@@ -138,6 +149,7 @@ def _status_payload(context: dict, binding, history: list) -> dict:
     return {
         "model": get_model(),
         "mode": get_mode(),
+        "permission_mode": get_permission_mode(),
         "reasoning_effort": effort_id,
         "reasoning_effort_label": effort_label,
         "reasoning_effort_options": effort_items,
@@ -170,8 +182,21 @@ def _emit_welcome() -> None:
     )
 
 
-def _emit_history_replay(history: list, *, limit: int = 300) -> None:
-    """Send a bounded, display-ready transcript when the TUI reconnects."""
+def _emit_history_replay(
+    history: list,
+    *,
+    limit: int = 300,
+    replace: bool = False,
+    session_id: str | None = None,
+    new_session: bool = False,
+) -> None:
+    """Send a bounded, display-ready transcript to the TUI.
+
+    Startup replay is additive only when the viewport is still empty.  Session
+    switches and ``/new`` pass ``replace=True`` so an already-rendered
+    transcript is replaced (including with an empty list for a brand-new
+    session) instead of leaving the previous chat on screen.
+    """
     from harness.project.resume import _message_text
 
     rows = []
@@ -183,8 +208,18 @@ def _emit_history_replay(history: list, *, limit: int = 300) -> None:
         if not text:
             continue
         rows.append({"id": f"history-{index}", "role": role, "text": text})
-    if rows:
-        emit("history_replay", messages=rows, truncated=len(history) > limit)
+    if rows or replace:
+        payload: dict[str, Any] = {
+            "messages": rows,
+            "truncated": len(history) > limit,
+        }
+        if replace:
+            payload["replace"] = True
+        if new_session:
+            payload["new_session"] = True
+        if session_id:
+            payload["session_id"] = str(session_id)
+        emit("history_replay", **payload)
 
 
 def _emit_status(context: dict, binding, history: list, *, running: bool = False) -> None:
@@ -250,7 +285,9 @@ _SLASH_COMPLETIONS = (
     "/mode",
     "/model",
     "/models",
+    "/new",
     "/open",
+    "/permission",
     "/rag",
     "/resume",
     "/usage",
@@ -310,9 +347,31 @@ def _handle_slash_command(query: str, history: list, binding) -> tuple[str | Non
     """
     from harness.models import handle_model_command, handle_effort_command, list_efforts
     from harness.modes import set_mode, format_mode_catalog
-    from harness.project.tools import run_project_clear
     from harness.rag.commands import run_rag_cli_command
     from harness.usage import handle_usage_command
+    from harness.project.resume import is_new_session_command, new_session_title, start_new_session
+
+    # ``new`` and ``/new`` are aliases for an explicit fresh chat.  Keep this
+    # before the other slash handlers so it never becomes an LLM prompt.
+    if is_new_session_command(query):
+        from harness.goal.runner import is_goal_running
+
+        if is_goal_running():
+            return "Cannot /new while a goal is running — use /goal pause or /goal cancel first.", binding
+        new_binding, note = start_new_session(
+            history,
+            binding=binding,
+            title=new_session_title(query),
+        )
+        # The caller owns the event-stream history reference; publish a full
+        # replacement even though the new session normally starts empty.
+        _emit_history_replay(
+            history,
+            replace=True,
+            new_session=True,
+            session_id=new_binding.session_id,
+        )
+        return note, new_binding
 
     if _match_cli_command(query, "/model"):
         parts = query.strip().split(maxsplit=1)
@@ -352,6 +411,27 @@ def _handle_slash_command(query: str, history: list, binding) -> tuple[str | Non
         return set_mode(parts[1]), binding
     if _match_cli_command(query, "/usage"):
         return handle_usage_command(query), binding
+    if _match_cli_command(query, "/permission"):
+        parts = query.strip().split(maxsplit=1)
+        if len(parts) == 1:
+            from harness.permission_session import PERMISSION_MODES, get_permission_mode
+            labels = {
+                "default": "默认权限（低风险自动放行）",
+                "auto-review": "自动审查（低、中风险自动放行）",
+                "full-access": "完全访问（低、中、高风险自动放行）",
+            }
+            current = get_permission_mode()
+            emit(
+                "show_picker",
+                id="permission",
+                title="Select permission mode",
+                items=[
+                    {"id": mode, "label": f"{labels[mode]} [{mode}]" + (" · 当前" if mode == current else ""), "detail": "Session-only"}
+                    for mode in PERMISSION_MODES
+                ],
+            )
+            return "", binding
+        return handle_permission_command(query), binding
     if _match_cli_command(query, "/rag"):
         return run_rag_cli_command(query), binding
     if _match_cli_command(query, "/clear"):
@@ -359,7 +439,18 @@ def _handle_slash_command(query: str, history: list, binding) -> tuple[str | Non
 
         if is_goal_running():
             return "Cannot /clear while a goal is running — use /goal pause or /goal cancel first.", binding
-        return run_project_clear(clear_project=False), binding
+        # Match classic CLI semantics: archive the current conversation,
+        # create a new binding, and notify the TUI to replace its transcript.
+        from harness.project.resume import start_new_session
+
+        new_binding, note = start_new_session(history, binding=binding)
+        _emit_history_replay(
+            history,
+            replace=True,
+            new_session=True,
+            session_id=getattr(new_binding, "session_id", None),
+        )
+        return note, new_binding
     if _match_cli_command(query, "/resume"):
         from harness.goal.runner import is_goal_running
 
@@ -372,7 +463,16 @@ def _handle_slash_command(query: str, history: list, binding) -> tuple[str | Non
         sub = parts[1] if len(parts) > 1 else ""
         if sub:
             note, new_binding = run_resume_command(sub, messages=history, binding=binding)
-            return note, new_binding or binding
+            previous_id = getattr(binding, "session_id", None)
+            new_id = getattr(new_binding, "session_id", None)
+            if new_binding is not None and new_binding is not binding and new_id != previous_id:
+                from harness.permission_session import reset_permission_session
+
+                reset_permission_session()
+            selected = new_binding or binding
+            if selected is not binding:
+                _emit_history_replay(history, replace=True, session_id=getattr(selected, "session_id", None))
+            return note, selected
         sessions = visible_session_summaries(limit=20)
         if not sessions:
             return "No saved sessions.", binding
@@ -387,7 +487,10 @@ def _handle_slash_command(query: str, history: list, binding) -> tuple[str | Non
             return "", binding
         # Single session: just resume it
         note, new_binding = run_resume_command("1", messages=history, binding=binding)
-        return note, new_binding or binding
+        selected = new_binding or binding
+        if selected is not binding:
+            _emit_history_replay(history, replace=True, session_id=getattr(selected, "session_id", None))
+        return note, selected
     if _match_cli_command(query, "/models"):
         from harness.models import list_models
         models = list_models()
@@ -406,11 +509,14 @@ def _handle_slash_command(query: str, history: list, binding) -> tuple[str | Non
             "  @path + Tab        — complete file/dir path\n"
             "  /model <id>  — switch model (use /models to list)\n"
             "  /effort      — choose reasoning effort\n"
+            "  /permission [mode] — view/set session permissions\n"
             "  /models      — list available models\n"
             "  /mode <id>   — switch mode\n"
             "  /mode        — list modes\n"
             "  /resume      — list saved sessions\n"
             "  /resume <N>  — switch to session N\n"
+            "  new [title]   — start a fresh chat (old history stays resumable)\n"
+            "  /new [title]  — same as new\n"
             "  /clear       — clear session\n"
             "  Ctrl+C       — interrupt agent\n"
             "  Ctrl+L       — clear display\n"
@@ -447,7 +553,7 @@ def _run_user_turn(
     """Run one user turn. Returns (possibly updated context, interrupted, binding)."""
     # Slash commands are internal instructions: never echo them as transcript
     # messages, regardless of echo_user. Feedback is delivered via log events.
-    if echo_user and not query.strip().startswith("/"):
+    if echo_user and not query.strip().startswith("/") and not is_new_session_command(query):
         emit("user_message", text=query, silent=False)
 
     if _is_goal_draft_answer(query, goal_context=goal_context):
@@ -503,9 +609,12 @@ def _run_user_turn(
         context = _update_context({}, [])
         apply_project_instructions(context, start=Path(target))
         reset_ephemeral_cache()
+        from harness.permission_session import reset_permission_session
+
+        reset_permission_session()
         return context, False, binding
 
-    if query.strip().startswith("/"):
+    if query.strip().startswith("/") or is_new_session_command(query):
         if _match_cli_command(query, "/goal"):
             from harness.goal.commands import handle_goal_command
 
@@ -537,7 +646,15 @@ def _run_user_turn(
             emit("log", level="plain", text=command_note)
         if new_binding is not binding:
             from harness.todos.state import set_binding as _todos_set_binding
+            from harness.prompts.project_md import apply_project_instructions
+
             _todos_set_binding(new_binding)
+            # A session switch/new chat must not inherit turn-scoped context
+            # (writing/RAG constraints, stale session source, etc.). Rebuild
+            # the context from the newly loaded history and project rules.
+            fresh_context = update_context({}, history)
+            apply_project_instructions(fresh_context)
+            return fresh_context, False, new_binding
         return update_context(context, history), False, new_binding
 
     from harness.modes import get_mode, note_user_query_for_mode
@@ -678,7 +795,11 @@ def run_event_stream() -> None:
             # minutes in catalog/discovery/planning. Treat those as a real
             # turn so the TUI gets an active phase and heartbeat events.
             is_background = _is_goal_background_command(query, goal_context=goal_context)
-            is_slash = query.strip().startswith("/") or _is_goal_draft_answer(query, goal_context=goal_context)
+            is_slash = (
+                query.strip().startswith("/")
+                or is_new_session_command(query)
+                or _is_goal_draft_answer(query, goal_context=goal_context)
+            )
             if not is_slash or is_background:
                 running.set()
                 emit("agent_start", phase="goal_draft" if is_background else "preparing")
@@ -710,8 +831,11 @@ def run_event_stream() -> None:
     worker_thread = threading.Thread(target=worker, name="harness-event-stream-worker", daemon=True)
     worker_thread.start()
 
+    # Replay the conversation before the status/task snapshot.  The latter
+    # may contain an empty task update, and treating that UI-only row as chat
+    # content would make the TUI incorrectly skip the history replay.
+    _emit_history_replay(history, session_id=getattr(binding, "session_id", None))
     _emit_status(context, binding, history, running=False)
-    _emit_history_replay(history)
     # On launch, reuse the /resume picker protocol so users can immediately
     # choose a persisted conversation without typing a command first.
     from harness.project.session_registry import visible_session_summaries
