@@ -1,7 +1,7 @@
 import {BoxRenderable, ScrollBoxRenderable, SyntaxStyle, CliRenderEvents} from '@opentui/core';
 import {batch, createSignal, createMemo, createEffect, For, Show as SolidShow, Switch, Match, onCleanup} from 'solid-js';
 import {useTerminalDimensions, useKeyboard, useRenderer} from '@opentui/solid';
-import {startBackend, type Backend} from '../src/backend.ts';
+import {initialWorkspace, startBackend, type Backend} from '../src/backend.ts';
 import {alwaysSeparate, layoutBudget, layoutMode, setPreLayoutSiblingMargin, type LayoutBudget} from './layout.ts';
 import {buildSections} from './sections.ts';
 import type {ActionRow, Entry, Section, SubagentStatus} from './sections.ts';
@@ -1496,8 +1496,11 @@ function TranscriptEntryView(props: {entry: Entry; liveEntry?: (id: string) => E
     const gutterChar = () => liveStreaming() ? (props.tick() % 5 < 4 ? '▌' : '│') : '│';
     const gutterColor = () => liveStreaming() && props.tick() % 5 < 4 ? C.primary : C.info;
     return text === null ? <box /> : shell(<box flexDirection="row" minWidth={0} paddingTop={1} paddingLeft={1} paddingRight={1}>
-      <text fg={gutterColor()} wrapMode="none" selectable={false}>{props.compactRole ? `AI ${gutterChar()}` : gutterChar()}</text>
-      <box flexGrow={1} minWidth={0} paddingLeft={1}>
+      {/* Keep the compact role rail fixed-width.  Both role labels occupy two
+       * cells; the streaming rail is represented by the pulsing AI color so
+       * the reply body starts on the same column as the user's text. */}
+      <text fg={props.compactRole ? (liveStreaming() && props.tick() % 5 < 4 ? C.primary : C.info) : gutterColor()} wrapMode="none" selectable={false}>{props.compactRole ? 'AI' : gutterChar()}</text>
+      <box flexGrow={1} minWidth={0} paddingLeft={props.compactRole ? 0 : 1}>
         {props.plainResponse ? <SafeText fg={C.text} wrapMode="word" value={text} /> : <StreamingClamp active={liveStreaming}><markdown syntaxStyle={getMarkdownSyntax()} streaming={liveStreaming()} internalBlockMode="top-level" tableOptions={{style: 'grid'}} content={liveText() ?? ''} fg={C.text} conceal /></StreamingClamp>}
       </box>
     </box>);
@@ -1540,7 +1543,7 @@ function TranscriptEntryView(props: {entry: Entry; liveEntry?: (id: string) => E
       const live = liveOf();
       return mergedActionOutput(live || entry);
     });
-    const expanded = entry.expanded === true;
+    const expanded = () => entry.expanded === true;
     const name = normalizeTranscriptText(entry.name) || text || 'action';
     const status = normalizeTranscriptText(entry.summary) || detail;
     const count = Number(entry.count || 0);
@@ -1548,7 +1551,7 @@ function TranscriptEntryView(props: {entry: Entry; liveEntry?: (id: string) => E
     const marker = () => props.focusId() === entry.id ? '▶' : entry.done ? (entry.ok ? '✓' : '✕') : '◌';
     // Keep the collapsed state to one compact, actionable row. Mouse click and
     // the existing focused Enter binding both use the same toggle callback.
-    const head = () => `${marker()} ${name}${count > 1 ? ` · ${count} 次` : ''}${summary}`;
+    const head = () => `${expanded() ? '▾' : '▸'} ${marker()} ${name}${count > 1 ? ` · ${count} 次` : ''}${summary}`;
     const elapsedText = () => formatElapsed(entry.start, entry.end, props.now());
     // Elapsed tick-pop: the counter flashes bright for ~3 animation ticks
     // (240ms) right after its value changes, then settles back to muted.
@@ -1560,19 +1563,31 @@ function TranscriptEntryView(props: {entry: Entry; liveEntry?: (id: string) => E
       if (cur !== lastElapsed) { lastElapsed = cur; lastChangeTick = t; }
       return t - lastChangeTick <= 3 ? C.warning : C.textMuted;
     };
+    const activate = (event: any) => {
+      const key = String(event?.name || event?.key || '').toLowerCase();
+      if (key === 'enter' || key === 'return' || key === 'space' || key === 'spacebar') {
+        props.onToggleExpand(entry.id);
+        event?.preventDefault?.();
+      }
+    };
     return <box flexShrink={0} minWidth={0} flexDirection="column">
       <box flexDirection="row" minWidth={0} onMouseUp={(event: any) => {
         if (event?.button === 0) props.onToggleExpand(entry.id);
-      }}>
+      }} onKeyDown={activate}>
         <text fg={toolCategoryColor(name, Boolean(entry.done), entry.ok, props.focusId() === entry.id)} wrapMode="word" flexShrink={1}>{head()}</text>
         <text fg={elapsedColor()} wrapMode="none">{elapsedText()}</text>
       </box>
-      <Show when={expanded && liveOutput().length > 0}>
+      <Show when={expanded() && liveOutput().length > 0}>
         <For each={actionOutputPreview(liveOutput(), true)}>{(line: string) => <box flexDirection="row" minWidth={0} paddingLeft={2}>
           <SafeText fg={C.textMuted} wrapMode="word" value={`│ ${line}`} />
         </box>}</For>
       </Show>
-      <Show when={!expanded && (liveOutput().length > 0 || !entry.done)}>
+      <Show when={expanded()}>
+        <box flexDirection="row" minWidth={0} paddingLeft={2}>
+          <SafeText fg={C.textMuted} wrapMode="none" truncate value="Enter 收起输出" />
+        </box>
+      </Show>
+      <Show when={!expanded() && (liveOutput().length > 0 || !entry.done)}>
         <box flexDirection="row" minWidth={0} paddingLeft={2}>
           <SafeText fg={C.textMuted} wrapMode="none" truncate value={entry.done ? 'Enter 展开输出' : '运行中 · 输出随时更新 · Enter 展开'} />
         </box>
@@ -1656,7 +1671,10 @@ function TranscriptEntryView(props: {entry: Entry; liveEntry?: (id: string) => E
 function TimelineRail(props: {entry: Entry}) {
   const role = props.entry.kind === 'prompt' ? '你' : props.entry.kind === 'response' ? 'AI' : '·';
   const color = props.entry.kind === 'prompt' ? C.primary : props.entry.kind === 'response' ? C.info : C.textMuted;
-  return <box width={4} flexShrink={0} flexDirection="column" alignItems="center">
+  // Response rows add one cell of breathing room in TranscriptEntryView.
+  // Mirror that offset in the role rail so `AI` sits on the same baseline as
+  // the first line of the answer instead of floating one row above it.
+  return <box width={4} flexShrink={0} flexDirection="column" alignItems="center" paddingTop={props.entry.kind === 'response' ? 1 : 0}>
     <text fg={color} wrapMode="none" selectable={false}>{role}</text>
   </box>;
 }
@@ -1840,7 +1858,8 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
     if (props?.debugEntries == null) return;
     setEntries(debugEntriesAccessor() as Entry[]);
   });
-  const [model, setModel] = createSignal(readDefaultModel()); const [mode, setMode] = createSignal(readDefaultMode()); const [cwd, setCwd] = createSignal(''); const [session, setSession] = createSignal('');
+  const startupWorkspace = initialWorkspace() || '';
+  const [model, setModel] = createSignal(readDefaultModel()); const [mode, setMode] = createSignal(readDefaultMode()); const [cwd, setCwd] = createSignal(startupWorkspace); const [session, setSession] = createSignal('');
   const [effort, setEffort] = createSignal(props?.debugEffort?.value ?? 'off'); const [effortLabel, setEffortLabel] = createSignal(props?.debugEffort?.label ?? 'Model default'); const [effortOptions, setEffortOptions] = createSignal<OverlayOption[]>(props?.debugEffort?.options ?? []);
   // Welcome panel data mirrored from the CLI startup (daily quote only).
   const [welcomeQuote, setWelcomeQuote] = createSignal(props?.debugWelcome?.quote ?? '');
@@ -1892,7 +1911,7 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
   const [now, setNow] = createSignal(Date.now()); const [overlay, setOverlay] = createSignal<Overlay | null>(props?.debugOverlay ?? null);
   const [overlayIndex, setOverlayIndex] = createSignal(0);
   // Input history is durable per workspace and de-duplicates consecutive turns.
-  const [inputHistory, setInputHistory] = createSignal<string[]>(loadHistory(repoRoot));
+  const [inputHistory, setInputHistory] = createSignal<string[]>(loadHistory(startupWorkspace || repoRoot));
   const [historyIdx, setHistoryIdx] = createSignal(-1);
   const [historyDraft, setHistoryDraft] = createSignal('');
   const [historySearchOpen, setHistorySearchOpen] = createSignal(false);
