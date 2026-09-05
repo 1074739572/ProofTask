@@ -104,6 +104,30 @@ _ROUTE_RULES = [
     ),
 ]
 
+# Questions and short conversational replies should stay with the lead unless
+# they also contain an explicit evidence-gathering target.  This prevents a
+# broad word such as "分析" from turning every explanatory question into a
+# blocking explore run.
+_QUESTION_RE = re.compile(
+    r"(?:为什么|怎么回事|是什么|如何|能不能|可不可以|是否|有没有|how\b|why\b|what\b|can\s+you\b)",
+    re.IGNORECASE,
+)
+_EVIDENCE_TARGET_RE = re.compile(
+    r"(?:项目|仓库|目录|文件|代码|日志|结构|配置|源码|测试|read|search|inspect|look\s+at)",
+    re.IGNORECASE,
+)
+
+
+def _is_high_confidence_route(text: str) -> bool:
+    """Keep auto-routing for concrete work, not generic questions."""
+    body = (text or "").strip()
+    if not body:
+        return False
+    if _QUESTION_RE.search(body) and not _EVIDENCE_TARGET_RE.search(body):
+        return False
+    # Very short messages rarely contain enough scope for a new worker.
+    return len(body) >= 4
+
 
 def load_agents_config() -> dict:
     """Load config/agents.json."""
@@ -114,6 +138,8 @@ def load_agents_config() -> dict:
 
 def _classify_message(text: str) -> str | None:
     """Classify user message into an agent type (explore / code / write / None)."""
+    if not _is_high_confidence_route(text):
+        return None
     text_lower = text.lower()
     matches: list[tuple[int, str]] = []
     for agent_type, priority, patterns in _ROUTE_RULES:
@@ -141,9 +167,11 @@ def _build_agent_prompt(agent_type: str, user_message: str) -> str:
         f"## User Request\n{user_message}\n\n"
         f"## Instructions\n"
         f"1. Complete the task above to the best of your ability.\n"
-        f"2. When finished, return a concise summary of what you did and what you found.\n"
-        f"3. Do NOT ask for confirmation before taking action.\n"
-        f"4. Do NOT spawn sub-agents yourself."
+        f"2. Return a concise structured report: status (completed/partial/failed/blocked), "
+        f"summary, findings, changed_paths, verification, confidence, and next_action.\n"
+        f"3. Do NOT claim a change or test is verified unless you actually checked it.\n"
+        f"4. Do NOT ask for confirmation before taking action.\n"
+        f"5. Do NOT spawn sub-agents yourself."
     )
 
 

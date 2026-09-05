@@ -252,7 +252,8 @@ def agent_loop(
             effective_disabled.update(
                 {"bash", "write_file", "edit_file", "patch_file", "rag_index",
                  "task", "spawn_teammate", "create_worktree", "remove_worktree",
-                 "project_init", "project_note", "project_reset", "project_set_chapter"}
+                 "project_init", "project_note", "project_reset", "project_set_chapter",
+                 "cancel_background_task"}
             )
         tools, handlers = get_tool_pool(disabled_tools=effective_disabled)
         tool_schemas = {
@@ -511,6 +512,29 @@ def agent_loop(
                 )
                 continue
 
+            from harness.tools.dispatch import validate_tool_input
+
+            # Validate before permission/background dispatch so malformed
+            # requests cannot start an asynchronous command with missing or
+            # out-of-range arguments.
+            input_error = validate_tool_input(tool_schemas.get(name), tool_input)
+            if input_error:
+                output = f"Tool input error ({name}): {input_error}"
+                renderer.tool_result(
+                    output,
+                    name=name,
+                    tool_input=tool_input if isinstance(tool_input, dict) else None,
+                    tool_use_id=tool_use_id,
+                )
+                results.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": tool_use_id,
+                        "content": output,
+                    }
+                )
+                continue
+
             blocked = trigger_hooks("PreToolUse", block)
             if blocked:
                 renderer.tool_result(
@@ -554,11 +578,7 @@ def agent_loop(
                 continue
 
             handler = handlers.get(name)
-            from harness.tools.dispatch import validate_tool_input
-            input_error = validate_tool_input(tool_schemas.get(name), tool_input)
-            if input_error:
-                output = f"Tool input error ({name}): {input_error}"
-            elif name == "bash" and isinstance(tool_input, dict):
+            if name == "bash" and isinstance(tool_input, dict):
                 # Stream stdout/stderr line-by-line as tool_output events so the
                 # TUI shows live output (Claude Code style) instead of a black
                 # box that resolves when the command finishes.

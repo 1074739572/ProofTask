@@ -155,6 +155,17 @@ def build_session_context(
         if todos_block:
             sections.append(todos_block)
 
+    pending_question = context.get("pending_question")
+    if isinstance(pending_question, dict):
+        question = str(pending_question.get("text") or "").strip()
+        if question:
+            sections.append(
+                "Pending clarification from the previous turn:\n"
+                f"{question}\n"
+                "Treat a short next user reply as the answer to this question "
+                "unless the user explicitly starts a different request."
+            )
+
     turn_constraints = (context.get("turn_constraints") or "").strip()
     if turn_constraints:
         sections.append(f"Turn constraints (internal, not a user message):\n{turn_constraints}")

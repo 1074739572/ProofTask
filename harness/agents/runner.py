@@ -21,7 +21,7 @@ from harness.messages.blocks import block_field, is_tool_use
 from harness.project.session import serialize_messages
 from harness.settings import MAX_RETRIES, get_workdir
 from harness.skills_loader import load_skill
-from harness.tools.dispatch import call_tool_handler, extract_text, has_tool_use
+from harness.tools.dispatch import call_tool_handler, extract_text, has_tool_use, validate_tool_input
 from harness.tools.filesystem import (
     run_bash,
     run_edit,
@@ -549,6 +549,11 @@ def run_agent_task(
     except ImportError:
         pass
     started = time.time()
+    tool_schemas = {
+        str(tool.get("name")): tool.get("input_schema")
+        for tool in tools
+        if tool.get("name")
+    }
     tool_count = 0
     round_num = 0
     final_text: str | None = None
@@ -670,6 +675,20 @@ def run_agent_task(
             tool_use_id = block_field(block, "id", "")
             name = block_field(block, "name", "")
             tool_input = block_field(block, "input", {}) or {}
+            input_error = validate_tool_input(tool_schemas.get(name), tool_input)
+            if input_error:
+                output = f"Tool input error ({name}): {input_error}"
+                if stats is not None:
+                    stats.record_tool(name, tool_input, output)
+                renderer.subagent_tool(run_id, name, tool_input, output, tool_use_id=tool_use_id)
+                results.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": tool_use_id,
+                        "content": output,
+                    }
+                )
+                continue
             blocked = trigger_hooks("PreToolUse", block)
             if blocked:
                 output = str(blocked)

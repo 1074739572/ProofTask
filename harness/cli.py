@@ -334,6 +334,10 @@ def bootstrap_cli_session(
         checkpoint_history(history, binding=binding)
         renderer.warn(f"Repaired {repair_fixes} broken tool message(s) in saved session.")
     context = update_context({}, history if history else [])
+    if history:
+        from harness.agent.question_state import remember_latest_question
+
+        remember_latest_question(context, history)
     if session_source:
         context["session_source"] = session_source
     project_md = apply_project_instructions(context)
@@ -725,11 +729,12 @@ def run_cli() -> None:
         context["lookup_active"] = lookup_active
         context["writing_mode"] = is_writing_query(query) and not lookup_active
         from harness.prompts.goal_stickiness import augment_if_needed
+        from harness.agent.question_state import pending_question_text
         from harness.prompts.lookup import LOOKUP_CONSTRAINT
         from harness.prompts.writing import WRITING_CONSTRAINT
 
         constraints = []
-        sticky = augment_if_needed(query)
+        sticky = augment_if_needed(query, has_pending_question=bool(pending_question_text(context)))
         if sticky:
             constraints.append(sticky[len(query):].strip())
         if lookup_active:
@@ -765,6 +770,11 @@ def run_cli() -> None:
         finally:
             listener.stop()
             clear_cancel()
+
+        if not interrupted:
+            from harness.agent.question_state import remember_turn_question
+
+            remember_turn_question(context, history, turn_start)
 
         if interrupted:
             message, rolled_back = abort_inflight_turn(history, turn_start, binding=binding)

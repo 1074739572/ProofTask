@@ -16,7 +16,9 @@ def build_task_tool_schema() -> dict:
             "Rules:\n"
             "- Pass a complete prompt (goal, paths, constraints); subagent cannot see parent history\n"
             "- code for scripts/edits; write for Chinese prose; explore for read-only search\n"
-            "- Returns summary only — update todo_write after each task"
+            "- Returns a report with status (completed/partial/failed/blocked), "
+            "summary, findings, changed_paths, verification, confidence, and next_action; "
+            "the lead must verify claims before reporting success"
         ),
         "input_schema": {
             "type": "object",

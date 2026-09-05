@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from harness.agent.cron import run_cancel_cron, run_list_crons, run_schedule_cron
+from harness.agent.background import cancel_background_task, list_background_tasks
 from harness.agent.subagent import run_agent_task
 from harness.agents.schema import build_task_tool_schema
 from harness.mcp.pool import assemble_tool_pool, connect_mcp
@@ -95,6 +96,17 @@ def run_complete_task(task_id: str) -> str:
         return complete_task(task_id)
     except FileNotFoundError:
         return f"Error: task {task_id} not found"
+
+
+def run_list_background_tasks() -> str:
+    """List background commands without consuming their completion result."""
+    tasks = list_background_tasks()
+    if not tasks:
+        return "No active background tasks."
+    return "\n".join(
+        f"  {item['task_id']}: {item['status']} — {item['command']}"
+        for item in tasks
+    )
 
 
 # --- feature tools (L2/L3/L5) ------------------------------------------------
@@ -360,6 +372,20 @@ BUILTIN_TOOLS = [
             "type": "object",
             "properties": {"pattern": {"type": "string"}},
             "required": ["pattern"],
+        },
+    },
+    {
+        "name": "background_tasks",
+        "description": "List running or recently completed background commands without consuming their results.",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "cancel_background_task",
+        "description": "Request cancellation of one background command by task id.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"task_id": {"type": "string"}},
+            "required": ["task_id"],
         },
     },
     {
@@ -776,6 +802,8 @@ BUILTIN_TOOLS = [
 
 BUILTIN_HANDLERS = {
     "bash": run_bash,
+    "background_tasks": run_list_background_tasks,
+    "cancel_background_task": cancel_background_task,
     "read_file": run_read,
     "write_file": run_write,
     "edit_file": run_edit,

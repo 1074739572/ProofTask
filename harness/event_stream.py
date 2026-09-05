@@ -696,11 +696,12 @@ def _run_user_turn(
     context["lookup_active"] = lookup_active
     context["writing_mode"] = is_writing_query(query) and not lookup_active
     from harness.prompts.goal_stickiness import augment_if_needed
+    from harness.agent.question_state import pending_question_text
     from harness.prompts.lookup import LOOKUP_CONSTRAINT
     from harness.prompts.writing import WRITING_CONSTRAINT
 
     constraints = []
-    sticky = augment_if_needed(query)
+    sticky = augment_if_needed(query, has_pending_question=bool(pending_question_text(context)))
     if sticky:
         constraints.append(sticky[len(query):].strip())
     if lookup_active:
@@ -731,6 +732,11 @@ def _run_user_turn(
     finally:
         clear_cancel()
         _emit_status(context, binding, history, running=False)
+
+    if not interrupted:
+        from harness.agent.question_state import remember_turn_question
+
+        remember_turn_question(context, history, turn_start)
 
     if interrupted:
         message, _rolled_back = abort_inflight_turn(history, turn_start, binding=binding)

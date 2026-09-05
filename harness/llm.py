@@ -2,10 +2,74 @@
 
 from __future__ import annotations
 
+import threading
+
+from harness.agent.cancel import is_cancelled
 from harness.models import get_model_profile
 from harness.providers.router import create_provider_message
 from harness.ui.renderer import renderer
 from harness.usage import parse_cache_usage, record_usage
+
+
+class _CancelledLLMRequest(RuntimeError):
+    """Internal signal used to stop waiting for a provider request."""
+
+
+def _call_provider_cancellable(*, profile, messages, max_tokens, system, tools,
+                               on_delta, read_timeout_seconds):
+    """Run a provider request without making Esc wait for the HTTP timeout.
+
+    Provider SDK calls are synchronous and can block while connecting or
+    waiting for the first response chunk.  The agent loop cannot observe its
+    cooperative cancel flag during that call, so run it in a daemon worker and
+    poll the flag here.  The worker is deliberately isolated from the turn
+    after cancellation; its stream callback also checks the per-request event
+    so late chunks cannot leak into a subsequent turn.
+    """
+    done = threading.Event()
+    abandoned = threading.Event()
+    result: dict[str, object] = {}
+
+    if is_cancelled():
+        raise _CancelledLLMRequest("LLM request cancelled")
+
+    def _delta(text: str, event_type: str) -> None:
+        if abandoned.is_set() or is_cancelled():
+            raise _CancelledLLMRequest("LLM request cancelled")
+        if on_delta is not None:
+            on_delta(text, event_type)
+
+    def _run() -> None:
+        try:
+            result["response"] = create_provider_message(
+                profile=profile,
+                messages=messages,
+                max_tokens=max_tokens,
+                system=system,
+                tools=tools,
+                on_delta=_delta if on_delta is not None else None,
+                read_timeout_seconds=read_timeout_seconds,
+            )
+        except BaseException as exc:  # pass provider failures to the caller
+            result["error"] = exc
+        finally:
+            done.set()
+
+    threading.Thread(target=_run, name="harness-llm-request", daemon=True).start()
+    while not done.wait(0.05):
+        if is_cancelled():
+            abandoned.set()
+            raise _CancelledLLMRequest("LLM request cancelled")
+    # A cancel can race with the final response, and must still win for this
+    # turn.  This also prevents usage accounting for a response the user
+    # explicitly discarded.
+    if is_cancelled():
+        abandoned.set()
+        raise _CancelledLLMRequest("LLM request cancelled")
+    error = result.get("error")
+    if error is not None:
+        raise error
+    return result["response"]
 
 
 def _format_llm_tag(profile) -> str:
@@ -112,7 +176,7 @@ def create_message(
         )
 
     with renderer.llm_busy(_format_llm_tag(profile)):
-        response = create_provider_message(
+        response = _call_provider_cancellable(
             profile=profile,
             messages=messages,
             max_tokens=max_tokens,

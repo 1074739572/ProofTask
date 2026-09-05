@@ -25,7 +25,8 @@
         "spawn_teammate",
         "create_worktree",
         "remove_worktree",
-        "project_set_chapter"
+        "project_set_chapter",
+        "cancel_background_task"
       ],
       "allowed_tools": ["read_file", "glob", "search_text", "inspect_file", "git_status", "git_diff", "load_skill", "rag_search", "rag_status", "list_tasks", "get_task", "list_features", "project_status", "todo_write"],
       "prompt": "Execution mode: PLAN (read-only planning)\n- Do NOT modify files or run shell commands.\n- Start with search_text/inspect_file, then use read_file for relevant ranges; avoid rereading identical files.\n- Use load_skill and rag_search only when they answer a concrete planning question.\n- Produce a clear numbered plan in your reply.\n- Use todo_write to capture steps (all pending until user approves).\n- Ask clarifying questions if requirements are ambiguous.\n- Stop after the plan — do NOT implement until the user says to proceed.\n- Tell the user: switch to direct or orchestrate mode to execute."
@@ -54,7 +55,8 @@
         "create_worktree",
         "remove_worktree",
         "project_set_chapter",
-        "todo_write"
+        "todo_write",
+        "cancel_background_task"
       ],
       "allowed_tools": ["read_file", "glob", "search_text", "inspect_file", "git_status", "git_diff", "load_skill", "rag_search", "rag_status", "web_search", "mcp__fetch__*"],
       "prompt": "Execution mode: FILE (document Q&A)\n- Classic CLI and Textual TUI route normal messages directly to local RAG over files/; no coding agent loop runs.\n- Answers must be grounded in retrieved excerpts only.\n- Scope defaults to the full indexed corpus and can be narrowed with /rag select or /rag pick.\n- Switch to /mode direct for coding, editing, or non-document tasks."
@@ -75,7 +77,8 @@
         "spawn_teammate",
         "create_worktree",
         "remove_worktree",
-        "project_set_chapter"
+        "project_set_chapter",
+        "cancel_background_task"
       ],
       "allowed_tools": ["read_file", "glob", "search_text", "inspect_file", "git_status", "git_diff", "load_skill", "rag_search", "rag_status", "list_tasks", "get_task", "list_features", "project_status", "todo_write"],
       "prompt": "Execution mode: GRILL (confirm-before-execute)\n- Builtin skill grill-me is already in context — follow it.\n- On a new request: parse the goal briefly, then grill ONE question at a time.\n- Look up facts with read_file/glob/rag_search; only ask the user for decisions.\n- Do NOT implement, edit, or run destructive commands while LOCKED.\n- When aligned: summarize the agreed plan and ask the user to reply「确认执行」or go.\n- After UNLOCKED: execute the agreed plan; do not reopen settled decisions without cause.\n- Use todo_write for the agreed checklist once unlocked (or while locked for planning only)."
@@ -95,7 +98,8 @@
         "create_worktree",
         "remove_worktree",
         "project_set_chapter",
-        "todo_write"
+        "todo_write",
+        "cancel_background_task"
       ],
       "allowed_tools": ["read_file", "glob", "search_text", "inspect_file", "git_status", "git_diff", "load_skill", "rag_search", "rag_status", "web_search", "mcp__fetch__*"],
       "prompt": "Execution mode: LOOKUP (web research + fact-checking, read-only)\n- You are in fact-checking / web-research mode. Answer factual questions with evidence from web_search + fetch.\n- Do NOT implement code, edit files, or run shell commands.\n- 成功标准：找到就给标题+来源链接；找不到就明确说「公开检索未找到」，并简要列出易混名/易混单位。\n- 读题（先复述再动手）：用一两句话写清——问的是什么（数量/名称/标题/列表）、单位与格式边界。复述错则整题错。\n- Before committing an answer, re-check: UNIT (thousands/millions/raw?), FORMAT (no thousands-separators unless asked), TYPE (title vs name vs number).\n- 流程：web_search 发现 URL → fetch 1–2 个有希望的页 → 真正读完页面再决定要不要再搜。\n- 证据：具体事实只信任本轮已 fetch 并读到的内容；不要把训练记忆当成已验证事实。\n- 换源：单 URL 404/robots/403 时换站点或策略（论文→arxiv/scholar；维基→API/摘要页），禁止近重复查询、禁止反复锤同一 host。\n- 手段：优先调用内置 web_search；有线索后再对具体 URL 用 mcp__fetch__fetch。禁止对 google.com / baidu.com / bing.com 搜索页做 fetch。\n- 禁止反复抓同一大页（如会议 Schedule / proceedings 目录）塞进对话。\n- 效率：有答案就收口，不要为凑证据无限联网。\n- 收口：先回答用户「有/没有」，再附来源。\n- 篇幅：最终回答 ≤8 行；追问单位/作者时用 1–3 句直接说清归属。\n- 护栏：LookupGuard 会拦截近重复搜索、连续无效搜索、已失败 URL/host；被拦后必须文字回答用户（用本轮已读到的证据，不要编造具体细节）。"

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import threading
+from html import escape
 from dataclasses import dataclass
 
 from harness.agent.compact.persist import stabilize_tool_results
@@ -24,6 +25,7 @@ class BackgroundEvent:
 
 background_tasks: dict[str, dict] = {}
 background_results: dict[str, str] = {}
+background_cancel_events: dict[str, threading.Event] = {}
 background_lock = threading.Lock()
 _SLOW_COMMAND_RE = re.compile(
     r"(?:^|[;&|]\s*)("
@@ -68,25 +70,30 @@ def start_background_task(block, handlers: dict) -> str:
         # A queued background operation must not start after the turn was
         # cancelled.  The foreground loop may have returned while this daemon
         # thread was still waiting for a scheduler slot.
-        if is_cancelled():
+        with background_lock:
+            cancel_requested = background_cancel_events.get(bg_id)
+        if is_cancelled() or (cancel_requested is not None and cancel_requested.is_set()):
             with background_lock:
                 background_tasks[bg_id]["status"] = "cancelled"
                 background_results[bg_id] = "[cancelled before start]"
+            _push_background_event(BackgroundEvent(task_id=bg_id, command=str(command), phase="cancelled"))
             return
         handler = handlers.get(name)
         result = call_tool_handler(handler, tool_input, name)
         trigger_hooks("PostToolUse", block, result)
         with background_lock:
-            background_tasks[bg_id]["status"] = "completed"
+            cancelled = background_cancel_events.get(bg_id)
+            was_cancelled = cancelled is not None and cancelled.is_set()
+            background_tasks[bg_id]["status"] = "cancelled" if was_cancelled else "completed"
             background_results[bg_id] = str(result)
-        _push_background_event(
-            BackgroundEvent(
-                task_id=bg_id,
-                command=str(command),
-                phase="completed",
-                preview=str(result)[:240],
-            )
+        event = BackgroundEvent(
+            task_id=bg_id,
+            command=str(command),
+            phase="cancelled" if was_cancelled else "completed",
+            preview=str(result)[:240],
         )
+        if not _push_background_event(event):
+            print(f"  \033[33m[background] {bg_id}: {event.phase}\033[0m")
 
     with background_lock:
         background_tasks[bg_id] = {
@@ -94,7 +101,7 @@ def start_background_task(block, handlers: dict) -> str:
             "command": command,
             "status": "running",
         }
-    threading.Thread(target=worker, daemon=True).start()
+        background_cancel_events[bg_id] = threading.Event()
     event = BackgroundEvent(
         task_id=bg_id,
         command=str(command),
@@ -102,11 +109,65 @@ def start_background_task(block, handlers: dict) -> str:
     )
     if not _push_background_event(event):
         print(f"  \033[33m[background] {bg_id}: {str(command)[:60]}\033[0m")
+    # Publish the start before launching the worker so a very fast command
+    # cannot deliver a completion event ahead of its running event.
+    threading.Thread(target=worker, daemon=True).start()
     return bg_id
 
 
 def _push_background_event(event) -> bool:
-    return False
+    # Keep the classic CLI fallback while making completion observable by the
+    # JSONL frontend.  The event stream is deliberately best-effort: a broken
+    # UI sink must never fail the background worker.
+    try:
+        from harness.ui import events
+
+        if not events.is_enabled():
+            return False
+        events.emit(
+            "background_task",
+            task_id=event.task_id,
+            command=event.command,
+            phase=event.phase,
+            preview=event.preview,
+        )
+        return True
+    except Exception:
+        return False
+
+
+def list_background_tasks() -> list[dict[str, object]]:
+    """Return a stable snapshot without consuming completed results."""
+    with background_lock:
+        return [
+            {
+                "task_id": task_id,
+                "command": str(task.get("command", "")),
+                "status": str(task.get("status", "unknown")),
+                "tool_use_id": str(task.get("tool_use_id", "")),
+            }
+            for task_id, task in sorted(background_tasks.items())
+        ]
+
+
+def cancel_background_task(task_id: str) -> str:
+    """Request cancellation for one task; running subprocesses finish safely."""
+    key = str(task_id or "").strip()
+    if not key:
+        return "Error: task_id is required"
+    with background_lock:
+        task = background_tasks.get(key)
+        cancel_event = background_cancel_events.get(key)
+        if task is None or cancel_event is None:
+            return f"Error: background task {key} not found"
+        status = str(task.get("status", ""))
+        if status in {"completed", "cancelled"}:
+            return f"Background task {key} is already {status}"
+        cancel_event.set()
+        task["status"] = "cancelling"
+        command = str(task.get("command", ""))
+    _push_background_event(BackgroundEvent(task_id=key, command=command, phase="cancelling"))
+    return f"Cancellation requested for background task {key}"
 
 
 def collect_background_results() -> list[str]:
@@ -121,6 +182,7 @@ def collect_background_results() -> list[str]:
         with background_lock:
             task = background_tasks.pop(bg_id)
             output = background_results.pop(bg_id, "")
+            background_cancel_events.pop(bg_id, None)
         summary = output[:2000] if len(output) > 2000 else output
         match = re.search(r"\[exit_code=(-?\d+)\]", str(output))
         if match:
@@ -130,11 +192,11 @@ def collect_background_results() -> list[str]:
         status = task.get("status", "completed")
         notifications.append(
             f"<task_notification>\n"
-            f"  <task_id>{bg_id}</task_id>\n"
-            f"  <status>{status}</status>\n"
+            f"  <task_id>{escape(bg_id)}</task_id>\n"
+            f"  <status>{escape(str(status))}</status>\n"
             f"  <exit_code>{exit_code}</exit_code>\n"
-            f"  <command>{task['command']}</command>\n"
-            f"  <summary>{summary}</summary>\n"
+            f"  <command>{escape(str(task['command']))}</command>\n"
+            f"  <summary>{escape(str(summary))}</summary>\n"
             f"  <output_chars>{len(output)}</output_chars>\n"
             f"</task_notification>"
         )

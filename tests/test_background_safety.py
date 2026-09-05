@@ -1,4 +1,5 @@
 import time
+import threading
 from unittest import mock
 
 
@@ -39,3 +40,44 @@ def test_background_worker_skips_execution_after_cancel():
     with background.background_lock:
         background.background_tasks.pop(task_id, None)
         background.background_results.pop(task_id, None)
+
+
+def test_background_event_is_emitted_for_jsonl_frontend():
+    from harness.agent import background
+
+    event = background.BackgroundEvent("bg_event", "pytest -q", "completed", "ok")
+    with mock.patch("harness.ui.events.is_enabled", return_value=True), mock.patch(
+        "harness.ui.events.emit"
+    ) as emit:
+        assert background._push_background_event(event) is True
+    emit.assert_called_once_with(
+        "background_task",
+        task_id="bg_event",
+        command="pytest -q",
+        phase="completed",
+        preview="ok",
+    )
+
+
+def test_background_task_can_be_listed_and_cancel_requested():
+    from harness.agent import background
+
+    with background.background_lock:
+        background.background_tasks.clear()
+        background.background_results.clear()
+        background.background_cancel_events.clear()
+        background.background_tasks["bg_list"] = {
+            "command": "pytest -q",
+            "status": "running",
+            "tool_use_id": "t3",
+        }
+        background.background_cancel_events["bg_list"] = threading.Event()
+
+    assert background.list_background_tasks()[0]["status"] == "running"
+    with mock.patch("harness.agent.background._push_background_event"):
+        message = background.cancel_background_task("bg_list")
+    assert "Cancellation requested" in message
+    assert background.list_background_tasks()[0]["status"] == "cancelling"
+    with background.background_lock:
+        background.background_tasks.clear()
+        background.background_cancel_events.clear()

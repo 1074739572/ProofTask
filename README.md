@@ -55,6 +55,32 @@ pip install -r requirements.txt
 python main.py
 ```
 
+### 从任意终端启动 Node TUI（Windows）
+
+Node TUI 的正式入口是 `node_tui\run.bat`。如果希望在任意目录打开终端后直接启动，
+在项目根目录执行一次：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\install-node-global.ps1
+```
+
+然后打开一个新的终端，输入下面任一命令即可。它们都会转发到
+`node_tui\run.bat`，并把**执行命令时所在的目录**作为工作区：
+
+```text
+prooftask
+proof-task
+run
+run.bat
+```
+
+安装只修改当前 Windows 用户的 PATH，不需要管理员权限。首次使用前请确保
+`node_tui\node_modules` 已安装（在 `node_tui` 目录执行 `npm install`）。
+
+例如，在 `D:\work\demo` 中运行 `prooftask`，该目录就是工作区；以后再次进入
+`D:\work\demo` 运行 `prooftask`，会继续使用该目录下保存的历史记录。不同目录的
+历史彼此隔离。
+
 在界面中创建一个 Goal：
 
 ```text

@@ -180,3 +180,11 @@ def test_route_requests_shutdown_after_idle_deadline() -> None:
 
     shutdown.assert_called_once_with("route_explore_123")
     assert "shutdown was requested" in messages[-1]["content"]
+
+
+def test_generic_question_is_not_auto_routed() -> None:
+    assert routing._classify_message("为什么这个函数很慢？") is None
+
+
+def test_concrete_evidence_question_can_still_route() -> None:
+    assert routing._classify_message("分析项目结构，找出入口文件") == "explore"
