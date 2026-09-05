@@ -93,13 +93,15 @@ def test_hook_mode_matrix_and_blocked_red_line() -> None:
         assert ask.call_count == 2
 
         state.set_mode("full-access")
-        assert permission_hook(block_unknown) is None
-        assert ask.call_count == 2
+        # Unknown tools remain interactive even in full-access; risk=high is
+        # not sufficient evidence to authorize an unregistered handler.
+        assert permission_hook(block_unknown) is not None
+        assert ask.call_count == 3
 
         # A policy-classified hard block cannot be widened by full-access.
         blocked = {"name": "bash", "input": {"command": "sudo rm -rf /"}}
         assert "Permission denied" in permission_hook(blocked)
-        assert ask.call_count == 2
+        assert ask.call_count == 3
 
 
 def test_goal_noninteractive_bypasses_session_overlay() -> None:

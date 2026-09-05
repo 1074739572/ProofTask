@@ -693,6 +693,7 @@ def _run_user_turn(
     turn_start = len(history)
     history.append({"role": "user", "content": model_query})
     lookup_active = is_lookup_active(query)
+    context["lookup_active"] = lookup_active
     context["writing_mode"] = is_writing_query(query) and not lookup_active
     from harness.prompts.goal_stickiness import augment_if_needed
     from harness.prompts.lookup import LOOKUP_CONSTRAINT

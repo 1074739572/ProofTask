@@ -29,6 +29,15 @@ class TestMcpEnvExpand(unittest.TestCase):
     def test_no_env_means_inherit(self) -> None:
         self.assertIsNone(resolve_server_env({}))
 
+    def test_allowlist_does_not_copy_unlisted_secrets(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {"PATH": "/bin", "OPENAI_API_KEY": "secret", "CUSTOM": "value"},
+            clear=True,
+        ):
+            env = resolve_server_env({"env_allowlist": ["PATH", "CUSTOM"]})
+        assert env == {"PATH": "/bin", "CUSTOM": "value"}
+
 
 if __name__ == "__main__":
     unittest.main()

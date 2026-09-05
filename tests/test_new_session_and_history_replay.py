@@ -91,3 +91,25 @@ def test_tui_new_command_is_routed_without_an_llm_turn(monkeypatch, tmp_path):
     replay = [payload for kind, payload in emitted if kind == "history_replay"]
     assert replay and replay[-1]["replace"] is True and replay[-1]["new_session"] is True
     assert replay[-1]["messages"] == []
+
+
+def test_classic_history_renderer_paints_loaded_messages(monkeypatch):
+    from harness import cli
+
+    rendered: list[tuple[str, str]] = []
+    monkeypatch.setattr(cli.renderer, "muted", lambda text: rendered.append(("muted", text)))
+    monkeypatch.setattr(cli.renderer, "user", lambda text: rendered.append(("user", text)))
+    monkeypatch.setattr(cli.renderer, "assistant", lambda text: rendered.append(("assistant", text)))
+
+    cli.print_session_history(
+        [
+            {"role": "user", "content": "历史问题"},
+            {"role": "assistant", "content": [{"type": "text", "text": "历史回答"}]},
+            {"role": "tool", "content": "内部工具结果"},
+        ]
+    )
+
+    assert ("user", "历史问题") in rendered
+    assert ("assistant", "历史回答") in rendered
+    assert rendered[0][0] == "muted"
+    assert rendered[-1][0] == "muted"

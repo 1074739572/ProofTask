@@ -11,7 +11,8 @@
       ],
       "env": {
         "PYTHONIOENCODING": "utf-8"
-      }
+      },
+      "env_allowlist": ["PATH", "PYTHONIOENCODING", "SYSTEMROOT", "TEMP", "TMP"]
     },
     "playwright": {
       "command": "npx",
@@ -20,14 +21,16 @@
         "@playwright/mcp@latest",
         "--browser",
         "chromium"
-      ]
+      ],
+      "env_allowlist": ["PATH", "SYSTEMROOT", "TEMP", "TMP", "USERPROFILE", "LOCALAPPDATA"]
     },
     "sequential-thinking": {
       "command": "npx",
       "args": [
         "-y",
         "@modelcontextprotocol/server-sequential-thinking"
-      ]
+      ],
+      "env_allowlist": ["PATH", "SYSTEMROOT", "TEMP", "TMP"]
     }
   }
 }

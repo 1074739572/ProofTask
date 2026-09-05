@@ -104,6 +104,22 @@ def test_tool_name_wildcard_matches_mcp_tools():
     assert evaluate_permission("mcp__github__delete_branch", {"branch": "main"}, rules=rules).effect == "deny"
 
 
+def test_sensitive_path_rules_apply_to_search_and_rag_index():
+    assert evaluate_permission("search_text", {"pattern": "TOKEN", "path": ".env"}).effect == "deny"
+    assert evaluate_permission("rag_index", {"path": ".env"}).effect == "deny"
+
+
+def test_destructive_mcp_annotation_overrides_broad_allow_rule():
+    decision = evaluate_permission(
+        "mcp__fetch__fetch",
+        {"url": "https://example.com"},
+        rules={"mcp__fetch__*": "allow"},
+        mcp_meta={"destructive": True, "readOnly": False},
+    )
+    assert decision.effect == "ask"
+    assert decision.source == "safety"
+
+
 def test_mcp_annotations_are_fallback_only():
     assert (
         evaluate_permission(

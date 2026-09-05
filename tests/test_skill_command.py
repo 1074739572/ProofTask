@@ -48,6 +48,27 @@ class SkillInjectTests(unittest.TestCase):
         self.assertIn("not found", note.lower())
         self.assertEqual(messages, [])
 
+    def test_inject_skill_is_idempotent_within_session(self) -> None:
+        from harness.skills_loader import inject_skill
+
+        messages: list = []
+        with mock.patch(
+            "harness.skills_loader.SKILL_REGISTRY",
+            {
+                "demo": {
+                    "name": "demo",
+                    "description": "Demo skill",
+                    "content": "---\nname: demo\n---\nDo the demo.",
+                }
+            },
+        ), mock.patch("harness.skills_loader.scan_skills"):
+            ok1, _ = inject_skill("demo", messages, checkpoint=False)
+            ok2, note2 = inject_skill("demo", messages, checkpoint=False)
+
+        self.assertTrue(ok1 and ok2)
+        self.assertIn("已在当前会话加载", note2)
+        self.assertEqual(len(messages), 1)
+
     def test_run_skill_list_without_messages(self) -> None:
         from harness.skills_loader import run_skill_command
 

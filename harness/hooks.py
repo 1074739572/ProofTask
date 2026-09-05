@@ -284,7 +284,27 @@ def permission_hook(block, session=None):
             or decision.save_tool == "external_directory"
             or bool(decision.external_resource)
         )
-        if risk in auto_levels and not boundary_ask:
+        # Never auto-approve an unknown tool.  Unknown tools are classified as
+        # ``high`` for conservative risk accounting, but treating that level as
+        # equivalent to a known high-risk tool would let full-access silently
+        # execute newly introduced or misspelled handlers.  MCP fallback
+        # decisions are also kept interactive unless an explicit config rule
+        # classified the tool.
+        # Config files commonly contain a catch-all ``*`` rule.  Its source is
+        # still ``config`` even for a name that has no registered handler, so
+        # inspect the canonical registry as well as the decision source.
+        try:
+            from harness.tools.registry import BUILTIN_HANDLERS
+
+            known_builtin = name in BUILTIN_HANDLERS
+        except Exception:
+            known_builtin = False
+        known_mcp = name in mcp_tool_meta
+        unknown_or_fallback = (
+            decision.source in {"default", "mcp"}
+            or (not known_builtin and not known_mcp)
+        )
+        if risk in auto_levels and not boundary_ask and not unknown_or_fallback:
             _safe_audit(
                 {
                     "event": "auto_approved",

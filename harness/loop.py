@@ -244,7 +244,22 @@ def agent_loop(
         prepare_context(messages, binding=binding)
         repair_tool_pairing(messages)
         context = update_context(context, messages)
-        tools, handlers = get_tool_pool(disabled_tools=disabled_tools)
+        effective_disabled = set(disabled_tools or ())
+        # Automatic lookup intent is a capability boundary, not just prompt
+        # prose.  Keep the user's selected mode intact while hiding mutation
+        # and shell tools for this turn.
+        if context.get("lookup_active"):
+            effective_disabled.update(
+                {"bash", "write_file", "edit_file", "patch_file", "rag_index",
+                 "task", "spawn_teammate", "create_worktree", "remove_worktree",
+                 "project_init", "project_note", "project_reset", "project_set_chapter"}
+            )
+        tools, handlers = get_tool_pool(disabled_tools=effective_disabled)
+        tool_schemas = {
+            str(tool.get("name")): tool.get("input_schema")
+            for tool in tools
+            if tool.get("name")
+        }
 
         # Auto-route: when enabled, classify and dispatch the latest user
         # message to a sub-agent before the lead model sees it.
@@ -254,7 +269,12 @@ def agent_loop(
             if route_user_message(messages):
                 # Routing happened; re-prepare context with the injected result.
                 context = update_context(context, messages)
-                tools, handlers = get_tool_pool(disabled_tools=disabled_tools)
+                tools, handlers = get_tool_pool(disabled_tools=effective_disabled)
+                tool_schemas = {
+                    str(tool.get("name")): tool.get("input_schema")
+                    for tool in tools
+                    if tool.get("name")
+                }
 
         try:
             llm_rounds += 1
@@ -534,7 +554,11 @@ def agent_loop(
                 continue
 
             handler = handlers.get(name)
-            if name == "bash" and isinstance(tool_input, dict):
+            from harness.tools.dispatch import validate_tool_input
+            input_error = validate_tool_input(tool_schemas.get(name), tool_input)
+            if input_error:
+                output = f"Tool input error ({name}): {input_error}"
+            elif name == "bash" and isinstance(tool_input, dict):
                 # Stream stdout/stderr line-by-line as tool_output events so the
                 # TUI shows live output (Claude Code style) instead of a black
                 # box that resolves when the command finishes.
@@ -547,6 +571,9 @@ def agent_loop(
                     tool_use_id=tool_use_id,
                 )
             else:
+                # Input was validated immediately above; keep the historical
+                # three-argument call shape for embedders that monkeypatch the
+                # dispatcher.
                 output = call_tool_handler(handler, tool_input, name)
             writing_guard.note_tool(name)
             mutations.note(

@@ -92,6 +92,7 @@ def switch_workspace(target: str | Path) -> tuple[bool, str, object | None]:
     _switch_root(resolved)
     record_recent_project(resolved)
     _refresh_rag_paths()
+    _reset_mcp_runtime()
     _reset_rag_caches()
     binding = _reset_session_state(resolved)
 
@@ -122,6 +123,7 @@ def _refresh_rag_paths() -> None:
 
     # Modules that re-export these constants into their own namespace.
     from harness.rag import assets, ingest, lexical, parents
+    from harness.rag import selection
 
     setattr(lexical, "INDEX_DIR", new_config["INDEX_DIR"])
     setattr(lexical, "MANIFEST_PATH", new_config["MANIFEST_PATH"])
@@ -134,17 +136,44 @@ def _refresh_rag_paths() -> None:
     setattr(ingest, "RAG_DIR", new_config["RAG_DIR"])
     # ingest.resolve_path() reads WORKDIR for default corpus resolution.
     setattr(ingest, "WORKDIR", root)
+    # selection.py imports RAG_DIR by value, so point its persistence file at
+    # the target workspace as well.
+    setattr(selection, "SELECTION_PATH", new_config["RAG_DIR"] / "selection.json")
 
 
 def _reset_rag_caches() -> None:
     """Drop RAG in-memory indexes so the next lookup rebuilds from the new dir."""
-    from harness.rag import lexical, parents
+    from harness.rag import lexical, parents, pipeline
 
     lexical._corpus = []
     lexical._idf = {}
     lexical._doc_freq = {}
     lexical._avg_dl = 1.0
     parents._parent_map = {}
+    pipeline.reset_runtime()
+
+
+def _reset_mcp_runtime() -> None:
+    """Close clients and invalidate bootstrap state after workspace changes."""
+    from harness.mcp import pool
+
+    for client in list(pool.mcp_clients.values()):
+        close = getattr(client, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
+    pool.mcp_clients.clear()
+    pool.mcp_tool_meta.clear()
+    pool.mcp_pool_warnings.clear()
+    with pool._bootstrap_lock:
+        pool._bootstrap_started = False
+        pool._bootstrap_results.clear()
+        pool._bootstrap_done.clear()
+    with pool._barrier_lock:
+        pool._barrier_consumed = False
+        pool._warnings_consumed = False
 
 
 def _reset_session_state(root: Path):

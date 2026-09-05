@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import threading
 from pathlib import Path
 
@@ -10,6 +11,7 @@ import yaml
 from harness import settings
 
 SKILL_REGISTRY: dict[str, dict] = {}
+SKILL_CONFLICTS: dict[str, list[dict]] = {}
 _REGISTRY_LOCK = threading.RLock()
 _registry_generation = -1
 MAX_SKILL_BODY_BYTES = 8_000
@@ -50,6 +52,7 @@ def skill_roots() -> list[tuple[str, Path]]:
 def scan_skills() -> None:
     global _registry_generation
     fresh: dict[str, dict] = {}
+    conflicts: dict[str, list[dict]] = {}
     for source, root in skill_roots():
         if not root.exists():
             continue
@@ -72,16 +75,22 @@ def scan_skills() -> None:
             if not name:
                 continue
             desc = str(meta.get("description", raw.split("\n")[0].lstrip("#").strip()))
-            fresh[name] = {
+            entry = {
                 "name": name,
                 "description": desc[:MAX_SKILL_DESCRIPTION_CHARS],
                 "content": raw,
                 "path": str(manifest),
                 "source": source,
             }
+            if name in fresh:
+                conflicts.setdefault(name, [fresh[name]])
+                conflicts[name].append(entry)
+            fresh[name] = entry
     with _REGISTRY_LOCK:
         SKILL_REGISTRY.clear()
         SKILL_REGISTRY.update(fresh)
+        SKILL_CONFLICTS.clear()
+        SKILL_CONFLICTS.update(conflicts)
         _registry_generation = settings.workspace_generation()
 
 
@@ -104,18 +113,46 @@ def skill_names() -> list[str]:
 
 
 def load_skill(name: str) -> str:
+    """Load a bounded skill body for model context.
+
+    Use :func:`load_skill_detail` when callers need provenance/truncation
+    metadata.  The string API remains for backwards compatibility.
+    """
+    detail = load_skill_detail(name)
+    return detail["content"]
+
+
+def load_skill_detail(name: str) -> dict:
+    """Return skill content plus provenance and truncation metadata."""
     if _registry_generation != settings.workspace_generation():
         scan_skills()
     skill = SKILL_REGISTRY.get(name)
     if not skill:
         available = ", ".join(SKILL_REGISTRY.keys()) or "(none)"
-        return f"Skill not found: {name}. Available: {available}"
+        return {
+            "name": name,
+            "content": f"Skill not found: {name}. Available: {available}",
+            "source": "",
+            "path": "",
+            "truncated": False,
+            "sha256": "",
+        }
     content = skill["content"]
+    digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    truncated = False
     encoded = content.encode("utf-8")
     if len(encoded) > MAX_SKILL_BODY_BYTES:
         content = encoded[:MAX_SKILL_BODY_BYTES].decode("utf-8", errors="ignore")
         content += "\n\n[skill body truncated; read the source file for the remainder]"
-    return content
+        truncated = True
+    return {
+        "name": skill["name"],
+        "content": content,
+        "source": skill.get("source", ""),
+        "path": skill.get("path", ""),
+        "truncated": truncated,
+        "sha256": digest,
+    }
 
 
 def format_skill_injection(name: str, content: str) -> str:
@@ -157,6 +194,10 @@ def format_skill_command_status() -> str:
         "Skills",
         "用法：/skill <name> 将全文注入当前会话  ·  加载后再提问",
     ]
+    if SKILL_CONFLICTS:
+        lines.append("警告：存在同名 Skill 覆盖（project/global 优先级更高）：")
+        for name, entries in sorted(SKILL_CONFLICTS.items()):
+            lines.append(f"  - {name}: " + ", ".join(str(item.get("source", "?")) for item in entries))
     for skill in SKILL_REGISTRY.values():
         desc = (skill.get("description") or "").strip()
         if len(desc) > 80:
@@ -180,6 +221,14 @@ def inject_skill(
     if raw not in SKILL_REGISTRY:
         available = ", ".join(SKILL_REGISTRY.keys()) or "(none)"
         return False, f"Skill not found: {raw}. Available: {available}"
+
+    # Loading the same immutable skill twice only inflates history and can
+    # cause contradictory duplicate instructions after a later edit.  Treat a
+    # matching injection as idempotent; callers can restart the session or
+    # explicitly reload after changing the file.
+    for message in messages:
+        if is_skill_injection(message) and parse_skill_loaded_name(message.get("content", "")) == raw:
+            return True, skill_loaded_notice(raw) + "（已在当前会话加载）"
 
     content = load_skill(raw)
     messages.append({"role": "user", "content": format_skill_injection(raw, content)})

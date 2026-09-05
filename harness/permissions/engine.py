@@ -31,6 +31,27 @@ class ToolPermissionContext:
     external_resource: str | None = None
 
 
+_SENSITIVE_NAMES = frozenset({".env", ".env.local", ".env.production", ".env.development"})
+
+
+def _is_sensitive_path(resource: str) -> bool:
+    """Return whether a workspace-relative resource is secret-like.
+
+    This check is intentionally independent of the user-editable permission
+    file so adding a broad ``search_text: allow`` rule cannot reopen secrets.
+    Example templates remain readable.
+    """
+    path = resource.replace("\\", "/").strip().lower()
+    while path.startswith("./"):
+        path = path[2:]
+    if not path:
+        return False
+    name = path.rsplit("/", 1)[-1]
+    if name in _SENSITIVE_NAMES or (name.startswith(".env.") and not name.endswith(".example")):
+        return True
+    return name.endswith((".pem", ".key", ".p12", ".pfx"))
+
+
 def _match(pattern: str, value: str) -> bool:
     return fnmatch.fnmatchcase(value.lower(), pattern.lower())
 
@@ -43,7 +64,10 @@ def _json_preview(data: dict) -> str:
 
 
 def _path_value(tool_name: str, data: dict) -> str:
-    if tool_name in ("read_file", "write_file", "edit_file", "patch_file", "inspect_file", "git_diff"):
+    if tool_name in (
+        "read_file", "write_file", "edit_file", "patch_file", "inspect_file",
+        "git_diff", "search_text", "rag_index",
+    ):
         return str(data.get("path") or "")
     return ""
 
@@ -55,7 +79,10 @@ def _normalize_resource(tool_name: str, resource: str) -> str:
     backslashes. Matching the raw input let the same protected file have two
     different permission outcomes.
     """
-    if tool_name in ("read_file", "write_file", "edit_file", "patch_file", "inspect_file", "git_diff"):
+    if tool_name in (
+        "read_file", "write_file", "edit_file", "patch_file", "inspect_file",
+        "git_diff", "search_text", "rag_index",
+    ):
         normalized = resource.replace("\\", "/")
         # Policies are workspace-relative. Without canonicalizing an absolute
         # path inside the workspace, `.project/goal.json` can evade a deny rule
@@ -104,7 +131,10 @@ def context_for_tool(tool_name: str, tool_input: dict | None) -> ToolPermissionC
         return ToolPermissionContext(
             tool_name, _normalize_resource(tool_name, str(data.get("command") or ""))
         )
-    if tool_name in ("read_file", "write_file", "edit_file", "patch_file", "inspect_file", "git_diff"):
+    if tool_name in (
+        "read_file", "write_file", "edit_file", "patch_file", "inspect_file",
+        "git_diff", "search_text", "rag_index",
+    ):
         return ToolPermissionContext(
             tool_name,
             _normalize_resource(tool_name, str(data.get("path") or "")),
@@ -292,6 +322,34 @@ def evaluate_permission(
     ``external_directory`` gate before the tool's own permission.
     """
     ctx = context_for_tool(tool_name, tool_input)
+    if tool_name in {
+        "read_file", "inspect_file", "git_diff", "search_text", "rag_index",
+    } and _is_sensitive_path(ctx.resource):
+        return PermissionDecision(
+            effect="deny",
+            tool=tool_name,
+            resource=ctx.resource,
+            reason="sensitive resource is protected",
+            save_tool=tool_name,
+            save_resource=ctx.resource,
+            source="safety",
+            external_resource=ctx.external_resource,
+        )
+    # MCP annotations are safety metadata, not merely descriptive fields.
+    # A destructive tool must remain interactive even when a broad config
+    # wildcard (for example ``mcp__fetch__*``) would otherwise allow it.
+    if tool_name.startswith("mcp__") and isinstance(mcp_meta, dict):
+        if bool(mcp_meta.get("destructive")) or mcp_meta.get("readOnly") is False:
+            return PermissionDecision(
+                effect="ask",
+                tool=tool_name,
+                resource=ctx.resource,
+                reason="destructive MCP tool requires explicit approval",
+                save_tool=tool_name,
+                save_resource=ctx.resource,
+                source="safety",
+                external_resource=ctx.external_resource,
+            )
     if tool_name == "bash" and any(token in ctx.resource for token in ("&", "|", ">", "<", "\n", "\r")):
         # A prefix allow-list cannot safely authorize a compound shell command.
         # It may contain an unrelated destructive command after the separator.

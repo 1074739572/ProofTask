@@ -7,6 +7,7 @@ import threading
 from dataclasses import dataclass
 
 from harness.agent.compact.persist import stabilize_tool_results
+from harness.agent.cancel import is_cancelled
 from harness.hooks import trigger_hooks
 from harness.messages.blocks import block_field
 from harness.tools.dispatch import call_tool_handler
@@ -64,6 +65,14 @@ def start_background_task(block, handlers: dict) -> str:
     command = tool_input.get("command", name)
 
     def worker():
+        # A queued background operation must not start after the turn was
+        # cancelled.  The foreground loop may have returned while this daemon
+        # thread was still waiting for a scheduler slot.
+        if is_cancelled():
+            with background_lock:
+                background_tasks[bg_id]["status"] = "cancelled"
+                background_results[bg_id] = "[cancelled before start]"
+            return
         handler = handlers.get(name)
         result = call_tool_handler(handler, tool_input, name)
         trigger_hooks("PostToolUse", block, result)
@@ -105,7 +114,7 @@ def collect_background_results() -> list[str]:
         ready = [
             bg_id
             for bg_id, task in background_tasks.items()
-            if task["status"] == "completed"
+            if task["status"] in {"completed", "cancelled"}
         ]
     notifications = []
     for bg_id in ready:
@@ -113,11 +122,16 @@ def collect_background_results() -> list[str]:
             task = background_tasks.pop(bg_id)
             output = background_results.pop(bg_id, "")
         summary = output[:2000] if len(output) > 2000 else output
-        exit_code = 0 if not str(output).startswith("Error:") else 1
+        match = re.search(r"\[exit_code=(-?\d+)\]", str(output))
+        if match:
+            exit_code = int(match.group(1))
+        else:
+            exit_code = 0 if not str(output).startswith("Error:") else 1
+        status = task.get("status", "completed")
         notifications.append(
             f"<task_notification>\n"
             f"  <task_id>{bg_id}</task_id>\n"
-            f"  <status>completed</status>\n"
+            f"  <status>{status}</status>\n"
             f"  <exit_code>{exit_code}</exit_code>\n"
             f"  <command>{task['command']}</command>\n"
             f"  <summary>{summary}</summary>\n"

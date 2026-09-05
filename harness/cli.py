@@ -230,6 +230,53 @@ def print_turn_assistants(messages: list, turn_start: int | None) -> None:
             console.terminal_print(text)
 
 
+def print_session_history(messages: list, *, limit: int = 300) -> None:
+    """Render a restored transcript in the classic terminal.
+
+    The JSONL/TUI frontend receives a ``history_replay`` event, but the classic
+    line frontend has no event reducer to paint that transcript.  Previously a
+    successful ``/resume`` only printed a one-line preview, which made the
+    loaded session look empty even though the model received the messages.
+    Keep this renderer bounded like the TUI replay and use the normal user /
+    assistant renderers so Rich and plain terminals have the same formatting.
+    """
+    from harness.project.resume import _message_text
+    from harness.ui import events
+
+    # A JSONL caller has its own history_replay protocol.  Keeping this helper
+    # silent there avoids turning restored messages into fresh user/assistant
+    # events (and avoids duplicate rows in an external TUI).
+    if events.is_enabled():
+        return
+
+    if not messages:
+        return
+    bounded_limit = max(1, int(limit))
+    selected = messages[-bounded_limit:]
+    rows: list[tuple[str, str]] = []
+    for message in selected:
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role") or "")
+        if role not in ("user", "assistant"):
+            continue
+        text = _message_text(message.get("content")).strip()
+        if text:
+            rows.append((role, text))
+    if not rows:
+        return
+
+    renderer.muted("--- 历史消息（已加载） ---")
+    if len(messages) > bounded_limit:
+        renderer.muted(f"… 更早的历史消息已折叠，仅显示最近 {bounded_limit} 条")
+    for role, text in rows:
+        if role == "user":
+            renderer.user(text)
+        else:
+            renderer.assistant(text)
+    renderer.muted("--- 历史消息结束 ---")
+
+
 def cron_autorun_loop(history: list, context: dict, *, binding: SessionBinding) -> None:
     while True:
         time.sleep(1)
@@ -297,6 +344,11 @@ def bootstrap_cli_session(
             renderer.warn(project_md.status)
         else:
             renderer.muted(project_md.status)
+        # Classic CLI has no frontend reducer to consume a history replay
+        # event. Paint an automatically restored transcript immediately after
+        # the welcome so ``HARNESS_CONTINUE_SESSION=1`` is visibly useful.
+        if cli_active and history:
+            print_session_history(history)
 
     if should_auto_inject_project_on_startup():
         ok, note = inject_project_context(history, binding=binding, checkpoint=True)
@@ -508,13 +560,13 @@ def run_cli() -> None:
             with agent_lock:
                 previous_binding = binding
                 note, new_binding = run_resume_command(sub, messages=history, binding=binding)
+                previous_id = getattr(previous_binding, "session_id", None)
                 if new_binding is not None:
                     binding = new_binding
                     todos_set_binding(binding)
                     # ``/resume status`` returns the current binding and must
                     # not reset a mode; selecting/deleting into a different
                     # session starts a fresh runtime permission context.
-                    previous_id = getattr(previous_binding, "session_id", None)
                     new_id = getattr(new_binding, "session_id", None)
                     if new_binding is not previous_binding and new_id != previous_id:
                         from harness.permission_session import reset_permission_session
@@ -523,6 +575,12 @@ def run_cli() -> None:
                 repair_tool_pairing(history)
                 context = update_context(context, history)
                 renderer.plain(note)
+                switched = (
+                    new_binding is not None
+                    and getattr(new_binding, "session_id", None) != previous_id
+                )
+                if switched:
+                    print_session_history(history)
             print()
             continue
         if _match_cli_command(query, "/skill"):
@@ -661,6 +719,10 @@ def run_cli() -> None:
         turn_start = len(history)
         history.append({"role": "user", "content": model_query})
         lookup_active = is_lookup_active(query)
+        # The prompt constraint is accompanied by a hard per-turn capability
+        # flag consumed by agent_loop; automatic lookup must not merely ask the
+        # model to self-police mutation tools.
+        context["lookup_active"] = lookup_active
         context["writing_mode"] = is_writing_query(query) and not lookup_active
         from harness.prompts.goal_stickiness import augment_if_needed
         from harness.prompts.lookup import LOOKUP_CONSTRAINT

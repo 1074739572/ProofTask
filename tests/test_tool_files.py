@@ -187,6 +187,15 @@ def test_glob_no_recursive_match_without_starstar(tmp_path):
     assert out == "(no matches)"
 
 
+def test_glob_is_bounded(tmp_path):
+    from harness.tools.filesystem import MAX_GLOB_RESULTS
+
+    for index in range(MAX_GLOB_RESULTS + 5):
+        (tmp_path / f"item-{index}.txt").write_text("x", encoding="utf-8")
+    out = run_glob("*.txt", cwd=tmp_path)
+    assert f"limited to {MAX_GLOB_RESULTS} results" in out
+
+
 def test_search_text_returns_capped_line_numbered_matches(tmp_path):
     (tmp_path / "a.py").write_text("alpha\nneedle one\nneedle two\n", encoding="utf-8")
     out = run_search_text("needle", cwd=tmp_path, max_results=1)

@@ -29,6 +29,20 @@ def test_skill_scan_is_workspace_aware_and_project_overrides_builtin(tmp_path, m
     assert "project body" in skills_loader.load_skill("demo")
 
 
+def test_skill_scan_records_same_name_conflicts(tmp_path, monkeypatch):
+    from harness import settings, skills_loader
+
+    _write_skill(tmp_path / "skills", "demo", "project body")
+    builtin = tmp_path / "builtin"
+    _write_skill(builtin, "demo", "builtin body", name="demo")
+    monkeypatch.setattr(settings, "BUILTIN_SKILLS_DIR", builtin)
+    monkeypatch.setattr(settings, "get_workdir", lambda: tmp_path)
+    monkeypatch.setattr(settings, "workspace_generation", lambda: 420)
+    skills_loader.scan_skills()
+    assert "demo" in skills_loader.SKILL_CONFLICTS
+    assert len(skills_loader.SKILL_CONFLICTS["demo"]) == 2
+
+
 def test_skill_scan_isolates_bad_encoding_and_scalar_frontmatter(tmp_path, monkeypatch):
     from harness import settings
     from harness import skills_loader

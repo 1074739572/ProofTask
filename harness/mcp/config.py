@@ -20,12 +20,26 @@ def _expand_env_value(value: str) -> str:
 
 
 def resolve_server_env(server_cfg: dict) -> dict | None:
-    """Build child-process env: inherit os.environ, overlay expanded mcp.json env."""
+    """Build child-process env with optional explicit inheritance allowlist.
+
+    Existing configs without ``env_allowlist`` retain legacy inheritance for
+    compatibility.  Shipped/production server entries should provide an
+    allowlist so API keys and unrelated process secrets are not copied into
+    MCP children.
+    """
     raw = server_cfg.get("env")
-    if not raw:
+    allowlist = server_cfg.get("env_allowlist")
+    if not raw and not isinstance(allowlist, list):
         return None
-    merged = dict(os.environ)
-    for key, value in raw.items():
+    if isinstance(allowlist, list):
+        merged = {
+            str(key): os.environ[str(key)]
+            for key in allowlist
+            if isinstance(key, str) and key in os.environ
+        }
+    else:
+        merged = dict(os.environ)
+    for key, value in (raw or {}).items():
         if isinstance(value, str):
             merged[key] = _expand_env_value(value)
         elif value is None:

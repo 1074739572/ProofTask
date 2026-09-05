@@ -48,7 +48,7 @@ def test_lookup_constraint_mentions_web_search() -> None:
     assert "web_search" in LOOKUP_CONSTRAINT
 
 
-def test_browse_soft_allow_skips_permission() -> None:
+def test_browse_destructive_annotation_requires_permission() -> None:
     from harness.hooks import permission_hook
     from harness.mcp.pool import mcp_tool_meta
 
@@ -56,6 +56,12 @@ def test_browse_soft_allow_skips_permission() -> None:
     mcp_tool_meta[name] = {"destructive": True, "server": "playwright", "tool": "browser_navigate"}
     try:
         block = {"name": name, "input": {"url": "https://www.baidu.com"}}
-        assert permission_hook(block) is None
+        with mock.patch("harness.hooks.ask_permission") as ask:
+            ask.return_value = mock.Mock(
+                decision="deny", allowed=False, remember_session=False,
+                remember_always=False, value="",
+            )
+            assert permission_hook(block) is not None
+            ask.assert_called_once()
     finally:
         mcp_tool_meta.pop(name, None)

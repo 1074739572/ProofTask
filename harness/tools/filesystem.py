@@ -33,6 +33,7 @@ def safe_path(path: str, cwd: Path | None = None) -> Path:
 
 DEFAULT_BASH_TIMEOUT_MS = 120_000
 MAX_BASH_TIMEOUT_MS = 3_600_000
+MAX_GLOB_RESULTS = 1_000
 _GRACE_SECONDS = 3.0
 
 
@@ -601,6 +602,8 @@ def run_glob(pattern: str, cwd: Path | None = None) -> str:
         for match in globlib.glob(pattern, root_dir=base, recursive=True):
             if (base / match).resolve().is_relative_to(base):
                 results.append(match)
+                if len(results) >= MAX_GLOB_RESULTS:
+                    return "\n".join(sorted(results)) + f"\n... (limited to {MAX_GLOB_RESULTS} results)"
         return "\n".join(sorted(results)) if results else "(no matches)"
     except Exception as exc:
         return f"Error: {exc}"
