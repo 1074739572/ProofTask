@@ -32,18 +32,18 @@
     "load_skill": "low",
     "todo_write": "low",
     "web_search": "low",
-    "write_file": "medium",
-    "edit_file": "medium",
-    "patch_file": "medium",
+    "write_file": "low",
+    "edit_file": "low",
+    "patch_file": "low",
     "mcp__fetch__*": "low",
-    "mcp__*": "high",
-    "bash": "high",
-    "subagent": "high",
-    "task": "high",
-    "spawn_teammate": "high"
+    "mcp__*": "low",
+    "bash": "low",
+    "subagent": "low",
+    "task": "low",
+    "spawn_teammate": "low"
   },
   "bash": {
-    "default_risk": "high",
+    "default_risk": "low",
     "patterns": {
       "blocked": [
         "rm\\s+(-[a-z]*[rR][a-z]*\\s+)*/?\\s*$",

@@ -5,6 +5,15 @@ from __future__ import annotations
 from harness.agent.cron import run_cancel_cron, run_list_crons, run_schedule_cron
 from harness.agent.background import cancel_background_task, list_background_tasks
 from harness.agent.subagent import run_agent_task
+from harness.agent.server_manager import (
+    start_fastapi_server,
+    stop_fastapi_server,
+    restart_fastapi_server,
+    get_fastapi_server_status,
+    format_server_status,
+    remove_fastapi_server,
+)
+from harness.agent.services import ServiceError, list_services
 from harness.agents.schema import build_task_tool_schema
 from harness.mcp.pool import assemble_tool_pool, connect_mcp
 from harness.modes import mode_enables_task, mode_disables_tool
@@ -211,6 +220,90 @@ def run_check_inbox() -> str:
         req_id = meta.get("request_id", "")
         tag = f" [{msg['type']} req:{req_id}]" if req_id else f" [{msg['type']}]"
         lines.append(f"  [{msg['from']}]{tag} {msg['content'][:200]}")
+    return "\n".join(lines)
+
+
+# --- service management tools (Layer 4) ----------------------------------------
+
+_DEFAULT_SERVICE_ID = "fastapi_backend"
+
+
+def _service_error(exc: Exception) -> str:
+    return f"Error: {exc}"
+
+
+def run_start_server(
+    service_id: str = _DEFAULT_SERVICE_ID,
+    backend_path: str | None = None,
+    port: int = 8000,
+    host: str = "127.0.0.1",
+) -> str:
+    """Start the FastAPI backend server as a durable service."""
+    try:
+        result = start_fastapi_server(
+            service_id=service_id,
+            backend_path=backend_path,
+            port=port,
+            host=host,
+        )
+    except (ServiceError, ValueError) as exc:
+        return _service_error(exc)
+    print(f"  \033[32m[service] {result}\033[0m")
+    return result
+
+
+def run_stop_server(service_id: str = _DEFAULT_SERVICE_ID) -> str:
+    """Stop the FastAPI backend server."""
+    try:
+        result = stop_fastapi_server(service_id=service_id)
+    except (ServiceError, ValueError) as exc:
+        return _service_error(exc)
+    print(f"  \033[33m[service] {result}\033[0m")
+    return result
+
+
+def run_restart_server(service_id: str = _DEFAULT_SERVICE_ID) -> str:
+    """Restart the FastAPI backend server."""
+    try:
+        result = restart_fastapi_server(service_id=service_id)
+    except (ServiceError, ValueError) as exc:
+        return _service_error(exc)
+    print(f"  \033[36m[service] {result}\033[0m")
+    return result
+
+
+def run_server_status(service_id: str = _DEFAULT_SERVICE_ID) -> str:
+    """Get detailed status of the FastAPI backend server."""
+    try:
+        status = get_fastapi_server_status(service_id=service_id)
+    except (ServiceError, ValueError) as exc:
+        return _service_error(exc)
+    return format_server_status(status)
+
+
+def run_remove_server(service_id: str = _DEFAULT_SERVICE_ID, force: bool = False) -> str:
+    """Unregister the FastAPI backend server service."""
+    try:
+        result = remove_fastapi_server(service_id=service_id, force=force)
+    except (ServiceError, ValueError) as exc:
+        return _service_error(exc)
+    print(f"  \033[31m[service] {result}\033[0m")
+    return result
+
+
+def run_list_services() -> str:
+    """List all registered durable services with their status."""
+    services = list_services()
+    if not services:
+        return "No registered services."
+    lines = []
+    for svc in services:
+        sid = svc.get("service_id", "unknown")
+        state = "running" if svc.get("is_running") else "stopped"
+        pid = svc.get("pid") or "N/A"
+        health = svc.get("health_status")
+        suffix = f" | health: {health}" if health else ""
+        lines.append(f"  {sid}: {state} (PID: {pid}){suffix}")
     return "\n".join(lines)
 
 
@@ -798,6 +891,112 @@ BUILTIN_TOOLS = [
         "description": "Clear saved conversation history only (keeps chapter progress).",
         "input_schema": {"type": "object", "properties": {}, "required": []},
     },
+    {
+        "name": "start_server",
+        "description": (
+            "Start the FastAPI backend server as a durable service that survives "
+            "Agent session termination. Registers the service, starts uvicorn with "
+            "process detachment, redirects logs, and polls the health endpoint."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "service_id": {
+                    "type": "string",
+                    "description": "Unique service identifier (default: fastapi_backend).",
+                },
+                "backend_path": {
+                    "type": "string",
+                    "description": "Path to backend directory containing app/main.py.",
+                },
+                "port": {
+                    "type": "integer",
+                    "description": "Port to bind server to (default: 8000).",
+                },
+                "host": {
+                    "type": "string",
+                    "description": "Host address to bind to (default: 127.0.0.1).",
+                },
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "stop_server",
+        "description": (
+            "Stop the FastAPI backend server gracefully. Terminates the process tree "
+            "and cleans up PID files."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "service_id": {
+                    "type": "string",
+                    "description": "Service identifier (default: fastapi_backend).",
+                },
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "restart_server",
+        "description": "Restart the FastAPI backend server (stop + start sequence).",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "service_id": {
+                    "type": "string",
+                    "description": "Service identifier (default: fastapi_backend).",
+                },
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "server_status",
+        "description": (
+            "Get detailed status of the FastAPI backend server including PID, "
+            "process status, port availability, health check result, and log paths."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "service_id": {
+                    "type": "string",
+                    "description": "Service identifier (default: fastapi_backend).",
+                },
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "remove_server",
+        "description": (
+            "Unregister the FastAPI backend server service from the registry. "
+            "Requires the service to be stopped unless force=true."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "service_id": {
+                    "type": "string",
+                    "description": "Service identifier (default: fastapi_backend).",
+                },
+                "force": {
+                    "type": "boolean",
+                    "description": "Force removal even if service is running.",
+                },
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "list_services",
+        "description": (
+            "List all registered durable services with their running status and PID."
+        ),
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
 ]
 
 BUILTIN_HANDLERS = {
@@ -848,6 +1047,12 @@ BUILTIN_HANDLERS = {
     "project_set_chapter": run_project_set_chapter,
     "project_note": run_project_note,
     "project_reset": run_project_reset,
+    "start_server": run_start_server,
+    "stop_server": run_stop_server,
+    "restart_server": run_restart_server,
+    "server_status": run_server_status,
+    "remove_server": run_remove_server,
+    "list_services": run_list_services,
 }
 
 

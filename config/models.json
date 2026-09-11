@@ -10,18 +10,10 @@
       "effort_options": ["low", "high", "max"]
     },
     {
-      "id": "ox-alpha-free",
-      "provider": "opencode",
-      "label": "Ox Alpha Free",
-      "api_model": "ox-alpha-free",
-      "context_window": 1000000,
-      "effort_options": ["max"]
-    },
-    {
-      "id": "deepseek-v4-pro",
+      "id": "deepseek-v4.1-flash-expires-on-0910",
       "provider": "deepseek",
-      "label": "DeepSeek V4 Pro",
-      "api_model": "deepseek-v4-pro",
+      "label": "deepseek-v4.1-flash-expires-on-0910",
+      "api_model": "deepseek-v4.1-flash-expires-on-0910",
       "context_window": 1000000,
       "reasoning_effort": "high",
       "effort_options": ["low", "high", "max"]
@@ -32,6 +24,15 @@
       "label": "Xiaomi MiMo V2.5 (long-context explorer)",
       "api_model": "mimo-v2.5",
       "context_window": 1000000
+    },
+    {
+      "id": "gpt-5.6-luna",
+      "provider": "kapibala",
+      "label": "GPT-5.6 luna",
+      "api_model": "gpt-5.6-luna",
+      "context_window": 1000000,
+      "reasoning_effort": "high",
+      "effort_options": ["medium", "high", "xhigh", "max"]
     },
     {
       "id": "gpt-5.6-sol",

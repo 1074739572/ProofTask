@@ -197,7 +197,7 @@ def handle_goal_command(query: str, history: list, context: dict, binding: Any) 
             return _handle_approve(runner, history, context, binding)
         if action == "run":
             return _handle_run(runner, history, context, binding)
-        return _handle_draft(cmd)
+        return _handle_draft(cmd, runner, history, context, binding)
     except GoalStoreError as exc:
         return f"Goal state is {exc.code}: {exc}"
     except runner.GoalNotRunningError as exc:
@@ -287,13 +287,18 @@ def _start_precondition_note(request: Any) -> str | None:
     return None
 
 
-def _handle_draft(cmd: dict) -> str:
+def _handle_draft(cmd: dict, runner, history: list, context: dict, binding: Any) -> str:
     from harness.goal.draft import GoalDraftError, create_draft, format_draft
 
     try:
         draft = create_draft(cmd["target"], verification=cmd.get("verify"), limits=cmd.get("limits"))
     except GoalDraftError as exc:
         return str(exc)
+    # A completed planning review is the machine approval boundary. Continue
+    # through the same startup checks as the explicit /goal approve command;
+    # clarification, planning failures, and paused drafts remain interactive.
+    if draft.status == "ready":
+        return _handle_approve(runner, history, context, binding)
     return format_draft(draft)
 
 

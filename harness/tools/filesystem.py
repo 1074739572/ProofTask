@@ -706,6 +706,7 @@ def _run_git_read(command: list[str], cwd: Path | None = None, max_chars: int = 
             text=True,
             encoding="utf-8",
             errors="replace",
+            stdin=subprocess.DEVNULL,
             timeout=15,
             check=False,
         )

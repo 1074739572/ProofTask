@@ -1445,8 +1445,8 @@ def format_draft(draft: GoalDraft) -> str:
     for index, plan in enumerate(draft.task_plan, start=1):
         spec = plan.get("verification_spec") or {}
         source = spec.get("source", "needs_generation")
-        selectors = ", ".join(spec.get("selectors") or []) or "focused test will be generated after approval"
+        selectors = ", ".join(spec.get("selectors") or []) or "focused test will be generated during execution"
         lines.append(f"  Task {index}: {plan.get('name')} [{source}]\n    Tests: {selectors}")
     if draft.status == "ready":
-        lines.append("  Review complete. Run /goal approve to write tests and begin execution.")
+        lines.append("  Planning review complete. Execution will start automatically.")
     return "\n".join(lines)
