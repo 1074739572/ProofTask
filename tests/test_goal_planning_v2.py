@@ -119,7 +119,25 @@ def test_v2_plan_streams_the_planner_response():
     assert result.tasks
     assert calls[0]["stream_response"] is True
     assert calls[0]["request_read_timeout_seconds"] == 300.0
-    assert calls[0]["max_request_attempts"] == 1
+    assert calls[0]["max_request_attempts"] == 2
+
+
+def test_plan_prompt_shows_a_selector_example_shaped_by_the_adapter():
+    from harness.verification.maven_adapter import MavenTestCatalog
+
+    pytest_prompt = build_plan_prompt("add a rate limit", "pytest -q", test_catalog=TestCatalog())
+    maven_prompt = build_plan_prompt(
+        "render the batch summary", "mvnw.cmd -q test", test_catalog=MavenTestCatalog((), ()),
+    )
+
+    # The planner copies the schema illustration verbatim when it has nothing
+    # better, so a Java reactor must never be shown a pytest-shaped selector.
+    assert "tests/test_pagination.py::test_all_pages" in pytest_prompt
+    assert "tests/test_pagination.py::test_all_pages" not in maven_prompt
+    assert (
+        "batch-summary-common/src/test/java/com/example/SummaryServiceTest.java::"
+        "com.example.SummaryServiceTest#rendersSummaryFromMarkdown"
+    ) in maven_prompt
 
 
 def test_v2_planner_continues_once_with_an_upgraded_output_budget():
@@ -140,8 +158,9 @@ def test_v2_planner_continues_once_with_an_upgraded_output_budget():
 
     assert result.tasks
     assert len(calls) == 2
-    assert calls[0]["max_tokens"] == 12_000
-    assert calls[1]["max_tokens"] == 24_000
+    assert calls[0]["max_tokens"] == 8_000
+    assert calls[0]["reasoning_effort_override"] == "medium"
+    assert calls[1]["max_tokens"] == 12_000
     assert calls[0]["conversation"] is calls[1]["conversation"]
     assert "exhausted its output budget" in calls[1]["prompt"]
 
@@ -163,7 +182,7 @@ def test_v2_planner_continues_truncated_json_even_without_max_token_stop_reason(
 
     assert result.tasks
     assert len(calls) == 2
-    assert calls[1]["max_tokens"] == 24_000
+    assert calls[1]["max_tokens"] == 12_000
 
 
 def test_execution_replan_repair_uses_compact_prompt():
@@ -222,7 +241,7 @@ def test_execution_replan_repair_continues_truncated_response():
     )
     assert result.tasks
     assert len(calls) == 2
-    assert calls[1]["max_tokens"] == 24_000
+    assert calls[1]["max_tokens"] == 12_000
 
 
 def test_valid_candidate_can_resume_at_review_without_replanning():

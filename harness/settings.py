@@ -104,6 +104,16 @@ def workspace_generation() -> int:
         return _workspace_generation
 
 
+#: Harness metadata directory names that must never become the active
+#: workspace root.  Opening one (e.g. ``/open repo/.project``) used to create
+#: a nested ``.project/.project`` and trip the Goal ``workspace_changed``
+#: guard, killing a running Goal 20 ms into its next round.
+_RESERVED_WORKSPACE_NAMES = frozenset({
+    ".project", ".tasks", ".worktrees", ".mailboxes", ".features",
+    ".transcripts", ".task_outputs", ".memory",
+})
+
+
 def switch_workspace(root: Path) -> int:
     """Atomically switch the active workspace root.
 
@@ -112,6 +122,10 @@ def switch_workspace(root: Path) -> int:
     """
     global _workspace, _workspace_generation
     root = root.expanduser().resolve()
+    if root.name.lower() in _RESERVED_WORKSPACE_NAMES:
+        raise ValueError(
+            f"refusing to bind the workspace to harness metadata directory: {root}"
+        )
     with _WORKSPACE_LOCK:
         _workspace = root
         _workspace_generation += 1

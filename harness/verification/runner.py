@@ -138,6 +138,45 @@ def _validate_script_path(tokens: list[str], workspace: Path) -> str | None:
     return None
 
 
+def _resolve_script_program(program: str, cwd: Path) -> str | None:
+    """Absolute path of a `.cmd` / `.bat` runner named by ``program``, else None."""
+    candidates: list[Path] = []
+    if "/" in program or "\\" in program:
+        raw = Path(program)
+        candidates.append(raw if raw.is_absolute() else cwd / program)
+    else:
+        # Bare names: the workspace first (`mvnw` -> sibling `mvnw.cmd`), then PATH.
+        candidates.extend([cwd / program, cwd / f"{program}.cmd", cwd / f"{program}.bat"])
+        for name in (program, f"{program}.cmd", f"{program}.bat"):
+            found = shutil.which(name)
+            if found:
+                candidates.append(Path(found))
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            continue
+        if resolved.is_file() and resolved.suffix.lower() in {".cmd", ".bat"}:
+            return str(resolved)
+    return None
+
+
+def _wrap_windows_scripts(argv: list[str], cwd: Path) -> list[str]:
+    """Launch `.cmd` / `.bat` runners through `cmd.exe /d /s /c` on Windows.
+
+    ``shell=False`` cannot execute a batch script at all, so Maven and Gradle
+    wrapper entry points would fail with ``failed to start``. The structural
+    policy has already rejected shell metacharacters, so the argv tokens stay
+    fixed and no shell interpretation of user input happens.
+    """
+    if sys.platform != "win32" or not argv:
+        return argv
+    program = _resolve_script_program(argv[0], cwd)
+    if program is None:
+        return argv
+    return ["cmd.exe", "/d", "/s", "/c", program, *argv[1:]]
+
+
 def run_verification(
     command: str,
     *,
@@ -195,6 +234,8 @@ def run_verification(
                 argv[0] = str(resolved_program)
         except OSError:
             pass
+
+    argv = _wrap_windows_scripts(argv, cwd)
 
     snapshot_before = capture_code_snapshot(cwd)
     timeout = timeout_s if timeout_s is not None else DEFAULT_VERIFY_TIMEOUT_S

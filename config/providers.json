@@ -5,8 +5,8 @@
     "base_url": "https://token-plan-cn.xiaomimimo.com/v1",
     "api_key_env": "XIAOMI_MIMO_API_KEY"
   },
-  "anzhiyu": {
-    "label": "鱼鱼API",
+  "aijws": {
+    "label": "aijws",
     "type": "openai",
     "base_url": "https://api.aijws.com/v1",
     "api_key_env": "ANZHIYU_API_KEY"
@@ -21,6 +21,12 @@
     "label": "kapibala",
     "type": "openai",
     "base_url": "https://kapibala.asia/v1",
-    "api_key_env": "kapibala_API_KEY"
+    "api_key_env": "kapibala_API_KEY_2"
+  },
+  "asianinfo": {
+    "label": "asianinfo",
+    "type": "openai",
+    "base_url": "https://tokenerpgw.asiainfo.com/erp/v1",
+    "api_key_env": "asianinfo_API_KEY"
   }
 }

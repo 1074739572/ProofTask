@@ -50,7 +50,9 @@ ALLOWED_PROGRAMS = frozenset(
         "cargo",
         "dotnet",
         "mvn",
+        "mvnw",
         "gradle",
+        "gradlew",
         "git",
     }
 )
@@ -152,10 +154,15 @@ def _leading_program(tokens: list[str]) -> str:
     if not tokens:
         return ""
     prog = tokens[0]
-    # Windows may invoke `python.exe` / `py.exe` — normalize the extension.
+    # Windows may invoke `python.exe` / `py.exe`, and the Maven / Gradle
+    # wrappers are `mvnw.cmd` / `gradlew.bat` — normalize every script
+    # extension so the allow-list match runs on the bare program name.
     prog = prog.replace("\\", "/").rsplit("/", 1)[-1]
-    if prog.lower().endswith(".exe"):
-        prog = prog[:-4]
+    lowered = prog.lower()
+    for suffix in (".exe", ".cmd", ".bat"):
+        if lowered.endswith(suffix):
+            prog = prog[: -len(suffix)]
+            break
     return prog.lower()
 
 

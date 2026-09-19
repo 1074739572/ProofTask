@@ -53,6 +53,19 @@ def diagnose_verification_output(
     if run_match:
         summary["total"] = int(run_match.group(1))
 
+    # Maven Surefire / Failsafe: `Tests run: 3, Failures: 1, Errors: 0, Skipped: 0`.
+    # The pattern is printed once per test class and again as the module total,
+    # so the LAST match is the run summary that matters.
+    maven_summaries = re.findall(
+        r"Tests run:\s*(\d+),\s*Failures:\s*(\d+),\s*Errors:\s*(\d+),\s*Skipped:\s*(\d+)",
+        text,
+    )
+    if maven_summaries:
+        total, failures, errors, _skipped = (int(value) for value in maven_summaries[-1])
+        summary["total"] = total
+        summary["failed"] = failures + errors
+        summary["passed"] = max(0, total - failures - errors)
+
     failed_cases: list[str] = []
     for line in text.splitlines():
         # Bun/OpenTUI: (fail) AC1 ... [1.2ms]

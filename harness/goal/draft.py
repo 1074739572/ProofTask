@@ -23,7 +23,7 @@ from typing import Any, Callable
 from harness.goal.language import detect_goal_language, human_language_label
 from harness.goal.planner import GoalPlan, GoalPlanningError, TaskPlan, discovery_readiness_error, plan_tasks, planning_error_requires_discovery
 from harness.settings import get_workdir
-from harness.verification import VerificationContext, select_adapter
+from harness.verification import ALLOWED_PROGRAMS, VerificationContext, check_verification_command, select_adapter
 
 DRAFT_SCHEMA_VERSION = 6
 DRAFT_FILENAME = "goal-draft.json"
@@ -32,7 +32,18 @@ _ACTIVE_DRAFT_STAGES = frozenset({"preflight", "catalog", "intake", "discovering
 _VERIFY_RE = re.compile(r'/goal\s+--verify\s+["\']([^"\']+)["\']')
 _DRAFT_IO_LOCK = threading.RLock()
 _AGENT_RESULT_HEADER_RE = re.compile(r"^\[[^\]]+\][^\n]*\n+")
-_PROJECT_MARKERS = frozenset({"package.json", "pyproject.toml", "pytest.ini", "setup.cfg", "setup.py"})
+_PROJECT_MARKERS = frozenset(
+    {
+        "package.json",
+        "pyproject.toml",
+        "pytest.ini",
+        "setup.cfg",
+        "setup.py",
+        "pom.xml",
+        "build.gradle",
+        "build.gradle.kts",
+    }
+)
 _PROJECT_EXCLUDED_DIRS = frozenset({".git", ".project", ".venv", "venv", "node_modules", "dist", "build", "coverage", ".worktrees"})
 _INTAKE_FORMAT_RETRY_TOKENS = 2_000
 _INTAKE_FORMAT_RETRY_EFFORT = "low"
@@ -419,7 +430,11 @@ def pause_draft(*, workspace: Path | None = None, cancelled: bool = False) -> st
     return f"Goal draft {action}. {suffix}"
 
 
-def infer_verification(workspace: Path, explicit: str | None = None) -> tuple[str, str]:
+def infer_verification(
+    workspace: Path,
+    explicit: str | None = None,
+    requirement: str | None = None,
+) -> tuple[str, str]:
     """Return a conservative global regression command and where it came from."""
     if explicit:
         return explicit, "user"
@@ -428,6 +443,24 @@ def infer_verification(workspace: Path, explicit: str | None = None) -> tuple[st
         match = _VERIFY_RE.search(handbook.read_text(encoding="utf-8", errors="replace"))
         if match:
             return match.group(1), "HARNESS.md"
+    # Build-file probes run before the Python heuristics: a JVM project has no
+    # `tests/` directory, and the wrapper is the only entry point that
+    # satisfies "no system-wide Maven required".
+    if any((workspace / name).exists() for name in ("pom.xml", "mvnw", "mvnw.cmd")):
+        wrapper = "mvnw" if (workspace / "mvnw").exists() else "mvnw.cmd"
+        return f"{wrapper} -q test", "maven wrapper"
+    if any(
+        (workspace / name).exists()
+        for name in (
+            "build.gradle",
+            "build.gradle.kts",
+            "settings.gradle",
+            "gradlew",
+            "gradlew.bat",
+        )
+    ):
+        wrapper = "gradlew.bat" if (workspace / "gradlew.bat").exists() else "gradlew"
+        return f"{wrapper} test", "gradle wrapper"
     if (workspace / "pytest.ini").exists() or (workspace / "tests").exists():
         return "python -m pytest -q", "pytest discovery"
     package = workspace / "package.json"
@@ -438,6 +471,19 @@ def infer_verification(workspace: Path, explicit: str | None = None) -> tuple[st
             scripts = {}
         if isinstance(scripts, dict) and scripts.get("test"):
             return "npm test", "package.json"
+    # A brand-new JVM project has no build files yet. Fall back to the
+    # requirement text instead of asking the user for a command the harness
+    # could have derived itself.
+    if requirement:
+        text = requirement.lower()
+        if "gradle" in text:
+            wrapper = "gradlew.bat" if (workspace / "gradlew.bat").exists() else "gradlew"
+            return f"{wrapper} test", "requirement mentions Gradle"
+        if "maven" in text or "pom.xml" in text or re.search(
+            r"\bjava\b(?!script)|\bjdks?\b|spring boot", text
+        ):
+            wrapper = "mvnw" if (workspace / "mvnw").exists() else "mvnw.cmd"
+            return f"{wrapper} -q test", "requirement mentions Maven/JDK"
     return "", "not inferred"
 
 
@@ -865,7 +911,17 @@ def create_draft(
     if existing and existing.status not in {"consumed", "cancelled"}:
         raise GoalDraftError("A Goal draft already exists. Use /goal preview, answer, revise, approve, or discard.")
     project_root = resolve_target_project(root, target)
-    command, source = infer_verification(project_root, verification)
+    if verification:
+        # Fail before any model request: an explicit ``--verify`` value that
+        # the structural policy refuses can never be used to start the Goal.
+        decision = check_verification_command(verification)
+        if not decision.allowed:
+            raise GoalDraftError(
+                f"--verify command rejected: {decision.reason}. "
+                f"Allowed programs: {', '.join(sorted(ALLOWED_PROGRAMS))}. "
+                'Example: /goal --verify "mvnw.cmd -q test" -- <your requirement>'
+            )
+    command, source = infer_verification(project_root, verification, target)
     operation_timeout = max(1, int((limits or {}).get("operation_timeout_seconds", 1800)))
     draft_id = f"goal_draft_{int(time.time())}_{uuid.uuid4().hex[:4]}"
     draft = GoalDraft(
@@ -1176,6 +1232,22 @@ def answer_draft(
     text = answer.strip()
     if not text:
         raise GoalDraftError("Clarification answer must not be empty.")
+    # The first clarification is usually the global regression command itself.
+    # Reject a prose answer here instead of storing it as a command: an
+    # unusable command passes intake but is refused later by the structural
+    # verification policy, which makes approval bounce the draft back to
+    # ``ready`` and looks like the Goal is stuck.
+    if not draft.verification:
+        decision = check_verification_command(text)
+        if not decision.allowed:
+            raise GoalDraftError(
+                "Clarification answer is not a usable verification command: "
+                f"{decision.reason}. "
+                f"Allowed programs: {', '.join(sorted(ALLOWED_PROGRAMS))}. "
+                "Reply with the exact command, or with the command that will run "
+                "the suite once it exists (for example: mvnw.cmd -q test, "
+                "or python -m pytest -q)."
+            )
     draft.answers.append(text[:1000])
     if not draft.verification:
         draft.verification = text

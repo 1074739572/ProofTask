@@ -107,6 +107,7 @@ class Task:
     # it possible to show and enforce why a path is writable.
     primary_write: list[str] = field(default_factory=list)
     planned_new: list[str] = field(default_factory=list)
+    planned_api: list[dict] = field(default_factory=list)
     conditional_write: list[str] = field(default_factory=list)
     read_envelope: list[str] = field(default_factory=list)
     forbidden: list[str] = field(default_factory=list)
@@ -168,6 +169,7 @@ def create_task(
     scope_paths: list[str] | None = None,
     primary_write: list[str] | None = None,
     planned_new: list[str] | None = None,
+    planned_api: list[dict] | None = None,
     conditional_write: list[str] | None = None,
     read_envelope: list[str] | None = None,
     forbidden: list[str] | None = None,
@@ -194,6 +196,7 @@ def create_task(
         scope_paths=list(scope_paths or [*(primary_write or []), *(planned_new or [])]),
         primary_write=list(primary_write or []),
         planned_new=list(planned_new or []),
+        planned_api=[dict(item) for item in (planned_api or []) if isinstance(item, dict)],
         conditional_write=list(conditional_write or []),
         read_envelope=list(read_envelope or []),
         forbidden=list(forbidden or []),
@@ -618,7 +621,7 @@ def complete_task(task_id: str, *, clean_check_mode: str | None = None) -> str:
         return f"Cannot complete {task.id}: bound verification has not passed ({task.verification_state})"
     if task.evaluation_required and (task.evaluation or {}).get("passed") is not True:
         return f"Cannot complete {task.id}: required independent evaluation has not passed"
-    if task.goal_id and task.acceptance_cases:
+    if task.goal_id and task.acceptance_cases and (task.verification_spec or {}).get("source") != "bootstrap":
         required_cases = {
             str(case.get("id"))
             for case in task.acceptance_cases

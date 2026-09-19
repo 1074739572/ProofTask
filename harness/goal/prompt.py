@@ -82,6 +82,12 @@ def build_goal_act_prompt(
         lines += ["Approved existing files to edit:", *[f"  - {path}" for path in primary_write]]
     if planned_new:
         lines += ["Approved new paths to create:", *[f"  - {path}" for path in planned_new]]
+    planned_api = [dict(item) for item in (getattr(task, "planned_api", None) or []) if isinstance(item, dict)]
+    if planned_api:
+        lines += [
+            "Planner-approved API contract for new production source (implement exactly this seam):",
+            json.dumps(planned_api, ensure_ascii=False),
+        ]
     if conditional_write:
         lines += ["Conditional paths (not writable unless runner-approved):", *[f"  - {path}" for path in conditional_write]]
     active_write_paths = [*primary_write, *planned_new]

@@ -50,3 +50,39 @@ def test_goal_task_requires_passing_eval_and_coverage_for_completion(tmp_path, m
     assert "evaluation has not passed" in complete_task(task.id)
     record_task_evaluation(task.id, {"passed": True})
     assert complete_task(task.id).startswith("Completed")
+
+
+def test_greenfield_bootstrap_can_complete_with_build_validation(tmp_path, monkeypatch):
+    monkeypatch.setenv("HARNESS_CLEAN_MODE", "off")
+    import harness.tasks as tasks
+
+    monkeypatch.setattr(tasks, "TASKS_DIR", tmp_path / ".tasks")
+    task = create_task(
+        "bootstrap Maven build",
+        "create the Maven reactor before behavior tests exist",
+        goal_id="goal_greenfield",
+        acceptance_cases=[{
+            "id": "AC1",
+            "given": "an empty workspace",
+            "when": "Maven validates the scaffold",
+            "then": "the build model is usable",
+        }],
+        verification_spec={
+            "adapter": "maven",
+            "source": "bootstrap",
+            "command": "mvn -q -DskipTests validate",
+            "selectors": ["build:validate"],
+            "collected_count": 1,
+            "covers": ["AC1"],
+            "case_selectors": {},
+        },
+    )
+    claim_task(task.id)
+    set_task_verification_result(
+        task.id,
+        passed=True,
+        evidence={"command": "mvn -q -DskipTests validate", "exit_code": 0},
+    )
+
+    assert complete_task(task.id).startswith("Completed")
+    assert load_task(task.id).status == "completed"

@@ -184,6 +184,22 @@ def handle_goal_command(query: str, history: list, context: dict, binding: Any) 
                     return format_draft(resume_draft())
                 except GoalDraftError as exc:
                     return str(exc)
+            # ``resume_draft`` only continues a paused draft. Falling through to
+            # the runner here would silently do nothing when the draft is the
+            # only live state, so answer with the command that does apply.
+            if draft is not None and draft.status in {"ready", "approved"}:
+                return (
+                    f"Goal draft {draft.id} is already planned [{draft.status}]; "
+                    "/goal resume only continues a paused draft. "
+                    "Use /goal approve to start it, /goal preview to review the plan, "
+                    "or /goal discard to rebuild it."
+                )
+            if draft is not None and draft.status == "clarifying":
+                return (
+                    f"Goal draft {draft.id} is waiting for your answer [{draft.status}]; "
+                    "/goal resume only continues a paused draft. "
+                    "Reply in the TUI, or use: /goal answer <answer>"
+                )
             return _handle_resume(runner, history, context, binding, cmd.get("budget") or {})
         if action == "preview":
             return _handle_preview()
@@ -283,7 +299,11 @@ def _start_precondition_note(request: Any) -> str | None:
         )
     decision = check_verification_command(request.verification)
     if not decision.allowed:
-        return f"Verification command rejected by policy: {decision.reason}"
+        return (
+            f"Verification command rejected by policy: {decision.reason}\n"
+            "Rebuild the draft with a usable command, for example: "
+            '/goal --verify "mvnw.cmd -q test" -- <your requirement>'
+        )
     return None
 
 
@@ -320,12 +340,18 @@ def _handle_answer(text: str) -> str:
 
 def _handle_revise(target: str) -> str:
     from harness.goal.draft import GoalDraftError, create_draft, discard_draft, load_draft, format_draft
+    from harness.verification import check_verification_command
 
     existing = load_draft()
+    verification = existing.verification if existing else None
+    if verification and not check_verification_command(verification).allowed:
+        # Do not carry a command the policy gate refuses into the rebuilt
+        # draft; leave it empty so intake asks for a usable one.
+        verification = None
     if existing:
         discard_draft()
     try:
-        return format_draft(create_draft(target, verification=existing.verification if existing else None, limits=existing.limits if existing else None))
+        return format_draft(create_draft(target, verification=verification, limits=existing.limits if existing else None))
     except GoalDraftError as exc:
         return str(exc)
 

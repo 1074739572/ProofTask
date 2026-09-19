@@ -2700,6 +2700,64 @@ def test_node_goal_regression_creates_a_node_bound_repair_task(tmp_path, monkeyp
     assert repair.verification_spec["selectors"] == ["test/queue.test.ts::queue drains in FIFO order"]
 
 
+def test_maven_goal_regression_creates_a_maven_bound_repair_task(tmp_path, monkeypatch):
+    import harness.goal.repair as repair_mod
+    import harness.goal.runner as runner_mod
+    import harness.tasks as tasks
+    from harness.goal.repair import GoalRegressionDecision
+    from harness.verification.maven_adapter import MavenTestAdapter, MavenTestCatalog
+
+    monkeypatch.setattr(tasks, "TASKS_DIR", tmp_path / ".tasks")
+    state = GoalState.new(target="x", verification="mvnw.cmd -q test", workspace=str(tmp_path))
+    state.phase = GoalPhase.FULL_VERIFY.value
+    # Surefire prints the bare SimpleClass.method token, never pytest's
+    # "FAILED path::node" marker, so the repair Task must be bound through the
+    # Maven catalog instead of the pytest failure-line parser.
+    state.final_verification = {
+        "stdout_tail": (
+            "[ERROR] Tests run: 2, Failures: 1, Errors: 0, Skipped: 0, "
+            "Time elapsed: 0.02 s <<< FAILURE! -- in com.example.SummaryServiceTest\n"
+            "[ERROR]   SummaryServiceTest.rendersSummaryFromMarkdown:12 "
+            "expected: <two sections> but was: <one section>"
+        ),
+        "exit_code": 1,
+    }
+    monkeypatch.setattr(runner_mod, "save_goal", lambda current: None)
+    monkeypatch.setattr(runner_mod, "_emit_goal", lambda *args: None)
+    monkeypatch.setattr(
+        repair_mod,
+        "plan_goal_regression_repair",
+        lambda *args, **kwargs: GoalRegressionDecision(
+            "create_repair_task", None, "restore the summary rendering contract", "new Maven repair"
+        ),
+    )
+    selector = (
+        "batch-summary-common/src/test/java/com/example/SummaryServiceTest.java::"
+        "com.example.SummaryServiceTest#rendersSummaryFromMarkdown"
+    )
+    catalog = MavenTestCatalog(
+        (selector,),
+        ("batch-summary-common/src/test/java/com/example/SummaryServiceTest.java",),
+    )
+    monkeypatch.setattr(MavenTestAdapter, "discover", lambda self, context: catalog)
+
+    GoalRunner(state=state, history=[], context={}, binding=None)._queue_goal_repair(
+        state, "full verification failed with exit code 1"
+    )
+
+    repair = tasks.load_task(state.current_task_id)
+    assert repair.verification_spec["adapter"] == "maven"
+    assert repair.verification_spec["selectors"] == [selector]
+    # The pre-`::` half stays a real repository path so the existing write-root
+    # and test-hash derivation keep working for a Java reactor.
+    assert repair.verification_spec["test_files"] == [
+        "batch-summary-common/src/test/java/com/example/SummaryServiceTest.java"
+    ]
+    assert "-Dtest=com.example.SummaryServiceTest#rendersSummaryFromMarkdown" in repair.verification_spec["command"]
+    assert repair.verification_spec["command"].endswith(" test")
+    assert "pytest" not in repair.verification_spec["command"]
+
+
 def test_replan_without_structured_scope_evidence_is_rejected(tmp_path, monkeypatch):
     import harness.goal.repair as repair_mod
     import harness.goal.runner as runner_mod

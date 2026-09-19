@@ -61,7 +61,7 @@ def _is_transient(exc: Exception) -> bool:
         return False
     return any(
         token in name or token in msg
-        for token in ("timeout", "connection", "temporarily unavailable", "502", "503", "529")
+        for token in ("timeout", "connection", "temporarily unavailable", "502", "503", "524", "529")
     )
 
 
@@ -114,7 +114,7 @@ def is_model_recoverable_error(exc: Exception) -> bool:
     if isinstance(status, str) and status.isdigit():
         status = int(status)
     return bool(
-        status in (403, 404, 429, 500, 502, 503, 529)
+        status in (403, 404, 429, 500, 502, 503, 524, 529)
         or any(
             token in name or token in msg
             for token in (

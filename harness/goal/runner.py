@@ -99,6 +99,89 @@ def _execution_workspace(state: GoalState) -> str:
     return str(candidate) if candidate.is_dir() and candidate.is_relative_to(root) else str(root)
 
 
+def goal_workspace_drift(state: GoalState) -> str | None:
+    """Return a failure reason only when the Goal's project root really moved.
+
+    ``workspace_generation`` advances on *every* ``switch_workspace`` call, and a
+    TUI re-opens the workspace it already shows (startup, ``/open`` on the same
+    path, a second window).  The counter therefore cannot by itself prove that
+    the Goal's project changed: a resumed Goal used to be failed 20 ms into its
+    first round by a benign re-bind of the same directory.  The active root is
+    the durable fact; the counter is only used to re-baseline.
+    """
+    try:
+        active = get_workdir().expanduser().resolve()
+        target = Path(state.workspace).expanduser().resolve()
+    except OSError:
+        return "Goal workspace is no longer a valid path"
+    if active != target:
+        return "workspace switched while goal was active"
+    return None
+
+
+def _goal_made_no_progress(state: GoalState) -> bool:
+    """True when no Task ever started, so the checkout held no unique work."""
+    if state.attempts or state.worker_generation or state.execution_trace:
+        return False
+    try:
+        from harness.tasks import load_task
+    except Exception:
+        return True
+    for task_id in state.task_ids or ():
+        try:
+            task = load_task(task_id)
+        except Exception:
+            continue
+        if getattr(task, "status", "pending") != "pending":
+            return False
+    return True
+
+
+def _rebuild_missing_change_worktree(state: GoalState) -> bool:
+    """Recreate a deleted isolated Goal checkout at its recorded baseline.
+
+    Only attempted when the Goal never made progress
+    (:func:`_goal_made_no_progress`): the missing worktree then held no unique
+    work, so re-materializing it from ``change_baseline_commit`` reproduces the
+    exact starting state instead of stranding the Goal on
+    ``change_session_unavailable``.  Returns True when the worktree is present
+    afterwards and execution may continue.
+    """
+    if state.change_mode != "worktree" or not state.change_worktree:
+        return False
+    try:
+        worktree = Path(state.change_worktree).expanduser().resolve()
+    except OSError:
+        return False
+    if worktree.is_dir():
+        return True
+    if not _goal_made_no_progress(state):
+        return False
+    repo = Path(state.change_repository_root or state.workspace).expanduser()
+    baseline = state.change_baseline_commit or state.change_base_commit
+    if not baseline:
+        return False
+    try:
+        # ``prune`` first: a manually deleted checkout is often still
+        # registered, which makes ``worktree add`` refuse the same path.
+        ChangeSession._run(repo, "worktree", "prune")
+        ChangeSession._run(repo, "worktree", "add", "--detach", str(worktree), baseline)
+    except (ChangeSessionError, OSError):
+        return False
+    rebuilt = worktree.is_dir()
+    if rebuilt:
+        state.execution_trace.append({
+            "at": time.time(),
+            "event": "change_worktree_rebuilt",
+            "task_id": state.current_task_id,
+            "route": "recover",
+            "summary": "Isolated Goal worktree was missing and zero progress existed; rebuilt it at the recorded baseline commit.",
+            "detail": {"worktree": str(worktree), "baseline": baseline},
+        })
+        del state.execution_trace[:-80]
+    return rebuilt
+
+
 _EXECUTION_REPLAN_IGNORED_DIRS = frozenset({
     ".git", ".mypy_cache", ".project", ".pytest_cache", ".ruff_cache", ".venv", "__pycache__", "node_modules",
 })
@@ -272,6 +355,7 @@ def goal_event_payload(state: GoalState) -> dict[str, Any]:
                 "scope_paths": list(task.scope_paths) if isinstance(task.scope_paths, list) else [],
                 "primary_write": list(task.primary_write) if isinstance(task.primary_write, list) else [],
                 "planned_new": list(task.planned_new) if isinstance(task.planned_new, list) else [],
+                "planned_api": list(task.planned_api) if isinstance(task.planned_api, list) else [],
                 "conditional_write": list(task.conditional_write) if isinstance(task.conditional_write, list) else [],
                 "read_envelope": list(task.read_envelope) if isinstance(task.read_envelope, list) else [],
                 "forbidden": list(task.forbidden) if isinstance(task.forbidden, list) else [],
@@ -282,6 +366,8 @@ def goal_event_payload(state: GoalState) -> dict[str, Any]:
                 "latest_evidence": evidence_summary,
                 "last_error": task.last_error,
             }
+        if not task_payload.get("planned_api"):
+            task_payload.pop("planned_api", None)
         # Keep the terminal UI payload compatible with v1 consumers when a
         # legacy Task has no v2 scope-class declarations at all. Native v2
         # Tasks retain the richer fields for auditing and handoff.
@@ -632,10 +718,13 @@ def resume_goal(
         try:
             _execution_workspace(state)
         except ChangeSessionError as exc:
-            state.last_error = str(exc)
-            state.stop_reason = StopReason.change_session_unavailable.value
-            save_goal(state)
-            raise GoalNotRunningError(f"Goal isolation is unavailable: {exc}") from exc
+            # A deleted checkout with zero Goal progress can be rebuilt at its
+            # recorded baseline instead of refusing the resume outright.
+            if not _rebuild_missing_change_worktree(state):
+                state.last_error = str(exc)
+                state.stop_reason = StopReason.change_session_unavailable.value
+                save_goal(state)
+                raise GoalNotRunningError(f"Goal isolation is unavailable: {exc}") from exc
         try:
             lease_token = acquire_goal_lease(state)
         except GoalLeaseError as exc:
@@ -688,6 +777,11 @@ def resume_goal(
 
             target = _resume_target(state)
             _consume_supervisor_recovery(state)
+            # A resume binds the Goal to this process's live workspace
+            # generation.  The persisted value belongs to the process that
+            # started the Goal; keeping it would fail the resumed run on its
+            # very first round through the ``workspace_changed`` guard.
+            state.workspace_generation = workspace_generation()
             GoalEngine().transition(state, target, "goal_resumed")
             state.stop_reason = None
             save_goal(state)
@@ -1775,6 +1869,7 @@ class GoalRunner(threading.Thread):
                     "verification_state": task.verification_state,
                     "primary_write": list(task.primary_write),
                     "planned_new": list(task.planned_new),
+                    "planned_api": list(task.planned_api),
                     "conditional_write": list(task.conditional_write),
                     "acceptance_cases": list(task.acceptance_cases),
                     "last_error": task.last_error,
@@ -2001,8 +2096,19 @@ class GoalRunner(threading.Thread):
                 return
             self._poll_supervisor()
             if workspace_generation() != state.workspace_generation:
-                self._fail(state, StopReason.workspace_changed, "workspace switched while goal was active")
-                return
+                drift = goal_workspace_drift(state)
+                if drift is not None:
+                    # Pause, not fail: the Goal's state is durable under its own
+                    # workspace (save_goal keys on state.workspace), so the user
+                    # can switch back and /goal resume instead of losing the run
+                    # to a terminal workspace_changed failure.
+                    state.last_error = drift
+                    self._pause(state, "workspace_changed", stop_reason=StopReason.workspace_changed.value)
+                    return
+                # Benign re-bind of the same project: keep running against the
+                # new generation instead of failing a healthy Goal.
+                state.workspace_generation = workspace_generation()
+                save_goal(state)
             if self._cancel_event.is_set():
                 self._cancel(state, "user requested cancel")
                 return
@@ -2012,13 +2118,16 @@ class GoalRunner(threading.Thread):
             try:
                 _execution_workspace(state)
             except ChangeSessionError as exc:
-                state.last_error = str(exc)
-                self._pause(
-                    state,
-                    "change_session_unavailable",
-                    stop_reason=StopReason.change_session_unavailable.value,
-                )
-                return
+                # A deleted checkout with zero Goal progress can be rebuilt at
+                # its recorded baseline instead of stranding the Goal.
+                if not _rebuild_missing_change_worktree(state):
+                    state.last_error = str(exc)
+                    self._pause(
+                        state,
+                        "change_session_unavailable",
+                        stop_reason=StopReason.change_session_unavailable.value,
+                    )
+                    return
             self._step_once(state)
 
     def _step_once(self, state: GoalState) -> None:
@@ -2140,6 +2249,7 @@ class GoalRunner(threading.Thread):
                 evaluation_required=state.evaluation_required,
                 primary_write=list(plan.get("primary_write") or []),
                 planned_new=list(plan.get("planned_new") or []),
+                planned_api=list(plan.get("planned_api") or []),
                 conditional_write=list(plan.get("conditional_write") or []),
                 read_envelope=list(plan.get("read_envelope") or []),
                 forbidden=list(plan.get("forbidden") or []),
@@ -2198,7 +2308,7 @@ class GoalRunner(threading.Thread):
         first so repair/test-gap checkpoints retain their ownership.
         """
         from harness.goal.memory import record_test_binding
-        from harness.tasks import bind_task_verification, load_task
+        from harness.tasks import bind_task_verification, load_task, save_task
 
         root = Path(_execution_workspace(state))
         deferred = False
@@ -2316,10 +2426,37 @@ class GoalRunner(threading.Thread):
                 if adapter.id == "pytest"
                 else adapter.discover(verification_context)
             )
-            write_roots = self._test_write_roots(before_catalog)
+            checkpoint = task.verification_spec.get("generation_checkpoint")
+            checkpoint = checkpoint if isinstance(checkpoint, dict) else {}
+            checkpoint_selectors = tuple(
+                str(item) for item in checkpoint.get("selectors", [])
+                if str(item) and before_catalog.contains(str(item))
+            )
+            checkpoint_mapping = {
+                str(case_id): [str(selector) for selector in values if str(selector) in checkpoint_selectors]
+                for case_id, values in (checkpoint.get("case_selectors") or {}).items()
+                if isinstance(values, list)
+            } if isinstance(checkpoint.get("case_selectors"), dict) else {}
+            write_roots = self._test_write_roots(before_catalog, adapter=adapter, task=task)
             before_tree = self._snapshot_test_tree(root, write_roots)
             test_read_roots: list[str] = [*write_roots, "docs"]
             test_read_paths = ["package.json", "tsconfig.json", "tsconfig.ink.json", "bunfig.toml"]
+            if adapter.id == "maven":
+                # A Maven test writer must read the reactor and module POMs to
+                # reuse the declared JUnit version and dependency set instead
+                # of inventing a dependency the module cannot resolve.
+                maven_poms: list[str] = []
+                for pom in root.rglob("pom.xml"):
+                    try:
+                        relative_pom = pom.relative_to(root)
+                    except ValueError:
+                        continue
+                    if any(part in {".git", ".project", "target"} for part in relative_pom.parts):
+                        continue
+                    maven_poms.append(relative_pom.as_posix())
+                test_read_paths = list(dict.fromkeys([
+                    *sorted(maven_poms),
+                ]))
             # Test writers inspect the pre-approved read envelope, not merely
             # the paths that the implementation worker may edit or create.
             for raw_path in [*task.read_envelope, *task.primary_write]:
@@ -2340,6 +2477,37 @@ class GoalRunner(threading.Thread):
                     "Create the focused test first and let the project runner settle syntax/runtime questions instead "
                     "of spending a slice debating TypeScript rules. Return the exact discovered test name after the file path. "
                 )
+            elif adapter.id == "maven":
+                maven_test_paths = [
+                    str(rel).replace("\\", "/") for rel in getattr(before_catalog, "test_files", ()) or ()
+                ]
+                maven_source_prefix = "src/test/java/"
+                for item in maven_test_paths:
+                    marker_at = item.find("/src/test/java/")
+                    if marker_at != -1:
+                        maven_source_prefix = item[: marker_at + len("/src/test/java/")]
+                        break
+                selector_example = (
+                    f"{maven_source_prefix}com/example/ExampleTest.java::"
+                    "com.example.ExampleTest#rendersExpectedBehavior"
+                )
+                adapter_test_guidance = (
+                    "For Maven, add a JUnit 5 test under <module>/src/test/java/<package>/ and keep the file name "
+                    "ending in Test, Tests, or TestCase so the catalog can collect it. Reply with the "
+                    "repository-relative path, then '::', then the fully qualified test class, then '#', then the "
+                    "exact annotated method name; a bare class name or a bare method name is not collectable. "
+                    "The package declaration must match the directory. Prefer a plain unit test over @SpringBootTest "
+                    "so the new test does not need the full application context. "
+                )
+                if getattr(task, "planned_new", None):
+                    adapter_test_guidance += (
+                        "This Task creates new production code after a completed build-scaffold Task. Import JUnit 5 "
+                        "(org.junit.jupiter.api.*) and only the exact classes and signatures in planned_api below. "
+                        "A compile failure is a valid red baseline only when it names one of those approved missing symbols. "
+                        "Do NOT work around missing classes with reflection, Class.forName, or classpath scanning. "
+                        "Assert DDL/schema acceptance cases by reading the schema file text directly; assert "
+                        "entity/mapper/service contracts by importing the class the implementation will create. "
+                    )
             else:
                 selector_example = "tests/test_x.py::test_name"
                 adapter_test_guidance = ""
@@ -2379,8 +2547,8 @@ class GoalRunner(threading.Thread):
                 "keep the observable boundary extensible for later compatible Goal upgrades. "
                 "For a broad Task, make multiple focused test groups when its acceptance cases cross pure state/data, "
                 "async coordination, input routing, and rendering. Each group must state its layer, existing target module, "
-                "observed seam, and covered acceptance IDs in test_design. Do not invent a new production API or module just "
-                "to make a test fail; assert missing behavior through an existing observable boundary. "
+                "observed seam, and covered acceptance IDs in test_design. Do not invent a new production API or module. "
+                "Use an existing observable boundary, or when supplied, the exact planner-approved planned_api boundary. "
                 "Your read boundary excludes dependency trees such as node_modules: use the Task source, existing tests, "
                 "docs, and project configuration as the evidence base. "
                 "The Git HEAD revision is not this Task's baseline: completed Tasks and recovered Goal work may already "
@@ -2391,6 +2559,12 @@ class GoalRunner(threading.Thread):
                 f"Test architecture rules: {test_architecture_guidance}\n\n"
                 f"Task: {task.subject}\nBehavior: {task.description}\nAcceptance cases: {json.dumps(task.acceptance_cases)}"
             )
+            if checkpoint_selectors:
+                prompt += (
+                    "\n\nA prior generation slice already created and machine-collected these immutable partial tests: "
+                    f"{json.dumps(checkpoint_mapping, ensure_ascii=False)}. Create NEW tests only for acceptance cases "
+                    "not listed there, then return one complete mapping that includes these exact checkpoint selectors."
+                )
             prompt += (
                 "\n\nWrite only human-facing test descriptions and your final summary in "
                 f"{human_language_label((state.goal_contract or {}).get('language'))}. "
@@ -2416,6 +2590,10 @@ class GoalRunner(threading.Thread):
                     "conditional_write": task.conditional_write,
                     "read_envelope": task.read_envelope,
                 })
+            if getattr(task, "planned_api", None):
+                prompt += "\nPlanner-approved planned_api (the only future symbols/signatures you may import): " + json.dumps(
+                    task.planned_api, ensure_ascii=False,
+                )
             from harness.goal.skills import assigned_skill_context, normalize_goal_skills
 
             test_skills = normalize_goal_skills(task.skill_names)
@@ -2551,9 +2729,15 @@ class GoalRunner(threading.Thread):
                 snapshot=lambda: self._snapshot_test_tree(root, write_roots),
                 assess_progress=test_progress,
                 on_slice=on_test_slice,
+                # Keep the writer going until it submits a parseable
+                # ``test_selectors`` response — not merely until it has created
+                # a test file.  A writer commonly creates its focused tests in
+                # one slice and reasons out the remaining acceptance-case
+                # mapping in the next; stopping on ``writer_has_test_artifact``
+                # alone captured an unfinished response and rejected an
+                # otherwise valid generation as "did not contain test_selectors".
                 continue_when=lambda raw, stats, _progress: (
                     stats.stop_reason == "completed"
-                    and not writer_has_test_artifact
                     and not self._requested_selectors_from_generation(raw)
                 ),
             )
@@ -2620,8 +2804,11 @@ class GoalRunner(threading.Thread):
             }
             selectors = self._selectors_from_generation(raw, root, catalog=after_catalog)
             case_selectors = self._case_selectors_from_generation(raw, selectors, task.acceptance_cases)
+            selectors = tuple(dict.fromkeys((*checkpoint_selectors, *selectors)))
+            case_selectors = {**checkpoint_mapping, **case_selectors}
             test_design = self._test_design_from_generation(raw)
             requested_selectors = self._requested_selectors_from_generation(raw)
+            generated_selector_set.update(checkpoint_selectors)
 
             def contract_mismatches(*, response_empty: bool, response_stalled: bool) -> list[str]:
                 mismatches: list[str] = []
@@ -2857,8 +3044,24 @@ class GoalRunner(threading.Thread):
                     f"Task {task.id} test writer must map every acceptance case to machine-collected selectors. "
                     f"Diagnostic: {mismatch_diagnostic()}"
                 )
-                self._restore_test_tree(root, before_tree, write_roots, expected_after=self._snapshot_test_tree(root, write_roots))
-                self._pause(state, "test_generation_case_mapping_required", stop_reason=StopReason.test_generation_required.value)
+                # Keep valid new test evidence instead of deleting it because a
+                # broad Task was only partially covered in this slice. The next
+                # bounded pass receives only the missing cases.
+                task.verification_spec["generation_checkpoint"] = {
+                    "selectors": list(selectors),
+                    "case_selectors": case_selectors,
+                    "test_files": list(dict.fromkeys(item.split("::", 1)[0] for item in selectors)),
+                    "test_hashes": self._test_file_hashes(
+                        root, tuple(dict.fromkeys(item.split("::", 1)[0] for item in selectors)),
+                    ),
+                }
+                save_task(task)
+                self._record_execution_trace(
+                    state, "test_generation_checkpoint", task_id=task.id, route="continue",
+                    summary="Saved partial machine-collected coverage; continuing only missing acceptance cases.",
+                    detail={"covered_cases": sorted(case_selectors), "missing_cases": self._missing_case_selectors(required_cases, case_selectors)},
+                )
+                self._apply(state, GoalPhase.PREPARE_TESTS, "partial_test_generation_checkpointed")
                 return
             if any(selector not in generated_selector_set for selector in selectors):
                 self._restore_test_tree(root, before_tree, write_roots, expected_after=self._snapshot_test_tree(root, write_roots))
@@ -3008,6 +3211,8 @@ class GoalRunner(threading.Thread):
                 or "importerror" in output.lower()
                 or "fixture" in output.lower() and "error" in output.lower()
             ) and not self._is_expected_planned_new_module_import_failure(task, output)
+            if adapter.id == "maven":
+                infrastructure_failure = self._maven_baseline_infrastructure_failure(task, output)
             posthoc = bool(task.verification_spec.get("allow_posthoc_test"))
             skipped_match = re.search(r"\b(\d+)\s+skipped\b", output, re.IGNORECASE)
             skipped_only = bool(
@@ -3272,6 +3477,41 @@ class GoalRunner(threading.Thread):
         return False
 
     @staticmethod
+    def _is_expected_maven_planned_api_compile_failure(task, output: str) -> bool:
+        """Accept javac red only when it points at a planner-approved future symbol."""
+        text = str(output or "").replace("\\", "/").casefold()
+        compile_markers = ("compilation failure", "cannot find symbol", "package ")
+        if not any(marker in text for marker in compile_markers):
+            return False
+        for item in getattr(task, "planned_api", ()) or ():
+            if not isinstance(item, dict):
+                continue
+            package = str(item.get("package") or "").casefold()
+            symbol = str(item.get("symbol") or "").split(".")[-1].casefold()
+            if (package and package in text) or (symbol and symbol in text):
+                return True
+        return False
+
+    @classmethod
+    def _maven_baseline_infrastructure_failure(cls, task, output: str) -> bool:
+        """Reject Maven failures that occurred before an approved behavior seam."""
+        text = str(output or "").casefold()
+        if cls._is_expected_maven_planned_api_compile_failure(task, output):
+            return False
+        markers = (
+            "missingprojectexception", "there is no pom in this directory", "non-readable pom",
+            "could not resolve dependencies", "could not find artifact", "failed to read artifact descriptor",
+            "pluginresolutionexception", "could not resolve plugin", "failed to execute goal",
+            "surefirebooterforkexception", "the forked vm terminated", "no tests were executed",
+            "no tests matching pattern", "testengine with id 'junit-jupiter' failed to discover",
+        )
+        if any(marker in text for marker in markers):
+            return True
+        # An arbitrary Java compilation error is not a behavioral red. Only a
+        # missing symbol explicitly frozen in planned_api may cross this gate.
+        return any(marker in text for marker in ("compilation failure", "cannot find symbol", "compilation error"))
+
+    @staticmethod
     def _test_design_from_generation(raw: str) -> tuple[dict[str, Any], ...]:
         """Keep the writer's source-grounded test design with its bound evidence."""
         try:
@@ -3332,7 +3572,10 @@ class GoalRunner(threading.Thread):
     @staticmethod
     def _selectors_from_generation(raw: str, workspace: Path, *, catalog=None) -> tuple[str, ...]:
         requested = GoalRunner._requested_selectors_from_generation(raw)
-        catalog = catalog or collect_pytest_catalog(workspace)
+        if catalog is None:
+            # Fall back to the workspace's own adapter so a Java reactor is
+            # never silently searched with the pytest collector.
+            catalog = select_adapter(workspace).discover(VerificationContext(workspace))
         if not requested:
             return ()
         resolved: list[str] = []
@@ -3479,7 +3722,25 @@ class GoalRunner(threading.Thread):
                 continue
 
     @staticmethod
-    def _test_write_roots(catalog) -> tuple[str, ...]:
+    def _test_write_roots(catalog, *, adapter=None, task=None) -> tuple[str, ...]:
+        # Maven/Java tests live under ``src/test/java`` per module, not under
+        # ``tests``/``test``/``__tests__``.  The catalog is empty before the
+        # first Task creates its module, so derive the roots from the Task's
+        # planned modules plus a repo-root fallback — otherwise the test writer
+        # writes to ``<module>/src/test/java`` and the write-scope guard flags
+        # it as outside the boundary, pausing the Goal on ``permission_wait``.
+        if getattr(adapter, "id", None) == "maven":
+            roots: set[str] = {"src/test/java"}
+            if task is not None:
+                for rel in (*getattr(task, "scope_paths", ()), *getattr(task, "planned_new", ())):
+                    rel = str(rel or "").strip().strip("/")
+                    if rel and rel != ".":
+                        marker_at = rel.find("/src/main/java/")
+                        module = rel[:marker_at] if marker_at != -1 else rel
+                        if rel.endswith(".java") and marker_at == -1:
+                            continue
+                        roots.add(f"{module}/src/test/java" if module else "src/test/java")
+            return tuple(sorted(roots))
         roots = {"tests", "test", "__tests__"}
         for test_file in getattr(catalog, "test_files", ()):
             parts = Path(test_file).parts[:-1]
@@ -4724,15 +4985,20 @@ class GoalRunner(threading.Thread):
             self._pause(state, "execution_replan_target_unavailable", stop_reason=StopReason.execution_preflight_failed.value)
             return
         replacement_scope = tuple({
-            "task_id": candidate.id,
-            "name": candidate.subject,
-            "behavior": candidate.description,
-            "acceptance_cases": list(candidate.acceptance_cases),
-            "primary_write": list(candidate.primary_write),
-            "planned_new": list(candidate.planned_new),
-            "conditional_write": list(candidate.conditional_write),
-            "read_envelope": list(candidate.read_envelope),
-            "verification": dict(candidate.verification_spec),
+            **{
+                "task_id": candidate.id,
+                "name": candidate.subject,
+                "behavior": candidate.description,
+                "acceptance_cases": list(candidate.acceptance_cases),
+                "primary_write": list(candidate.primary_write),
+                "planned_new": list(candidate.planned_new),
+            },
+            **({"planned_api": list(candidate.planned_api)} if candidate.planned_api else {}),
+            **{
+                "conditional_write": list(candidate.conditional_write),
+                "read_envelope": list(candidate.read_envelope),
+                "verification": dict(candidate.verification_spec),
+            },
         } for candidate in superseded)
         dependency_anchors = [*completed, *preserved_unfinished]
         anchor_names = tuple(candidate.subject for candidate in dependency_anchors)
@@ -4972,6 +5238,7 @@ class GoalRunner(threading.Thread):
                 evaluation_required=state.evaluation_required,
                 primary_write=list(item.primary_write),
                 planned_new=list(item.planned_new),
+                planned_api=list(item.planned_api),
                 conditional_write=list(item.conditional_write),
                 read_envelope=list(item.read_envelope),
                 forbidden=list(item.forbidden),
@@ -5821,6 +6088,40 @@ class GoalRunner(threading.Thread):
                 return match.group(1).replace("\\", "/")
         return None
 
+    @staticmethod
+    def _failed_maven_selector(output: str, catalog) -> str | None:
+        """Resolve a Surefire failure line such as ``FooTest.bar:12``.
+
+        Surefire prints ``[ERROR]   FooTest.bar:12 expectation`` for each
+        failure and ``[ERROR]   FooTest.bar -- Time elapsed`` in its tally, so
+        the printed class/method token is matched against the collected
+        catalog instead of assuming pytest's ``FAILED path::node`` marker.
+        """
+        index: dict[str, list[str]] = {}
+        for selector in getattr(catalog, "selectors", ()) or ():
+            node = str(selector).split("::", 1)[-1]
+            class_name, _, method = node.partition("#")
+            if not method:
+                continue
+            simple = class_name.rsplit(".", 1)[-1]
+            for key in (
+                f"{class_name}#{method}",
+                f"{simple}#{method}",
+                f"{class_name}.{method}",
+                f"{simple}.{method}",
+            ):
+                index.setdefault(key, []).append(str(selector))
+        for line in output.splitlines():
+            text = re.sub(r"^\[(?:ERROR|WARNING)\]\s*", "", line.strip())
+            text = text.split("<<<", 1)[0].strip()
+            if not text:
+                continue
+            token = text.split()[0].rstrip("»").split(":", 1)[0].strip()
+            matches = index.get(token)
+            if matches and len(set(matches)) == 1:
+                return matches[0]
+        return None
+
     @classmethod
     def _failed_verification_selector(cls, output: str, *, adapter, workspace: Path, command: str) -> str | None:
         """Return one collected failing selector without assuming pytest.
@@ -5832,6 +6133,8 @@ class GoalRunner(threading.Thread):
         if adapter.id == "pytest":
             return cls._failed_pytest_selector(output)
         catalog = adapter.discover(VerificationContext(workspace, command=command))
+        if adapter.id == "maven":
+            return cls._failed_maven_selector(output, catalog)
         for line in output.splitlines():
             match = re.match(r"^(?:not ok\s+\d+\s+-|[✖x])\s*(.+?)(?:\s+\([^)]*\))?$", line.strip(), re.IGNORECASE)
             if not match:

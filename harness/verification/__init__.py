@@ -54,6 +54,7 @@ from harness.verification.runner import (
     run_verification,
 )
 from harness.verification.adapters import VerificationAdapter, VerificationContext
+from harness.verification.maven_adapter import MavenTestAdapter, MavenTestCatalog, build_maven_command
 from harness.verification.node_adapter import NodeTestAdapter, NodeTestCatalog
 from harness.verification.pytest_adapter import PytestAdapter
 from harness.verification.registry import select_adapter
@@ -82,6 +83,9 @@ __all__ = [
     "PytestAdapter",
     "NodeTestAdapter",
     "NodeTestCatalog",
+    "MavenTestAdapter",
+    "MavenTestCatalog",
+    "build_maven_command",
     "select_adapter",
     "debug_task_selector",
 ]

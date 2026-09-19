@@ -26,17 +26,21 @@ PLAN_REVIEWER_AGENT = "goal_plan_reviewer"
 # implementation worker; keeping planning tool-free prevents an invisible,
 # unbounded explore loop before a draft can be saved.
 PLANNER_MAX_ROUNDS = 1
-PLANNER_MAX_OUTPUT_TOKENS = 12_000
-PLANNER_ESCALATED_OUTPUT_TOKENS = 24_000
+PLANNER_MAX_OUTPUT_TOKENS = 8_000
+PLANNER_ESCALATED_OUTPUT_TOKENS = 12_000
+PLANNER_REASONING_EFFORT = "medium"
 # The continuation is a new provider request. It must not inherit a nearly
-# exhausted read deadline from the 12k attempt, otherwise the advertised 24k
-# upgrade deterministically fails before the model can answer.
+# exhausted read deadline from the 8k attempt, otherwise the bounded 12k
+# correction request can fail before the model answers.
 PLANNER_CONTINUATION_TIMEOUT_SECONDS = 600.0
-# The configured Sol relay buffers the initial response, so the shared 90s
-# read timeout is too short for a high-reasoning Goal contract. One longer
-# attempt is more predictable than three full 90s retries.
+# The configured Sol relay may buffer the initial response. The local timeout
+# is longer than the relay's proxy window, while bounded reasoning/output and
+# one retry keep individual requests likely to complete within that window.
 PLANNER_READ_TIMEOUT_SECONDS = 300.0
-PLANNER_MAX_REQUEST_ATTEMPTS = 1
+# Planning is a long, read-only request and upstream relays can terminate it
+# with a retryable 524 before a complete response arrives. One retry stays
+# bounded while avoiding a paused Draft for a single transient proxy timeout.
+PLANNER_MAX_REQUEST_ATTEMPTS = 2
 PLANNER_FORMAT_RETRY_MAX_ROUNDS = 1
 PLAN_REVIEW_MAX_ROUNDS = 1
 PLANNER_REPAIR_INPUT_LIMIT = 24_000
@@ -80,6 +84,28 @@ def _normalise_strings(raw: Any, *, limit: int | None = None) -> tuple[str, ...]
         if limit is not None and len(values) >= limit:
             break
     return tuple(values)
+
+
+def _normalise_planned_api(raw: Any) -> tuple[dict[str, Any], ...]:
+    """Normalize the planner-approved observable seam for not-yet-existing code."""
+    if not isinstance(raw, (list, tuple)):
+        return ()
+    result: list[dict[str, Any]] = []
+    for item in raw[:24]:
+        if not isinstance(item, dict):
+            continue
+        path = str(item.get("path") or "").strip().replace("\\", "/")[:500]
+        symbol = str(item.get("symbol") or "").strip()[:300]
+        package = str(item.get("package") or "").strip()[:300]
+        signatures = _normalise_strings(item.get("signatures"), limit=24)
+        if path and symbol and signatures:
+            result.append({
+                "path": path,
+                "package": package,
+                "symbol": symbol,
+                "signatures": list(signatures),
+            })
+    return tuple(result)
 
 
 def _valid_scope_path(path: str) -> bool:
@@ -198,6 +224,9 @@ class TaskPlan:
     verification_spec: VerificationSpec = field(default_factory=VerificationSpec)
     primary_write: tuple[str, ...] = ()
     planned_new: tuple[str, ...] = ()
+    # Exact public seam approved by planning for source that does not exist yet.
+    # Test generation may consume this contract, but may not invent another API.
+    planned_api: tuple[dict[str, Any], ...] = ()
     conditional_write: tuple[str, ...] = ()
     read_envelope: tuple[str, ...] = ()
     forbidden: tuple[str, ...] = ()
@@ -220,6 +249,7 @@ class TaskPlan:
             "verification_spec": self.verification_spec.to_dict(),
             "primary_write": list(self.primary_write),
             "planned_new": list(self.planned_new),
+            "planned_api": [dict(item) for item in self.planned_api],
             "conditional_write": list(self.conditional_write),
             "read_envelope": list(self.read_envelope),
             "forbidden": list(self.forbidden),
@@ -241,6 +271,7 @@ class TaskPlan:
             verification_spec=VerificationSpec.from_dict(spec_raw),
             primary_write=_normalise_strings(data.get("primary_write")),
             planned_new=_normalise_strings(data.get("planned_new")),
+            planned_api=_normalise_planned_api(data.get("planned_api")),
             conditional_write=_normalise_strings(data.get("conditional_write")),
             read_envelope=_normalise_strings(data.get("read_envelope")),
             forbidden=_normalise_strings(data.get("forbidden")),
@@ -493,6 +524,41 @@ def _task_has_source_evidence(
     return bool(candidates) and all(scope in candidates for scope in code_scopes)
 
 
+def _plan_example(adapter_id: str) -> str:
+    """Schema illustration whose selectors match the workspace's adapter.
+
+    The planner copies this example verbatim when it has nothing better, so a
+    Java reactor must not be shown a pytest-shaped selector.
+    """
+    if adapter_id == "maven":
+        selector = (
+            "batch-summary-common/src/test/java/com/example/SummaryServiceTest.java::"
+            "com.example.SummaryServiceTest#rendersSummaryFromMarkdown"
+        )
+        source = "batch-summary-common/src/main/java/com/example/SummaryService.java"
+        return (
+            '{"name":"render summary","behavior":"the summary renders every section",'
+            '"acceptance_cases":[{"id":"AC1","given":"a batch with two sections",'
+            '"when":"the summary is rendered","then":"both sections appear"}],'
+            f'"test_selectors":["{selector}"],'
+            f'"depends_on":[],"primary_write":["{source}"],"planned_new":[],"planned_api":[],"conditional_write":[],'
+            f'"read_envelope":["{source}"],"forbidden":[".env"],"evidence_refs":["E1"],'
+            f'"test_strategy":"one selector per acceptance case", "case_selectors":{{"AC1":["{selector}"]}},'
+            '"skills":["test-driven-development"]}'
+        )
+    selector = "tests/test_pagination.py::test_all_pages"
+    return (
+        '{"name":"paginate list","behavior":"list returns every page",'
+        '"acceptance_cases":[{"id":"AC1","given":"more than one page",'
+        '"when":"the caller requests pages","then":"no row is skipped"}],'
+        f'"test_selectors":["{selector}"],'
+        '"depends_on":[],"primary_write":["src/list.py"],"planned_new":[],"planned_api":[],"conditional_write":[],'
+        '"read_envelope":["src/list.py"],"forbidden":[".env"],"evidence_refs":["E1"],'
+        f'"test_strategy":"one selector per acceptance case", "case_selectors":{{"AC1":["{selector}"]}},'
+        '"skills":["test-driven-development"]}'
+    )
+
+
 def build_plan_prompt(
     target: str,
     full_verification: str,
@@ -508,6 +574,7 @@ def build_plan_prompt(
 ) -> str:
     """Prompt for the read-only planner. Output is a GoalPlan v2 object."""
     catalog_text = (test_catalog or TestCatalog(error="not collected")).prompt_text(limit=PLANNER_CATALOG_LIMIT)
+    plan_example = _plan_example(str(getattr(test_catalog, "adapter", "pytest") or "pytest"))
     manifest_text = "No Discovery Manifest supplied. Do not guess repository paths."
     if isinstance(discovery_manifest, dict):
         manifest_text = (
@@ -602,6 +669,10 @@ def build_plan_prompt(
         "- Task scope has five explicit classes: primary_write (existing files to edit), planned_new (new files/directories), conditional_write (existing files that may be added only after proof), read_envelope (existing paths needed to understand the task), forbidden (paths that must not change).\n"
         "- Never put a whole project root or a broad parent directory in primary_write. Use the smallest exact existing files.\n"
         "- primary_write, conditional_write, and read_envelope must be discovered paths. planned_new must not already exist.\n\n"
+        "- For a Task that creates production source with no existing observable boundary, planned_api is mandatory. "
+        "Each entry must give the exact relative source path, package, symbol, and method/constructor signatures. "
+        "This is the only future API that the test writer and implementation worker may use; do not leave API design to them. "
+        "Use an empty planned_api array when the Task creates only build/configuration files.\n\n"
         "State-lifetime rule:\n"
         "- Separate persistent implementation artifacts from runtime user selections. Source files and checked-in configuration may be primary_write when the Task explicitly implements a schema, shipped default policy, or parser for them.\n"
         "- A current-session, temporary, or non-persistent user selection belongs in session/runtime state. It must not be written back to a user/default configuration file on each command invocation.\n"
@@ -611,11 +682,22 @@ def build_plan_prompt(
         "- For a feature that changes how a command affects later tool calls, the Tasks together must explicitly cover: command/input registration, current-session state ownership, and the centralized enforcement hook. A static configuration/schema task is separate from, and cannot substitute for, the runtime enforcement task.\n"
         "- Put every required integration boundary in primary_write or read_envelope. Do not hide command routing, session state, hook registration, or an explicitly requested client/event bridge only in broad behavior prose. Add a dependency when one boundary needs another.\n"
         "- Do not invent a UI or event-stream task when the confirmed Goal limits the feature to the ordinary CLI; include such a boundary only when the Goal or Discovery evidence requires it.\n\n"
+        "Test-first tractability rule:\n"
+        "- A greenfield Maven project (no pom.xml/build.gradle) must start with a scaffold-only Task whose planned_new "
+        "contains the exact pom.xml path. It may have at most two build/configuration acceptance cases and must not "
+        "include Java business behavior or planned Java source. The system verifies this Task with Maven validate; "
+        "later behavior Tasks depend on it and receive normal test-first verification.\n"
+        "- Order Tasks so each Task's acceptance cases are provable by a focused unit test against code that either "
+        "exists or is created by that same Task. Defer database-integration behavior (SELECT FOR UPDATE, optimistic "
+        "lock, live-connection round-trips) until the module build and persistence seam exist, or express it as a "
+        "structural assertion (e.g. an entity declares a @Version field) that a test-first baseline can actually fail on.\n\n"
         "Split the Goal into as many Tasks as its independently verifiable deliverables require:\n"
         "- First compare every requested behavior against Discovery evidence and classify it internally as implemented, partial, missing, or unknown. Create Tasks only for partial or missing behavior; implemented behavior may need regression coverage but is not implementation work.\n"
         "- There is no target Task count. Cover every distinct deliverable; never merge work merely to reduce the count.\n"
         "- Each Task is independently implementable and machine-verifiable.\n"
         "- Each Task must include 1-8 concrete acceptance_cases using given/when/then; split a Task that needs more.\n"
+        "- In a greenfield Maven project, a non-scaffold Task may contain at most three acceptance cases. Split schema, "
+        "pure domain behavior, persistence integration, concurrency, and lifecycle behavior into separate Tasks.\n"
         "- depends_on lists names of earlier Tasks only.\n"
         "- Every Task needs a non-empty primary_write or planned_new list. The system derives evidence_refs from these paths.\n"
         "- test_strategy must explain how each acceptance case will be verified.\n"
@@ -631,13 +713,7 @@ def build_plan_prompt(
         "Keep JSON keys, evidence IDs, paths, commands, and selectors exactly as supplied.\n\n"
         "Reply with ONLY one JSON object in this schema:\n"
         f"{output_schema}"
-        '{"name":"paginate list","behavior":"list returns every page",'
-        '"acceptance_cases":[{"id":"AC1","given":"more than one page",'
-        '"when":"the caller requests pages","then":"no row is skipped"}],'
-        '"test_selectors":["tests/test_pagination.py::test_all_pages"],'
-        '"depends_on":[],"primary_write":["src/list.py"],"planned_new":[],"conditional_write":[],"read_envelope":["src/list.py"],"forbidden":[".env"],"evidence_refs":["E1"],'
-        '"test_strategy":"one selector per acceptance case", "case_selectors":{"AC1":["tests/test_pagination.py::test_all_pages"]},'
-        '"skills":["test-driven-development"]}'
+        f"{plan_example}"
         f"{response_suffix}\n"
         "No prose and no code fence."
     )
@@ -1000,6 +1076,17 @@ def _parse_plan_result(
     names: set[str] = set()
     external_names = set(external_dependency_names)
     generated_paths_by_task: dict[str, frozenset[str]] = {}
+    dependency_closure_by_task: dict[str, frozenset[str]] = {}
+    adapter_id = str(getattr(verification_adapter, "id", getattr(test_catalog, "adapter", "")) or "")
+    manifest_files = {str(item).replace("\\", "/") for item in (discovery_manifest or {}).get("repo_files", [])}
+    build_names = {"pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts"}
+    greenfield_maven = (
+        not legacy_mode
+        and discovery_manifest is not None
+        and adapter_id == "maven"
+        and not any(Path(path).name in build_names for path in manifest_files)
+    )
+    scaffold_name = ""
     for index, entry in enumerate(data["tasks"], start=1):
         label = f"Task {index}"
         if not isinstance(entry, dict):
@@ -1022,10 +1109,56 @@ def _parse_plan_result(
         dependency_generated_paths = frozenset().union(
             *(generated_paths_by_task.get(dependency, frozenset()) for dependency in dependencies)
         )
+        dependency_closure = frozenset(dependencies).union(*(
+            dependency_closure_by_task.get(dependency, frozenset()) for dependency in dependencies
+        ))
         spec = _spec_from_entry(entry, test_catalog, cases, verification_adapter, legacy=legacy_mode)
         primary_write = _normalise_strings(entry.get("primary_write"))
         planned_new = _normalise_strings(entry.get("planned_new"))
+        planned_api = _normalise_planned_api(entry.get("planned_api"))
         conditional_write = _normalise_strings(entry.get("conditional_write"))
+        if greenfield_maven:
+            planned_poms = tuple(path for path in planned_new if Path(path).name == "pom.xml")
+            planned_java = tuple(path for path in planned_new if path.lower().endswith(".java"))
+            if index == 1:
+                scaffold_name = name
+                if not planned_poms:
+                    errors.append(f"{label} must be the greenfield Maven scaffold and declare an exact pom.xml in planned_new")
+                if planned_java or planned_api:
+                    errors.append(f"{label} must be scaffold-only; move Java source and planned_api to a dependent Task")
+                if len(cases) > 2:
+                    errors.append(f"{label} scaffold may have at most two build/configuration acceptance_cases")
+                if planned_poms:
+                    command_builder = getattr(verification_adapter, "build_bootstrap_command", None)
+                    command = command_builder(planned_poms[0]) if callable(command_builder) else f"mvn -q -f {planned_poms[0]} -DskipTests validate"
+                    spec = VerificationSpec(
+                        adapter="maven",
+                        command=command,
+                        selectors=("build:validate",),
+                        source="bootstrap",
+                        collected_count=1,
+                        baseline_result="not_run",
+                        confidence="high",
+                        covers=tuple(case.id for case in cases),
+                        case_selectors={case.id: ("build:validate",) for case in cases},
+                    )
+            else:
+                if len(cases) > 3:
+                    errors.append(f"{label} has too many greenfield acceptance_cases; split it into focused Tasks (maximum 3)")
+                if scaffold_name and scaffold_name not in dependency_closure:
+                    errors.append(f"{label} must depend on the greenfield Maven scaffold Task {scaffold_name!r}")
+                creates_behavior_source = bool(planned_java or any(not Path(path).suffix for path in planned_new))
+                if not planned_api and creates_behavior_source:
+                    errors.append(f"{label} creates new production behavior and must declare planned_api")
+        if planned_api:
+            for api in planned_api:
+                api_path = str(api.get("path") or "")
+                in_scope = any(
+                    api_path == scope or api_path.startswith(scope.rstrip("/") + "/")
+                    for scope in planned_new
+                )
+                if not _valid_scope_path(api_path) or not in_scope:
+                    errors.append(f"{label} planned_api path must be inside planned_new scope: {api_path or '(missing)'}")
         if contract_override is not None and discovery_manifest is not None:
             # Execution replans operate on a moving worktree. Models often
             # preserve an old scope label after an earlier slice created a
@@ -1101,7 +1234,9 @@ def _parse_plan_result(
                 if str(item).strip()
             }
             planned_new_valid = all(
-                _path_can_be_planned_new(path, file_paths, directory_paths) for path in planned_new
+                _path_can_be_planned_new(path, file_paths, directory_paths)
+                or any(path == generated or path.startswith(generated.rstrip("/") + "/") for generated in dependency_generated_paths)
+                for path in planned_new
             )
             conditional_valid = all(_valid_scope_path(path) and _path_is_existing(path, file_paths) for path in conditional_write)
             read_valid = all(
@@ -1167,6 +1302,7 @@ def _parse_plan_result(
                 verification_spec=spec,
                 primary_write=primary_write,
                 planned_new=planned_new,
+                planned_api=planned_api,
                 conditional_write=conditional_write,
                 read_envelope=read_envelope,
                 forbidden=forbidden,
@@ -1177,6 +1313,7 @@ def _parse_plan_result(
         )
         names.add(name)
         generated_paths_by_task[name] = dependency_generated_paths | frozenset(planned_new)
+        dependency_closure_by_task[name] = dependency_closure
     if errors:
         return None, _contract_error_text(errors)
     coverage = tuple(dict(item) for item in data.get("replacement_coverage", []) if isinstance(item, dict))
@@ -1218,6 +1355,7 @@ def _format_repair_prompt(
                 "acceptance_cases": item.get("acceptance_cases", []),
                 "primary_write": item.get("primary_write", []),
                 "planned_new": item.get("planned_new", []),
+                "planned_api": item.get("planned_api", []),
                 "conditional_write": item.get("conditional_write", []),
                 "read_envelope": item.get("read_envelope", []),
                 "verification": item.get("verification", {}),
@@ -1392,6 +1530,11 @@ def plan_tasks(
         # Keep the historical 32k allowance for bare v1 callbacks. Native v2
         # plans use the bounded first attempt and an explicit continuation.
         "max_tokens": 32_000 if discovery_manifest is None else PLANNER_MAX_OUTPUT_TOKENS,
+        # The configured relay has a hard 120-second proxy window. Max effort
+        # can spend that entire window in hidden reasoning before a JSON byte
+        # is returned, so planning uses a bounded effort and relies on the
+        # independent reviewer for contract quality.
+        "reasoning_effort_override": PLANNER_REASONING_EFFORT,
         "tools_override": (),
         # Goal planning returns a potentially large JSON contract. Stream it
         # even when no interactive event sink is active so relay read timeouts

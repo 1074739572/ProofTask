@@ -101,11 +101,23 @@ def test_ac5_absolute_path_outside_workspace_hits_external_directory_gate(
 
     decision = _decision("read_file", {"path": str(outside)})
 
-    # read_file alone would allow; the external_directory gate must return a
-    # non-allow effect before the tool rule applies.
-    assert decision.effect != "allow"
-    assert decision.save_tool == "external_directory"
+    # The shipped policy sets ``external_directory: allow``, so an ordinary
+    # file outside the workspace follows the tool's own rule and is allowed
+    # silently. The boundary is still detected (``external_resource`` is set)
+    # and the sensitive-path guard below still applies.
+    assert decision.effect == "allow"
     assert decision.external_resource is not None
+
+
+def test_ac5b_secret_outside_workspace_is_still_denied(shipped_workspace):
+    outside_secret = shipped_workspace.parent / "outside_workspace" / ".env"
+
+    decision = _decision("read_file", {"path": str(outside_secret)})
+
+    # Relaxing the external-directory gate must not reopen secrets: the
+    # hardcoded sensitive-path check is independent of the permission file.
+    assert decision.effect == "deny"
+    assert decision.source == "safety"
 
 
 def test_ac6_unknown_mcp_tool_is_ask(shipped_workspace):

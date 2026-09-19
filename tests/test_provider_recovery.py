@@ -55,3 +55,18 @@ def test_connection_error_honors_single_attempt_limit(monkeypatch):
     else:
         raise AssertionError("expected the single request to fail")
     assert calls == 1
+
+
+def test_cloudflare_524_retries_then_succeeds(monkeypatch):
+    monkeypatch.setattr(recovery, "retry_delay", lambda attempt: 0)
+    calls = 0
+
+    def request():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("Error code: 524 - origin_response_timeout")
+        return "ok"
+
+    assert with_retry(request, RecoveryState(), max_attempts=2) == "ok"
+    assert calls == 2

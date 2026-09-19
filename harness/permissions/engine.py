@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import fnmatch
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -50,6 +51,36 @@ def _is_sensitive_path(resource: str) -> bool:
     if name in _SENSITIVE_NAMES or (name.startswith(".env.") and not name.endswith(".example")):
         return True
     return name.endswith((".pem", ".key", ".p12", ".pfx"))
+
+
+# Separators that make a whole-command prefix allow-list unsound: whatever
+# follows them is a separate command that must clear the policy on its own.
+_SHELL_SEPARATORS = ("&", "|", ">", "<", ";", "\n", "\r")
+_SHELL_SEPARATOR_RE = re.compile(r"[&|><;]+|\r?\n")
+
+
+def _is_compound_shell_command(command: str) -> bool:
+    """Return whether a shell command chains or redirects several commands."""
+    return any(token in command for token in _SHELL_SEPARATORS)
+
+
+def _split_shell_segments(command: str) -> list[str]:
+    """Split a compound shell command into individually checkable segments.
+
+    A full shell parse is intentionally out of scope.  This is a conservative
+    split on the separators that make a prefix allow-list unsound (``&``,
+    ``|``, ``>``, ``<``, ``;`` and newlines), followed by stripping whitespace.
+    Bare file-descriptor numbers produced by redirections (the ``2`` and ``1``
+    of ``2>&1``) are dropped because they are not commands; '' segments are
+    dropped as well.  Erring toward more segments only ever makes the decision
+    stricter, never more permissive.
+    """
+    segments: list[str] = []
+    for raw in _SHELL_SEPARATOR_RE.split(command):
+        segment = raw.strip()
+        if segment and not segment.isdigit():
+            segments.append(segment)
+    return segments
 
 
 def _match(pattern: str, value: str) -> bool:
@@ -350,18 +381,59 @@ def evaluate_permission(
                 source="safety",
                 external_resource=ctx.external_resource,
             )
-    if tool_name == "bash" and any(token in ctx.resource for token in ("&", "|", ">", "<", "\n", "\r")):
-        # A prefix allow-list cannot safely authorize a compound shell command.
-        # It may contain an unrelated destructive command after the separator.
-        return PermissionDecision(
-            effect="ask",
-            tool=tool_name,
-            resource=ctx.resource,
-            reason="compound shell command requires explicit approval",
-            save_tool=tool_name,
-            save_resource=ctx.resource,
-            source="safety",
-        )
+    if tool_name == "bash" and _is_compound_shell_command(ctx.resource):
+        # A prefix allow-list cannot safely authorize a compound shell command
+        # as a whole: inheriting the ``dir *`` allow rule would also authorize
+        # ``dir . & del important.txt``.  Instead of asking unconditionally,
+        # split the command on the separators and evaluate every segment
+        # independently, then keep the most restrictive outcome.
+        #
+        # The command is auto-allowed only when *every* segment is allowed on
+        # its own; a single deny or ask segment keeps the decision interactive.
+        # A blocking verdict is still tagged ``source="safety"`` so a session
+        # convenience mode (auto-review / full-access) cannot silently approve
+        # a compound command whose parts the policy did not all clear.
+        segments = _split_shell_segments(ctx.resource)
+        if segments:
+            segment_decisions = [
+                evaluate_single_permission(
+                    tool_name,
+                    segment,
+                    rules=rules,
+                    include_saved=include_saved,
+                    source_tool=tool_name,
+                )
+                for segment in segments
+            ]
+            worst_effect: PermissionEffect = "allow"
+            worst_reason = ""
+            for segment_decision in segment_decisions:
+                if segment_decision.effect == "deny":
+                    worst_effect, worst_reason = "deny", segment_decision.reason
+                    break
+                if segment_decision.effect == "ask" and worst_effect == "allow":
+                    worst_effect, worst_reason = "ask", segment_decision.reason
+            if worst_effect == "allow":
+                return PermissionDecision(
+                    effect="allow",
+                    tool=tool_name,
+                    resource=ctx.resource,
+                    reason="compound shell command: every segment is allowed",
+                    save_tool=tool_name,
+                    save_resource=ctx.resource,
+                    source="config",
+                    external_resource=ctx.external_resource,
+                )
+            return PermissionDecision(
+                effect=worst_effect,
+                tool=tool_name,
+                resource=ctx.resource,
+                reason=f"compound shell command: {worst_reason}",
+                save_tool=tool_name,
+                save_resource=ctx.resource,
+                source="safety",
+                external_resource=ctx.external_resource,
+            )
     if ctx.external_resource:
         external_decision = evaluate_single_permission(
             "external_directory",
