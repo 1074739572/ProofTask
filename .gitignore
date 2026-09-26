@@ -129,4 +129,21 @@ _verify_*.js
 
 # Project overview is published despite the generic local-text rule above.
 !readme.txt
+
+# Debug/run artifacts from goal layout work and crash/process recovery
+hs_err_pid*.log
+replay_pid*.log
+pytest_sweep.log
+sweep_remaining.ps1
+goal_layout_*.html
+node_tui/goal_preview_*.png
+node_tui/goal_run_*.png
+node_tui/goal_run_*_spans.json
+node_tui/src-open/debug_old_tmp.tsx
+node_tui/src-open/probe_goal_flow.tsx
+
+# Local scratch: IDE runtime state, staging scratch, recovered temp files
+.workbuddy/
+_staging/
+/src-open/
 docs/

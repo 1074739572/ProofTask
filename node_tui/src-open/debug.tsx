@@ -150,7 +150,14 @@ const fakeGoal: GoalSnapshot = {
   },
   tasks: [
     {id: 'task_state', subject: '归并 Agent 生命周期事件', status: 'completed', verification_state: 'passing', evidence_count: 2},
-    {id: 'task_ui', subject: '实现阶段轨道和 Agent 现场面板', status: 'in_progress', verification_state: 'not_started', evidence_count: 0},
+    {
+      id: 'task_ui', subject: '实现阶段轨道和 Agent 现场面板', status: 'in_progress', verification_state: 'not_started', evidence_count: 0,
+      acceptance_cases: [
+        {given: 'Goal 已启动', when: '进入执行页', then: '显示阶段轨道与执行流'},
+        {given: '宽屏 120 列', when: '渲染', then: '左右分栏无重叠'},
+      ],
+      verification_spec: {command: 'pytest tests/goal-layout.test.tsx'},
+    },
     {id: 'task_tests', subject: '验证宽屏和窄屏布局', status: 'pending', verification_state: 'not_started', blocked_by: ['task_ui']},
   ],
 };

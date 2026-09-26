@@ -389,6 +389,70 @@ def test_unknown_read_envelope_requests_discovery_refresh():
     assert "src/missing.py" in str(exc_info.value)
 
 
+def test_unresolved_contract_requests_discovery_refresh():
+    raw = _plan()
+    raw["goal_contract"]["unresolved"] = ["which entry owns session storage"]
+    responses = iter((json.dumps(raw), json.dumps(raw)))
+
+    with pytest.raises(GoalPlanningError) as exc_info:
+        plan_tasks(
+            "add a rate limit",
+            "pytest -q",
+            planner_runner=lambda **_: next(responses),
+            discovery_manifest=MANIFEST,
+            test_catalog=TestCatalog(),
+        )
+
+    assert exc_info.value.requires_discovery_refresh is True
+    assert "unresolved decisions" in str(exc_info.value)
+
+
+def test_review_repair_with_unresolved_contract_requests_discovery_refresh():
+    valid = json.dumps(_plan())
+    unresolved = _plan()
+    unresolved["goal_contract"]["unresolved"] = ["which entry owns session storage"]
+    planner_responses = iter((valid, json.dumps(unresolved)))
+    rejection = json.dumps({
+        "approved": False,
+        "summary": "contract needs work",
+        "findings": [{"severity": "high", "task": "enforce rate limit", "issue": "thin evidence", "repair": "cite paths"}],
+    })
+
+    with pytest.raises(GoalPlanningError, match="did not repair the reviewed GoalPlan") as exc_info:
+        plan_tasks(
+            "add a rate limit",
+            "pytest -q",
+            planner_runner=lambda **_: next(planner_responses),
+            reviewer_runner=lambda **_: rejection,
+            discovery_manifest=MANIFEST,
+            test_catalog=TestCatalog(),
+        )
+
+    assert exc_info.value.requires_discovery_refresh is True
+
+
+def test_reviewer_unresolved_decisions_rejection_requests_discovery_refresh():
+    valid = json.dumps(_plan())
+    planner_responses = iter((valid, valid))
+    rejection = json.dumps({
+        "approved": False,
+        "summary": "goal_contract has unresolved decisions about entry resolution",
+        "findings": [{"severity": "high", "task": "goal_contract", "issue": "entry resolution undecided", "repair": "prove it"}],
+    })
+
+    with pytest.raises(GoalPlanningError, match="remains rejected after one correction") as exc_info:
+        plan_tasks(
+            "add a rate limit",
+            "pytest -q",
+            planner_runner=lambda **_: next(planner_responses),
+            reviewer_runner=lambda **_: rejection,
+            discovery_manifest=MANIFEST,
+            test_catalog=TestCatalog(),
+        )
+
+    assert exc_info.value.requires_discovery_refresh is True
+
+
 def test_planned_new_file_is_not_retained_in_read_envelope():
     raw = _plan(primary_write=[], planned_new=["src/rate_limit.py"])
     raw["tasks"][0]["read_envelope"] = ["src", "src/rate_limit.py"]

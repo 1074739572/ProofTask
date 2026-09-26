@@ -9,8 +9,9 @@ import {C} from './theme.ts';
 
 export type GoalLike = GoalSnapshot | GoalDraftSnapshot;
 
-/** 宽屏右栏（执行流 + 详情面板）宽度占比；左栏（GOAL 卡 + 任务看板）为 1 - 该值。 */
+/** 宽屏右栏（GOAL 卡 + 任务看板 + 统计）宽度占比；左栏（执行流 + 测试 + 检查）为 1 - 该值。 */
 export const GOAL_SIDE_COLUMN_RATIO = 0.36;
+export const GOAL_MAIN_COLUMN_RATIO = 1 - GOAL_SIDE_COLUMN_RATIO;
 
 export function readSource<T>(source: T | (() => T) | undefined): T | undefined {
   return typeof source === 'function' ? (source as () => T)() : source;
@@ -54,25 +55,59 @@ export const GOAL_PHASE_LABELS: Record<string, string> = {
   subagent: '子代理', 'goal planning': 'Goal 规划', idle: '待命',
 };
 
+/** Goal 页面 UI 文案统一表：所有硬编码中英文混排标签从这里取，避免四处漂移。 */
+export const GOAL_UI_LABELS = {
+  title: '目标',
+  status: '状态',
+  phase: '阶段',
+  progress: '进度',
+  rounds: '轮次',
+  pipeline: '执行链路',
+  taskBoard: '任务看板',
+  currentTask: '当前任务',
+  nextAction: '下一步',
+  currentAction: '当前动作',
+  executionFlow: '执行流',
+  testCases: '对应测试',
+  checkProcess: '模型检查过程',
+  acceptances: '验收',
+  command: '命令',
+  evidence: '证据',
+  verify: '验证',
+  verifiedBy: '验证者',
+  model: '模型',
+  agent: 'Agent',
+  task: '任务',
+  context: '上下文',
+  waitingPermission: '等待权限批准',
+  resumeHint: '批准后可恢复',
+  stale: '可能停滞',
+  noEvents: '暂无模型执行事件',
+  stats: '统计',
+  totalElapsed: '总耗时',
+  taskProgress: '任务进度',
+  draftStages: {intake: '需求', discovering: '发现', planning: '规划', ready: '就绪'},
+} as const;
+
 export function goalPhaseLabel(phase: string): string {
   const text = String(phase || '').trim();
   return GOAL_PHASE_LABELS[text] || text || '准备';
 }
 
-/** 执行链路的七个展示阶段。 */
+/** 执行链路的七个展示阶段（对齐后端真实阶段机 GoalPhase）。 */
 export const GOAL_TRACK: readonly [string, string][] = [
-  ['intake', '需求'], ['prepare_tests', '测试'], ['planning', '规划'],
-  ['discovering', '发现'], ['act', '实现'], ['verify', '验证'], ['completed', '完成'],
+  ['intake', '需求'], ['prepare_tests', '测试准备'], ['prepare_execution', '执行准备'],
+  ['act', '实现'], ['verify', '验证'], ['full_verify', '全量回归'], ['completed', '完成'],
 ];
 
-/** 后端状态机阶段 → 展示轨道索引。时间线只能单调前进，执行期的小阶段全部归到「实现」。 */
+/** 后端状态机阶段 → 展示轨道索引。时间线只能单调前进。 */
 const PHASE_TRACK_INDEX: Record<string, number> = {
   intake: 0, initialize: 0,
   prepare_tests: 1, catalog: 1, preflight: 1,
-  planning: 2,
-  discovering: 3,
-  act: 4, working: 4, select_task: 4, prepare_execution: 4, claim: 4, rollover: 4, repair_plan: 4,
-  verify: 5, verification: 5, evaluate: 5, clean_check: 5, impact_review: 5, full_verify: 5,
+  prepare_execution: 2, select_task: 2, claim: 2,
+  act: 3, working: 3, rollover: 3, repair_plan: 3,
+  verify: 4, verification: 4, evaluate: 4, clean_check: 4, impact_review: 4,
+  full_verify: 5,
   completed: 6, done: 6,
 };
 

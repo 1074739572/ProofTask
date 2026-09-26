@@ -136,15 +136,6 @@ def inspect_agent_model(
         "reasoning_effort": selected_effort or None,
         "supported_efforts": tuple(model_profile.effort_options),
     }
-    if selected_effort and selected_effort not in model_profile.effort_options:
-        available = ", ".join(model_profile.effort_options) or "none"
-        return AgentModelBinding(
-            **base,
-            error=(
-                f"Agent '{agent_type}' requests reasoning_effort={selected_effort!r} "
-                f"for {profile.model_id}, but supported values are: {available}."
-            ),
-        )
     try:
         provider = get_provider(model_profile.provider)
     except KeyError:
@@ -157,25 +148,32 @@ def inspect_agent_model(
             ),
         )
     key_configured = bool(resolve_api_key(provider))
+    route = {
+        "provider_id": provider.id,
+        "provider_label": provider.label,
+        "api_key_env": provider.api_key_env,
+        "api_key_configured": key_configured,
+    }
+    if selected_effort and selected_effort not in model_profile.effort_options:
+        available = ", ".join(model_profile.effort_options) or "none"
+        return AgentModelBinding(
+            **base,
+            **route,
+            error=(
+                f"Agent '{agent_type}' requests reasoning_effort={selected_effort!r} "
+                f"for {profile.model_id}, but supported values are: {available}."
+            ),
+        )
     if not key_configured:
         return AgentModelBinding(
             **base,
-            provider_id=provider.id,
-            provider_label=provider.label,
-            api_key_env=provider.api_key_env,
-            api_key_configured=False,
+            **route,
             error=(
                 f"Agent '{agent_type}' needs model {profile.model_id} "
                 f"but API key for {provider.label} is missing ({provider.api_key_env})."
             ),
         )
-    return AgentModelBinding(
-        **base,
-        provider_id=provider.id,
-        provider_label=provider.label,
-        api_key_env=provider.api_key_env,
-        api_key_configured=True,
-    )
+    return AgentModelBinding(**base, **route)
 
 
 def validate_agent_model(

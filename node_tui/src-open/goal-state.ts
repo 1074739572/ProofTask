@@ -220,21 +220,21 @@ const STAGE_ALIASES: Record<string, string> = {
   catalog: 'prepare_tests',
   preflight: 'prepare_tests',
   working: 'act',
-  select_task: 'act',
-  prepare_execution: 'act',
-  claim: 'act',
+  select_task: 'prepare_execution',
+  prepare_execution: 'prepare_execution',
+  claim: 'prepare_execution',
   rollover: 'act',
-  repair_plan: 'act',
+  repair_plan: 'verify',
   verification: 'verify',
   evaluate: 'verify',
   clean_check: 'verify',
   impact_review: 'verify',
-  full_verify: 'verify',
+  full_verify: 'full_verify',
   done: 'completed',
 };
 
-/** 归一化后端阶段名到展示轨道键（intake/prepare_tests/planning/discovering/act/verify/completed）。
- * 阶段时钟按轨道键聚合耗时，执行期的小阶段（select_task/claim/rollover 等）计入「实现」。 */
+/** 归一化后端阶段名到展示轨道键（intake/prepare_tests/prepare_execution/act/verify/full_verify/completed）。
+ * 阶段时钟按轨道键聚合耗时。 */
 export function normalizeGoalStage(raw: string): string {
   return STAGE_ALIASES[raw] || raw;
 }

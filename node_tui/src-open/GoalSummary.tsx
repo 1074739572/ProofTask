@@ -1,7 +1,9 @@
 import {For, Show, createMemo} from 'solid-js';
 import {formatStageElapsed, goalPhaseOf, normalizeGoalStage, type GoalDraftTaskSummary, type GoalTaskSnapshot, type StageMark} from './goal-state.ts';
 import {
+  GOAL_SIDE_COLUMN_RATIO,
   GOAL_TRACK,
+  GOAL_UI_LABELS,
   fallbackGoal,
   goalPhaseLabel,
   goalPhaseTrackIndex,
@@ -43,9 +45,15 @@ export type GoalSummaryProps = {
   stageMarks?: StageMark[] | (() => StageMark[]);
   /** 当前时间；缺省 Date.now()。调试预览传入固定值以得到确定性耗时。 */
   now?: number | (() => number);
+  /** 宽屏下所在列的宽度占比；用于时间线和文本截断预算。 */
+  columnRatio?: number;
+  /** 是否显示任务看板区域。 */
+  showTaskBoard?: boolean;
+  /** 是否显示底部"当前动作"行。 */
+  showCurrentAction?: boolean;
 };
 
-type TaskBoardRow = {icon: string; color: string; subject: string; note: string};
+type TaskBoardRow = {icon: string; color: string; subject: string; note: string; current: boolean; detail?: string};
 
 function safeText(value: unknown, fallback = '暂无'): string {
   const text = value == null ? fallback : String(value).trim();
@@ -114,17 +122,27 @@ function taskBoardFor(goal: GoalLike): TaskBoardRow[] {
   return goal.tasks.map(task => {
     const state = goalTaskState(task, goal.current_task_id);
     const blocked = state === 'pending' && (task.blocked_by || []).length > 0;
+    const current = task.id === goal.current_task_id;
     const note = state === 'done'
       ? (task.evidence_count ? `证据 ${task.evidence_count}` : '完成')
       : state === 'failed' ? '失败'
         : state === 'active' ? '进行中'
           : blocked ? '等前序完成'
             : '';
+    let detail: string | undefined;
+    if (current) {
+      const parts: string[] = [];
+      if (task.acceptance_cases?.length) parts.push(`验收 ${task.acceptance_cases.length} 项`);
+      if (task.verification_spec?.command) parts.push(`$ ${task.verification_spec.command}`);
+      detail = parts.length ? parts.join(' · ') : undefined;
+    }
     return {
       icon: goalTaskIcon(state),
       color: goalTaskColor(state),
       subject: safeText(task.subject),
       note,
+      current,
+      detail,
     };
   });
 }
@@ -149,6 +167,9 @@ export function GoalSummary(props: GoalSummaryProps) {
   const mode = (): LayoutMode => layoutMode(width(), height());
   const narrow = () => mode() !== 'wide';
   const short = () => mode() === 'short';
+  const colRatio = () => props.columnRatio ?? GOAL_SIDE_COLUMN_RATIO;
+  const showBoard = () => props.showTaskBoard !== false;
+  const showAction = () => props.showCurrentAction !== false;
   const taskLabel = () => {
     const task = currentTask();
     const tasks = goal().tasks;
@@ -220,7 +241,9 @@ export function GoalSummary(props: GoalSummaryProps) {
     }));
     const icon = (state: string) => state === 'active' ? '◉' : state === 'done' ? '●' : '○';
     const color = (state: string) => state === 'active' ? C.primary : state === 'done' ? C.success : C.textMuted;
-    const budget = Math.max(24, Math.floor(width() * (mode() === 'wide' ? 0.64 : 1)) - 6);
+    // 预算 = 当前列宽 - 6（前缀"执行链路 "≈5 + 边框 padding）
+    const colWidth = mode() === 'wide' ? Math.floor(width() * colRatio()) : width();
+    const budget = Math.max(24, colWidth - 6);
     const overhead = terminalColumns('执行链路 ') + Math.max(0, cells.length - 1) * 3
       + cells.reduce((sum, cell) => sum + terminalColumns(`${icon(cell.state)}${cell.label}`), 0);
     const elapsedWidth = (keep: (cell: typeof cells[number]) => boolean) => overhead + cells.reduce(
@@ -247,11 +270,15 @@ export function GoalSummary(props: GoalSummaryProps) {
 
   const statusText = () => `${goalStatusIcon(displayStatus())} ${goalStatusLabel(displayStatus())}`;
   const progressText = () => progress().total ? `${progress().done}/${progress().total} 任务 · ${progress().percent}%` : '任务图准备中';
-  // The compact shell renders its own one-line details affordance directly
-  // below the summary.  Keep the extra hint only where it adds information:
-  // short terminals need the explicit key, while wide terminals benefit from
-  // the longer mouse/keyboard wording beside the inspector.
   const detailsHint = () => short() ? '[Enter] 查看任务 / Agent / 证据' : '';
+  const currentActionText = () => {
+    const active = decisions().find(decision => decision.status === 'active');
+    if (active) return `${active.agent || 'Agent'} · ${active.text || '执行中'}`;
+    const current = goal();
+    const supervisor = isSnapshot(current) && current.supervision?.latest;
+    if (supervisor) return `监督 · ${supervisor.action || ''}${supervisor.summary ? `：${supervisor.summary}` : ''}`;
+    return nextAction(goal());
+  };
 
   // A compact execution summary replaces the former three-card row.  The
   // fields are ordered by actionability so short terminals lose IDs and
@@ -259,11 +286,11 @@ export function GoalSummary(props: GoalSummaryProps) {
   return <box flexDirection="column" flexGrow={0} flexShrink={0} minWidth={0} paddingX={1} paddingTop={short() ? 0 : 1}>
     <box border={!short()} borderStyle="rounded" borderColor={goalStatusColor(displayStatus())} flexDirection="column" flexShrink={0} paddingX={short() ? 0 : 1} minWidth={0}>
       <box flexDirection={mode() === 'wide' ? 'row' : 'column'} justifyContent="space-between" minWidth={0} flexShrink={1}>
-        <text fg={C.primary} wrapMode="none" truncate flexGrow={1} flexShrink={1}>{short() ? 'GOAL' : `GOAL · ${clip(goal().target, mode() === 'wide' ? 74 : 54)}`}</text>
+        <text fg={C.primary} wrapMode="none" truncate flexGrow={1} flexShrink={1}>{short() ? GOAL_UI_LABELS.title : `${GOAL_UI_LABELS.title} · ${clip(goal().target, mode() === 'wide' ? 74 : 54)}`}</text>
         <text fg={goalStatusColor(displayStatus())} wrapMode="none" truncate flexShrink={0}>{statusText()}</text>
       </box>
       <Show when={!short()} fallback={<box />}>
-        <text fg={C.textMuted} wrapMode="none" truncate flexShrink={1}>{mode() === 'wide' ? `ID ${clip(goal().id, 52)} · ` : ''}阶段 {goalPhaseLabel(phase())}</text>
+        <text fg={C.textMuted} wrapMode="none" truncate flexShrink={1}>{mode() === 'wide' ? `ID ${clip(goal().id, 52)} · ` : ''}{GOAL_UI_LABELS.phase} {goalPhaseLabel(phase())}</text>
       </Show>
       <Show when={short()} fallback={<box />}><text fg={C.text} wrapMode="none" truncate>{clip(goal().target, 48)}</text></Show>
       <box flexDirection="row" minWidth={0} marginTop={narrow() ? 0 : 1}>
@@ -274,7 +301,7 @@ export function GoalSummary(props: GoalSummaryProps) {
       </box>
       <Show when={roundsInfo()} fallback={<box />}>
         <box flexDirection="row" minWidth={0} marginTop={narrow() ? 0 : 1}>
-          <text fg={C.textMuted} wrapMode="none" flexShrink={0}>轮次 </text>
+          <text fg={C.textMuted} wrapMode="none" flexShrink={0}>{GOAL_UI_LABELS.rounds} </text>
           <Show when={(roundsInfo()?.max || 0) > 0} fallback={<box />}>
             <text fg={(roundsInfo()?.used || 0) >= (roundsInfo()?.max || 0) ? C.error : C.primary} wrapMode="none" flexShrink={0}>{'█'.repeat(roundCells())}</text>
             <text fg={C.textMuted} wrapMode="none" flexShrink={0}>{'░'.repeat(Math.max(0, 10 - roundCells()))}</text>
@@ -286,7 +313,7 @@ export function GoalSummary(props: GoalSummaryProps) {
       </Show>
       <Show when={!short()} fallback={<box />}>
         <box flexDirection="row" minWidth={0} marginTop={narrow() ? 0 : 1}>
-          <text fg={C.secondary} wrapMode="none" flexShrink={0}>执行链路 </text>
+          <text fg={C.secondary} wrapMode="none" flexShrink={0}>{GOAL_UI_LABELS.pipeline} </text>
           <For each={timelineCells()}>{(cell, index) => <>
             <Show when={index() > 0} fallback={<box />}>
               <text fg={C.textMuted} wrapMode="none" flexShrink={0}>{' › '}</text>
@@ -297,30 +324,39 @@ export function GoalSummary(props: GoalSummaryProps) {
       </Show>
     </box>
 
-    <Show when={taskBoard().length > 0} fallback={
-      <box flexDirection="column" minWidth={0} flexShrink={0} marginTop={narrow() ? 0 : 1}>
-        <text fg={C.info} wrapMode="none" truncate>Task  {clip(taskLabel(), metricWidth())}</text>
-        <text fg={C.secondary} wrapMode="none" truncate>Agent {clip(currentAgentFor(goal(), decisions()), metricWidth())}</text>
-      </box>
+    <Show when={showBoard() && taskBoard().length > 0} fallback={
+      <Show when={showBoard()} fallback={<box />}>
+        <box flexDirection="column" minWidth={0} flexShrink={0} marginTop={narrow() ? 0 : 1}>
+          <text fg={C.info} wrapMode="none" truncate>{GOAL_UI_LABELS.currentTask}  {clip(taskLabel(), metricWidth())}</text>
+          <text fg={C.secondary} wrapMode="none" truncate>{GOAL_UI_LABELS.agent} {clip(currentAgentFor(goal(), decisions()), metricWidth())}</text>
+        </box>
+      </Show>
     }>
       <box flexDirection="column" minWidth={0} flexShrink={0} marginTop={narrow() ? 0 : 1}>
-        <text fg={C.secondary} wrapMode="none" truncate>任务看板 {progress().done}/{progress().total} 完成</text>
-        <For each={taskBoard()}>{row => <box flexDirection="row" minWidth={0}>
-          <text fg={row.color} wrapMode="none" flexShrink={0} selectable={false}>{`${row.icon} `}</text>
-          <text fg={row.color} wrapMode="none" truncate flexGrow={1} flexShrink={1}>{row.subject}</text>
-          <Show when={row.note} fallback={<box />}>
-            <text fg={C.textMuted} wrapMode="none" truncate flexShrink={0}> · {row.note}</text>
+        <text fg={C.secondary} wrapMode="none" truncate>{GOAL_UI_LABELS.taskBoard} · {progress().done}/{progress().total} 完成</text>
+        <For each={taskBoard()}>{row => <box flexDirection="column" minWidth={0}>
+          <box flexDirection="row" minWidth={0}>
+            <text fg={row.color} wrapMode="none" flexShrink={0} selectable={false}>{`${row.icon} `}</text>
+            <text fg={row.color} wrapMode="none" truncate flexGrow={1} flexShrink={1}>{row.subject}</text>
+            <Show when={row.note} fallback={<box />}>
+              <text fg={C.textMuted} wrapMode="none" truncate flexShrink={0}> · {row.note}</text>
+            </Show>
+          </box>
+          <Show when={row.current && row.detail} fallback={<box />}>
+            <text fg={C.textMuted} wrapMode="none" truncate flexShrink={0}>  {row.detail}</text>
           </Show>
         </box>}</For>
       </box>
     </Show>
-    <text fg={permissionWaiting() ? C.warning : C.success} wrapMode="none" truncate marginTop={narrow() ? 0 : 1}>下一步 {clip(nextAction(goal()), metricWidth())}</text>
+    <Show when={showAction()} fallback={<box />}>
+      <text fg={permissionWaiting() ? C.warning : C.success} wrapMode="none" truncate marginTop={narrow() ? 0 : 1}>{GOAL_UI_LABELS.currentAction} {clip(currentActionText(), metricWidth())}</text>
+    </Show>
 
     <Show when={permissionWaiting() || showRecovery()} fallback={<box />}>
       <Show when={permissionWaiting()} fallback={<box />}>
-        <text fg={C.warning} wrapMode="none" truncate>权限：等待工具权限批准，批准后可恢复</text>
+        <text fg={C.warning} wrapMode="none" truncate>{GOAL_UI_LABELS.waitingPermission}，{GOAL_UI_LABELS.resumeHint}</text>
       </Show>
-      <Show when={showRecovery()} fallback={<box />}><text fg={C.warning} wrapMode="word" truncate>状态说明：{permissionWaiting() ? '等待批准后可恢复执行' : clip(errorFor(goal()), 80)}</text></Show>
+      <Show when={showRecovery()} fallback={<box />}><text fg={C.warning} wrapMode="word" truncate>状态说明：{permissionWaiting() ? GOAL_UI_LABELS.resumeHint : clip(errorFor(goal()), 80)}</text></Show>
     </Show>
     <Show when={detailsHint()} fallback={<box />}><text fg={C.textMuted} wrapMode="none" truncate selectable={false}>{detailsHint()}</text></Show>
   </box>;

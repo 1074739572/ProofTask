@@ -1,20 +1,24 @@
-import {createMemo, createRenderEffect, createSignal, For, Show} from 'solid-js';
-import {useKeyboard, useRenderer} from '@opentui/solid';
-import {GoalDetails} from './GoalDetails.tsx';
+import {createMemo, For, Show} from 'solid-js';
 import {GoalSummary} from './GoalSummary.tsx';
-import {createStageClock, goalPhaseOf, type GoalDraftSnapshot, type GoalSnapshot, type StageMark} from './goal-state.ts';
+import {createStageClock, formatStageElapsed, goalPhaseOf, normalizeGoalStage, type GoalDraftSnapshot, type GoalSnapshot, type GoalTaskSnapshot, type StageMark} from './goal-state.ts';
 import {
+  GOAL_MAIN_COLUMN_RATIO,
   GOAL_SIDE_COLUMN_RATIO,
+  GOAL_TRACK,
+  GOAL_UI_LABELS,
   fallbackGoal,
   goalDraftAgentRows,
   goalDraftHeartbeatPresentation,
   goalDraftNextActionPresentation,
   goalDraftStageRail,
+  goalStatusColor,
+  goalTaskColor,
+  goalTaskIcon,
+  goalTaskState,
   isSnapshot,
   readSource,
 } from './goal-presentation.ts';
 import type {InteractionTrace} from './interaction-trace.ts';
-import {submitRenderFrame} from './interaction-trace.ts';
 import {clipTerminalText, layoutMode, type LayoutMode} from './layout.ts';
 import {C} from './theme.ts';
 
@@ -67,11 +71,19 @@ function relativeTime(at: number | undefined, now: number): string {
   return `${Math.floor(seconds / 3600)}h 前`;
 }
 
+function elapsedText(startedAt: number | undefined, now: number): string {
+  if (!startedAt || !Number.isFinite(startedAt) || startedAt <= 0) return '';
+  const seconds = Math.max(0, Math.round((now - startedAt) / 1000));
+  if (seconds < 60) return `${seconds}s`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m${String(seconds % 60).padStart(2, '0')}s`;
+  return `${Math.floor(seconds / 3600)}h${String(Math.round((seconds % 3600) / 60)).padStart(2, '0')}m`;
+}
+
 /**
- * 常驻执行流：右栏（宽屏）或摘要下方（窄屏）展示每个模型正在做什么。
- * 活跃 Agent 头行 + 当前意图 + 最近工具行；监督模型单独一行。
- * compact 模式（堆叠且高度不足）：每个模型合并为单行（意图并入头行），
- * 省略工具明细与块间距，监督模型也压成单行，保证不超出主区高度。
+ * 常驻执行流：左栏展示执行 Agent（不含监督模型）。
+ * 活跃 Agent 头行 + 当前意图 + 最近工具行。
+ * compact 模式（堆叠且高度不足）：每个模型合并为单行，
+ * 省略工具明细与块间距，保证不超出主区高度。
  */
 function GoalExecutionFlow(props: {
   goal: () => GoalLike;
@@ -83,46 +95,30 @@ function GoalExecutionFlow(props: {
   fullWidth: () => boolean;
 }) {
   const spinner = () => SPINNER_FRAMES[Math.abs(props.frame()) % SPINNER_FRAMES.length];
-  const labelWidth = () => Math.max(16, Math.floor(props.width() * (props.fullWidth() ? 0.96 : GOAL_SIDE_COLUMN_RATIO)) - 4);
-  const supervision = () => {
-    const current = props.goal();
-    return isSnapshot(current) ? current.supervision : undefined;
-  };
-  const supervisorStatus = () => supervision()?.status;
-  const supervisorTone = () =>
-    supervisorStatus() === 'unavailable' ? C.error : supervisorStatus() === 'attention' ? C.warning : C.info;
-  const supervisorIcon = () =>
-    supervisorStatus() === 'unavailable' ? '×' : supervisorStatus() === 'attention' ? '!' : '●';
+  const labelWidth = () => Math.max(16, Math.floor(props.width() * (props.fullWidth() ? 0.96 : GOAL_MAIN_COLUMN_RATIO)) - 4);
   const toolRows = (tools: readonly unknown[]): FlowTool[] => (
     props.compact() ? [] : (tools as FlowTool[]).slice(-3)
   );
   const shown = () => props.decisions().slice(-4);
-  // 计数口径是「不同的模型/Agent」，同一模型连发多条决策只算一个。
-  const modelCount = () => new Set(shown().map(decision => decision.agent || 'Agent')).size + (supervision() ? 1 : 0);
-  const supervisorLine = () => {
-    const label = `监督 · ${supervisorStatusLabel(supervision()?.status)}`;
-    if (!props.compact()) return `${label}${supervision()?.model ? ` · ${supervision()?.model}` : ''}`;
-    const latest = supervision()?.latest;
-    const detail = latest
-      ? `${latest.action || ''}${latest.summary ? `：${latest.summary}` : (latest.next_step || '')}`
-      : '';
-    return clipTerminalText(detail ? `${label} · ${detail}` : label, labelWidth());
-  };
+  const modelCount = () => new Set(shown().map(decision => decision.agent || 'Agent')).size;
 
-  return <box flexDirection="column" minWidth={0} minHeight={0} flexGrow={1} flexShrink={1} paddingX={1}>
-    {/* 布局确定性：不用 marginTop/paddingTop（OpenTUI 会把它算进文本高度，
-        高度临界时产生 h=2 的错位测量），改用显式高度 1 的 spacer 盒。 */}
+  return <box flexDirection="column" minWidth={0} minHeight={0} flexGrow={props.fullWidth() ? 0 : 1} flexShrink={props.fullWidth() ? 0 : 1} paddingX={1}>
     <Show when={!props.compact()} fallback={<box height={0} flexShrink={0} />}>
       <box height={1} flexShrink={0} />
     </Show>
-    <text fg={C.secondary} wrapMode="none" truncate flexShrink={0}>执行流 · {modelCount()} 个模型</text>
+    <text fg={C.secondary} wrapMode="none" truncate flexShrink={0}>{GOAL_UI_LABELS.executionFlow} · {modelCount()} 个模型</text>
     <For each={shown()}>{decision => {
       const active = () => decision.status === 'active';
       const failed = () => decision.status === 'failed';
       const tone = () => active() ? C.info : failed() ? C.error : C.textMuted;
+      const timeText = () => {
+        if (active() && decision.startedAt) return elapsedText(decision.startedAt, props.now());
+        if (!active() && decision.at) return relativeTime(decision.at, props.now());
+        return '';
+      };
       const header = () => props.compact()
         ? clipTerminalText(
-          `${decision.agent || 'Agent'}${active() && decision.round ? ` · 第 ${decision.round} 轮` : ''}${decision.text ? ` · ${decision.text}` : ''}`,
+          `${decision.agent || 'Agent'}${active() && decision.round ? ` · 第 ${decision.round} 轮` : ''}${decision.text ? ` · ${decision.text}` : ''}${timeText() ? ` · ${timeText()}` : ''}`,
           labelWidth(),
         )
         : clipTerminalText(
@@ -135,6 +131,9 @@ function GoalExecutionFlow(props: {
         <box flexDirection="row" minWidth={0} flexShrink={0}>
           <text fg={tone()} wrapMode="none" flexShrink={0} selectable={false}>{`${active() ? spinner() : failed() ? '×' : '✓'} `}</text>
           <text fg={tone()} wrapMode="none" truncate flexGrow={1} flexShrink={1}>{header()}</text>
+          <Show when={timeText() && !props.compact()} fallback={<box />}>
+            <text fg={active() ? C.info : C.textMuted} wrapMode="none" flexShrink={0}>{timeText()}</text>
+          </Show>
         </box>
         <Show when={!props.compact() && active() && decision.text} fallback={<box height={0} flexShrink={0} />}>
           <text fg={C.text} wrapMode="none" truncate flexShrink={0}>{clipTerminalText(`  ${decision.text}`, labelWidth())}</text>
@@ -145,71 +144,257 @@ function GoalExecutionFlow(props: {
         </box>}</For>
       </box>;
     }}</For>
-    <Show when={supervision()} fallback={<box height={0} flexShrink={0} />}>
-      <box flexDirection="column" minWidth={0} flexShrink={0}>
-        <box flexDirection="row" minWidth={0} flexShrink={0}>
-          <text fg={supervisorTone()} wrapMode="none" flexShrink={0} selectable={false}>{`${supervisorIcon()} `}</text>
-          <text fg={supervisorTone()} wrapMode="none" truncate flexGrow={1} flexShrink={1}>{supervisorLine()}</text>
-        </box>
-        <Show when={!props.compact() && (supervision()?.latest?.summary || supervision()?.latest?.action || supervision()?.latest?.next_step)} fallback={<box height={0} flexShrink={0} />}>
-          <text fg={C.textMuted} wrapMode="none" truncate flexShrink={0}>{clipTerminalText(
-            `  ${supervision()?.latest?.action || ''}${supervision()?.latest?.summary ? `：${supervision()?.latest?.summary}` : (supervision()?.latest?.next_step || '')}${relativeTime(supervision()?.latest?.at, props.now()) ? ` · ${relativeTime(supervision()?.latest?.at, props.now())}` : ''}`,
-            labelWidth(),
-          )}</text>
-        </Show>
-      </box>
-    </Show>
-    <Show when={shown().length === 0 && !supervision()} fallback={<box height={0} flexShrink={0} />}>
-      <text fg={C.textMuted} wrapMode="none" truncate flexShrink={0}>暂无模型执行事件</text>
+    <Show when={shown().length === 0} fallback={<box height={0} flexShrink={0} />}>
+      <text fg={C.textMuted} wrapMode="none" truncate flexShrink={0}>{GOAL_UI_LABELS.noEvents}</text>
     </Show>
   </box>;
+}
+
+/** 当前任务的测试案例与验证命令。 */
+function GoalTestPanel(props: {goal: () => GoalLike; width: () => number; variant: () => 'full' | 'compact' | 'none'}) {
+  const goal = () => props.goal();
+  const currentTask = () => {
+    const g = goal();
+    if (!isSnapshot(g)) return undefined;
+    return g.tasks.find(task => task.id === g.current_task_id);
+  };
+  const cases = () => {
+    const task = currentTask();
+    return task && 'acceptance_cases' in task ? task.acceptance_cases || [] : [];
+  };
+  const command = () => {
+    const task = currentTask();
+    return task && 'verification_spec' in task ? task.verification_spec?.command : undefined;
+  };
+  const maxCases = () => props.variant() === 'full' ? 3 : 1;
+  const labelWidth = () => Math.max(16, Math.floor(props.width() * GOAL_MAIN_COLUMN_RATIO) - 6);
+  return <Show when={props.variant() !== 'none' && currentTask() && (cases().length > 0 || command())} fallback={<box />}>
+    <box flexDirection="column" minWidth={0} flexShrink={0} paddingX={1} paddingTop={1}>
+      <text fg={C.secondary} wrapMode="none" truncate flexShrink={0}>{GOAL_UI_LABELS.testCases} {cases().length ? `· ${GOAL_UI_LABELS.acceptances} ${cases().length} 项` : ''}</text>
+      <For each={cases().slice(0, maxCases())}>{(item, index) => <text fg={C.textMuted} wrapMode="none" truncate flexShrink={0}>  {index() + 1}. {clipTerminalText(`${item.given || ''} ${item.when || ''} ${item.then || ''}`.replace(/\s+/g, ' ').trim(), labelWidth())}</text>}</For>
+      <Show when={command() && props.variant() === 'full'} fallback={<box />}>
+        <text fg={C.info} wrapMode="none" truncate flexShrink={0}>  $ {clipTerminalText(command(), labelWidth())}</text>
+      </Show>
+    </box>
+  </Show>;
+}
+
+/** 当前任务的模型检查过程：验证证据。 */
+function GoalCheckPanel(props: {goal: () => GoalLike; width: () => number; now: () => number; variant: () => 'full' | 'compact' | 'none'}) {
+  const goal = () => props.goal();
+  const currentTask = () => {
+    const g = goal();
+    if (!isSnapshot(g)) return undefined;
+    return g.tasks.find(task => task.id === g.current_task_id);
+  };
+  const evidence = () => {
+    const task = currentTask();
+    return task && 'latest_evidence' in task ? task.latest_evidence : undefined;
+  };
+  const labelWidth = () => Math.max(16, Math.floor(props.width() * GOAL_MAIN_COLUMN_RATIO) - 6);
+  return <Show when={props.variant() !== 'none' && currentTask() && evidence()} fallback={<box />}>
+    <box flexDirection="column" minWidth={0} flexShrink={0} paddingX={1} paddingTop={1}>
+      <text fg={C.secondary} wrapMode="none" truncate flexShrink={0}>{GOAL_UI_LABELS.checkProcess} · {GOAL_UI_LABELS.currentTask}</text>
+      <Show when={evidence()} fallback={<box />}>
+        <box flexDirection="row" minWidth={0} flexShrink={0}>
+          <text fg={evidence()?.exit_code === 0 ? C.success : C.error} wrapMode="none" flexShrink={0} selectable={false}>{evidence()?.exit_code === 0 ? '✓ ' : '× '}</text>
+          <text fg={C.textMuted} wrapMode="none" truncate flexGrow={1} flexShrink={1}>{clipTerminalText(`${GOAL_UI_LABELS.verify} 退出码 ${evidence()?.exit_code ?? '?'}${evidence()?.verified_by ? ` · ${GOAL_UI_LABELS.verifiedBy} ${evidence()?.verified_by}` : ''}`, labelWidth())}</text>
+          <Show when={evidence()?.duration_ms && props.variant() === 'full'} fallback={<box />}>
+            <text fg={C.textMuted} wrapMode="none" flexShrink={0}>{Math.round((evidence()?.duration_ms || 0) / 1000)}s</text>
+          </Show>
+        </box>
+      </Show>
+    </box>
+  </Show>;
+}
+
+/**
+ * 右栏任务看板：独立的任务状态面板。
+ */
+function GoalTaskBoardPanel(props: {goal: () => GoalLike; short: () => boolean}) {
+  const rows = () => {
+    const g = props.goal();
+    if (isSnapshot(g)) {
+      return g.tasks.map((task: GoalTaskSnapshot) => {
+        const state = goalTaskState(task, g.current_task_id);
+        const blocked = state === 'pending' && (task.blocked_by || []).length > 0;
+        const current = task.id === g.current_task_id;
+        const note = state === 'done'
+          ? (task.evidence_count ? `证据 ${task.evidence_count}` : '完成')
+          : state === 'failed' ? '失败'
+            : state === 'active' ? '进行中'
+              : blocked ? '等前序完成' : '';
+        let detail: string | undefined;
+        if (current) {
+          const parts: string[] = [];
+          if (task.acceptance_cases?.length) parts.push(`验收 ${task.acceptance_cases.length} 项`);
+          if (task.verification_spec?.command) parts.push(`$ ${task.verification_spec.command}`);
+          detail = parts.length ? parts.join(' · ') : undefined;
+        }
+        return {icon: goalTaskIcon(state), color: goalTaskColor(state), subject: task.subject || '', note, current, detail};
+      });
+    }
+    // Draft snapshot: tasks are GoalDraftTaskSummary (no status/verification)
+    return (g.tasks || []).map(task => {
+      const done = /^(done|completed|passing)$/i.test(task.name || '');
+      return {
+        icon: done ? '✓' : '○',
+        color: done ? C.success : C.textMuted,
+        subject: task.name || '',
+        note: task.verification_source ? `验证 ${task.verification_source}` : '',
+        current: false,
+        detail: undefined,
+      };
+    });
+  };
+  const progress = () => {
+    const g = props.goal();
+    const tasks = g.tasks || [];
+    const done = tasks.filter(t => {
+      if ('status' in t) return /^(done|completed|passing)$/i.test(t.status);
+      return false;
+    }).length;
+    return {done, total: tasks.length};
+  };
+  return <Show when={!props.short() && rows().length > 0} fallback={<box />}>
+    <box border borderStyle="rounded" borderColor={C.secondary} flexDirection="column" flexShrink={0} marginTop={1} paddingX={1} paddingBottom={1} minWidth={0}>
+      <text fg={C.secondary} wrapMode="none" truncate flexShrink={0}>{GOAL_UI_LABELS.taskBoard} · {progress().done}/{progress().total} 完成</text>
+      <For each={rows()}>{row => <box flexDirection="column" minWidth={0} flexShrink={0}>
+        <box flexDirection="row" minWidth={0} flexShrink={0}>
+          <text fg={row.color} wrapMode="none" flexShrink={0} selectable={false}>{`${row.icon} `}</text>
+          <text fg={row.color} wrapMode="none" truncate flexGrow={1} flexShrink={1}>{row.subject}</text>
+          <Show when={row.note} fallback={<box />}>
+            <text fg={C.textMuted} wrapMode="none" truncate flexShrink={0}> · {row.note}</text>
+          </Show>
+        </box>
+        <Show when={row.current && row.detail} fallback={<box />}>
+          <text fg={C.textMuted} wrapMode="none" truncate flexShrink={0}>  {row.detail}</text>
+        </Show>
+      </box>}</For>
+    </box>
+  </Show>;
+}
+
+/**
+ * 右栏监督模型面板：全局监督状态和最近决策。
+ */
+function GoalSupervisionPanel(props: {
+  goal: () => GoalLike;
+  now: () => number;
+  short: () => boolean;
+}) {
+  const supervision = () => {
+    const current = props.goal();
+    return isSnapshot(current) ? current.supervision : undefined;
+  };
+  const supervisorStatus = () => supervision()?.status;
+  const tone = () =>
+    supervisorStatus() === 'unavailable' ? C.error : supervisorStatus() === 'attention' ? C.warning : C.info;
+  const icon = () =>
+    supervisorStatus() === 'unavailable' ? '×' : supervisorStatus() === 'attention' ? '!' : '●';
+  const stale = () => {
+    const latest = supervision()?.latest;
+    if (!latest?.at) return false;
+    return props.now() - latest.at > 30_000;
+  };
+  const history = () => (supervision()?.history || []).slice(-3).reverse();
+  return <Show when={!props.short() && supervision()} fallback={<box />}>
+    <box border borderStyle="rounded" borderColor={C.warning} flexDirection="column" flexShrink={0} marginTop={1} paddingX={1} paddingBottom={1} minWidth={0}>
+      <box flexDirection="row" minWidth={0} flexShrink={0}>
+        <text fg={tone()} wrapMode="none" flexShrink={0} selectable={false}>{`${icon()} `}</text>
+        <text fg={tone()} wrapMode="none" truncate flexGrow={1} flexShrink={1}>监督 · {supervisorStatusLabel(supervision()?.status)}{supervision()?.model ? ` · ${supervision()?.model}` : ''}</text>
+        <Show when={stale()} fallback={<box />}>
+          <text fg={C.warning} wrapMode="none" flexShrink={0}>可能停滞</text>
+        </Show>
+      </box>
+      <Show when={supervision()?.latest?.summary || supervision()?.latest?.action || supervision()?.latest?.next_step} fallback={<box />}>
+        <text fg={C.textMuted} wrapMode="none" truncate flexShrink={0}>  {supervision()?.latest?.action || ''}{supervision()?.latest?.summary ? `：${supervision()?.latest?.summary}` : (supervision()?.latest?.next_step || '')}</text>
+      </Show>
+      <For each={history()}>{item => <box flexDirection="row" minWidth={0} flexShrink={0}>
+        <text fg={C.info} wrapMode="none" flexShrink={0} selectable={false}>● </text>
+        <text fg={C.textMuted} wrapMode="none" truncate flexGrow={1} flexShrink={1}>  #{history().length - history().indexOf(item)} {item.action || ''} → {item.summary || ''}</text>
+        <Show when={item.at} fallback={<box />}>
+          <text fg={C.textMuted} wrapMode="none" flexShrink={0}>{relativeTime(item.at, props.now())}</text>
+        </Show>
+      </box>}</For>
+    </box>
+  </Show>;
+}
+
+/**
+ * 右栏统计面板：总耗时、已用轮次、任务进度、各阶段耗时明细。
+ * 阶段时钟数据来自客户端 stageMarks。
+ */
+function GoalStatsPanel(props: {
+  goal: () => GoalLike;
+  stageMarks: () => StageMark[];
+  now: () => number;
+  short: () => boolean;
+}) {
+  const data = createMemo(() => {
+    const goal = props.goal();
+    const marks = props.stageMarks();
+    const now = props.now();
+
+    let totalSec = 0;
+    const stageMap = new Map<string, number>();
+
+    if (marks && marks.length > 0) {
+      const normalized = marks.map(m => ({phase: normalizeGoalStage(m.phase), at: m.at}));
+      const lastIdx = new Map<string, number>();
+      normalized.forEach((m, i) => lastIdx.set(m.phase, i));
+
+      totalSec = Math.max(0, Math.round((now - marks[0].at) / 1000));
+
+      for (const [key] of GOAL_TRACK) {
+        const idx = lastIdx.get(key);
+        if (idx == null) continue;
+        const start = normalized[idx].at;
+        const end = normalized[idx + 1]?.at ?? now;
+        const sec = Math.max(0, Math.round((end - start) / 1000));
+        if (sec > 0) stageMap.set(key, sec);
+      }
+    }
+
+    const tasks = goal.tasks || [];
+    const done = tasks.filter(t => 'status' in t && /^(done|completed|passing)$/i.test(t.status)).length;
+
+    let roundsUsed = 0;
+    let roundsMax = 0;
+    if (isSnapshot(goal)) {
+      roundsUsed = goal.total_llm_rounds || 0;
+      roundsMax = goal.max_total_rounds || 0;
+    }
+
+    return {totalSec, stageMap, tasksDone: done, tasksTotal: tasks.length, roundsUsed, roundsMax};
+  });
+
+  const visibleStages = () => GOAL_TRACK.filter(([key]) => props.stageMarks().length > 0 && data().stageMap.has(key));
+
+  return <Show when={!props.short() && data().totalSec > 0} fallback={<box />}>
+    <box border borderStyle="rounded" borderColor={C.secondary} flexDirection="column" flexShrink={0} marginTop={1} paddingX={1} paddingBottom={1} minWidth={0}>
+      <text fg={C.secondary} wrapMode="none" truncate flexShrink={0}>{GOAL_UI_LABELS.stats}</text>
+      <text fg={C.text} wrapMode="none" truncate>{GOAL_UI_LABELS.totalElapsed}  {formatStageElapsed(data().totalSec)}</text>
+      <Show when={data().roundsMax > 0} fallback={<box />}>
+        <text fg={C.text} wrapMode="none" truncate>{GOAL_UI_LABELS.rounds}  {data().roundsUsed}/{data().roundsMax}</text>
+      </Show>
+      <Show when={data().tasksTotal > 0} fallback={<box />}>
+        <text fg={C.text} wrapMode="none" truncate>{GOAL_UI_LABELS.taskProgress}  {data().tasksDone}/{data().tasksTotal}</text>
+      </Show>
+      <For each={visibleStages()}>
+        {([key, label]) => <box flexDirection="row" minWidth={0} flexShrink={0}>
+          <text fg={C.textMuted} wrapMode="none" truncate flexGrow={1}>{`  ${label}`}</text>
+          <text fg={C.text} wrapMode="none" flexShrink={0}>{formatStageElapsed(data().stageMap.get(key) || 0)}</text>
+        </box>}
+      </For>
+    </box>
+  </Show>;
 }
 
 export function GoalView(props: GoalViewProps) {
   const viewWidth = () => Math.max(1, Number(readSource(props.width)) || 120);
   const viewHeight = () => Math.max(1, Number(readSource(props.height)) || 28);
-  // Expansion is a session-local opt-in on every terminal size.  This keeps
-  // the existing Goal contract (details collapsed by default) while the wide
-  // shell still reserves a stable inspector column for the affordance.
-  const [detailsExpanded, setDetailsExpanded] = createSignal(false);
-  const renderer = useRenderer();
-  // Resolve the snapshot through a memo so function-valued props (the live
-  // Goal signal supplied by App/debug harnesses) remain a tracked dependency
-  // even when the child view itself stays mounted across lifecycle updates.
   const selectedGoal = createMemo<GoalLike>(() => readSource(props.goal) || readSource(props.snapshot) || readSource(props.draft) || fallbackGoal());
-  let initialRender = true;
-  createRenderEffect(() => {
-    detailsExpanded();
-    if (initialRender) {
-      initialRender = false;
-      return;
-    }
-    // 仅在展开 signal 已触发 Solid 响应式更新后提交，确保详情分支可被离屏 renderer 观察。
-    submitRenderFrame(renderer, props.interactionTrace);
-  });
-  const toggleDetails = () => {
-    const before = detailsExpanded();
-    const next = !before;
-    props.interactionTrace?.record({event: 'state_before', target: 'GOAL_DETAILS_TOGGLE', state_before: {expanded: before}});
-    setDetailsExpanded(next);
-    props.interactionTrace?.record({event: 'state_after', target: 'GOAL_DETAILS_TOGGLE', state_after: {expanded: next}});
-    // 帧提交由 signal 的同步响应式 effect 负责，避免早于详情分支更新。
-  };
-
-  useKeyboard((event: any) => {
-    if (props.composerEmpty && !props.composerEmpty()) return;
-    if (event?.ctrl || event?.meta || event?.alt) return;
-    const key = String(event?.name || event?.key || '').toLowerCase();
-    // 不用字母键（如 d）：空输入框时按键应流入 composer，否则用户无法输入
-    // 以该字母开头的消息。Enter 在空输入框本就无效，Space 开头的消息会被
-    // 提交前 trim，因此两者作为展开/收起快捷键是安全的。
-    if (key === 'enter' || key === 'return' || key === 'space' || key === ' ') {
-      toggleDetails();
-      event.preventDefault?.();
-    }
-  });
-
-  // 客户端阶段时钟：phase 切换即记时。调试场景允许注入固定记录。
   const internalClock = createStageClock(() => goalPhaseOf(selectedGoal()));
   const resolvedStageMarks = createMemo<StageMark[]>(() =>
     (readSource(props.stageMarks) as StageMark[] | undefined) ?? internalClock());
@@ -218,36 +403,54 @@ export function GoalView(props: GoalViewProps) {
   const layoutModeOf = (): LayoutMode => layoutMode(viewWidth(), viewHeight());
   const isWide = () => layoutModeOf() === 'wide';
   const isShort = () => layoutModeOf() === 'short';
-  // 堆叠布局的行数预算：优先用 App 按 layoutBudget 扣除 composer/页脚/队列
-  // 后的真实预算；缺省（debug 预览）按「状态行 2 + composer 3」固定开销估算。
   const mainRows = () => {
     const provided = readSource(props.mainRows);
     return typeof provided === 'number' && Number.isFinite(provided)
       ? Math.max(0, provided)
       : Math.max(0, viewHeight() - 5);
   };
-  const summaryRows = () => {
+  /** 宽屏右栏高度估算：任务看板 + 统计 + 监督 */
+  const rightColRows = () => {
     const tasks = (selectedGoal().tasks || []).length;
-    const boxRows = isShort() ? 4 : isWide() ? 10 : 8;
-    const board = tasks > 0 ? 1 + tasks : 2;
-    return boxRows + board + 2;
+    const board = tasks > 0 ? 2 + tasks : 2;
+    const statsRows = isShort() ? 0 : 6;
+    const supervisionRows = isShort() ? 0 : 5;
+    return board + statsRows + supervisionRows;
   };
-  // 执行流降级：宽屏恒为 full；堆叠时按剩余高度选 full → compact（单行/模型）
-  // → none。行数按真实渲染行计数（spacer+头行+意图+工具+监督两行+详情开关）。
+  /** 窄屏摘要区高度估算：仅 Goal 卡片（看板/统计/监督在执行流之后渲染） */
+  const summaryRows = () => {
+    if (isWide()) return 0;
+    return isShort() ? 4 : 8;
+  };
   const flowVariant = (): 'full' | 'compact' | 'none' => {
     if (isWide()) return 'full';
     if (isShort()) return 'none';
     const decisions = (readSource(props.decisions) || []).slice(-4);
     const goal = selectedGoal();
     const snapshot = 'phase' in goal ? goal : undefined;
-    const supervised = !!snapshot?.supervision;
     const supervisorFullRows = snapshot?.supervision ? (snapshot.supervision.latest ? 2 : 1) : 0;
     const modelFullRows = decisions.reduce((sum, decision) => sum + 1
       + (decision.status === 'active' && decision.text ? 1 : 0)
       + Math.min(3, (decision.tools || []).length), 0);
     const remaining = mainRows() - summaryRows();
     if (remaining >= 2 + modelFullRows + supervisorFullRows + 1) return 'full';
-    if (remaining >= 1 + decisions.length + (supervised ? 1 : 0) + 1) return 'compact';
+    if (remaining >= 1 + decisions.length + 1) return 'compact';
+    return 'none';
+  };
+  // 测试/检查面板在堆叠布局下的降级：先砍检查历史行数，再砍测试案例数，最后隐藏。
+  const testCheckVariant = (): 'full' | 'compact' | 'none' => {
+    if (isWide()) return 'full';
+    if (isShort()) return 'none';
+    const goal = selectedGoal();
+    if (!('phase' in goal)) return 'none';
+    const snapshot = goal as GoalSnapshot;
+    const currentTask = snapshot.tasks.find(t => t.id === snapshot.current_task_id);
+    if (!currentTask) return 'none';
+    const testRows = 1 + Math.min(3, (currentTask.acceptance_cases || []).length) + (currentTask.verification_spec?.command ? 1 : 0);
+    const checkRows = 1 + (currentTask.latest_evidence ? 1 : 0);
+    const remaining = mainRows() - summaryRows() - (flowVariant() === 'full' ? 8 : flowVariant() === 'compact' ? 4 : 0);
+    if (remaining >= testRows + checkRows) return 'full';
+    if (remaining >= 1 + 1 + 1 + 1) return 'compact';
     return 'none';
   };
 
@@ -259,6 +462,8 @@ export function GoalView(props: GoalViewProps) {
     tick={typeof props.tick === 'function' ? props.tick as () => number : undefined}
     now={now}
     stageMarks={resolvedStageMarks}
+    columnRatio={GOAL_MAIN_COLUMN_RATIO}
+    showTaskBoard={false}
   />;
   const executionFlow = <GoalExecutionFlow
     goal={selectedGoal}
@@ -269,22 +474,32 @@ export function GoalView(props: GoalViewProps) {
     compact={() => flowVariant() === 'compact'}
     fullWidth={() => !isWide()}
   />;
-  const details = <GoalDetails
-    goal={selectedGoal}
-    expanded={detailsExpanded}
-    onToggle={toggleDetails}
-    interactionTrace={props.interactionTrace}
-    width={viewWidth}
-    height={viewHeight}
-  />;
+  const testPanel = <GoalTestPanel goal={selectedGoal} width={viewWidth} variant={testCheckVariant} />;
+  const checkPanel = <GoalCheckPanel goal={selectedGoal} width={viewWidth} now={now} variant={testCheckVariant} />;
+  const taskBoardPanel = <GoalTaskBoardPanel goal={selectedGoal} short={() => isShort()} />;
+  const stats = <GoalStatsPanel goal={selectedGoal} stageMarks={resolvedStageMarks} now={now} short={() => isShort()} />;
+  const supervisionPanel = <GoalSupervisionPanel goal={selectedGoal} now={now} short={() => isShort()} />;
   return <box flexDirection={isWide() ? 'row' : 'column'} flexGrow={1} flexShrink={1} minHeight={0} minWidth={0} height="100%">
-    <box flexDirection="column" width={isWide() ? `${(1 - GOAL_SIDE_COLUMN_RATIO) * 100}%` : '100%'} flexGrow={0} flexShrink={1} minHeight={0} minWidth={0}>{summary}</box>
-    <box flexDirection="column" width={isWide() ? `${GOAL_SIDE_COLUMN_RATIO * 100}%` : '100%'} flexGrow={isWide() ? 1 : 0} flexShrink={1} minHeight={0} minWidth={0}>
+    <box flexDirection="column" width={isWide() ? `${GOAL_MAIN_COLUMN_RATIO * 100}%` : '100%'} flexGrow={1} flexShrink={1} minHeight={0} minWidth={0}>
+      {summary}
       <Show when={flowVariant() !== 'none'} fallback={<box />}>
         {executionFlow}
       </Show>
-      {details}
+      <Show when={testCheckVariant() !== 'none'} fallback={<box />}>
+        {testPanel}
+        {checkPanel}
+      </Show>
+      {!isWide() && <>
+        {taskBoardPanel}
+        {stats}
+        {supervisionPanel}
+      </>}
     </box>
+    {isWide() && <box flexDirection="column" width={`${GOAL_SIDE_COLUMN_RATIO * 100}%`} flexGrow={0} flexShrink={0} minHeight={0} minWidth={0}>
+      {taskBoardPanel}
+      {stats}
+      {supervisionPanel}
+    </box>}
   </box>;
 }
 

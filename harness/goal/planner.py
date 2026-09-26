@@ -892,7 +892,7 @@ def _path_can_be_planned_new(path: str, files: set[str], directories: set[str] |
 
 
 def planning_error_requires_discovery(error: str | None) -> bool:
-    """Whether a rejected plan relies on paths the current manifest cannot prove."""
+    """Whether a rejected plan needs evidence the current manifest cannot prove."""
     text = str(error or "")
     return any(
         marker in text
@@ -900,6 +900,9 @@ def planning_error_requires_discovery(error: str | None) -> bool:
             "primary_write must contain exact discovered files",
             "conditional_write must contain exact discovered files",
             "read_envelope must contain discovered files or directories",
+            # Validator and reviewer both cite this when evidence is too thin
+            # to settle the contract; only fresh discovery can unblock it.
+            "unresolved decisions",
         )
     )
 
@@ -1780,7 +1783,11 @@ def plan_tasks(
             contract=plan.contract, tasks=plan.tasks, replacement_coverage=plan.replacement_coverage,
         ), review)
     if used_repair:
-        raise GoalPlanningError("GoalPlan was rejected after its one permitted correction: " + str(review.get("summary") or review.get("findings")))
+        detail = str(review.get("summary") or review.get("findings"))
+        raise GoalPlanningError(
+            "GoalPlan was rejected after its one permitted correction: " + detail,
+            requires_discovery_refresh=planning_error_requires_discovery(detail),
+        )
     repair_call = dict(planner_call)
     repair_call["description"] = "repair GoalPlan v2 after independent review"
     repair_call["prompt"] = _format_repair_prompt(
@@ -1828,7 +1835,10 @@ def plan_tasks(
     if repair_error:
         repaired = None
     if repaired is None:
-        raise GoalPlanningError("Goal planner did not repair the reviewed GoalPlan: " + (repair_error or "unknown error"))
+        raise GoalPlanningError(
+            "Goal planner did not repair the reviewed GoalPlan: " + (repair_error or "unknown error"),
+            requires_discovery_refresh=planning_error_requires_discovery(repair_error),
+        )
     if candidate_callback is not None:
         candidate_callback(GoalPlan(
             contract=repaired.contract, tasks=repaired.tasks, replacement_coverage=repaired.replacement_coverage,
@@ -1839,7 +1849,11 @@ def plan_tasks(
             review_callback(GoalPlan(
                 contract=repaired.contract, tasks=repaired.tasks, replacement_coverage=repaired.replacement_coverage,
             ), final_review)
-        raise GoalPlanningError("GoalPlan remains rejected after one correction: " + str(final_review.get("summary") or final_review.get("findings")))
+        detail = str(final_review.get("summary") or final_review.get("findings"))
+        raise GoalPlanningError(
+            "GoalPlan remains rejected after one correction: " + detail,
+            requires_discovery_refresh=planning_error_requires_discovery(detail),
+        )
     return GoalPlan(
         contract=repaired.contract, tasks=repaired.tasks,
         replacement_coverage=repaired.replacement_coverage, review=final_review,

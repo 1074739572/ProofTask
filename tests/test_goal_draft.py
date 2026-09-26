@@ -621,6 +621,54 @@ def test_resume_path_grounding_failure_refreshes_discovery(tmp_path, monkeypatch
     assert discovery_calls == [paused.id, paused.id]
 
 
+def test_resume_routes_unresolved_decisions_back_to_discovery(tmp_path, monkeypatch):
+    import harness.goal.draft as draft_module
+    from harness.goal.planner import GoalPlanningError
+
+    discovery_calls = []
+    plan_calls = []
+    manifest = {
+        "repo_files": ["src/rate.py"],
+        "evidence": [{"id": "E1", "path": "src/rate.py"}],
+        "jobs": [{"id": "implementation-1", "status": "done"}],
+        "revision": 1,
+    }
+
+    def discovery(**kwargs):
+        discovery_calls.append(kwargs["draft"].id)
+        return manifest
+
+    def planner(draft, *_args, **_kwargs):
+        plan_calls.append(draft.id)
+        if len(plan_calls) == 1:
+            # Drafts paused before the discovery-refresh flag existed only carry
+            # the failure text; resume must still route them back to Discovery.
+            raise GoalPlanningError(
+                "Goal planner did not repair the reviewed GoalPlan: Plan contract errors:\n"
+                "- goal_contract has unresolved decisions: which entry owns session storage"
+            )
+        draft.status = "ready"
+
+    monkeypatch.setattr(draft_module, "_plan", planner)
+    with pytest.raises(ValueError, match="Goal planning failed"):
+        draft_module.create_draft(
+            "add rate limits",
+            workspace=tmp_path,
+            verification="python -m pytest -q",
+            intake_runner=lambda **_: '{"questions":[]}',
+            discovery_runner=discovery,
+        )
+
+    paused = draft_module.load_draft(tmp_path)
+    assert paused is not None
+    assert paused.resume_from == "planning"
+
+    resumed = draft_module.resume_draft(workspace=tmp_path, discovery_runner=discovery)
+
+    assert resumed.status == "ready"
+    assert discovery_calls == [paused.id, paused.id]
+
+
 def test_completed_planning_sets_ready_stage(tmp_path, monkeypatch):
     import harness.goal.draft as draft_module
 

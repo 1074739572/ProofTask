@@ -15,7 +15,8 @@
       "provider": "xiaomi-mimo",
       "label": "mimo-v2.6-pro (long-context explorer)",
       "api_model": "mimo-v2.6-pro",
-      "context_window": 1000000
+      "context_window": 1000000,
+      "effort_options": ["medium", "high", "xhigh", "max"]
     },
     {
       "id": "mimo-v2.6-flash",
@@ -52,10 +53,10 @@
       "effort_options": ["medium", "high", "xhigh", "max"]
     },
     {
-      "id": "xiyu/minimax-m3",
+      "id": "AI/deekseek-v4.1-flash",
       "provider": "asianinfo",
-      "label": "xiyu/minimax-m3",
-      "api_model": "xiyu/minimax-m3",
+      "label": "AI/deekseek-v4.1-flash",
+      "api_model": "AI/deekseek-v4.1-flash",
       "context_window": 1000000,
       "effort_options": ["medium", "high", "xhigh", "max"]
     },
