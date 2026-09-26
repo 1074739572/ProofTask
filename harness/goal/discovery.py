@@ -33,7 +33,7 @@ DISCOVERY_ROLES = (
     "requirement", "architecture", "implementation", "tests", "history",
 )
 DISCOVERY_MAX_ROUNDS = 16
-DISCOVERY_FILE_LIMIT = 16
+DISCOVERY_FILE_LIMIT = 64
 DEFAULT_DISCOVERY_CONCURRENCY = 2
 DISCOVERY_FACT_LIMIT = 8
 DISCOVERY_GAP_LIMIT = 8
@@ -253,8 +253,14 @@ def _assigned_paths(
     *,
     target: str = "",
     limit: int = DISCOVERY_FILE_LIMIT,
+    prior_evidence: tuple[dict, ...] = (),
 ) -> tuple[str, ...]:
-    """Assign a small, target-local evidence set to each discovery role."""
+    """Assign a small, target-local evidence set to each discovery role.
+
+    prior_evidence: list of prior wave reports; used to dynamically expand
+    the file list for downstream waves (architecture gets requirement's paths,
+    implementation gets architecture's paths + import chain).
+    """
     names = [item.path for item in shards]
     roots = _target_scope(target, names)
     scoped = [path for path in names if not roots or any(path == root or path.startswith(f"{root}/") for root in roots)]
@@ -264,7 +270,12 @@ def _assigned_paths(
 
     def resolve(reference: str, source: str) -> tuple[str, ...]:
         raw = reference.replace("\\", "/").lstrip("./")
-        candidates = [raw, (Path(source).parent / raw).as_posix()]
+        # Handle Python package imports: "harness.rag.bootstrap" -> "harness/rag/bootstrap"
+        if "." in raw and "/" not in raw and not raw.endswith((".py", ".ts", ".tsx", ".js", ".jsx", ".md", ".json", ".toml")):
+            package_path = raw.replace(".", "/")
+            candidates = [package_path, (Path(source).parent / package_path).as_posix()]
+        else:
+            candidates = [raw, (Path(source).parent / raw).as_posix()]
         expanded: list[str] = []
         for candidate in candidates:
             expanded.append(candidate)
@@ -297,8 +308,52 @@ def _assigned_paths(
                 pending.extend(resolve(reference, path))
         return selected
 
+    def paths_from_evidence(reports: tuple[dict, ...]) -> list[str]:
+        """Extract file paths mentioned in prior wave evidence."""
+        found: list[str] = []
+        for report in reports:
+            if not isinstance(report, dict):
+                continue
+            for item in report.get("evidence", []) if isinstance(report.get("evidence"), list) else []:
+                if not isinstance(item, dict):
+                    continue
+                path = str(item.get("path") or "").replace("\\", "/").strip()
+                if path and path in index:
+                    found.append(path)
+            for item in report.get("candidate_scope", []) if isinstance(report.get("candidate_scope"), list) else []:
+                path = str(item).replace("\\", "/").strip()
+                if path and path in index:
+                    found.append(path)
+        return list(dict.fromkeys(found))
+
+    def grep_evidence_for_paths(reports: tuple[dict, ...]) -> list[str]:
+        """From prior wave evidence claims, grep all shards for matching paths/dirs."""
+        keywords: set[str] = set()
+        for report in reports:
+            if not isinstance(report, dict):
+                continue
+            for item in report.get("evidence", []) if isinstance(report.get("evidence"), list) else []:
+                if not isinstance(item, dict):
+                    continue
+                claim = str(item.get("claim") or "")
+                # Extract path-like tokens from claims (e.g. "harness/rag/config.py", ".rag", "harness/goal/runner.py")
+                for match in re.finditer(r"(?<![A-Za-z0-9_.@+-])([A-Za-z0-9_.@+-]+[/\\])+[A-Za-z0-9_.@+-]+\.(py|ts|tsx|js|jsx|md|json|toml)", claim):
+                    candidate = match.group(0).replace("\\", "/").lstrip("./")
+                    if candidate in index:
+                        keywords.add(candidate)
+                # Also extract directory names like .rag, .project, harness/rag
+                for match in re.finditer(r"(?<![A-Za-z0-9_.@+-])([A-Za-z0-9_.@+-]+[/\\])+[A-Za-z0-9_.@+-]+", claim):
+                    candidate = match.group(0).replace("\\", "/").lstrip("./")
+                    if candidate in index:
+                        keywords.add(candidate)
+        return sorted(keywords)
+
     seeded = dependency_closure(target_files)
     manifest_files = [path for path in scoped if Path(path).name in {"package.json", "pyproject.toml", "pytest.ini", "setup.cfg"}]
+
+    # Build prior-wave path pool for dynamic expansion
+    prior_paths = paths_from_evidence(prior_evidence) if prior_evidence else []
+    grep_paths = grep_evidence_for_paths(prior_evidence) if prior_evidence else []
 
     if role == "tests":
         selected = [*target_files, *manifest_files, *(path for path in scoped if is_test(path))]
@@ -306,8 +361,21 @@ def _assigned_paths(
         selected = [*target_files, *manifest_files, *(path for path in scoped if path.startswith("docs/") or "/docs/" in path or "/goal" in path)]
     elif role == "requirement":
         selected = [*target_files, *manifest_files, *(path for path in scoped if path.lower().endswith((".md", ".txt")))]
-    else:
-        selected = [*seeded, *manifest_files, *(path for path in scoped if not is_test(path))]
+    elif role == "architecture":
+        # Architecture: seeds + manifests + source package tops + paths from requirement evidence.
+        source_tops = [path for path in scoped if Path(path).name in {"__init__.py", "index.ts", "index.tsx", "main.py", "app.py"}]
+        selected = [*seeded, *prior_paths, *grep_paths, *manifest_files, *source_tops, *(path for path in scoped if not is_test(path) and path.lower().endswith((".py", ".ts", ".tsx")))]
+    else:  # implementation
+        # Implementation: seeds + manifests + paths from architecture evidence + import chain from those paths.
+        # Split prior_paths into source and docs: expand import chain only from source files,
+        # docs are included directly but not expanded (they pull in more docs and crowd out code).
+        prior_source = [p for p in prior_paths if p.lower().endswith((".py", ".ts", ".tsx"))]
+        prior_docs = [p for p in prior_paths if not p.lower().endswith((".py", ".ts", ".tsx"))]
+        impl_seeds = dependency_closure([*seeded, *prior_source, *grep_paths])
+        # Prioritize source files over docs in fallback
+        source_files = [p for p in scoped if not is_test(p) and p.lower().endswith((".py", ".ts", ".tsx"))]
+        doc_files = [p for p in scoped if not is_test(p) and p.lower().endswith((".md", ".txt"))]
+        selected = [*impl_seeds, *prior_docs, *manifest_files, *source_files, *doc_files]
     if not selected:
         selected = scoped or names
     return tuple(dict.fromkeys(selected))[:limit]
@@ -576,9 +644,37 @@ class DiscoverySupervisor:
         requirement_reports = run_wave(
             tuple(job for role, job in jobs_by_role.items() if role == "requirement"), ()
         )
+        # Architecture gets requirement evidence to dynamically expand its file list
+        architecture_job = jobs_by_role.get("architecture")
+        if architecture_job is not None:
+            architecture_paths = _assigned_paths(
+                "architecture", shards, target=target,
+                prior_evidence=requirement_reports,
+            )
+            architecture_job = DiscoveryJob(**{
+                **architecture_job.to_dict(),
+                "read_paths": architecture_paths,
+            })
+            save_job_state(storage_root, goal_id, architecture_job.to_dict())
+            _emit_discovery_job(goal_id, architecture_job, event="queued")
+            jobs_by_role["architecture"] = architecture_job
         architecture_reports = run_wave(
             tuple(job for role, job in jobs_by_role.items() if role == "architecture"), requirement_reports
         )
+        # Implementation gets architecture evidence + requirement evidence to expand its file list
+        implementation_job = jobs_by_role.get("implementation")
+        if implementation_job is not None:
+            implementation_paths = _assigned_paths(
+                "implementation", shards, target=target,
+                prior_evidence=requirement_reports + architecture_reports,
+            )
+            implementation_job = DiscoveryJob(**{
+                **implementation_job.to_dict(),
+                "read_paths": implementation_paths,
+            })
+            save_job_state(storage_root, goal_id, implementation_job.to_dict())
+            _emit_discovery_job(goal_id, implementation_job, event="queued")
+            jobs_by_role["implementation"] = implementation_job
         run_wave(
             tuple(job for role, job in jobs_by_role.items() if role in {"implementation", "tests", "history"}),
             requirement_reports + architecture_reports,

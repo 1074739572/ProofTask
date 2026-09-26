@@ -4021,6 +4021,14 @@ class GoalRunner(threading.Thread):
             if error is not None or relative is None or candidate is None or not candidate.exists():
                 continue
             (read_roots if candidate.is_dir() else read_paths).append(relative)
+        # planned_new files do not exist before the worker writes them, so they
+        # fail the exists() filter above. They still need to be readable so the
+        # worker can re-read what it just wrote.
+        for raw_path in task.planned_new:
+            relative, _candidate, error = self._scope_candidate(_execution_workspace(state), str(raw_path))
+            if error is not None or relative is None:
+                continue
+            read_paths.append(relative)
         spec = task.verification_spec if isinstance(task.verification_spec, dict) else {}
         read_paths.extend(str(path) for path in spec.get("test_files") or [] if str(path).strip())
         read_roots = list(dict.fromkeys(read_roots))
