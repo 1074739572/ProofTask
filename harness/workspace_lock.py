@@ -12,9 +12,17 @@ from pathlib import Path
 class WorkspaceMutationLock:
     """An advisory lock shared by harness writers and Goal publication."""
 
-    def __init__(self, workspace: str | Path, *, purpose: str = "mutation") -> None:
+    def __init__(
+        self,
+        workspace: str | Path,
+        *,
+        purpose: str = "mutation",
+        lock_name: str = "workspace-mutation.lock",
+    ) -> None:
         self.workspace = self._workspace_root(Path(workspace).expanduser().resolve())
-        self.path = self.workspace / ".project" / "workspace-mutation.lock"
+        if not lock_name or Path(lock_name).name != lock_name:
+            raise ValueError("lock_name must be one file name")
+        self.path = self.workspace / ".project" / lock_name
         self.purpose = purpose
         self.token = uuid.uuid4().hex
         self.acquired = False

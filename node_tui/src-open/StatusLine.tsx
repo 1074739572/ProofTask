@@ -1,6 +1,15 @@
 import {C} from './theme.ts';
+import {GOAL_PHASE_LABELS} from './goal-presentation.ts';
 import {Sp} from './Sp.tsx';
 import type {UiStatus} from './ui-status.ts';
+
+/** 页脚展示「正在做什么」，在共享阶段词汇上把活跃阶段改为进行体；
+ * 其余（completed/paused/failed/idle 及 App 瞬态阶段）沿用共享映射。 */
+const PHASE_LABELS: Record<string, string> = {
+  ...GOAL_PHASE_LABELS,
+  discovering: '探索中', act: '实现中', working: '实现中',
+  verify: '验证中', verification: '验证中', completed: '已完成',
+};
 
 /** 将统一的 UiStatus 快照渲染为页脚的瞬态状态行。 */
 export function statusLineText(status: UiStatus): string {
@@ -17,34 +26,37 @@ export function statusLineText(status: UiStatus): string {
     return `${connection} backend unavailable${code} · Enter retry · Ctrl+R reconnect`;
   }
   if (status.permissionWait) {
-    return `${connection} permission required · Allow / Deny · Esc cancel`;
+    return `${connection} permission required · Allow / Deny · Esc deny`;
   }
   if (status.completionOpen) return '⌕ suggestions · ↑↓ navigate · Tab/Enter apply · Esc close';
   if (status.historySearch?.open) {
     return `⌕ history ${status.historySearch.matches} matches · ↑↓ choose · Enter apply · Esc close`;
   }
   if (status.running) {
-    const phase = status.phase || 'working';
+    // App 会把 Goal 阶段标成 'goal: act' 形式；去掉前缀后走同一套中文映射，
+    // 避免页脚漏出英文原文。
+    const stripped = status.phase.startsWith('goal: ') ? status.phase.slice(6) : status.phase;
+    const phase = PHASE_LABELS[status.phase] || PHASE_LABELS[stripped] || stripped || '实现中';
     const spin = status.spinner ? `${status.spinner} ` : '';
     const tool = status.currentTool ? ` · ${status.currentTool}` : '';
-    const progress = status.toolsTotal > 0 ? ` · ${status.toolsDone}/${status.toolsTotal} tools` : '';
-    const queued = status.queuedMessages > 0 ? ` · q${status.queuedMessages}` : '';
+    const progress = status.toolsTotal > 0 ? ` · ${status.toolsDone}/${status.toolsTotal} 工具` : '';
+    const queued = status.queuedMessages > 0 ? ` · 队列 ${status.queuedMessages}` : '';
     const tps = status.tokensPerSecond && status.tokensPerSecond > 0 ? ` · ${status.tokensPerSecond} t/s` : '';
     // Keep recovery/input hints before optional telemetry on compact terminals
     // so truncation never hides the action the user needs to take.
     if (status.width < 90) {
-      return `${connection} ${spin}${phase}${tool} · ${status.elapsed}${progress}${queued} · Enter queue · Ctrl+K${tps}`;
+      return `${connection} ${spin}${phase}${tool} · ${status.elapsed}${progress}${queued} · Enter 排队 · Ctrl+K 打断${tps}`;
     }
-    return `${connection} ${spin}${phase}${tool} · ${status.elapsed}${progress}${queued}${tps} · Enter queue · Ctrl+K interrupt`;
+    return `${connection} ${spin}${phase}${tool} · ${status.elapsed}${progress}${queued}${tps} · Enter 排队 · Ctrl+K 打断`;
   }
   if (status.toast) return `✓ ${status.toast}`;
   // Keep the narrow form useful while avoiding the old multi-clause context
   // paragraph under every message.
   return status.width < 76
-    ? 'Enter send · Shift+Enter newline'
+    ? 'Enter 发送 · Shift+Enter 换行'
     : status.width < 100
-      ? 'Enter send · Shift+Enter · /effort 推理强度'
-      : 'Enter send · Shift+Enter newline · /effort 推理强度 · Ctrl+R history';
+      ? 'Enter 发送 · Shift+Enter 换行 · /effort 推理强度 · /usage 用量'
+      : 'Enter 发送 · Shift+Enter 换行 · /effort 推理强度 · /usage 用量 · Ctrl+R 历史';
 }
 
 export type ContextMeterCells = {
@@ -90,15 +102,31 @@ function IdentityRow(props: {status: () => UiStatus; onEffortClick?: () => void;
   const meter = () => contextMeterCells(status(), status().width >= 76 ? 12 : 8);
   const meterColor = () => contextMeterColor(status().contextUsage);
   const medium = () => status().width >= 76 && status().width < 100;
+  const wide = () => status().width >= 100;
+  // 剩余 token 绝对值：ctx 计量条只有百分比，用户无从得知窗口实际余量。
+  const freeTokens = () => {
+    const free = Math.max(0, status().contextWindow - status().contextUsed);
+    return free >= 1000 ? `${Math.round(free / 1000)}k` : String(free);
+  };
+  // cwd 只显示最末一段；多仓库场景下分段路径太长，且上一级目录通常无歧义。
+  const cwdLabel = () => {
+    const cwd = status().cwd || '';
+    if (!cwd) return '';
+    const parts = cwd.replace(/[\\/]+$/, '').split(/[\\/]/);
+    return parts[parts.length - 1] || cwd;
+  };
   return <box height={1} flexShrink={0} minWidth={0} paddingX={2} flexDirection="row">
     <text fg={conn().color} wrapMode="none" selectable={false}>{`${conn().icon} `}</text>
     <text fg={C.primary} wrapMode="none" selectable={false}>{status().model || 'model'}</text>
-    {medium() || status().width >= 100 ? <text fg={C.textMuted} wrapMode="none" selectable={false}>{' · '}</text> : null}
-    {medium() || status().width >= 100 ? <text fg={C.secondary} wrapMode="none" selectable={false}>{status().mode || 'direct'}</text> : null}
+    <text fg={C.textMuted} wrapMode="none" selectable={false}>{' · '}</text>
+    <text fg={C.secondary} wrapMode="none" selectable={false}>{status().mode || 'direct'}</text>
     <text fg={C.textMuted} wrapMode="none" selectable={false}>{' · '}</text>
     <box minWidth={0} flexShrink={0} onMouseUp={(event: any) => { if (event?.button === 0) props.onEffortClick?.(); }}>
       <text fg={C.textMuted} wrapMode="none" selectable={false}>{`${status().effort || 'Default'}▾`}</text>
     </box>
+    {/* 窄屏预算先给 mode，git 分支只在 76 列以上出现；分支名长且可推测，mode 不可推测。 */}
+    {(medium() || wide()) && status().gitBranch ? <text fg={C.textMuted} wrapMode="none" truncate selectable={false}>{` · ${status().gitBranch}`}</text> : null}
+    {wide() && cwdLabel() ? <text fg={C.textMuted} wrapMode="none" truncate selectable={false}>{` · ${cwdLabel()}`}</text> : null}
     <box flexGrow={1} />
     {status().contextWindow > 0 ? (
       <box minWidth={0} flexShrink={0} onMouseUp={(event: any) => { if (event?.button === 0) props.onContextClick?.(); }}>
@@ -107,6 +135,7 @@ function IdentityRow(props: {status: () => UiStatus; onEffortClick?: () => void;
           <Sp fg={meterColor()}>{'█'.repeat(meter().used)}</Sp>
           <Sp fg={C.textMuted}>{'░'.repeat(meter().free)}</Sp>
           <Sp fg={meterColor()}>{` ${meter().percent}%`}</Sp>
+          <Sp fg={C.textMuted}>{` · 剩 ${freeTokens()}`}</Sp>
           <Sp fg={C.textMuted}>{'▾'}</Sp>
         </text>
       </box>
@@ -127,7 +156,7 @@ export function StatusLine(props: {status: UiStatus | (() => UiStatus); onEffort
   // Footer/status content is an interaction hint, not transcript data. Keep
   // it out of mouse selection so dragging across the bottom bar never copies
   // controls instead of the conversation.
-  return <box height={2} flexShrink={0} minWidth={0} flexDirection="column" backgroundColor="#151b22">
+  return <box height={2} flexShrink={0} minWidth={0} flexDirection="column" backgroundColor={C.panelRaised}>
     <box height={1} flexShrink={0} minWidth={0} paddingX={2}>
       <text fg={color()} wrapMode="none" truncate selectable={false} content={statusLineText(status())} />
     </box>

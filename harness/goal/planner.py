@@ -43,7 +43,7 @@ PLANNER_READ_TIMEOUT_SECONDS = 300.0
 PLANNER_MAX_REQUEST_ATTEMPTS = 2
 PLANNER_FORMAT_RETRY_MAX_ROUNDS = 1
 PLAN_REVIEW_MAX_ROUNDS = 1
-PLANNER_REPAIR_INPUT_LIMIT = 24_000
+PLANNER_REPAIR_INPUT_LIMIT = 12_000
 MAX_BEHAVIOR_CHARS = 600
 MAX_ACCEPTANCE_CASES = 8
 MAX_SKILLS_PER_TASK = 2
@@ -467,29 +467,48 @@ def _implementation_candidates(discovery_manifest: dict[str, Any]) -> tuple[str,
     return tuple(candidates[:80])
 
 
+def _repo_source_paths(discovery_manifest: dict[str, Any]) -> set[str]:
+    """Repo paths that look like production source code (files Discovery read)."""
+    return {
+        str(path or "").replace("\\", "/").strip()
+        for path in discovery_manifest.get("repo_files", [])
+        if Path(str(path or "")).suffix.lower() in _SOURCE_SUFFIXES
+    }
+
+
+def _evidence_source_paths(discovery_manifest: dict[str, Any]) -> set[str]:
+    return {
+        str(item.get("path") or "").replace("\\", "/").strip()
+        for item in discovery_manifest.get("evidence", []) if isinstance(item, dict)
+        if Path(str(item.get("path") or "")).suffix.lower() in _SOURCE_SUFFIXES
+    }
+
+
 def discovery_readiness_error(discovery_manifest: dict[str, Any] | None) -> str | None:
     """Reject planning only when system-validated evidence is insufficient.
 
     Agent-reported gaps are advisory prose. They can describe role-local
     assignments, external reference projects, or uncertainty, so parsing them
     as a global gate makes planning depend on wording instead of facts.
+
+    A repository that contains *no source files at all* is the greenfield
+    case: there is nothing to cite, and the plan is expected to declare
+    ``planned_new`` paths instead. Refusing to plan there made an empty
+    workspace permanently un-startable, because every Discovery role
+    legitimately returned no evidence.
     """
     if not isinstance(discovery_manifest, dict):
+        return None
+    repo_source_paths = _repo_source_paths(discovery_manifest)
+    if not repo_source_paths:
+        # Nothing in this repository is source code yet, so an empty evidence
+        # set is the only honest answer. Planning must be allowed to build the
+        # first files from the requirement.
         return None
     evidence = [item for item in discovery_manifest.get("evidence", []) if isinstance(item, dict)]
     if not evidence:
         return "Discovery produced no validated evidence. Continue discovery before planning."
-    repo_source_paths = {
-        str(path or "").replace("\\", "/").strip()
-        for path in discovery_manifest.get("repo_files", [])
-        if Path(str(path or "")).suffix.lower() in _SOURCE_SUFFIXES
-    }
-    source_evidence_paths = {
-        str(item.get("path") or "").replace("\\", "/").strip()
-        for item in evidence
-        if Path(str(item.get("path") or "")).suffix.lower() in _SOURCE_SUFFIXES
-    }
-    if repo_source_paths and not source_evidence_paths and not _implementation_candidates(discovery_manifest):
+    if not _evidence_source_paths(discovery_manifest) and not _implementation_candidates(discovery_manifest):
         return "Discovery produced no validated source-code evidence. Continue discovery before planning."
     return None
 
@@ -686,7 +705,8 @@ def build_plan_prompt(
         "- A greenfield Maven project (no pom.xml/build.gradle) must start with a scaffold-only Task whose planned_new "
         "contains the exact pom.xml path. It may have at most two build/configuration acceptance cases and must not "
         "include Java business behavior or planned Java source. The system verifies this Task with Maven validate; "
-        "later behavior Tasks depend on it and receive normal test-first verification.\n"
+        "later behavior Tasks depend on it and receive normal test-first verification. A scaffold Task is never a "
+        "complete greenfield Goal by itself: return every remaining business Task in this same GoalPlan.\n"
         "- Order Tasks so each Task's acceptance cases are provable by a focused unit test against code that either "
         "exists or is created by that same Task. Defer database-integration behavior (SELECT FOR UPDATE, optimistic "
         "lock, live-connection round-trips) until the module build and persistence seam exist, or express it as a "
@@ -1314,6 +1334,11 @@ def _parse_plan_result(
         names.add(name)
         generated_paths_by_task[name] = dependency_generated_paths | frozenset(planned_new)
         dependency_closure_by_task[name] = dependency_closure
+    if greenfield_maven and len(plans) == 1 and scaffold_name:
+        errors.append(
+            "a greenfield Maven Goal cannot contain only its scaffold Task; include the dependent business Tasks "
+            "needed to satisfy the complete Goal contract"
+        )
     if errors:
         return None, _contract_error_text(errors)
     coverage = tuple(dict(item) for item in data.get("replacement_coverage", []) if isinstance(item, dict))
@@ -1375,14 +1400,17 @@ def _format_repair_prompt(
             f"Superseded behavior closure: {json.dumps(compact_scope, ensure_ascii=False)}\n"
             f"Candidate response (possibly truncated):\n{previous}"
         )
+    # The planner conversation already contains ``original_prompt``. Replaying
+    # the discovery manifest and schema here can more than double the repair
+    # request and exhaust relays with a fixed read window before JSON arrives.
     return (
-        f"{original_prompt}\n\n"
-        "Your previous response was rejected before any execution began. "
+        "Repair the previously supplied GoalPlan JSON. The original requirement, Discovery evidence, "
+        "schema, and planning rules remain authoritative in this conversation. Return ONLY one COMPLETE "
+        "corrected GoalPlan JSON object.\n"
         f"Contract error: {error}.\n"
-        "Return a corrected COMPLETE GoalPlan JSON object now. Preserve valid planning intent, "
-        "but fix the contract error. Do not explain the correction, do not call tools, "
-        "and do not omit required fields.\n"
-        f"Previous response (may be truncated):\n{previous}"
+        "Preserve valid planning intent and fix only the listed error. Do not explain, call tools, or omit "
+        "required fields.\n"
+        f"Previous response (possibly truncated):\n{previous}"
     )
 
 
@@ -1580,7 +1608,7 @@ def plan_tasks(
         )
         if contract_error:
             plan = None
-    legacy_mode = raw.lstrip().startswith("[") or (
+    legacy_mode = _strip_agent_header(raw).lstrip().startswith("[") or (
         plan is not None and str(plan.contract.get("summary") or "").startswith("Migrated planning v1")
     )
     used_repair = False
@@ -1652,9 +1680,12 @@ def plan_tasks(
             except Exception as exc:
                 raise GoalPlanningError(f"Goal planner contract repair failed: {type(exc).__name__}: {exc}") from exc
             used_repair = True
-            legacy_mode = legacy_mode or raw.lstrip().startswith("[")
+            legacy_mode = legacy_mode or _strip_agent_header(raw).lstrip().startswith("[")
             if raw.startswith(f"[{PLANNER_AGENT}] failed:") or raw.startswith(f"[{PLANNER_AGENT}] stopped:"):
-                raise GoalPlanningError(f"Goal planner contract repair is unavailable: {raw}")
+                raise GoalPlanningError(
+                    "Goal planner contract repair is unavailable after initial contract rejection: "
+                    f"{contract_error or 'unknown contract error'}; provider result: {raw}"
+                )
             if planner_stats.stop_reason == "max_tokens" or _looks_like_incomplete_json(raw):
                 planner_stats.stop_reason = None
                 continuation_call = dict(repair_call)

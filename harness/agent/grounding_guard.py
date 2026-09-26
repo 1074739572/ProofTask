@@ -35,7 +35,8 @@ BLOCK_MESSAGE = (
     "(这/那/上面/刚才/this one/…) and this turn called tools without stating a "
     "resolved Working goal in text.\n"
     "Either (1) rewrite the goal from conversation context in one short sentence "
-    "then call tools, or (2) ask the user 1–3 clarifying questions with no tools. "
+    "then call tools, or (2) ask the user 1–3 blocking clarifying questions with "
+    "no tools (细节级 prep does not substitute for resolving deixis). "
     "Do not put assumptions or caveats inside tool parameters."
 )
 

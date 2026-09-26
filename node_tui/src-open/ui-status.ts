@@ -31,14 +31,15 @@ export type UiStatus = {
   contextMessages: number;
   /** 与 pending 相同的语义化别名，便于其他视图直接消费队列状态。 */
   queuedMessages: number;
-  /** 等待权限时显示的可恢复审批提示；无需审批时为空。 */
-  permissionPrompt: string | null;
   model?: string;
   mode?: string;
   effort?: string;
   spinner?: string;
-  /** Output token count and decode rate for the active turn, when known. */
-  outputTokens?: number;
+  /** 当前工作目录（basename 显示在身份行）。 */
+  cwd?: string;
+  /** 当前 git 分支；读取失败或不在仓库内为空。 */
+  gitBranch?: string;
+  /** Decode rate for the active turn, when known. */
   tokensPerSecond?: number;
   editorFullscreen?: boolean;
 };
@@ -75,7 +76,6 @@ export function deriveUiStatus(input: UiStatusInput): UiStatus {
     pending: queuedMessages,
     queuedMessages,
     permissionWait,
-    permissionPrompt: permissionWait ? 'Permission required: approve or allow to continue' : null,
     completionOpen: Boolean(input.completionOpen),
     composerLines: Math.max(1, Number(input.composerLines) || 1),
     paste: input.paste ?? null,
@@ -91,7 +91,8 @@ export function deriveUiStatus(input: UiStatusInput): UiStatus {
     mode: input.mode ? String(input.mode) : undefined,
     effort: input.effort ? String(input.effort) : undefined,
     spinner: input.spinner ? String(input.spinner) : undefined,
-    outputTokens: Math.max(0, Number(input.outputTokens) || 0),
+    cwd: input.cwd ? String(input.cwd) : undefined,
+    gitBranch: input.gitBranch ? String(input.gitBranch) : undefined,
     tokensPerSecond: Math.max(0, Number(input.tokensPerSecond) || 0),
     editorFullscreen: Boolean(input.editorFullscreen),
   };

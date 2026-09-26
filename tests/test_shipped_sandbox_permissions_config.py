@@ -65,7 +65,9 @@ def test_shipped_config_has_no_blanket_allows_for_write_edit_bash_external(
 
     # The sandbox default must not carry permissive catch-all rules for the
     # mutating tools; they may only be allowed per-resource/prefix.
-    for tool in ("write_file", "edit_file", "bash", "external_directory"):
+    # ``external_directory: allow`` is the deliberate v2 relaxation pinned by
+    # test_ac5/test_ac5b (boundary still detected, secrets still hard-denied).
+    for tool in ("write_file", "edit_file", "bash"):
         assert _blanket_effect(rules.get(tool)) != "allow", tool
     assert rules.get("*") != "allow"
 

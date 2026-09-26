@@ -42,7 +42,7 @@
     "verify_command": "allow",
     "web_search": "allow",
     "write_file": {
-      "*": "allow",
+      "*": "ask",
       "*.env": "deny",
       "*.env.*": "deny",
       "*.env.example": "allow",
@@ -62,7 +62,7 @@
       "**/.project/goal-history/*": "deny"
     },
     "edit_file": {
-      "*": "allow",
+      "*": "ask",
       "*.env": "deny",
       "*.env.*": "deny",
       "*.env.example": "allow",
@@ -82,7 +82,7 @@
       "**/.project/goal-history/*": "deny"
     },
     "patch_file": {
-      "*": "allow",
+      "*": "ask",
       "*.env": "deny",
       "*.env.*": "deny",
       "*.env.example": "allow",
@@ -102,7 +102,13 @@
       "**/.project/goal-history/*": "deny"
     },
     "bash": {
-      "*": "allow",
+      "*": "ask",
+      "dir *": "allow",
+      "type *": "allow",
+      "where *": "allow",
+      "git status*": "allow",
+      "git diff*": "allow",
+      "git log*": "allow",
       "del *": "ask",
       "del /*": "ask",
       "Remove-Item *": "ask",
@@ -140,7 +146,7 @@
       "auto_approve": ["low"]
     },
     "auto-review": {
-      "label": "自动审查",
+      "label": "按风险自动放行",
       "auto_approve": ["low", "medium"]
     },
     "full-access": {
@@ -165,18 +171,17 @@
     "load_skill": "low",
     "todo_write": "low",
     "web_search": "low",
-    "write_file": "low",
-    "edit_file": "low",
-    "patch_file": "low",
+    "write_file": "medium",
+    "edit_file": "medium",
+    "patch_file": "medium",
     "mcp__fetch__*": "low",
-    "mcp__*": "low",
-    "bash": "low",
-    "subagent": "low",
+    "bash": "high",
+    "subagent": "high",
     "task": "low",
     "spawn_teammate": "low"
   },
   "bash": {
-    "default_risk": "low",
+    "default_risk": "high",
     "patterns": {
       "blocked": [
         "rm\\s+(-[a-z]*[rR][a-z]*\\s+)*/?\\s*$",

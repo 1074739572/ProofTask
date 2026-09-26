@@ -1,5 +1,6 @@
 import {For} from 'solid-js';
 import {C} from './theme.ts';
+import {formatK, formatTokens} from './layout.ts';
 import {Sp} from './Sp.tsx';
 import type {UiStatus} from './ui-status.ts';
 
@@ -12,16 +13,6 @@ export type BreakdownRow = {
   percent: number;
   free: boolean;
 };
-
-function formatTokens(value: number): string {
-  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`;
-  if (value >= 1_000) return `${(value / 1_000).toFixed(1)}k`;
-  return String(Math.round(value));
-}
-
-function formatWindow(value: number): string {
-  return value >= 1_000 ? `${Math.round(value / 1000)}k` : String(value);
-}
 
 /** Category rows for the popup, in display order. Bars and percents are
  * measured against the whole window so the free row visually completes the
@@ -71,8 +62,8 @@ export function ContextBreakdown(props: {
       onMouseUp={(event: any) => { if (event?.button === 0) props.onClose?.(); }} />
     <box position="absolute" left={Math.max(0, props.width - cardWidth())} bottom={props.bottomRows} width={cardWidth()}
       border borderStyle="rounded" borderColor={C.primary} flexDirection="column"
-      backgroundColor="#111820" paddingX={1} zIndex={20}>
-      <text fg={C.primary} wrapMode="none" truncate>{`上下文窗口 · ${formatWindow(win())} tokens`}</text>
+      backgroundColor={C.panel} paddingX={1} zIndex={20}>
+      <text fg={C.primary} wrapMode="none" truncate>{`上下文窗口 · ${formatK(win())} tokens`}</text>
       <For each={rows()}>{row => <box flexDirection="row" minWidth={0}>
         {/* CJK labels are double-width: 4 chars need 8 columns plus a gap. */}
         <text fg={C.textMuted} width={9} wrapMode="none" selectable={false}>{row.label}</text>

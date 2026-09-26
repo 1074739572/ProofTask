@@ -139,3 +139,39 @@ def test_guard_allows_no_deixis_bare_tools():
     block, _ = guard.evaluate(messages, content)
     assert block is False
     assert guard.armed is False
+
+
+def test_identity_bans_filler_phrases_and_comparison_frame():
+    identity = PROMPT_SECTIONS["identity"]
+    assert "禁用套话" in identity
+    assert "不是 X，而是 Y" in identity
+    # Banned filler tokens appear in both languages.
+    assert "delve" in identity and "综上所述" in identity
+
+
+def test_identity_steers_in_flight_messages_and_persists_authorization():
+    identity = PROMPT_SECTIONS["identity"]
+    assert "转向" in identity
+    assert "persists" in identity
+    # Skill use must be declared and cited.
+    assert "skill" in identity and "cite" in identity
+
+
+def test_grounding_splits_clarification_into_blocking_and_detail():
+    grounding = PROMPT_SECTIONS["grounding"]
+    assert "阻塞级" in grounding
+    assert "细节级" in grounding
+    # Numbered options are offered for enumerable answer spaces.
+    assert "1. 2. 3." in grounding
+
+
+def test_grounding_requires_three_elements_when_permission_blocked():
+    grounding = PROMPT_SECTIONS["grounding"]
+    assert "tool name" in grounding
+    assert "blocked resource" in grounding
+    assert "trigger reason" in grounding
+
+
+def test_block_message_references_blocking_level():
+    assert "blocking" in BLOCK_MESSAGE
+    assert "细节级" in BLOCK_MESSAGE

@@ -433,6 +433,28 @@ def test_cancelled_draft_is_terminal_and_allows_a_fresh_draft(tmp_path):
     assert fresh.id != draft.id
 
 
+def test_resume_refuses_a_concurrent_goal_draft_operation(tmp_path):
+    from harness.goal import draft as draft_module
+    from harness.workspace_lock import WorkspaceMutationLock
+
+    draft_module.save_draft(
+        draft_module.GoalDraft(
+            id="paused", target="add rate limits", verification="python -m pytest -q",
+            verification_source="test", status="paused", stage="paused",
+        ),
+        tmp_path,
+    )
+    lock = WorkspaceMutationLock(
+        tmp_path, purpose="test", lock_name="goal-draft-operation.lock",
+    )
+    assert lock.acquire()
+    try:
+        with pytest.raises(draft_module.GoalDraftError, match=r"owner PID .*?/goal resume"):
+            draft_module.resume_draft(workspace=tmp_path)
+    finally:
+        lock.release()
+
+
 def test_resume_reports_intake_provider_failure_without_json_masking(tmp_path, monkeypatch):
     from harness.goal import draft as draft_module
 
@@ -773,6 +795,46 @@ def test_start_failure_restores_ready_draft(monkeypatch, tmp_path):
     assert draft.last_error == "startup unavailable"
 
 
+def test_approve_reports_old_goal_conflict_and_keeps_new_draft_ready(monkeypatch, tmp_path):
+    import harness.goal.commands as commands
+    import harness.goal.draft as draft_module
+    import harness.goal.preflight as preflight_module
+    import harness.goal.runner as runner_module
+    import harness.settings as settings_module
+
+    create_draft(
+        "add rate limits",
+        workspace=tmp_path,
+        verification="python -m pytest -q",
+        intake_runner=lambda **_: '{"questions":[]}',
+        planner_runner=lambda **_: _plan_json(),
+    )
+    monkeypatch.setattr(draft_module, "get_workdir", lambda: tmp_path)
+    monkeypatch.setattr(settings_module, "get_workdir", lambda: tmp_path)
+    monkeypatch.setattr(commands, "_start_precondition_note", lambda _request: None)
+    monkeypatch.setattr(
+        preflight_module,
+        "preflight_goal_agents",
+        lambda _types: type("Result", (), {"ok": True})(),
+    )
+
+    def busy(*_args, **_kwargs):
+        raise runner_module.GoalBusyError(
+            "Goal goal_old is paused. Resume, cancel, or finish it first."
+        )
+
+    monkeypatch.setattr(runner_module, "start_goal", busy)
+
+    result = commands._handle_approve(runner_module, [], {}, None)
+
+    assert "run /goal cancel, then /goal approve" in result
+    assert "run /goal resume" in result
+    draft = load_draft(tmp_path)
+    assert draft.status == "ready"
+    assert draft.stage == "ready"
+    assert draft.last_error == result
+
+
 def test_approved_draft_plan_seeds_the_runner(monkeypatch, tmp_path):
     import harness.goal.runner as runner_mod
     from harness.goal.runner import GoalRequest
@@ -829,3 +891,134 @@ def test_execution_approval_resumes_from_the_test_review_pause(monkeypatch, tmp_
     assert resumed.phase == GoalPhase.SELECT_TASK.value
     assert resumed.status == GoalStatus.RUNNING.value
     assert resumed.execution_approved is True
+
+
+def test_intake_from_raw_parses_numbered_options_and_defaults():
+    from harness.goal.draft import _intake_from_raw
+
+    raw = json.dumps({
+        "summary": "need export format",
+        "assumptions": [],
+        "questions": [
+            {"q": "导出格式？", "options": ["Markdown", "PDF", "两者"], "recommend": 1, "default_assumption": "Markdown"},
+            "Who is the rate limit subject?",  # legacy bare string
+            {"q": "limit value?", "options": [], "recommend": 0, "default_assumption": ""},
+        ],
+    })
+    result = _intake_from_raw(raw)
+
+    assert result.questions == ["导出格式？", "Who is the rate limit subject?", "limit value?"]
+    assert result.question_options == [["Markdown", "PDF", "两者"], [], []]
+    assert result.question_defaults == ["Markdown", "", ""]
+
+
+def test_intake_from_raw_ignores_out_of_bounds_recommend():
+    from harness.goal.draft import _intake_from_raw
+
+    raw = json.dumps({
+        "summary": "x",
+        "assumptions": [],
+        "questions": [
+            {"q": "format?", "options": ["A", "B"], "recommend": 99, "default_assumption": "A"},
+        ],
+    })
+    result = _intake_from_raw(raw)
+
+    # An out-of-bounds recommend is silently dropped (no recommendation); the
+    # options and default assumption still parse and align.
+    assert result.question_options == [["A", "B"]]
+    assert result.question_defaults == ["A"]
+
+
+def test_format_draft_renders_numbered_options_and_default():
+    from harness.goal.draft import GoalDraft, format_draft
+
+    draft = GoalDraft(
+        id="opts", target="add rate limits", verification="python -m pytest -q",
+        verification_source="test", status="clarifying", stage="clarifying",
+        questions=["导出格式？", "limit value?"],
+        question_options=[["Markdown", "PDF", "两者"], []],
+        question_defaults=["Markdown", ""],
+    )
+    text = format_draft(draft)
+
+    assert "Question 1/2: 导出格式？" in text
+    assert "1. Markdown" in text and "2. PDF" in text and "3. 两者" in text
+    assert "不答则按: Markdown" in text
+
+
+def test_draft_event_payload_includes_options_and_default():
+    from harness.goal.draft import GoalDraft, _draft_event_payload
+
+    draft = GoalDraft(
+        id="payload", target="t", verification="python -m pytest -q",
+        verification_source="test", status="clarifying", stage="clarifying",
+        questions=["format?"],
+        question_options=[["A", "B"]],
+        question_defaults=["A"],
+    )
+    payload = _draft_event_payload(draft, event="clarifying")
+
+    assert payload["question"] == "format?"
+    assert payload["question_options"] == ["A", "B"]
+    assert payload["question_default"] == "A"
+
+
+def test_record_clarification_limit_truncates_parallel_arrays():
+    from harness.goal.draft import GoalDraft, _record_clarification_limit
+
+    draft = GoalDraft(
+        id="limit", target="t", verification="python -m pytest -q",
+        verification_source="test", status="clarifying", stage="clarifying",
+        questions=["q1", "q2", "q3"],
+        question_options=[["a", "b"], [], ["x"]],
+        question_defaults=["a", "", "x-default"],
+        answers=["ans1"],
+    )
+    _record_clarification_limit(draft)
+
+    # Remaining questions beyond the answered prefix are closed; the three
+    # parallel arrays stay aligned at len(answers).
+    assert draft.questions == ["q1"]
+    assert draft.question_options == [["a", "b"]]
+    assert draft.question_defaults == ["a"]
+    # The dropped per-question default was surfaced as a bounded assumption.
+    assert any("x-default" in assumption for assumption in draft.intake_assumptions)
+
+
+def test_followup_intake_preserves_options_for_new_questions(tmp_path, monkeypatch):
+    intake_responses = iter([
+        json.dumps({"summary": "need format", "questions": [
+            {"q": "format?", "options": ["Markdown", "PDF"], "recommend": 1, "default_assumption": "Markdown"},
+        ]}),
+        json.dumps({"summary": "clear", "questions": []}),
+    ])
+    planner_targets = []
+
+    def mark_ready(draft, *_args, **_kwargs):
+        from harness.goal.draft import _planner_target
+
+        planner_targets.append(_planner_target(draft))
+        draft.task_plan = [{"verification_spec": {"source": "needs_generation"}}]
+        draft.status = "ready"
+
+    monkeypatch.setattr("harness.goal.draft._plan", mark_ready)
+
+    draft = create_draft(
+        "add rate limits", workspace=tmp_path, verification="python -m pytest -q",
+        intake_runner=lambda **_: next(intake_responses),
+        planner_runner=lambda **_: pytest.fail("the patched planner should handle this"),
+    )
+
+    assert draft.status == "clarifying"
+    assert draft.question_options == [["Markdown", "PDF"]]
+    assert draft.question_defaults == ["Markdown"]
+
+    ready = answer_draft(
+        "Markdown", workspace=tmp_path,
+        intake_runner=lambda **_: next(intake_responses),
+        planner_runner=lambda **_: pytest.fail("the patched planner should handle this"),
+    )
+
+    assert ready.status == "ready"
+    assert ready.answers == ["Markdown"]

@@ -2,14 +2,13 @@ import {BoxRenderable, ScrollBoxRenderable, SyntaxStyle, CliRenderEvents} from '
 import {batch, createSignal, createMemo, createEffect, For, Show as SolidShow, Switch, Match, onCleanup} from 'solid-js';
 import {useTerminalDimensions, useKeyboard, useRenderer} from '@opentui/solid';
 import {initialWorkspace, startBackend, type Backend} from '../src/backend.ts';
-import {alwaysSeparate, layoutBudget, layoutMode, setPreLayoutSiblingMargin, type LayoutBudget} from './layout.ts';
-import {buildSections} from './sections.ts';
-import type {ActionRow, Entry, Section, SubagentStatus} from './sections.ts';
+import {alwaysSeparate, composerVisualLines, formatTokens, layoutBudget, layoutMode, setPreLayoutSiblingMargin, type LayoutBudget} from './layout.ts';
+import {collapseLatestSummary, foldTurnIntoSummary} from './sections.ts';
+import type {Entry, SubagentStatus} from './sections.ts';
 import {C} from './theme.ts';
-import {eastAsianWidth} from 'get-east-asian-width';
 import {WelcomeView} from './Welcome.tsx';
 import * as GoalViewModule from './GoalView.tsx';
-import type {GoalDecision, GoalDraftSnapshot, GoalSnapshot} from './GoalView.tsx';
+import type {GoalDecision, GoalDraftSnapshot, GoalSnapshot, StageMark} from './GoalView.tsx';
 
 const GoalDraftView = (GoalViewModule as any).GoalDraftView;
 const GoalView = (GoalViewModule as any).GoalView;
@@ -142,12 +141,6 @@ function materializeTranscriptLines(value: unknown): {lines: string[]; supported
 
 function normalizeActionOutput(value: unknown): string[] {
   return materializeTranscriptLines(value).lines;
-}
-
-function mergedActionOutput(entry: any): string[] {
-  const calls = Array.isArray(entry?.calls) ? entry.calls : [];
-  const perCall = calls.flatMap((call: any) => normalizeActionOutput(call?.output));
-  return perCall.length > 0 ? perCall : normalizeActionOutput(entry?.output);
 }
 
 export function promptPaddingTop(entries: readonly Entry[], index: number): number {
@@ -511,63 +504,7 @@ const repoRoot = process.cwd().replace(/[\\/]node_tui$/, '');
 // of a placeholder that only updates once the backend's first session_status
 // arrives (~1.5s later). The backend keeps being the source of truth and will
 // overwrite this on the first status event.
-export type EastAsianWidthOptions = {ambiguousAsWide?: boolean};
-
-// Zero-width characters: combining marks (Mn/Mc/Me) and format controls
-// (Cf, e.g. ZWJ U+200D, zero-width space U+200B). They contribute 0 columns
-// regardless of the ambiguous-width profile.
-const ZERO_WIDTH_RE = /[\p{M}\p{Cf}]/u;
-
-function charTerminalColumns(ch: string, options?: EastAsianWidthOptions): number {
-  if (ZERO_WIDTH_RE.test(ch)) return 0;
-  return eastAsianWidth(ch.codePointAt(0) || 0, options);
-}
-
-export function terminalColumns(text: string, options?: EastAsianWidthOptions): number {
-  let width = 0;
-  for (const ch of Array.from(text)) {
-    width += charTerminalColumns(ch, options);
-  }
-  return width;
-}
-
-// Truncate against an East Asian column budget (UAX#11): a CJK/emoji character
-// consumes 2 columns, combining/zero-width characters consume 0. The trailing
-// '...' is reserved up to maxColumns-3, so a text is only returned verbatim when
-// it fits together with the ellipsis placeholder.
-export function truncateTerminalText(text: string, maxColumns: number): string {
-  if (terminalColumns(text) + 3 <= maxColumns) return text;
-  const limit = Math.max(1, maxColumns - 3);
-  let used = 0;
-  let result = '';
-  for (const ch of Array.from(text)) {
-    const width = charTerminalColumns(ch);
-    if (used + width > limit) break;
-    result += ch;
-    used += width;
-  }
-  return `${result}...`;
-}
-
-export function composerVisualLines(text: string, width: number): number {
-  // The caller owns any UI minimum width; this pure helper must honor the
-  // supplied terminal-column budget, including narrow test/TTY dimensions.
-  const columns = Number.isFinite(width) ? Math.max(1, Math.floor(width)) : 1;
-  return text.split('\n').reduce((sum, line) => {
-    let rows = 1;
-    let used = 0;
-    for (const ch of Array.from(line)) {
-      const characterWidth = charTerminalColumns(ch);
-      if (characterWidth === 0) continue;
-      if (used > 0 && used + characterWidth > columns) {
-        rows += 1;
-        used = 0;
-      }
-      used += characterWidth;
-    }
-    return sum + rows;
-  }, 0);
-}
+export {composerVisualLines, terminalColumns, truncateTerminalText} from './layout.ts';
 
 function readDefaultModel(): string {
   const envModel = (process.env.MODEL_ID || '').trim();
@@ -647,12 +584,6 @@ function goalPhaseIntent(snapshot: GoalSnapshot): string {
   const task = snapshot.tasks.find(item => item.id === snapshot.current_task_id);
   const base = GOAL_PHASE_INTENTS[snapshot.phase] || '正在准备下一步';
   return task && snapshot.phase === 'act' ? `${base}：${task.subject}` : base;
-}
-
-function formatTokens(n: number): string {
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
-  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
-  return String(n);
 }
 
 function formatPercent(hit: number, total: number): string {
@@ -786,653 +717,6 @@ function SubagentCard(props: {agent: Entry; frame: () => string; compact?: boole
   </box>;
 }
 
-function LegacySectionView(props: {section: any; frame: () => string; now: () => number; focusId: () => string | null; onToggleExpand: (id: string) => void}) {
-  const sectionText = normalizeRenderableText((props.section as any).text);
-  const sectionDetail = normalizeRenderableText((props.section as any).detail);
-  // Prompt-only transcript captures are rendered by the OpenTUI test runtime's
-  // server renderer. That renderer materializes false <Show> branches as empty
-  // text nodes, which boxes cannot contain. Render this common leaf directly.
-  if (props.section.kind === 'prompt') {
-    const text = normalizeRenderableText(props.section.text);
-    if (text === null) return <box />;
-    return <box
-      flexShrink={0}
-      minWidth={0}
-      ref={(element: BoxRenderable) => {
-        alwaysSeparate.add(element);
-        setPreLayoutSiblingMargin(element, previous =>
-          previous instanceof BoxRenderable && (previous.height > 1 || alwaysSeparate.has(previous)) ? 1 : 0,
-        );
-      }}
-    >
-      <box minWidth={0} backgroundColor={C.userCard} paddingLeft={2} paddingRight={1}>
-        <SafeText fg={C.text} wrapMode="word" value={text} />
-      </box>
-    </box>;
-  }
-  if (props.section.kind === 'actions') {
-    return <box flexDirection="column" minWidth={0}>
-      <SafeText fg={C.warning} value="Actions" />
-      <For each={props.section.rows}>{row => {
-        const expanded = () => row.expanded === true;
-        const output = normalizeActionOutput(row.output);
-        const tail = output.slice(-3);
-        const truncated = !expanded() && output.length > 3;
-        const visible = !row.done && !expanded() ? tail : (expanded() ? output : []);
-        const focused = () => props.focusId() === row.id;
-        const color = () => !row.done ? C.warning : (row.ok ? C.success : C.error);
-        const elapsed = () => formatElapsed(row.start, row.end, props.now());
-        const showSummary = () => (!row.done || row.ok) && row.summary && row.summary !== 'completed';
-        const marker = () => focused() ? '▶' : (row.done ? (row.ok ? '✓' : '✕') : props.frame());
-        const head = () => row.count && row.count > 1
-          ? `${marker()} ${row.name} · Called ${row.count} times${elapsed()}`
-          : `${marker()} ${row.name}${showSummary() ? `  ${row.summary}` : ''}${elapsed()}`;
-        return <box flexDirection="column" minWidth={0}>
-          <SafeText fg={focused() ? C.primary : color()} wrapMode="word" value={head()} />
-          <For each={visible}>{line =>
-            <box flexDirection="row" minWidth={0} paddingLeft={2}>
-              <SafeText fg={C.textMuted} wrapMode="word" value={`│ ${line}`} />
-            </box>
-          }</For>
-          <Show when={truncated}>
-            <box flexDirection="row" minWidth={0} paddingLeft={2}>
-              <SafeText fg={C.textMuted} wrapMode="none" truncate value={`… ${output.length} lines · Enter to expand`} />
-            </box>
-          </Show>
-          <Show when={row.done && !row.ok && row.summary}>
-            <box flexDirection="row" minWidth={0} paddingLeft={2}>
-              <SafeText fg={C.error} wrapMode="word" value={`└ ${row.summary}`} />
-            </box>
-          </Show>
-        </box>;
-      }}</For>
-    </box>;
-  }
-  if (props.section.kind === 'log') {
-    const text = sectionDetail ? `${sectionText} · ${sectionDetail}` : sectionText;
-    return <SafeText fg={C.textMuted} wrapMode="word" value={text} />;
-  }
-  if (props.section.kind === 'intent') {
-    return <box flexDirection="row" minWidth={0} paddingLeft={1}>
-      <SafeText fg={C.textMuted} wrapMode="word" value={`• ${sectionText}`} />
-    </box>;
-  }
-  if (props.section.kind === 'blocked') {
-    return <box flexDirection="column" minWidth={0}>
-      <SafeText fg={C.error} value="Blocked" />
-      <SafeText fg={C.error} wrapMode="word" value={sectionText} />
-    </box>;
-  }
-  if (props.section.kind === 'response') {
-    return <box minWidth={0} paddingLeft={1}>
-      <markdown
-        syntaxStyle={getMarkdownSyntax()}
-        streaming={props.section.streaming}
-        internalBlockMode="top-level"
-        tableOptions={{style: 'grid'}}
-        content={sectionText!}
-        fg={C.text}
-        conceal
-      />
-    </box>;
-  }
-
-  if (props.section.kind === 'response' && sectionText === null) return <box />;
-  if (props.section.kind === 'intent' && sectionText === null) return <box />;
-  if (props.section.kind === 'blocked' && sectionText === null) return <box />;
-  if (props.section.kind === 'log' && sectionText === null) return <box />;
-  return <box
-    flexShrink={0}
-    minWidth={0}
-    ref={(element: BoxRenderable) => {
-      alwaysSeparate.add(element);
-      setPreLayoutSiblingMargin(element, previous =>
-        previous instanceof BoxRenderable && (previous.height > 1 || alwaysSeparate.has(previous)) ? 1 : 0,
-      );
-    }}
-  >
-    <Show when={props.section.kind === 'prompt'}>
-      <box minWidth={0} backgroundColor={C.userCard} paddingLeft={2} paddingRight={1}>
-        <SafeText fg={C.text} wrapMode="word" value={props.section.text} />
-      </box>
-    </Show>
-    <Show when={props.section.kind === 'response'}>
-      <box minWidth={0} paddingLeft={1}>
-        <markdown
-          syntaxStyle={getMarkdownSyntax()}
-          streaming={props.section.kind === 'response' && props.section.streaming}
-          internalBlockMode="top-level"
-          tableOptions={{style: 'grid'}}
-          content={sectionText || ''}
-          fg={C.text}
-          conceal
-        />
-      </box>
-    </Show>
-    <Show when={props.section.kind === 'intent'}>
-      <box flexDirection="row" minWidth={0} paddingLeft={1}>
-        <SafeText fg={C.textMuted} wrapMode="word" value={`• ${sectionText}`} />
-      </box>
-    </Show>
-    <Show when={props.section.kind === 'tasks'}>
-      <box flexDirection="column" minWidth={0} paddingLeft={1}>
-        <box
-          flexDirection="row"
-          minWidth={0}
-          gap={1}
-          onMouseUp={(event: any) => {
-            if (event?.button === 0) props.onToggleExpand((props.section as any).entryId);
-          }}
-        >
-          <text fg={props.focusId() === (props.section as any).entryId ? C.primary : C.info} wrapMode="none" selectable={false}>{(props.section as any).expanded ? 'v' : '>'}</text>
-          <text fg={C.info} wrapMode="none" selectable={false}>Todo</text>
-          <text fg={C.textMuted} wrapMode="none" truncate selectable={false}>
-            {(() => { const tasks = (props.section as any).tasks || []; const done = tasks.filter((task: any) => task.status === 'completed').length; return `${done}/${tasks.length}`; })()}
-          </text>
-          <Show when={!((props.section as any).expanded)}>
-            <text fg={C.warning} flexGrow={1} wrapMode="none" truncate selectable={false}>
-              {(() => { const tasks = (props.section as any).tasks || []; const active = tasks.find((task: any) => task.status === 'in_progress') || tasks.find((task: any) => task.status === 'pending'); return active?.activeForm || active?.content || 'Complete'; })()}
-            </text>
-          </Show>
-          <text fg={C.textMuted} wrapMode="none" truncate selectable={false}>Tab / Enter</text>
-        </box>
-        <Show when={(props.section as any).expanded}>
-          <box flexDirection="column" minWidth={0} paddingLeft={2}>
-            <For each={(props.section as any).tasks || []}>{(task: any) => {
-              const completed = () => task.status === 'completed';
-              const active = () => task.status === 'in_progress';
-              const marker = () => completed() ? '[x]' : active() ? '[~]' : '[ ]';
-              const label = () => active() ? task.activeForm || task.content : task.content;
-              const color = () => completed() ? C.textMuted : active() ? C.warning : C.text;
-              return <box flexDirection="row" minWidth={0} gap={1}>
-                <text fg={color()} wrapMode="none" selectable={false}>{marker()}</text>
-                <SafeText fg={color()} flexGrow={1} wrapMode="word" selectable={false} value={label()} />
-              </box>;
-            }}</For>
-          </box>
-        </Show>
-      </box>
-    </Show>
-    <Show when={props.section.kind === 'summary'}>
-      <box
-        flexDirection="column"
-        minWidth={0}
-        gap={0}
-      >
-        <box flexDirection="row" minWidth={0} gap={1}>
-          <text fg={props.focusId() === (props.section as any).entryId ? C.primary : C.info} selectable={false}>{(props.section as any).expanded ? '▾' : '▸'} </text>
-          <SafeText fg={C.success} wrapMode="word" selectable={false} value={(props.section as any).text} />
-          <Show when={(props.section as any).toolCount > 0}>
-            <text fg={C.textMuted} wrapMode="none" truncate selectable={false}>· {(props.section as any).toolCount} 工具</text>
-          </Show>
-          <Show when={((props.section as any).steps || []).filter((s: any) => s.type === 'subagent').length > 0}>
-            <text fg={C.textMuted} wrapMode="none" truncate selectable={false}>· {((props.section as any).steps || []).filter((s: any) => s.type === 'subagent').length} 子 agent</text>
-          </Show>
-          <Show when={(props.section as any).elapsed > 0}>
-            <text fg={C.textMuted} wrapMode="none" truncate selectable={false}>{(formatElapsed(Date.now() - (props.section as any).elapsed, Date.now()))}</text>
-          </Show>
-        </box>
-        <box flexDirection="row" minWidth={0} gap={1} paddingLeft={2}>
-          <text
-            fg={props.focusId() === (props.section as any).entryId ? C.primary : C.textMuted}
-            wrapMode="none"
-            truncate
-            selectable={false}
-            onMouseUp={(event: any) => {
-              if (event?.button === 0) props.onToggleExpand((props.section as any).entryId || props.section.id);
-            }}
-          >
-            {(props.section as any).expanded ? '收起过程' : '展开过程'}
-          </text>
-          <Show when={!((props.section as any).expanded)}>
-            <text fg={C.textMuted} wrapMode="none" truncate selectable={false}>· Tab / Enter</text>
-          </Show>
-        </box>
-        <Show when={(props.section as any).expanded}>
-          <box flexDirection="row" minWidth={0} gap={1} paddingLeft={2}>
-            <Show when={((props.section as any).tokens?.inp || 0) > 0}>
-              <text fg={C.textMuted} wrapMode="none" truncate>输入 {formatTokens((props.section as any).tokens.inp)}</text>
-            </Show>
-            <Show when={((props.section as any).tokens?.out || 0) > 0}>
-              <text fg={C.textMuted} wrapMode="none" truncate>· 输出 {formatTokens((props.section as any).tokens.out)}</text>
-            </Show>
-            <Show when={((props.section as any).tokens?.cache || 0) > 0}>
-              <text fg={C.textMuted} wrapMode="none" truncate>· 缓存 {formatPercent((props.section as any).tokens.cache, (props.section as any).tokens.inp || 1)}</text>
-            </Show>
-          </box>
-        </Show>
-        {/* Expanded view: every step of the turn in the order it happened —
-            one line per thinking note, per individual tool call (merged
-            "Called N times" rows unfold back into single calls), per subagent.
-            Grouping by type would pile same-kind rows together and hide the
-            actual sequence, which is exactly what this list must show. */}
-        <Show when={(props.section as any).expanded && (props.section as any).steps?.length > 0}>
-          <box flexDirection="column" minWidth={0} paddingLeft={2}>
-            <text fg={C.textMuted} wrapMode="none">过程 · {(props.section as any).steps.length} 步</text>
-            <For each={(props.section as any).steps}>{(step: any, index: () => number) => {
-              const no = () => `${index() + 1}. `;
-              if (step.type === 'intent') {
-                return <box flexDirection="row" minWidth={0}>
-                  <text fg={C.textMuted} wrapMode="none" selectable={false}>{no()}</text>
-                  <text fg={C.info} selectable={false}>💭 </text>
-                  <SafeText fg={C.info} wrapMode="word" selectable={false} value={step.text} />
-                </box>;
-              }
-              if (step.type === 'subagent') {
-                const agent = step.entry;
-                const status = () => (agent.status || (agent.done ? 'done' : 'running')) as SubagentStatus;
-                const stats = () => {
-                  const toolCount = agent.toolCount ?? agent.tools?.length ?? 0;
-                  const elapsed = agent.elapsed != null ? ` · ${agent.elapsed.toFixed(1)}s` : '';
-                  return `${toolCount} tools${elapsed}`;
-                };
-                return <box flexDirection="row" minWidth={0}>
-                  <text fg={C.textMuted} wrapMode="none" selectable={false}>{no()}</text>
-                  <text fg={subagentColor(status())} wrapMode="word" selectable={false}>
-                    {`${subagentIcon(status(), props.frame())} subagent ${agent.agentType || 'agent'} · ${agent.model || 'model'} · ${stats()}${agent.summary ? ` — ${agent.summary}` : ''}`}
-                  </text>
-                </box>;
-              }
-              const row = step.row;
-              const color = () => row.done ? (row.ok ? C.success : C.error) : C.warning;
-              const icon = () => row.done ? (row.ok ? '✓' : '✕') : props.frame();
-              const elapsed = () => formatElapsed(row.start, row.end, props.now());
-              const showSummary = () => (!row.done || row.ok) && row.summary && row.summary !== 'completed';
-              return <>
-                <box flexDirection="row" minWidth={0}>
-                  <text fg={C.textMuted} wrapMode="none" selectable={false}>{no()}</text>
-                  <text fg={color()} wrapMode="word" selectable={false}>{`${icon()} ${row.name}${showSummary() ? `  ${row.summary}` : ''}${elapsed()}`}</text>
-                </box>
-                <Show when={row.done && !row.ok && row.summary}>
-                  <box flexDirection="row" minWidth={0} paddingLeft={4}>
-                    <text fg={C.error} wrapMode="word" selectable={false}>└ {row.summary}</text>
-                  </box>
-                </Show>
-              </>;
-            }}</For>
-          </box>
-        </Show>
-        <Show when={(props.section as any).expanded && (props.section as any).paths?.length > 0}>
-          <box flexDirection="column" minWidth={0} paddingLeft={2}>
-            <text fg={C.textMuted} wrapMode="none">文件变更</text>
-            <For each={(props.section as any).paths}>{path => <text fg={C.secondary} wrapMode="word">· {path}</text>}</For>
-          </box>
-        </Show>
-      </box>
-    </Show>
-    <Show when={props.section.kind === 'actions'}>
-      <box flexDirection="column" minWidth={0}>
-        <text fg={C.warning}>Actions</text>
-        <For each={props.section.kind === 'actions' ? props.section.rows : []}>{row => {
-          // OpenCode-style output handling: a running tool shows only the tail
-          // few lines (so chatty commands never cause a scrolling storm); a
-          // completed tool folds back to one line; Enter expands the full
-          // output. The view never follows every line — only the tail window.
-          const expanded = () => row.expanded === true;
-          const output = normalizeActionOutput(row.output);
-          const tail = output.slice(-3);
-          const truncated = !expanded() && output.length > 3;
-          const visible = !row.done && !expanded() ? tail : (expanded() ? output : []);
-          const focused = () => props.focusId() === row.id;
-          const color = () => !row.done ? C.warning : (row.ok ? C.success : C.error);
-          const elapsed = () => formatElapsed(row.start, row.end, props.now());
-          const showSummary = () => (!row.done || row.ok) && row.summary && row.summary !== 'completed';
-          const marker = () => focused() ? '▶' : (row.done ? (row.ok ? '✓' : '✕') : props.frame());
-          const head = () => row.count && row.count > 1
-            ? `${marker()} ${row.name} · Called ${row.count} times${elapsed()}`
-            : `${marker()} ${row.name}${showSummary() ? `  ${row.summary}` : ''}${elapsed()}`;
-          return <>
-            <SafeText fg={focused() ? C.primary : color()} wrapMode="word" value={head()} />
-            <Show when={visible.length > 0}>
-              <For each={visible}>{line =>
-                <box flexDirection="row" minWidth={0} paddingLeft={2}>
-                  <SafeText fg={C.textMuted} wrapMode="word" value={`│ ${line}`} />
-                </box>
-              }</For>
-            </Show>
-            <Show when={truncated}>
-              <box flexDirection="row" minWidth={0} paddingLeft={2}>
-                <SafeText fg={C.textMuted} wrapMode="none" truncate value={`… ${output.length} lines · Enter to expand`} />
-              </box>
-            </Show>
-            <Show when={row.done && !row.ok && row.summary}>
-              <box flexDirection="row" minWidth={0} paddingLeft={2}>
-                <SafeText fg={C.error} wrapMode="word" value={`└ ${row.summary}`} />
-              </box>
-            </Show>
-          </>;
-        }}</For>
-      </box>
-    </Show>
-    <Show when={props.section.kind === 'subagent'}>
-      <SubagentCard agent={(props.section as any).entry} frame={props.frame} />
-    </Show>
-    <Show when={props.section.kind === 'files'}>
-      <box flexDirection="column" minWidth={0}>
-        <text fg={C.secondary}>Changed files</text>
-        <For each={props.section.kind === 'files' ? props.section.paths : []}>{path =>
-          <text fg={C.secondary} wrapMode="word">· {path}</text>
-        }</For>
-      </box>
-    </Show>
-    <Show when={props.section.kind === 'blocked'}>
-      <box flexDirection="column" minWidth={0}>
-        <text fg={C.error}>Blocked</text>
-        <SafeText fg={C.error} wrapMode="word" value={sectionText} />
-      </box>
-    </Show>
-    <Show when={props.section.kind === 'log'}>
-        <SafeText fg={C.textMuted} wrapMode="word" value={`${sectionText}${sectionDetail ? ` · ${sectionDetail}` : ''}`} />
-    </Show>
-  </box>;
-}
-
-function UnsafeSectionView(props: {section: Section; frame: () => string; now: () => number; focusId: () => string | null; onToggleExpand: (id: string) => void}) {
-  const section: any = props.section;
-  const text = normalizeRenderableText(section.text);
-  const detail = normalizeRenderableText(section.detail);
-  const shell = (children: any) => <box
-    flexShrink={0}
-    minWidth={0}
-    ref={(element: BoxRenderable) => {
-      alwaysSeparate.add(element);
-      setPreLayoutSiblingMargin(element, previous =>
-        previous instanceof BoxRenderable && (previous.height > 1 || alwaysSeparate.has(previous)) ? 1 : 0,
-      );
-    }}
-  >{children}</box>;
-  const maybe = (condition: boolean, children: any) => condition ? children : <box />;
-
-  if (section.kind === 'prompt') {
-    return text === null ? <box /> : shell(<box minWidth={0} backgroundColor={C.userCard} paddingLeft={2} paddingRight={1}>
-      <SafeText fg={C.text} wrapMode="word" value={text} />
-    </box>);
-  }
-  if (section.kind === 'response') {
-    return text === null ? <box /> : shell(<box minWidth={0} paddingLeft={1}>
-      <markdown syntaxStyle={getMarkdownSyntax()} streaming={section.streaming === true} internalBlockMode="top-level" tableOptions={{style: 'grid'}} content={text} fg={C.text} conceal />
-    </box>);
-  }
-  if (section.kind === 'log') {
-    const value = text === null ? detail : detail === null ? text : `${text} · ${detail}`;
-    return value === null ? <box /> : shell(<SafeText fg={C.textMuted} wrapMode="word" value={value} />);
-  }
-  if (section.kind === 'intent') {
-    return text === null ? <box /> : shell(<box flexDirection="row" minWidth={0} paddingLeft={1}>
-      <SafeText fg={C.textMuted} wrapMode="word" value={`• ${text}`} />
-    </box>);
-  }
-  if (section.kind === 'blocked') {
-    return shell(<box flexDirection="column" minWidth={0} onMouseUp={(event: any) => {
-      if (event?.button === 0) props.onToggleExpand(section.id);
-    }}>
-      <SafeText fg={C.error} value="Blocked" />
-      {maybe(text !== null, <SafeText fg={C.error} wrapMode="word" value={text} />)}
-    </box>);
-  }
-  if (section.kind === 'actions') {
-    const rows = Array.isArray(section.rows) ? section.rows : [];
-    return shell(<box flexDirection="column" minWidth={0}>
-      <SafeText fg={C.warning} value="Actions" />
-      <For each={rows}>{(row: any) => {
-        // Normalize once per row. In particular, do not read or mutate a large
-        // pasted output again while Solid reconciles this view.
-        const output = Array.isArray(row.output)
-          ? row.output.map(normalizeRenderableText).filter((line: string | null): line is string => line !== null)
-          : [];
-        const expanded = row.expanded === true;
-        const visible = !row.done && !expanded ? output.slice(-1) : expanded ? output : [];
-        const summary = normalizeRenderableText(row.summary);
-        const elapsed = formatElapsed(row.start, row.end, props.now());
-        const marker = props.focusId() === row.id
-          ? '▶'
-          : row.done ? (row.ok ? '✓' : '✕') : props.frame();
-        const name = normalizeRenderableText(row.name) || 'action';
-        const showSummary = (!row.done || row.ok) && summary !== null && summary !== 'completed';
-        const head = row.count && row.count > 1
-          ? `${marker} ${name} · Called ${row.count} times${elapsed}`
-          : `${marker} ${name}${showSummary ? `  ${summary}` : ''}${elapsed}`;
-        const color = props.focusId() === row.id
-          ? C.primary
-          : !row.done ? C.warning : row.ok ? C.success : C.error;
-        const truncated = !expanded && output.length > 3;
-        const failedSummary = row.done && !row.ok && summary !== null;
-        return <box flexDirection="column" minWidth={0}>
-          <SafeText fg={color} wrapMode="word" value={head} />
-          <For each={visible}>{(line: string) =>
-            <box flexDirection="row" minWidth={0} paddingLeft={2}>
-              <SafeText fg={C.textMuted} wrapMode="word" value={`│ ${line}`} />
-            </box>
-          }</For>
-          {truncated ? <box flexDirection="row" minWidth={0} paddingLeft={2}>
-            <SafeText fg={C.textMuted} wrapMode="none" truncate value={`… ${output.length} lines · Enter to expand`} />
-          </box> : <box />}
-          {failedSummary ? <box flexDirection="row" minWidth={0} paddingLeft={2}>
-            <SafeText fg={C.error} wrapMode="word" value={`└ ${summary}`} />
-          </box> : <box />}
-        </box>;
-      }}</For>
-    </box>);
-  }
-  if (section.kind === 'tasks') {
-    const tasks = Array.isArray(section.tasks) ? section.tasks : [];
-    const active = tasks.find((task: any) => task.status === 'in_progress') || tasks.find((task: any) => task.status === 'pending');
-    const activeLabel = normalizeRenderableText(active?.activeForm || active?.content) || 'Complete';
-    return shell(<box flexDirection="column" minWidth={0} paddingLeft={1}>
-      <box flexDirection="row" minWidth={0} gap={1}>
-        <SafeText fg={props.focusId() === section.entryId ? C.primary : C.info} value={section.expanded ? 'v' : '>'} />
-        <SafeText fg={C.info} value="Todo" />
-        <SafeText fg={C.textMuted} value={`${tasks.filter((task: any) => task.status === 'completed').length}/${tasks.length}`} />
-        {!section.expanded ? <SafeText fg={C.warning} flexGrow={1} wrapMode="none" truncate value={activeLabel} /> : <box />}
-        <SafeText fg={C.textMuted} value="Tab / Enter" />
-      </box>
-      {section.expanded ? <box flexDirection="column" minWidth={0} paddingLeft={2}>
-        <For each={tasks}>{(task: any) => {
-          const completed = task.status === 'completed';
-          const activeTask = task.status === 'in_progress';
-          const label = normalizeRenderableText(activeTask ? task.activeForm || task.content : task.content);
-          return <box flexDirection="row" minWidth={0} gap={1}>
-            <SafeText fg={completed ? C.textMuted : activeTask ? C.warning : C.text} value={completed ? '[x]' : activeTask ? '[~]' : '[ ]'} />
-            <SafeText fg={completed ? C.textMuted : activeTask ? C.warning : C.text} flexGrow={1} wrapMode="word" value={label} />
-          </box>;
-        }}</For>
-      </box> : <box />}
-    </box>);
-  }
-  if (section.kind === 'summary') {
-    const summary = normalizeRenderableText(section.text);
-    if (summary === null) return <box />;
-    const steps = Array.isArray(section.steps) ? section.steps : [];
-    const subagentCount = steps.filter((step: any) => step.type === 'subagent').length;
-    return shell(<box flexDirection="column" minWidth={0}>
-      <box flexDirection="row" minWidth={0} gap={1}>
-        <SafeText fg={props.focusId() === section.entryId ? C.primary : C.info} value={section.expanded ? '▾' : '▸'} />
-        <SafeText fg={C.success} wrapMode="word" value={summary} />
-        {section.toolCount > 0 ? <SafeText fg={C.textMuted} value={`· ${section.toolCount} 工具`} /> : <box />}
-        {subagentCount > 0 ? <SafeText fg={C.textMuted} value={`· ${subagentCount} 子 agent`} /> : <box />}
-        {section.elapsed > 0 ? <SafeText fg={C.textMuted} wrapMode="none" truncate value={formatElapsed(Date.now() - section.elapsed, Date.now())} /> : <box />}
-      </box>
-      <box flexDirection="row" minWidth={0} gap={1} paddingLeft={2}>
-        <SafeText fg={props.focusId() === section.entryId ? C.primary : C.textMuted} wrapMode="none" truncate value={section.expanded ? '收起过程' : '展开过程'} />
-        {!section.expanded ? <SafeText fg={C.textMuted} wrapMode="none" truncate value="· Tab / Enter" /> : <box />}
-      </box>
-      {section.expanded ? <box flexDirection="column" minWidth={0} paddingLeft={2}>
-        <SafeText fg={C.textMuted} value={`过程 · ${steps.length} 步`} />
-        <For each={steps}>{(step: any, index: () => number) => {
-          const prefix = `${index() + 1}. `;
-          if (step.type === 'intent') {
-            const value = normalizeRenderableText(step.text);
-            return value === null ? <box /> : <SafeText fg={C.info} wrapMode="word" value={`${prefix}💭 ${value}`} />;
-          }
-          if (step.type === 'subagent') {
-            return <SafeText fg={C.secondary} wrapMode="word" value={`${prefix}subagent ${normalizeRenderableText(step.entry?.agentType) || 'agent'}`} />;
-          }
-          const row = step.row || {};
-          return <SafeText fg={row.done ? row.ok ? C.success : C.error : C.warning} wrapMode="word" value={`${prefix}${normalizeRenderableText(row.name) || 'action'}${formatElapsed(row.start, row.end, props.now())}`} />;
-        }}</For>
-      </box> : <box />}
-    </box>);
-  }
-  if (section.kind === 'files') {
-    const paths = Array.isArray(section.paths)
-      ? section.paths.map(normalizeRenderableText).filter((path: string | null): path is string => path !== null)
-      : [];
-    return shell(<box flexDirection="column" minWidth={0}>
-      <SafeText fg={C.secondary} value="Changed files" />
-      <For each={paths}>{(path: string) => <SafeText fg={C.secondary} wrapMode="word" value={`· ${path}`} />}</For>
-    </box>);
-  }
-  return <box />;
-}
-
-function StableSectionView(props: {section: Section; frame: () => string; now: () => number; focusId: () => string | null; onToggleExpand: (id: string) => void}) {
-  const section: any = props.section;
-  const text = normalizeTranscriptText(section.text);
-  const detail = normalizeTranscriptText(section.detail);
-  const shell = (children: any) => <box
-    flexShrink={0}
-    minWidth={0}
-    ref={(element: BoxRenderable) => {
-      alwaysSeparate.add(element);
-      setPreLayoutSiblingMargin(element, previous =>
-        previous instanceof BoxRenderable && (previous.height > 1 || alwaysSeparate.has(previous)) ? 1 : 0,
-      );
-    }}
-  >{children}</box>;
-  const empty = () => <box />;
-
-  if (section.kind === 'prompt') {
-    return text === null ? empty() : shell(<box minWidth={0} backgroundColor={C.userCard} paddingLeft={2} paddingRight={1}>
-      <SafeText fg={C.text} wrapMode="word" value={text} />
-    </box>);
-  }
-  if (section.kind === 'response') {
-    return text === null ? empty() : shell(<box minWidth={0} paddingLeft={1}>
-      <markdown syntaxStyle={getMarkdownSyntax()} streaming={section.streaming === true} internalBlockMode="top-level" tableOptions={{style: 'grid'}} content={text} fg={C.text} conceal />
-    </box>);
-  }
-  if (section.kind === 'log') {
-    const value = text === null ? detail : detail === null ? text : `${text} · ${detail}`;
-    return value === null ? empty() : shell(<SafeText fg={C.textMuted} wrapMode="word" value={value} />);
-  }
-  if (section.kind === 'intent') {
-    return text === null ? empty() : shell(<box flexDirection="row" minWidth={0} paddingLeft={1}>
-      <SafeText fg={C.textMuted} wrapMode="word" value={`• ${text}`} />
-    </box>);
-  }
-  if (section.kind === 'blocked') {
-    return shell(<box flexDirection="column" minWidth={0}>
-      <SafeText fg={C.error} value="Blocked" />
-      {text === null ? empty() : <SafeText fg={C.error} wrapMode="word" value={text} />}
-    </box>);
-  }
-  if (section.kind === 'actions') {
-    const rows = Array.isArray(section.rows) ? section.rows : [];
-    return shell(<box flexDirection="column" minWidth={0}>
-      <SafeText fg={C.warning} value="Actions" />
-      <For each={rows}>{(row: any) => {
-        const output = normalizeActionOutput(row.output);
-        const expanded = row.expanded === true;
-        const visible = !row.done && !expanded ? output.slice(-3) : expanded ? output : [];
-        const summary = normalizeTranscriptText(row.summary);
-        const elapsed = formatElapsed(row.start, row.end, props.now());
-        const marker = props.focusId() === row.id ? '▶' : row.done ? (row.ok ? '✓' : '✕') : props.frame();
-        const name = normalizeTranscriptText(row.name) || 'action';
-        const showSummary = (!row.done || row.ok) && summary !== null && summary !== 'completed';
-        const head = row.count && row.count > 1
-          ? `${marker} ${name} · Called ${row.count} times${elapsed}`
-          : `${marker} ${name}${showSummary ? `  ${summary}` : ''}${elapsed}`;
-        const color = props.focusId() === row.id ? C.primary : !row.done ? C.warning : row.ok ? C.success : C.error;
-        return <box flexDirection="column" minWidth={0}>
-          <SafeText fg={color} wrapMode="word" value={head} />
-          <For each={visible}>{(line: string) => <box flexDirection="row" minWidth={0} paddingLeft={2}>
-            <SafeText fg={C.textMuted} wrapMode="word" value={`│ ${line}`} />
-          </box>}</For>
-          {output.length > 3 && !expanded ? <box flexDirection="row" minWidth={0} paddingLeft={2}>
-            <SafeText fg={C.textMuted} wrapMode="none" truncate value={`… ${output.length} lines · Enter to expand`} />
-          </box> : empty()}
-          {row.done && !row.ok && summary !== null ? <box flexDirection="row" minWidth={0} paddingLeft={2}>
-            <SafeText fg={C.error} wrapMode="word" value={`└ ${summary}`} />
-          </box> : empty()}
-        </box>;
-      }}</For>
-    </box>);
-  }
-  if (section.kind === 'tasks') {
-    const tasks = Array.isArray(section.tasks) ? section.tasks : [];
-    const active = tasks.find((task: any) => task.status === 'in_progress') || tasks.find((task: any) => task.status === 'pending');
-    const activeLabel = normalizeTranscriptText(active?.activeForm || active?.content) || 'Complete';
-    return shell(<box flexDirection="column" minWidth={0} paddingLeft={1}>
-      <box flexDirection="row" minWidth={0} gap={1} onMouseUp={(event: any) => {
-        if (event?.button === 0) props.onToggleExpand(section.entryId);
-      }}>
-        <SafeText fg={props.focusId() === section.entryId ? C.primary : C.info} value={section.expanded ? 'v' : '>'} />
-        <SafeText fg={C.info} value="Todo" />
-        <SafeText fg={C.textMuted} value={`${tasks.filter((task: any) => task.status === 'completed').length}/${tasks.length}`} />
-        {section.expanded ? empty() : <SafeText fg={C.warning} flexGrow={1} wrapMode="none" truncate value={activeLabel} />}
-        <SafeText fg={C.textMuted} value="Tab / Enter" />
-      </box>
-      {section.expanded ? <box flexDirection="column" minWidth={0} paddingLeft={2}>
-        <For each={tasks}>{(task: any) => {
-          const completed = task.status === 'completed';
-          const activeTask = task.status === 'in_progress';
-          const label = normalizeTranscriptText(activeTask ? task.activeForm || task.content : task.content);
-          return <box flexDirection="row" minWidth={0} gap={1}>
-            <SafeText fg={completed ? C.textMuted : activeTask ? C.warning : C.text} value={completed ? '[x]' : activeTask ? '[~]' : '[ ]'} />
-            {label === null ? empty() : <SafeText fg={completed ? C.textMuted : activeTask ? C.warning : C.text} flexGrow={1} wrapMode="word" value={label} />}
-          </box>;
-        }}</For>
-      </box> : empty()}
-    </box>);
-  }
-  if (section.kind === 'summary') {
-    if (text === null) return empty();
-    const steps = Array.isArray(section.steps) ? section.steps : [];
-    const subagentCount = steps.filter((step: any) => step.type === 'subagent').length;
-    return shell(<box flexDirection="column" minWidth={0}>
-      <box flexDirection="row" minWidth={0} gap={1}>
-        <SafeText fg={props.focusId() === section.entryId ? C.primary : C.info} value={section.expanded ? '▾' : '▸'} />
-        <SafeText fg={C.success} wrapMode="word" value={text} />
-        {section.toolCount > 0 ? <SafeText fg={C.textMuted} value={`· ${section.toolCount} 工具`} /> : empty()}
-        {subagentCount > 0 ? <SafeText fg={C.textMuted} value={`· ${subagentCount} 子 agent`} /> : empty()}
-      </box>
-      <box flexDirection="row" minWidth={0} gap={1} paddingLeft={2}>
-        <SafeText fg={C.textMuted} value={section.expanded ? '收起过程' : '展开过程'} />
-        {section.expanded ? empty() : <SafeText fg={C.textMuted} value="· Tab / Enter" />}
-      </box>
-      {section.expanded ? <box flexDirection="column" minWidth={0} paddingLeft={2}>
-        <SafeText fg={C.textMuted} value={`过程 · ${steps.length} 步`} />
-        <For each={steps}>{(step: any, index: () => number) => {
-          const prefix = `${index() + 1}. `;
-          if (step.type === 'intent') {
-            const value = normalizeTranscriptText(step.text);
-            return value === null ? empty() : <SafeText fg={C.info} wrapMode="word" value={`${prefix}💭 ${value}`} />;
-          }
-          if (step.type === 'subagent') return <SafeText fg={C.secondary} wrapMode="word" value={`${prefix}subagent ${normalizeTranscriptText(step.entry?.agentType) || 'agent'}`} />;
-          const row = step.row || {};
-          return <SafeText fg={row.done ? row.ok ? C.success : C.error : C.warning} wrapMode="word" value={`${prefix}${normalizeTranscriptText(row.name) || 'action'}${formatElapsed(row.start, row.end, props.now())}`} />;
-        }}</For>
-      </box> : empty()}
-    </box>);
-  }
-  if (section.kind === 'files') {
-    const paths = Array.isArray(section.paths) ? section.paths.map(normalizeTranscriptText).filter((path: string | null): path is string => path !== null) : [];
-    return shell(<box flexDirection="column" minWidth={0}>
-      <SafeText fg={C.secondary} value="Changed files" />
-      <For each={paths}>{(path: string) => <SafeText fg={C.secondary} wrapMode="word" value={`· ${path}`} />}</For>
-    </box>);
-  }
-  return empty();
-}
-
-/**
- * Height clamp for live markdown. Block reclassification while streaming
- * (paragraph -> heading, list splitting, table normalization) can briefly
- * shrink the measured height; in a bottom-pinned scroll view every shrink
- * yanks the rows below upward, which reads as a flash. While `active()` the
- * wrapper's minHeight only ratchets upward; the clamp releases on stream end
- * and on width changes (when old measurements stop being meaningful).
- */
 function StreamingClamp(props: {active: () => boolean; children: any}) {
   let max = 0;
   let lastWidth = -1;
@@ -1460,10 +744,45 @@ function StreamingClamp(props: {active: () => boolean; children: any}) {
   }}>{props.children}</box>;
 }
 
-function TranscriptEntryView(props: {entry: Entry; liveEntry?: (id: string) => Entry | undefined; frame: () => string; now: () => number; tick: () => number; focusId: () => string | null; onToggleExpand: (id: string) => void; plainResponse?: boolean; latest?: () => boolean; compactRole?: boolean}) {
+// 回合总结展开后的单步：与 fold 前独立行的单行形态保持一致（状态图标 + 名称
+// + 摘要 + 耗时），但不提供输出展开——过程行的输出在 fold 前本就处于折叠态。
+function FoldedStepRow(props: {step: Entry; now: () => number}) {
+  const step: any = props.step;
+  if (step.kind === 'intent') {
+    const text = normalizeTranscriptText(step.text);
+    if (text === null) return <box />;
+    return <box flexDirection="row" minWidth={0} flexShrink={0}>
+      <text fg={C.textMuted} wrapMode="none" selectable={false}>{'∴ '}</text>
+      <SafeText fg={C.textMuted} wrapMode="word" flexShrink={1} value={`Thinking · ${text}`} />
+    </box>;
+  }
+  if (step.kind === 'subagent') {
+    const ok = step.status !== 'failed';
+    const tools = Number(step.toolCount ?? (Array.isArray(step.tools) ? step.tools.length : 0));
+    const label = [step.agentType || 'agent', step.model].filter(Boolean).join(' · ');
+    const detail = normalizeTranscriptText(step.summary || step.text);
+    const elapsed = step.start != null ? formatElapsed(step.start, step.end, props.now()) : (step.elapsed ? ` (${step.elapsed}s)` : '');
+    return <box flexDirection="row" minWidth={0} flexShrink={0}>
+      <SafeText fg={ok ? C.success : C.error} wrapMode="none" truncate flexShrink={1} value={`${ok ? '✓' : '×'} ${label}${tools ? ` · ${tools} 工具` : ''}${detail ? ` · ${detail}` : ''}${elapsed}`} />
+    </box>;
+  }
+  const name = (normalizeTranscriptText(step.name) || normalizeTranscriptText(step.text) || 'action').replace(/_/g, ' ');
+  const status = normalizeTranscriptText(step.summary) || normalizeTranscriptText(step.detail);
+  const done = Boolean(step.done);
+  const ok = step.ok !== false;
+  const elapsed = formatElapsed(step.start, step.end, props.now());
+  return <box flexDirection="row" minWidth={0} flexShrink={0}>
+    <SafeText fg={toolCategoryColor(name, done, ok)} wrapMode="none" truncate flexShrink={1} value={`${done ? (ok ? '✓' : '✕') : '◌'} ${name}${status ? `  ${status}` : ''}${elapsed}`} />
+  </box>;
+}
+
+function TranscriptEntryView(props: {entry: Entry; liveEntry?: (id: string) => Entry | undefined; frame: () => string; now: () => number; tick: () => number; focusId: () => string | null; onToggleExpand: (id: string) => void; plainResponse?: boolean; latest?: () => boolean; compactRole?: boolean; composerEmpty?: () => boolean}) {
   const entry: any = props.entry;
   const text = normalizeTranscriptText(entry.text);
   const detail = normalizeTranscriptText(entry.detail);
+  // 行内 Tab/Enter 快捷键仅在 composer 为空时生效（LogView 键盘分发的前置
+  // 条件）。输入中途提示键盘键位会误导，此时只保留鼠标点击的文案。
+  const keysActive = () => props.composerEmpty?.() !== false;
   // The cached entry pins render identity between flushes; streamed text,
   // the streaming flag, and tool output flow through this fresh lookup so the
   // mounted renderer updates in place instead of being remounted per flush.
@@ -1541,17 +860,16 @@ function TranscriptEntryView(props: {entry: Entry; liveEntry?: (id: string) => E
     // render identity between flushes, while appended lines flow via this memo.
     const liveOutput = createMemo(() => {
       const live = liveOf();
-      return mergedActionOutput(live || entry);
+      return normalizeActionOutput((live || entry)?.output);
     });
     const expanded = () => entry.expanded === true;
-    const name = normalizeTranscriptText(entry.name) || text || 'action';
+    const name = (normalizeTranscriptText(entry.name) || text || 'action').replace(/_/g, ' ');
     const status = normalizeTranscriptText(entry.summary) || detail;
-    const count = Number(entry.count || 0);
     const summary = status !== null ? `  ${status}` : '';
     const marker = () => props.focusId() === entry.id ? '▶' : entry.done ? (entry.ok ? '✓' : '✕') : '◌';
     // Keep the collapsed state to one compact, actionable row. Mouse click and
     // the existing focused Enter binding both use the same toggle callback.
-    const head = () => `${expanded() ? '▾' : '▸'} ${marker()} ${name}${count > 1 ? ` · ${count} 次` : ''}${summary}`;
+    const head = () => `${expanded() ? '▾' : '▸'} ${marker()} ${name}${summary}`;
     const elapsedText = () => formatElapsed(entry.start, entry.end, props.now());
     // Elapsed tick-pop: the counter flashes bright for ~3 animation ticks
     // (240ms) right after its value changes, then settles back to muted.
@@ -1584,12 +902,12 @@ function TranscriptEntryView(props: {entry: Entry; liveEntry?: (id: string) => E
       </Show>
       <Show when={expanded()}>
         <box flexDirection="row" minWidth={0} paddingLeft={2}>
-          <SafeText fg={C.textMuted} wrapMode="none" truncate value="Enter 收起输出" />
+          <SafeText fg={C.textMuted} wrapMode="none" truncate value={keysActive() ? 'Enter 收起输出' : '点击收起输出'} />
         </box>
       </Show>
       <Show when={!expanded() && (liveOutput().length > 0 || !entry.done)}>
         <box flexDirection="row" minWidth={0} paddingLeft={2}>
-          <SafeText fg={C.textMuted} wrapMode="none" truncate value={entry.done ? 'Enter 展开输出' : '运行中 · 输出随时更新 · Enter 展开'} />
+          <SafeText fg={C.textMuted} wrapMode="none" truncate value={entry.done ? (keysActive() ? 'Enter 展开输出' : '点击展开输出') : (keysActive() ? '运行中 · 输出随时更新 · Enter 展开' : '运行中 · 输出随时更新 · 点击展开')} />
         </box>
       </Show>
     </box>;
@@ -1604,7 +922,7 @@ function TranscriptEntryView(props: {entry: Entry; liveEntry?: (id: string) => E
     const active = tasks.find((task: any) => task.status === 'in_progress') || tasks.find((task: any) => task.status === 'pending');
     const activeLabel = normalizeTranscriptText(active?.activeForm || active?.content) || 'Complete';
     const doneCount = tasks.filter((task: any) => task.status === 'completed').length;
-    return shell(<box flexDirection="column" minWidth={0} paddingLeft={1} backgroundColor="#182028">
+    return shell(<box flexDirection="column" minWidth={0} paddingLeft={1} backgroundColor={C.panelInset}>
       <box flexDirection="row" minWidth={0} gap={1} onMouseUp={(event: any) => {
         if (event?.button === 0) props.onToggleExpand(entry.id);
       }}>
@@ -1612,7 +930,7 @@ function TranscriptEntryView(props: {entry: Entry; liveEntry?: (id: string) => E
         <SafeText fg={C.info} value={props.compactRole ? 'TASKS' : 'Todo'} />
         <SafeText fg={C.textMuted} value={`${doneCount}/${tasks.length}`} />
         {expanded ? <box /> : <SafeText fg={C.warning} flexGrow={1} wrapMode="none" truncate value={activeLabel} />}
-        <SafeText fg={C.textMuted} value="Tab / Enter" />
+        <SafeText fg={C.textMuted} value={keysActive() ? 'Tab / Enter' : '点击展开'} />
       </box>
       {expanded ? <box flexDirection="column" minWidth={0} paddingLeft={2}>
         <For each={tasks}>{(task: any) => {
@@ -1634,6 +952,7 @@ function TranscriptEntryView(props: {entry: Entry; liveEntry?: (id: string) => E
       ? entry.paths.map(normalizeTranscriptText).filter((path: string | null): path is string => path !== null)
       : [];
     const tokens = entry.tokens;
+    const folded = Array.isArray(entry.folded) ? entry.folded : [];
     const elapsed = formatElapsed(entry.start, entry.end, props.now()).trim();
     const tokenText = tokens && (tokens.inp > 0 || tokens.out > 0)
       ? `in ${formatTokens(tokens.inp)} · out ${formatTokens(tokens.out)} · cache ${formatTokens(tokens.cache)}`
@@ -1644,10 +963,10 @@ function TranscriptEntryView(props: {entry: Entry; liveEntry?: (id: string) => E
       }}>
         <SafeText fg={props.focusId() === entry.id ? C.primary : C.info} value={expanded ? '▾' : '▸'} />
         <SafeText fg={C.success} wrapMode="word" flexShrink={1} value={text} />
-        {(entry.toolCount || 0) > 0 ? <SafeText fg={C.textMuted} value={`· ${entry.toolCount} 工具`} /> : <box />}
         {elapsed ? <SafeText fg={C.textMuted} value={elapsed} /> : <box />}
       </box>
       {expanded ? <box flexDirection="column" minWidth={0} paddingLeft={2}>
+        <For each={folded}>{(step: Entry) => <FoldedStepRow step={step} now={props.now} />}</For>
         {tokenText ? <SafeText fg={C.textMuted} wrapMode="none" truncate value={tokenText} /> : <box />}
         <For each={paths}>{(path: string) => <SafeText fg={C.secondary} wrapMode="word" value={`· ${path}`} />}</For>
       </box> : <box />}
@@ -1682,6 +1001,15 @@ function TimelineRail(props: {entry: Entry}) {
 function LogView(props: {entries: () => Entry[]; now: () => number; tick: () => number; active: () => boolean; composerEmpty: () => boolean; height: number; width?: number; focusId: () => string | null; onCycleFocus: (dir: 1 | -1) => void; onToggleExpand: (id: string) => void; onClearFocus: () => void; staticRender?: boolean; staticText?: () => string}) {
   let scroll: ScrollBoxRenderable | undefined;
   const [atBottom, setAtBottom] = createSignal(true);
+  // 用户上滚离开底部期间到达的新条目计数，展示在"回到底部"按钮上。
+  const [unseenCount, setUnseenCount] = createSignal(0);
+  let lastEntryCount = 0;
+  createEffect(() => {
+    const count = props.entries().length;
+    if (atBottom()) setUnseenCount(0);
+    else if (count > lastEntryCount) setUnseenCount(n => n + (count - lastEntryCount));
+    lastEntryCount = count;
+  });
   const transcriptCache = new Map<string, Entry>();
   // Track scroll position: OpenTUI's ScrollBox natively stops following the
   // bottom when the user scrolls away and re-engages when they return to the
@@ -1716,14 +1044,12 @@ function LogView(props: {entries: () => Entry[]; now: () => number; tick: () => 
     else if (props.composerEmpty() && name === 'escape' && props.focusId()) { props.onClearFocus(); event.preventDefault?.(); }
   });
   const jumpToBottom = () => { scroll?.scrollTo({x: 0, y: scroll.scrollHeight}); setAtBottom(true); };
-  // Normalize at the LogView boundary as well as for App-level focus/layout
-  // calculations. This keeps every static mount and live render on the same
-  // non-empty, metadata-preserving snapshot path, without relying on an
-  // external signal to trigger a test-renderer frame.
+  // 归一化只在 App 层跑一次（displayedEntries）：LogView 收到的已是规范化
+  // 快照，不再重复 normalize。
   // freshEntries is the unstabilized latest snapshot: streaming text and tool
   // output reach pinned rows through the liveEntry lookup below, so the
   // mounted markdown renderer updates in place instead of remounting.
-  const freshEntries = createMemo(() => normalizeTranscriptEntries(props.entries()) as Entry[]);
+  const freshEntries = createMemo(() => props.entries() as Entry[]);
   const liveEntry = (id: string) => freshEntries().find(e => String(e?.id ?? '') === String(id));
   const normalizedEntries = createMemo(() => {
     const entries = stabilizeTranscriptEntries(freshEntries(), transcriptCache);
@@ -1757,7 +1083,7 @@ function LogView(props: {entries: () => Entry[]; now: () => number; tick: () => 
     return <box flexDirection="column" minWidth={0}>
       <For each={orderedEntries()}>{(entry: Entry, index: () => number) => {
         const latest = () => index() === orderedEntries().length - 1;
-        const row = <TranscriptEntryView entry={entry} liveEntry={liveEntry} frame={frame} now={props.now} tick={props.tick} focusId={props.focusId} onToggleExpand={props.onToggleExpand} plainResponse={props.staticRender} latest={latest} compactRole={props.width != null && props.width < 100} />;
+        const row = <TranscriptEntryView entry={entry} liveEntry={liveEntry} frame={frame} now={props.now} tick={props.tick} focusId={props.focusId} onToggleExpand={props.onToggleExpand} plainResponse={props.staticRender} latest={latest} compactRole={props.width != null && props.width < 100} composerEmpty={props.composerEmpty} />;
         const paddingTop = promptPaddingTop(orderedEntries(), index());
         return props.width != null && props.width >= 100
           ? <box flexDirection="row" minWidth={0} paddingTop={paddingTop}><TimelineRail entry={entry} /><box flexGrow={1} minWidth={0}>{row}</box></box>
@@ -1767,44 +1093,31 @@ function LogView(props: {entries: () => Entry[]; now: () => number; tick: () => 
   };
   const staticNeedsScroll = () => normalizedEntries().length > props.height;
   const renderTranscript = () => <TranscriptBody />;
+  // 回到底部行是条件占位：贴底时 transcript 拿到全部高度，离开底部时让出一行。
+  const bodyRows = () => props.height - (atBottom() ? 0 : 1);
   return <box flexDirection="column">
     {props.staticRender && !staticNeedsScroll() ? <box
-      height={props.height - 1}
+      height={bodyRows()}
       flexShrink={0}
       minHeight={0}
-    >{renderTranscript()}</box> : props.staticRender ? <scrollbox
-      ref={(element: ScrollBoxRenderable) => {
-        scroll = element;
-        updateAtBottom();
-      }}
-      height={props.height - 1}
-      flexShrink={0}
-      minHeight={0}
-      stickyScroll
-      stickyStart="bottom"
-      viewportCulling
-      viewportOptions={{paddingRight: 1}}
-      verticalScrollbarOptions={{visible: false}}
-      onMouseScroll={() => { updateAtBottom(); queueMicrotask(updateAtBottom); }}
-    >
-      {renderTranscript()}
-    </scrollbox> : <scrollbox
+    >{renderTranscript()}</box> : <scrollbox
       ref={(element: ScrollBoxRenderable) => { scroll = element; updateAtBottom(); }}
-      height={props.height - 1}
+      height={bodyRows()}
       flexShrink={0}
       minHeight={0}
       stickyScroll
       stickyStart="bottom"
       viewportCulling
       viewportOptions={{paddingRight: 1}}
-      verticalScrollbarOptions={{visible: true}}
+      verticalScrollbarOptions={{visible: !props.staticRender}}
       onMouseScroll={() => { updateAtBottom(); queueMicrotask(updateAtBottom); }}
     >
       {renderTranscript()}
     </scrollbox>}
-    <box height={1} flexShrink={0} paddingX={1} onMouseUp={(event: any) => { if (event?.button === 0) jumpToBottom(); }}>
+    {/* 只在离开底部时占位：贴底状态下这一行还给 transcript，避免常驻空行。 */}
+    <box height={atBottom() ? 0 : 1} flexShrink={0} paddingX={1} onMouseUp={(event: any) => { if (event?.button === 0) jumpToBottom(); }}>
       <SolidShow when={() => !atBottom()}>
-        <text fg={C.info} wrapMode="none" truncate selectable={false}>↓ 回到底部 (End)</text>
+        <text fg={C.info} wrapMode="none" truncate selectable={false}>{unseenCount() > 0 ? `↓ 回到底部 · ${unseenCount()} 条新消息 (End)` : '↓ 回到底部 (End)'}</text>
       </SolidShow>
     </box>
   </box>;
@@ -1816,7 +1129,7 @@ function LogView(props: {entries: () => Entry[]; now: () => number; tick: () => 
  * layout budget. */
 function QueuePreview(props: {rows: () => string[]}) {
   return <SolidShow when={() => props.rows().length > 0} fallback={<box height={0} />}>
-    <box flexDirection="column" minWidth={0} flexShrink={0} paddingX={2} backgroundColor="#151b22">
+    <box flexDirection="column" minWidth={0} flexShrink={0} paddingX={2} backgroundColor={C.panelRaised}>
       <For each={props.rows()}>{row => <text fg={C.warning} wrapMode="none" truncate selectable={false}>{row}</text>}</For>
     </box>
   </SolidShow>;
@@ -1833,7 +1146,7 @@ function resolveDebugValue<T>(value: T | (() => T) | undefined): T | undefined {
   return typeof value === 'function' ? (value as () => T)() : value;
 }
 
-export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal; debugDraft?: DebugDraft; debugDecisions?: DebugDecisions; debugRunning?: DebugFlag; debugStartedAt?: number; debugOverlay?: Overlay; debugUsage?: {input: number; output: number; cacheRead: number; contextUsed?: number; contextWindow?: number; contextSystem?: number; contextTools?: number; contextMessages?: number}; debugEffort?: {value: string; label: string; options: OverlayOption[]}; debugWelcome?: {quote: string; art: string[]}; debugUsageOpen?: boolean; debugUsageRange?: UsageRange; debugLiveMarkdown?: boolean; debugContextInfo?: boolean}) {
+export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal; debugDraft?: DebugDraft; debugDecisions?: DebugDecisions; debugStageMarks?: StageMark[] | (() => StageMark[]); debugRunning?: DebugFlag; debugStartedAt?: number; debugOverlay?: Overlay; debugUsage?: {input: number; output: number; cacheRead: number; contextUsed?: number; contextWindow?: number; contextSystem?: number; contextTools?: number; contextMessages?: number}; debugEffort?: {value: string; label: string; options: OverlayOption[]}; debugWelcome?: {quote: string; art: string[]}; debugUsageOpen?: boolean; debugUsageRange?: UsageRange; debugLiveMarkdown?: boolean; debugContextInfo?: boolean}) {
   const dims = useTerminalDimensions();
   const renderer = useRenderer();
   const copySelection = (selection: any) => {
@@ -1859,7 +1172,30 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
     setEntries(debugEntriesAccessor() as Entry[]);
   });
   const startupWorkspace = initialWorkspace() || '';
-  const [model, setModel] = createSignal(readDefaultModel()); const [mode, setMode] = createSignal(readDefaultMode()); const [cwd, setCwd] = createSignal(startupWorkspace); const [session, setSession] = createSignal('');
+  const [model, setModel] = createSignal(readDefaultModel()); const [mode, setMode] = createSignal(readDefaultMode()); const [cwd, setCwd] = createSignal(startupWorkspace); const [session, setSession] = createSignal(''); const [gitBranch, setGitBranch] = createSignal('');
+  // 启动与 workspace 切换时读一次 .git/HEAD；分支切换不频繁，无需监听。
+  const refreshGitBranch = (workspace: string) => {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const fs = require('node:fs');
+      const path = require('node:path');
+      let dir = workspace || repoRoot;
+      for (let depth = 0; depth < 8; depth++) {
+        const headFile = path.join(dir, '.git', 'HEAD');
+        if (fs.existsSync(headFile)) {
+          const head = fs.readFileSync(headFile, 'utf8').trim();
+          const match = head.match(/^ref: refs\/heads\/(.+)$/);
+          setGitBranch(match ? match[1] : head.slice(0, 7));
+          return;
+        }
+        const parent = path.dirname(dir);
+        if (parent === dir) break;
+        dir = parent;
+      }
+      setGitBranch('');
+    } catch { setGitBranch(''); }
+  };
+  refreshGitBranch(startupWorkspace || repoRoot);
   const [effort, setEffort] = createSignal(props?.debugEffort?.value ?? 'off'); const [effortLabel, setEffortLabel] = createSignal(props?.debugEffort?.label ?? 'Model default'); const [effortOptions, setEffortOptions] = createSignal<OverlayOption[]>(props?.debugEffort?.options ?? []);
   // Welcome panel data mirrored from the CLI startup (daily quote only).
   const [welcomeQuote, setWelcomeQuote] = createSignal(props?.debugWelcome?.quote ?? '');
@@ -1883,9 +1219,14 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
   // Folded tool entries are intentionally excluded, otherwise Enter would
   // toggle a hidden action and look like the UI is not interactive.
   const [focusId, setFocusId] = createSignal<string | null>(null);
-  const focusableIds = () => buildSections(displayedEntries()).flatMap(section => {
-    if (section.kind === 'summary' || section.kind === 'tasks') return [section.entryId];
-    if (section.kind === 'actions') return section.rows.map(row => row.id);
+  // 焦点集合必须与 TranscriptEntryView 实际渲染的可展开行一致：每条 action
+  // 单独成行（渲染层不做同名合并）、每个非空 tasks/非空 summary 可展开。
+  // 之前走 buildSections 会把同名连续 action 合并成一行、只保留最新 tasks，
+  // 导致部分可见行 Tab 不可达、点击后焦点同步失败。
+  const focusableIds = () => displayedEntries().flatMap(entry => {
+    if (entry.kind === 'action') return [entry.id];
+    if (entry.kind === 'tasks') return (entry.tasks || []).length > 0 ? [entry.id] : [];
+    if (entry.kind === 'summary') return normalizeTranscriptText(entry.text) !== null ? [entry.id] : [];
     return [];
   });
   const cycleFocus = (dir: 1 | -1) => {
@@ -1896,7 +1237,16 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
     const next = (idx + dir + ids.length) % ids.length;
     setFocusId(ids[next]);
   };
-  const toggleExpand = (id: string) => update(id, x => ({...x, expanded: !x.expanded}));
+  const toggleExpand = (id: string) => {
+    update(id, x => ({...x, expanded: !x.expanded}));
+    // 鼠标点击展开后同步键盘焦点，避免随后的 Tab/Enter 仍作用在旧焦点行上。
+    if (focusableIds().includes(id)) setFocusId(id);
+  };
+  // 回合交替时收起上一回合的总结：总结默认折叠，这里处理的是用户在回合间隙
+  // 手动展开了它的情形——新 prompt 到来时重新折回历史。
+  const collapseLastSummary = () => {
+    setEntries(prev => collapseLatestSummary(prev));
+  };
   // Debug snapshots represent an already-running Goal even when no lifecycle
   // event stream is attached; seed the shell status from that snapshot so the
   // Goal page and footer never disagree on the initial frame.
@@ -2269,7 +1619,8 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
   });
   const recordGoalSubagentTool = (id: string, event: any) => setGoalDecisions(previous => previous.map(item => {
     if (item.runId !== id || item.status !== 'active') return item;
-    const name = value(event, 'name') || 'tool';
+    // 显示层转换与 sections.ts 一致：read_file → read file。
+    const name = String(value(event, 'name') || 'tool').replace(/_/g, ' ');
     const runningMatch = ([...(item.tools || [])] as any[]).reverse().find((toolRow: any) => toolRow.name === name && toolRow.status === 'running');
     const toolId = value(event, 'tool_use_id') || (event.ok !== null && event.ok !== undefined ? runningMatch?.id : '') || `${name}-${(item.tools || []).length}`;
     const status = event.ok === null || event.ok === undefined ? 'running' : (event.ok ? 'done' : 'failed');
@@ -2562,12 +1913,23 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
         // visible so an empty questions list never looks like a stalled UI.
         const message = value(event, 'message');
         const question = value(event, 'question');
+        const questionOptions: string[] = Array.isArray(event?.question_options) ? event.question_options : [];
+        const questionDefault = value(event, 'question_default');
+        let draftDetail = question || message || `${stage || 'working'} (${value(event, 'status')})`;
+        if (question) {
+          const parts = [question];
+          if (questionOptions.length) {
+            questionOptions.forEach((opt, i) => parts.push(`${i + 1}. ${opt}`));
+          }
+          if (questionDefault) parts.push(`(不答则按: ${questionDefault})`);
+          if (parts.length > 1) draftDetail = parts.join('\n');
+        }
         if (draftEvent !== 'hydrated' && draftEvent !== 'heartbeat' && (message || question)) {
           add({
             id: `draft-${draftId}-${draftEvent || stage}-${Date.now()}`,
             kind: 'log',
             text: question ? 'Goal 需要澄清' : 'Goal 草案',
-            detail: question || message || `${stage || 'working'} (${value(event, 'status')})`,
+            detail: draftDetail,
           });
         }
         break;
@@ -2688,7 +2050,7 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
         });
         break;
       }
-      case 'user_message': if (!event.silent) { const prompt = value(event, 'text'); responseId = ''; const pendingIndex = pendingPrompts.indexOf(prompt); if (pendingIndex >= 0) pendingPrompts = pendingPrompts.filter((_, i) => i !== pendingIndex); else add({id: `prompt-${Date.now()}`, kind: 'prompt', text: prompt}); } break;
+      case 'user_message': if (!event.silent) { const prompt = value(event, 'text'); responseId = ''; const pendingIndex = pendingPrompts.indexOf(prompt); if (pendingIndex >= 0) pendingPrompts = pendingPrompts.filter((_, i) => i !== pendingIndex); else { collapseLastSummary(); add({id: `prompt-${Date.now()}`, kind: 'prompt', text: prompt}); } } break;
       case 'agent_start': begin(value(event, 'phase') || 'thinking'); setCurrentTool(null); setToolDone(0); setToolTotal(0); setTurnOutputTokens(0); turnStart = Date.now(); turnToolCount = 0; turnFiles = []; turnTokens = {inp: 0, out: 0, cache: 0}; lastIntentText = ''; break;
       case 'assistant_intent': { const text = value(event, 'text'); if (text) promoteResponseToIntent(text); break; }
       case 'thinking_start': if (!responseId) begin(value(event, 'phase') || 'thinking'); else setPhase(value(event, 'phase') || 'thinking'); break;
@@ -2714,7 +2076,7 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
       }
       case 'subagent_start': { promoteResponseToIntent(); begin('subagent'); const id = value(event, 'id') || `subagent-${++actionCounter}`; const ts = Number(event.ts || 0) * 1000 || Date.now(); add({id, kind: 'subagent', text: value(event, 'description') || 'subagent task', agentType: value(event, 'agent_type') || 'agent', model: value(event, 'model') || 'model', status: 'running', rounds: [], tools: [], start: ts, expanded: true}); recordGoalSubagentStart(event, id); break; }
       case 'subagent_round': { const id = value(event, 'id'); const roundText = value(event, 'text'); const label = roundText ? `Round ${Number(event.round || 0)} · "${roundText}"` : `Round ${Number(event.round || 0)}`; update(id, x => x.kind === 'subagent' ? {...x, rounds: [...(x.rounds || []), label]} : x); recordGoalSubagentRound(id, roundText, Number(event.round)); break; }
-      case 'subagent_tool': { const id = value(event, 'id'); const toolId = value(event, 'tool_use_id') || `${value(event, 'name')}-${Date.now()}`; const status = event.ok === null || event.ok === undefined ? 'running' : (event.ok ? 'done' : 'failed'); const name = value(event, 'name') || 'tool'; const summary = value(event, 'summary'); update(id, x => { if (x.kind !== 'subagent') return x; const tools = x.tools || []; const idx = tools.findIndex(tool => tool.id === toolId); const nextTool = {id: toolId, name, summary, status: status as SubagentStatus}; const nextTools = idx >= 0 ? tools.map((tool, i) => i === idx ? {...tool, ...nextTool} : tool) : [...tools, nextTool]; return {...x, tools: nextTools, toolCount: nextTools.length}; }); recordGoalSubagentTool(id, event); break; }
+      case 'subagent_tool': { const id = value(event, 'id'); const toolId = value(event, 'tool_use_id') || `${value(event, 'name')}-${Date.now()}`; const status = event.ok === null || event.ok === undefined ? 'running' : (event.ok ? 'done' : 'failed'); const name = String(value(event, 'name') || 'tool').replace(/_/g, ' '); const summary = value(event, 'summary'); update(id, x => { if (x.kind !== 'subagent') return x; const tools = x.tools || []; const idx = tools.findIndex(tool => tool.id === toolId); const nextTool = {id: toolId, name, summary, status: status as SubagentStatus}; const nextTools = idx >= 0 ? tools.map((tool, i) => i === idx ? {...tool, ...nextTool} : tool) : [...tools, nextTool]; return {...x, tools: nextTools, toolCount: nextTools.length}; }); recordGoalSubagentTool(id, event); break; }
       case 'subagent_end': { const id = value(event, 'id'); const ts = Number(event.ts || 0) * 1000 || Date.now(); const summary = value(event, 'summary'); update(id, x => x.kind === 'subagent' ? {...x, status: event.ok ? 'done' : 'failed', done: true, ok: Boolean(event.ok), end: ts, toolCount: Number(event.tools || x.toolCount || 0), elapsed: Number(event.elapsed || 0), summary} : x); recordGoalSubagentEnd(id, summary, Number(event.elapsed)); break; }
       case 'goal_started': {
         const snapshot = goalSnapshotFromEvent(event, goalSnapshot());
@@ -2783,9 +2145,19 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
         if (turnToolCount > 0 || turnFiles.length > 0) {
           // Fold the whole turn (thinking + tool calls) into a collapsible
           // summary block; clicking/Entering it expands the full transcript.
+          // 数据层 fold：本回合已完成的过程行物理并入 summary（锚定到最终回答之前）。
+          // 默认折叠：回合完成时过程行收成一行「已完成 N 项操作」，点击/Enter
+          // 展开步骤列表回看。
           const start = turnStart || Date.now();
           const end = Date.now();
-          add({id: `summary-${Date.now()}`, kind: 'summary', text: `已完成 ${turnToolCount} 项操作`, start, end, toolCount: turnToolCount, paths: turnFiles, tokens: {...turnTokens}, expanded: false});
+          const summary: Entry = {
+            id: `summary-${Date.now()}`, kind: 'summary',
+            text: `已完成 ${turnToolCount} 项操作`,
+            start, end, toolCount: turnToolCount,
+            paths: turnFiles, tokens: {...turnTokens},
+            expanded: false,
+          };
+          setEntries(prev => foldTurnIntoSummary(prev, summary));
         }
         }
         const durableGoalActive = goalIsActive(goalSnapshot());
@@ -2812,6 +2184,7 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
         const nextCwd = value(event, 'cwd');
         if (nextCwd) {
           setCwd(nextCwd);
+          refreshGitBranch(nextCwd);
           const nextHistory = loadHistory(nextCwd);
           setInputHistory(nextHistory);
           setHistoryIdx(-1);
@@ -2977,10 +2350,11 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
     if (current) {
       if (name === 'up') { setOverlayIndex(i => Math.max(0, i - 1)); event.preventDefault?.(); }
       else if (name === 'down') { setOverlayIndex(i => Math.min(current.options.length - 1, i + 1)); event.preventDefault?.(); }
-      else if (name === 'return' || name === 'enter') selectOverlay();
+      else if (name === 'return' || name === 'enter' || name === 'tab') { selectOverlay(); event.preventDefault?.(); }
       else if (name === 'escape') {
         if (current.kind === 'permission') send({type: 'permission_response', id: current.id, decision: 'deny'});
         setOverlay(null);
+        event.preventDefault?.();
       }
       return;
     }
@@ -3098,7 +2472,7 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
     // Slash commands are internal instructions; they must not appear in the
     // transcript. The backend also skips echoing them, so only their effect is
     // visible (toast / log / header state).
-    if (!isCommand) add({id: `prompt-${Date.now()}`, kind: 'prompt', text});
+    if (!isCommand) { collapseLastSummary(); add({id: `prompt-${Date.now()}`, kind: 'prompt', text}); }
     if (!isCommand) pendingPrompts.push(text);
     setUserStarted(true);
     const command = {type: 'user_message', text, goal_context: goalContext};
@@ -3147,7 +2521,8 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
     mode: mode(),
     effort: effortShortLabel(effortLabel(), effort()),
     spinner: spinner(),
-    outputTokens: turnOutputTokens(),
+    cwd: cwd() || repoRoot,
+    gitBranch: gitBranch() || undefined,
     tokensPerSecond: running() && startedAt() ? Math.round(turnOutputTokens() / Math.max(1, (now() - startedAt()) / 1000)) : 0,
     editorFullscreen: fullscreenEditor(),
   });
@@ -3162,7 +2537,7 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
   // Switch keeps the matched branch alive until the selection itself flips;
   // prop updates flow into the persistent view reactively.
   const mainContent = () => <Switch fallback={
-    <LogView entries={entries} now={now} tick={tick} width={dims().width} height={viewportHeight()} active={() => !hasActiveOverlay()} composerEmpty={() => !hasActiveOverlay() && input() === ''} focusId={focusId} onCycleFocus={cycleFocus} onToggleExpand={toggleExpand} onClearFocus={() => setFocusId(null)} staticRender={props?.debugEntries != null && props?.debugLiveMarkdown !== true} />
+    <LogView entries={displayedEntries} now={now} tick={tick} width={dims().width} height={viewportHeight()} active={() => !hasActiveOverlay()} composerEmpty={() => !hasActiveOverlay() && input() === ''} focusId={focusId} onCycleFocus={cycleFocus} onToggleExpand={toggleExpand} onClearFocus={() => setFocusId(null)} staticRender={props?.debugEntries != null && props?.debugLiveMarkdown !== true} />
   }>
     {/* Branch children stay one-arg functions: bun test runs solid-js's
         server build WITHOUT the OpenTUI transform, so plain JSX children of
@@ -3177,7 +2552,7 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
     </Match>
 
     <Match when={showGoalPage()}>
-      {(_matched: unknown) => <GoalView goal={goalSnapshot} decisions={goalDecisions} now={now} tick={tick} width={() => dims().width} height={() => dims().height} composerEmpty={() => !hasActiveOverlay() && input() === ''} />}
+      {(_matched: unknown) => <GoalView goal={goalSnapshot} decisions={goalDecisions} now={now} tick={tick} stageMarks={() => resolveDebugValue(props?.debugStageMarks) ?? undefined} width={() => dims().width} height={() => dims().height} mainRows={() => layout().mainRows} composerEmpty={() => !hasActiveOverlay() && input() === ''} />}
     </Match>
 
     <Match when={showDraftPage()}>
@@ -3234,7 +2609,7 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
         border
         borderStyle="rounded"
         borderColor={fullscreenEditor() ? C.primary : overlay()?.kind === 'permission' ? C.warning : running() ? C.info : C.textMuted}
-        backgroundColor="#111820"
+        backgroundColor={C.panel}
         flexDirection="column"
       >
         <box height={editorRows()} flexShrink={0} minWidth={0} flexDirection="row" paddingX={1}>

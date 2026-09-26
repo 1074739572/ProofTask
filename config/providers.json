@@ -28,5 +28,12 @@
     "type": "openai",
     "base_url": "https://tokenerpgw.asiainfo.com/erp/v1",
     "api_key_env": "asianinfo_API_KEY"
+  },
+  "stepfun": {
+    "label": "stepfun",
+    "type": "openai",
+    "base_url": "https://api.stepfun.com/step_plan/v1",
+    "api_key_env": "stepfun_API_KEY"
   }
+  
 }

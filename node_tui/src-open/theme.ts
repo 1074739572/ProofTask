@@ -3,10 +3,14 @@
 export const C = {
   primary: '#5ac8fa',
   secondary: '#9dd9ee',
-  accent: '#5ac8fa',
   // On a dark terminal this is roughly a 12% lift, matching Codex's user cell.
   userCard: '#20252b',
   userCardBorder: '#5ac8fa',
+  // Opaque panels that sit above the transcript canvas: popups/composer use
+  // panel, the footer strip uses panelRaised, inset groups (Todo) use panelInset.
+  panel: '#111820',
+  panelRaised: '#151b22',
+  panelInset: '#182028',
   error: '#ff6b6b',
   warning: '#e6b566',
   success: '#72d6a2',

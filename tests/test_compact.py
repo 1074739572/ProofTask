@@ -168,7 +168,10 @@ class TestCompactHistoryTail(unittest.TestCase):
                 ):
                     result = compact_history(messages)
 
-        self.assertEqual(result[0]["content"], "[Compacted]\n\nSUMMARY")
+        self.assertTrue(result[0]["content"].startswith("[Compacted]\n\nSUMMARY"))
+        self.assertIn("## Resume State", result[0]["content"])
+        self.assertIn("latest user", result[0]["content"])
+        self.assertIn("t.jsonl", result[0]["content"])
         self.assertEqual(len(result), 1 + COMPACT_TAIL_COUNT)
         self.assertIn(LATEST_USER_FOCUS_MARKER, result[-1]["content"])
         self.assertIn("latest user", result[-1]["content"])
@@ -234,6 +237,89 @@ class TestCompactHistoryTail(unittest.TestCase):
             {"role": "user", "content": "[Harness] continue the current goal"},
         ]
         self.assertEqual(find_latest_user_text(messages), "real ask")
+
+
+class TestCompactResumeState(unittest.TestCase):
+    """P4: compacted history carries deterministic resume state."""
+
+    def _run_compact(self, messages, summary="SUMMARY", degraded=False):
+        import harness.agent.compact.pipeline as pipeline
+        from harness.agent.compact.summarize import SUMMARY_UNUSABLE
+
+        with unittest.mock.patch.object(pipeline, "write_transcript", return_value=Path("t.jsonl")):
+            with unittest.mock.patch.object(
+                pipeline,
+                "summarize_history",
+                return_value=(SUMMARY_UNUSABLE if degraded else summary),
+            ):
+                with unittest.mock.patch(
+                    "harness.project.session_store.record_compact_boundary"
+                ):
+                    return compact_history(messages)
+
+    def test_resume_state_includes_todos_and_goal(self) -> None:
+        messages = [
+            {"role": "user", "content": "ship the permission fix"},
+            {"role": "assistant", "content": "working"},
+        ]
+        todos = [
+            {"content": "done step", "status": "completed"},
+            {"content": "pending step", "status": "pending"},
+            {"content": "active step", "status": "in_progress"},
+        ]
+        goal = unittest.mock.Mock(
+            id="g-1",
+            target="harden permissions",
+            status="running",
+            phase="execute",
+            current_task_id="task-3",
+            verification="pytest -q tests/test_permissions.py",
+        )
+        with unittest.mock.patch(
+            "harness.todos.state.get_todos", return_value=todos
+        ), unittest.mock.patch(
+            "harness.goal.store.load_goal", return_value=goal
+        ):
+            result = self._run_compact(messages)
+        head = result[0]["content"]
+        self.assertIn("Latest user request: ship the permission fix", head)
+        self.assertIn("pending step", head)
+        self.assertIn("active step", head)
+        self.assertNotIn("done step", head)
+        self.assertIn("Active Goal: g-1 — harden permissions", head)
+        self.assertIn("Current Task: task-3", head)
+        self.assertIn("Goal verification: pytest -q tests/test_permissions.py", head)
+        self.assertIn("t.jsonl", head)
+
+    def test_degraded_compact_still_carries_resume_state(self) -> None:
+        import harness.agent.compact.pipeline as pipeline
+        from harness.agent.compact.summarize import SUMMARY_UNUSABLE
+
+        messages = [{"role": "user", "content": f"turn {i}"} for i in range(30)]
+        messages.append({"role": "user", "content": "final instruction"})
+        with unittest.mock.patch.object(pipeline, "write_transcript", return_value=Path("t.jsonl")):
+            with unittest.mock.patch.object(
+                pipeline, "summarize_history", return_value=SUMMARY_UNUSABLE
+            ):
+                with unittest.mock.patch(
+                    "harness.project.session_store.record_compact_boundary"
+                ):
+                    result = compact_history(messages)
+        head = result[0]["content"]
+        self.assertIn("summary unavailable", head)
+        self.assertIn("## Resume State", head)
+        self.assertIn("final instruction", head)
+
+    def test_unavailable_stores_do_not_block_compact(self) -> None:
+        messages = [{"role": "user", "content": "keep going"}]
+        with unittest.mock.patch(
+            "harness.todos.state.get_todos", side_effect=RuntimeError("no store")
+        ), unittest.mock.patch(
+            "harness.goal.store.load_goal", side_effect=RuntimeError("no goal")
+        ):
+            result = self._run_compact(messages)
+        self.assertIn("## Resume State", result[0]["content"])
+        self.assertIn("keep going", result[0]["content"])
 
 
 class TestMicroCompactPersist(unittest.TestCase):

@@ -191,6 +191,9 @@ def permission_hook(block, session=None):
         )
     except Exception as exc:
         return hard_deny(f"Permission denied: permission engine unavailable ({exc})")
+    approval = getattr(decision, "approval", "normal")
+    if approval not in ("normal", "scoped", "action_time"):
+        approval = "normal"
     _safe_audit(
         {
             "event": "decision",
@@ -203,6 +206,7 @@ def permission_hook(block, session=None):
             "save_resource": decision.save_resource,
             "risk": risk or "goal",
             "mode": session_mode or "goal",
+            "approval": approval,
         }
     )
     if decision.effect == "deny":
@@ -363,7 +367,9 @@ def permission_hook(block, session=None):
                 detail=decision.resource or name,
                 title=f"Allow {name}?",
                 editable=name == "bash",
-                remember=True,
+                # Action-time confirmations are per-occurrence: offering to
+                # remember them would save a rule the engine never consults.
+                remember=approval != "action_time",
             )
     _safe_audit(
         {

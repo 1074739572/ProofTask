@@ -64,7 +64,7 @@ test('Goal 详情入口可通过鼠标切换，并在展开视图中独立呈现
   const expandedSetup = await createTestRenderer({width: 120, height: 36, exitOnCtrlC: false, consoleMode: 'disabled'});
   try {
     await render(() => <GoalDetails goal={goal} expanded={true} onToggle={() => {}} width={120} height={36} />, expandedSetup.renderer);
-    const expanded = await expandedSetup.waitForFrame(value => value.includes('TASK GRAPH'));
+    const expanded = await expandedSetup.waitForFrame(value => value.includes('任务明细'));
     assert.match(expanded, /DETAIL_CONTRACT/);
     assert.match(expanded, /DETAIL_VERIFICATION/);
     assert.match(expanded, /DETAIL_EVIDENCE/);

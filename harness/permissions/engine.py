@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from harness.permissions.config import PermissionEffect, PermissionRule, load_permission_rules
+from harness.permissions.execution import classify_bash_execution, has_wildcard
 from harness.permissions.state import SavedPermissionRule, load_persistent_rules, session_rules
 from harness.settings import WORKDIR, get_workdir
 
@@ -23,6 +24,12 @@ class PermissionDecision:
     save_resource: str = ""
     source: str = "config"
     external_resource: str | None = None
+    # ``normal``: ordinary decision; modes and scoped saved rules apply.
+    # ``scoped``: opaque execution; only an exact command-level authorization
+    # satisfies it, and session modes never auto-approve it.
+    # ``action_time``: irreversible action; every occurrence prompts, saved
+    # approvals are never consulted.
+    approval: str = "normal"
 
 
 @dataclass(frozen=True)
@@ -294,6 +301,75 @@ def evaluate_single_permission(
             external_resource=external_resource,
         )
 
+    exec_class = classify_bash_execution(resource) if tool_name == "bash" else "normal"
+
+    if exec_class == "action_time":
+        # Irreversible local deletion: every occurrence prompts. Saved
+        # approvals, broad config allows, and session modes (including
+        # full-access) never substitute for action-time confirmation.
+        return PermissionDecision(
+            effect="ask",
+            tool=tool_name,
+            resource=resource,
+            reason="irreversible local deletion requires action-time confirmation",
+            save_tool=tool_name,
+            save_resource=resource,
+            source="safety",
+            external_resource=external_resource,
+            approval="action_time",
+        )
+
+    if exec_class == "opaque":
+        # Opaque script/interpreter execution: a wildcard approval (`bash *`,
+        # `python *`) says nothing about what the script does, so only an
+        # exact command-level authorization can satisfy it.
+        if include_saved:
+            precise_rules = [
+                rule
+                for rule in [*session_rules(), *load_persistent_rules()]
+                if not has_wildcard(rule.tool) and not has_wildcard(rule.resource)
+            ]
+            saved_effect, saved_matched, saved_source = _evaluate_saved_rules(
+                tool_name, resource, precise_rules
+            )
+            if saved_effect == "allow":
+                return PermissionDecision(
+                    effect="allow",
+                    tool=tool_name,
+                    resource=resource,
+                    reason=f"matched exact authorization {saved_matched}",
+                    save_tool=tool_name,
+                    save_resource=resource,
+                    source=saved_source or "saved",
+                    external_resource=external_resource,
+                )
+        if (
+            config_effect == "allow"
+            and ":" in config_matched
+            and not has_wildcard(config_matched)
+        ):
+            return PermissionDecision(
+                effect="allow",
+                tool=tool_name,
+                resource=resource,
+                reason=f"matched exact config rule ({config_matched})",
+                save_tool=tool_name,
+                save_resource=resource,
+                source="config",
+                external_resource=external_resource,
+            )
+        return PermissionDecision(
+            effect="ask",
+            tool=tool_name,
+            resource=resource,
+            reason="opaque execution requires exact command authorization",
+            save_tool=tool_name,
+            save_resource=resource,
+            source="safety",
+            external_resource=external_resource,
+            approval="scoped",
+        )
+
     if include_saved:
         effect, matched, source = _evaluate_saved_rules(
             tool_name,
@@ -407,7 +483,11 @@ def evaluate_permission(
             ]
             worst_effect: PermissionEffect = "allow"
             worst_reason = ""
+            worst_approval = "normal"
+            approval_rank = {"normal": 0, "scoped": 1, "action_time": 2}
             for segment_decision in segment_decisions:
+                if approval_rank.get(segment_decision.approval, 0) > approval_rank.get(worst_approval, 0):
+                    worst_approval = segment_decision.approval
                 if segment_decision.effect == "deny":
                     worst_effect, worst_reason = "deny", segment_decision.reason
                     break
@@ -433,6 +513,7 @@ def evaluate_permission(
                 save_resource=ctx.resource,
                 source="safety",
                 external_resource=ctx.external_resource,
+                approval=worst_approval,
             )
     if ctx.external_resource:
         external_decision = evaluate_single_permission(

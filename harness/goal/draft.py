@@ -17,6 +17,7 @@ import hashlib
 import threading
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
+from functools import wraps
 from pathlib import Path
 from typing import Any, Callable
 
@@ -24,6 +25,7 @@ from harness.goal.language import detect_goal_language, human_language_label
 from harness.goal.planner import GoalPlan, GoalPlanningError, TaskPlan, discovery_readiness_error, plan_tasks, planning_error_requires_discovery
 from harness.settings import get_workdir
 from harness.verification import ALLOWED_PROGRAMS, VerificationContext, check_verification_command, select_adapter
+from harness.workspace_lock import WorkspaceMutationLock
 
 DRAFT_SCHEMA_VERSION = 6
 DRAFT_FILENAME = "goal-draft.json"
@@ -47,10 +49,48 @@ _PROJECT_MARKERS = frozenset(
 _PROJECT_EXCLUDED_DIRS = frozenset({".git", ".project", ".venv", "venv", "node_modules", "dist", "build", "coverage", ".worktrees"})
 _INTAKE_FORMAT_RETRY_TOKENS = 2_000
 _INTAKE_FORMAT_RETRY_EFFORT = "low"
+#: Maximum number of user clarification rounds. Intake runs against a
+#: possibly empty repository, where there is nothing to inspect and an
+#: unbounded intake model can keep inventing new questions forever. After this
+#: bound the remaining decisions are recorded as bounded assumptions so the
+#: Goal can reach Discovery instead of deadlocking the user.
+MAX_CLARIFICATION_ROUNDS = 3
+#: Prefix of the note appended to ``intake_summary`` when the round bound is hit.
+_CLARIFICATION_LIMIT_NOTE_EN = "Further clarification was skipped to avoid an unbounded question loop; remaining decisions were taken as bounded assumptions."
+_CLARIFICATION_LIMIT_NOTE_ZH = "为避免无限追问，已跳过后续澄清；剩余决定按有界假设处理。"
 
 
 class GoalDraftError(ValueError):
     pass
+
+
+def _exclusive_draft_operation(func):
+    """Prevent separate Harness processes from mutating one Draft at once."""
+    @wraps(func)
+    def wrapped(*args, **kwargs):
+        root = (kwargs.get("workspace") or get_workdir()).resolve()
+        lock = WorkspaceMutationLock(
+            root,
+            purpose=f"goal_draft_{func.__name__}",
+            lock_name="goal-draft-operation.lock",
+        )
+        if not lock.acquire():
+            owner = lock.path / "owner.json"
+            try:
+                payload = json.loads(owner.read_text(encoding="utf-8", errors="replace"))
+                owner_text = f"owner PID {int(payload.get('pid') or 0)}"
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                owner_text = "another live owner"
+            raise GoalDraftError(
+                f"Another Harness process is already operating this Goal draft ({owner_text}). "
+                "Stop the duplicate process or wait for the active operation to finish, then use /goal resume."
+            )
+        try:
+            return func(*args, **kwargs)
+        finally:
+            lock.release()
+
+    return wrapped
 
 
 @dataclass(frozen=True)
@@ -58,6 +98,12 @@ class GoalIntakeResult:
     questions: list[str]
     summary: str
     assumptions: list[str]
+    # Parallel arrays aligned with ``questions``. An empty list means the
+    # question is genuinely free-form; a non-empty list holds the enumerable
+    # choices the user may pick by number. ``question_defaults`` carries the
+    # bounded assumption applied when the user skips that question.
+    question_options: list[list[str]] = field(default_factory=list)
+    question_defaults: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -75,6 +121,10 @@ class GoalDraft:
     # as JSON keys, paths, commands, and selectors remain unchanged.
     language: str = "en"
     questions: list[str] = field(default_factory=list)
+    # Parallel to ``questions``: enumerable choices (empty list = free-form).
+    question_options: list[list[str]] = field(default_factory=list)
+    # Parallel to ``questions``: assumption applied when the user skips.
+    question_defaults: list[str] = field(default_factory=list)
     answers: list[str] = field(default_factory=list)
     intake_summary: str = ""
     intake_assumptions: list[str] = field(default_factory=list)
@@ -122,6 +172,8 @@ class GoalDraft:
             data.setdefault("planning_candidate", {})
             data.setdefault("planning_candidate_meta", {})
             data.setdefault("planning_stage", "compile")
+            data.setdefault("question_options", [])
+            data.setdefault("question_defaults", [])
             if version < 4:
                 data.setdefault("language", detect_goal_language(str(data.get("target") or "")))
             if version < 5:
@@ -136,6 +188,16 @@ class GoalDraft:
     @property
     def unanswered_question(self) -> str | None:
         return self.questions[len(self.answers)] if len(self.answers) < len(self.questions) else None
+
+    @property
+    def unanswered_options(self) -> list[str]:
+        idx = len(self.answers)
+        return self.question_options[idx] if idx < len(self.question_options) else []
+
+    @property
+    def unanswered_default(self) -> str:
+        idx = len(self.answers)
+        return self.question_defaults[idx] if idx < len(self.question_defaults) else ""
 
 
 def _project_dir(workspace: Path | None = None) -> Path:
@@ -266,6 +328,8 @@ def _draft_event_payload(draft: GoalDraft, *, event: str, message: str | None = 
         ],
         "last_error": (draft.last_error or "")[:2_000],
         "question": draft.unanswered_question or "",
+        "question_options": list(draft.unanswered_options),
+        "question_default": draft.unanswered_default,
         "question_index": len(draft.answers),
         "question_count": len(draft.questions),
         "task_count": len(draft.task_plan),
@@ -509,10 +573,36 @@ def _intake_from_raw(raw: str) -> GoalIntakeResult:
     if not isinstance(data, dict) or not isinstance(data.get("questions"), list):
         raise GoalDraftError("Goal intake returned invalid JSON: expected an object with a questions list")
     questions: list[str] = []
+    question_options: list[list[str]] = []
+    question_defaults: list[str] = []
     for item in data["questions"][:3]:
-        question = str(item).strip()[:500]
-        if question and question not in questions:
-            questions.append(question)
+        # Legacy protocol: a bare question string. New protocol: a dict with
+        # q / options / recommend / default_assumption. ``recommend`` is a
+        # 1-based hint for the model contract; it is validated here (an
+        # out-of-bounds or non-int value is ignored, i.e. no recommendation)
+        # but not persisted — only options and default_assumption are stored.
+        if isinstance(item, dict):
+            question = str(item.get("q") or "").strip()[:500]
+            raw_options = item.get("options")
+            if raw_options is not None and not isinstance(raw_options, list):
+                raise GoalDraftError("Goal intake returned invalid JSON: question options must be a list")
+            options: list[str] = []
+            seen: set[str] = set()
+            for opt in (raw_options or [])[:4]:
+                label = str(opt).strip()[:200]
+                if label and label not in seen:
+                    seen.add(label)
+                    options.append(label)
+            default = str(item.get("default_assumption") or "").strip()[:300]
+        else:
+            question = str(item).strip()[:500]
+            options = []
+            default = ""
+        if not question or question in questions:
+            continue
+        questions.append(question)
+        question_options.append(options)
+        question_defaults.append(default)
     summary = str(data.get("summary") or "").strip()[:1_000]
     assumptions: list[str] = []
     raw_assumptions = data.get("assumptions")
@@ -531,7 +621,13 @@ def _intake_from_raw(raw: str) -> GoalIntakeResult:
             if questions
             else "The requirement is clear enough to continue without clarification."
         )
-    return GoalIntakeResult(questions=questions, summary=summary, assumptions=assumptions)
+    return GoalIntakeResult(
+        questions=questions,
+        summary=summary,
+        assumptions=assumptions,
+        question_options=question_options,
+        question_defaults=question_defaults,
+    )
 
 
 def _run_strict_intake_retry(*, prompt: str, cwd: Path, deadline: float):
@@ -544,7 +640,9 @@ def _run_strict_intake_retry(*, prompt: str, cwd: Path, deadline: float):
         prompt=(
             prompt
             + "\n\nYour previous response was not parseable. Reply with ONLY one JSON object "
-            + '{"summary":"...","assumptions":[],"questions":["..."]}. '
+            + '{"summary":"...","assumptions":[],'
+            + '"questions":[{"q":"...","options":[],"recommend":0,'
+            + '"default_assumption":"..."}]}. '
             + "No markdown, explanation, or hidden reasoning-only answer."
         ),
         agent_type="goal_intake",
@@ -567,6 +665,8 @@ def _run_strict_intake_retry(*, prompt: str, cwd: Path, deadline: float):
 
 def _apply_intake_result(draft: GoalDraft, result: GoalIntakeResult) -> None:
     draft.questions = result.questions
+    draft.question_options = list(result.question_options)
+    draft.question_defaults = list(result.question_defaults)
     draft.intake_summary = result.summary
     draft.intake_assumptions = result.assumptions
 
@@ -580,7 +680,9 @@ def _append_followup_intake_result(draft: GoalDraft, result: GoalIntakeResult) -
     """Keep confirmed Q/A intact while adding only genuinely new questions."""
     known = {_question_key(question) for question in draft.questions}
     additions: list[str] = []
-    for question in result.questions:
+    addition_options: list[list[str]] = []
+    addition_defaults: list[str] = []
+    for index, question in enumerate(result.questions):
         key = _question_key(question)
         if not key or key in known:
             raise GoalDraftError(
@@ -589,12 +691,73 @@ def _append_followup_intake_result(draft: GoalDraft, result: GoalIntakeResult) -
             )
         known.add(key)
         additions.append(question)
+        addition_options.append(
+            list(result.question_options[index])
+            if index < len(result.question_options) else []
+        )
+        addition_defaults.append(
+            result.question_defaults[index]
+            if index < len(result.question_defaults) else ""
+        )
     draft.questions.extend(additions)
+    draft.question_options.extend(addition_options)
+    draft.question_defaults.extend(addition_defaults)
     if result.summary:
         draft.intake_summary = result.summary
     for assumption in result.assumptions:
         if assumption not in draft.intake_assumptions:
             draft.intake_assumptions.append(assumption)
+
+
+def _clarification_limit_note(draft: GoalDraft) -> str:
+    return _CLARIFICATION_LIMIT_NOTE_ZH if draft.language.startswith("zh") else _CLARIFICATION_LIMIT_NOTE_EN
+
+
+def clarification_round_exhausted(draft: GoalDraft) -> bool:
+    """Whether the user has answered the maximum number of clarification rounds.
+
+    The count is taken from answered questions, not from list length, so a
+    synthetic pending question (such as the missing-verification-command gate)
+    still consumes the round the user actually spent answering it.
+    """
+    return len(draft.answers) >= MAX_CLARIFICATION_ROUNDS
+
+
+def _record_clarification_limit(draft: GoalDraft) -> None:
+    """Close the remaining questions and document the bounded assumptions.
+
+    Reaching the bound is a normal outcome for a greenfield Goal: intake has
+    nothing to read, so it keeps producing speculative product questions. The
+    Goal must continue with recorded assumptions instead of deadlocking the
+    user in a clarification loop.
+    """
+    if draft.questions:
+        answered = len(draft.answers)
+        dropped = draft.questions[answered:]
+        if dropped:
+            # Surface the per-question default assumption when one was recorded;
+            # otherwise fall back to the question text itself.
+            pieces: list[str] = []
+            for offset, question in enumerate(dropped):
+                idx = answered + offset
+                default = (
+                    draft.question_defaults[idx]
+                    if idx < len(draft.question_defaults) and draft.question_defaults[idx]
+                    else ""
+                )
+                pieces.append(default or question[:200])
+            draft.intake_assumptions.append(
+                "Auto-assumed after the clarification round limit: "
+                + "; ".join(pieces)
+            )
+        # Keep the parallel arrays aligned with the answered prefix so that
+        # unanswered_options/unanswered_default report nothing past the bound.
+        draft.questions = draft.questions[:answered]
+        draft.question_options = draft.question_options[:answered]
+        draft.question_defaults = draft.question_defaults[:answered]
+    note = _clarification_limit_note(draft)
+    if note not in draft.intake_summary:
+        draft.intake_summary = (draft.intake_summary + " " + note).strip()
 
 
 def _collect_catalog(workspace: Path, verification: str):
@@ -702,7 +865,15 @@ def _intake_prompt(target: str, verification: str, catalog, *, clarifications: l
         f"{confirmed}\n"
         "Reply ONLY as JSON: "
         '{"summary":"how you understand the requested outcome",'
-        '"assumptions":["bounded assumption"],"questions":["short question"]}. '
+        '"assumptions":["bounded assumption"],'
+        '"questions":[{"q":"short question",'
+        '"options":["choice 1","choice 2"],"recommend":1,'
+        '"default_assumption":"what happens if the user does not answer"}]}. '
+        "Use options only when the answer space is a small enumerable set (2-4 choices); "
+        "set options to [] for genuinely free-form questions. "
+        "recommend is the 1-based index of the best default choice (omit or 0 when options is empty). "
+        "default_assumption states the bounded assumption applied if the user skips the question. "
+        "Write q/options/default_assumption in the user's language. "
         "Write the summary and questions in the user's language. Use an empty questions list when "
         "the requirement is sufficiently clear. Include only assumptions that materially constrain "
         "the result. Never propose implementation."
@@ -896,6 +1067,7 @@ def _planning_resume_stage(exc: Exception, draft: GoalDraft) -> str:
     return "planning"
 
 
+@_exclusive_draft_operation
 def create_draft(
     target: str,
     *,
@@ -1217,6 +1389,7 @@ def _run_plan_from_manifest(
         raise GoalDraftError(draft.last_error) from exc
 
 
+@_exclusive_draft_operation
 def answer_draft(
     answer: str,
     *,
@@ -1318,6 +1491,7 @@ def answer_draft(
     return draft
 
 
+@_exclusive_draft_operation
 def resume_draft(*, workspace: Path | None = None, planner_runner=None, discovery_runner=None) -> GoalDraft:
     root = (workspace or get_workdir()).resolve()
     draft = load_draft(root)
@@ -1512,8 +1686,24 @@ def format_draft(draft: GoalDraft) -> str:
     if draft.last_error:
         lines.append(f"  Last error: {draft.last_error[:200]}")
     if draft.unanswered_question:
-        lines.append(f"  Question: {draft.unanswered_question}")
-        lines.append("  Reply naturally in the TUI, or use: /goal answer <answer>")
+        total = len(draft.questions)
+        index = len(draft.answers) + 1
+        header = f"  Question {index}/{total}: {draft.unanswered_question}" if total > 1 else f"  Question: {draft.unanswered_question}"
+        lines.append(header)
+        options = draft.unanswered_options
+        if options:
+            for number, option in enumerate(options, start=1):
+                lines.append(f"    {number}. {option}")
+            suffix_parts = []
+            if draft.unanswered_default:
+                suffix_parts.append(f"不答则按: {draft.unanswered_default}")
+            suffix_parts.append("回复编号、选项文字或自然语言；或 /goal answer <answer>")
+            lines.append("    (" + "；".join(suffix_parts) + ")")
+        else:
+            reply = "  Reply naturally in the TUI, or use: /goal answer <answer>"
+            if draft.unanswered_default:
+                reply += f"  (不答则按: {draft.unanswered_default})"
+            lines.append(reply)
     for index, plan in enumerate(draft.task_plan, start=1):
         spec = plan.get("verification_spec") or {}
         source = spec.get("source", "needs_generation")

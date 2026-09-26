@@ -112,6 +112,18 @@ def test_greenfield_maven_plan_rejects_broad_first_business_task():
     assert "at most two" in error
 
 
+def test_greenfield_maven_plan_rejects_scaffold_as_the_complete_goal():
+    plan, error = _parse_plan_result(
+        _contract([_scaffold()]),
+        test_catalog=MavenTestCatalog((), ()),
+        discovery_manifest=_manifest(),
+        verification_adapter=MavenTestAdapter(),
+    )
+
+    assert plan is None
+    assert "cannot contain only its scaffold Task" in error
+
+
 def test_greenfield_new_source_requires_planner_approved_api():
     behavior = {
         **_scaffold(),

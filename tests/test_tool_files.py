@@ -1,5 +1,11 @@
 """File tools: read_file / write_file / edit_file / glob behavior."""
 
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
 import pytest
 
 from harness.tools.filesystem import (
@@ -58,6 +64,50 @@ def test_bash_reports_nonzero_exit_code(tmp_path):
     command = "cmd /c exit 7" if __import__("sys").platform == "win32" else "sh -c 'exit 7'"
     out = run_bash(command, cwd=tmp_path)
     assert out.startswith("[exit_code=7]")
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows Job Object semantics")
+def test_bash_survivor_outlives_tool_call(tmp_path):
+    """A process the command intentionally leaves behind (`start /b`) must
+    survive the tool call; it is reaped only when the harness exits."""
+    # Absolute path: this machine's PATH can exceed cmd.exe's 8191-char
+    # lookup limit, which makes plain `ping` unresolvable inside cmd.
+    ping = Path(os.environ["WINDIR"]) / "System32" / "PING.EXE"
+    marker = tmp_path / "survivor.txt"
+    command = f'start /b "" cmd /c "{ping} -n 12 127.0.0.1 > {marker}"'
+    try:
+        out = run_bash(command, cwd=tmp_path)
+        assert out.startswith("[exit_code=0]")
+        time.sleep(2.5)
+        first = marker.stat().st_size if marker.exists() else 0
+        assert first > 0, "background process produced no output"
+        time.sleep(2.5)
+        second = marker.stat().st_size
+        assert second > first, "survivor was killed when the tool call returned"
+    finally:
+        subprocess.run(["taskkill", "/F", "/IM", "ping.exe"], capture_output=True)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows Job Object semantics")
+def test_bash_timeout_kills_grandchildren(tmp_path):
+    """Timeout must still terminate the whole tree, including grandchildren
+    spawned via `start /b`, without touching other session members."""
+    ping = Path(os.environ["WINDIR"]) / "System32" / "PING.EXE"
+    marker = tmp_path / "grandchild.txt"
+    command = (
+        f'start /b "" cmd /c "{ping} -n 25 127.0.0.1 > {marker}"'
+        f" & {ping} -n 25 127.0.0.1 > nul"
+    )
+    try:
+        out = run_bash(command, cwd=tmp_path, timeout=3_000)
+        assert out.startswith("Error: Timeout")
+        assert marker.exists() and marker.stat().st_size > 0
+        time.sleep(2.5)
+        frozen = marker.stat().st_size
+        time.sleep(2.5)
+        assert marker.stat().st_size == frozen, "grandchild kept running after timeout kill"
+    finally:
+        subprocess.run(["taskkill", "/F", "/IM", "ping.exe"], capture_output=True)
 
 
 def test_read_directory_rejected(tmp_path):

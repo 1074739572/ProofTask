@@ -299,7 +299,7 @@ export function footerHint(state: FooterState): string {
       : ` (exit code ${state.backendExitCode})`;
     return `Backend unavailable${code} · Enter retry · Ctrl+R reconnect`;
   }
-  if (state.permissionWait) return 'Permission approval required · choose Allow or Deny · Esc cancel';
+  if (state.permissionWait) return 'Permission approval required · choose Allow or Deny · Esc deny';
   if (state.completionOpen) return '↑↓ select · Tab/Enter apply · Esc close';
   if (state.toast && !state.running) return state.toast;
   if (state.historySearch?.open) return `History search: ${state.historySearch.matches} matches | Up/Down choose | Enter apply | Esc cancel`;

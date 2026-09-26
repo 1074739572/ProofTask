@@ -4,7 +4,7 @@ export type EntryKind = 'prompt' | 'response' | 'action' | 'blocked' | 'files' |
 export type SubagentStatus = 'running' | 'done' | 'failed';
 export type SubagentToolRow = {id: string; name: string; summary: string; status: SubagentStatus};
 export type TokenUsage = {inp: number; out: number; cache: number; outputKnown?: boolean};
-export type Entry = {id: string; kind: EntryKind; text: string; detail?: string; done?: boolean; ok?: boolean; start?: number; end?: number; output?: string[]; expanded?: boolean; streaming?: boolean; toolCount?: number; count?: number; calls?: ActionCall[]; paths?: string[]; tasks?: TodoItem[]; tokens?: TokenUsage; agentType?: string; model?: string; status?: SubagentStatus; rounds?: string[]; tools?: SubagentToolRow[]; summary?: string; elapsed?: number};
+export type Entry = {id: string; kind: EntryKind; text: string; detail?: string; done?: boolean; ok?: boolean; start?: number; end?: number; output?: string[]; expanded?: boolean; streaming?: boolean; toolCount?: number; count?: number; calls?: ActionCall[]; paths?: string[]; tasks?: TodoItem[]; tokens?: TokenUsage; agentType?: string; model?: string; status?: SubagentStatus; rounds?: string[]; tools?: SubagentToolRow[]; summary?: string; elapsed?: number; folded?: Entry[]};
 // One recorded invocation inside a merged action row. Consecutive same-name
 // calls collapse into a single live row ("Called N times", Claude Code style),
 // but each call keeps its own summary/timing/output so the expanded turn summary
@@ -65,7 +65,9 @@ export function buildSections(entries: Entry[]): Section[] {
     switch (entry.kind) {
       case 'action': {
         flushFiles();
-        const row: ActionRow = {id: entry.id, name: entry.text, summary: entry.detail || '', done: Boolean(entry.done), ok: Boolean(entry.ok), start: entry.start, end: entry.end, output: entry.output, expanded: entry.expanded};
+        // 工具名显示层转换：read_file → read file；合并判断基于转换后的
+        // name，转换是确定性的，同名合并语义不变。
+        const row: ActionRow = {id: entry.id, name: String(entry.text || 'action').replace(/_/g, ' '), summary: entry.detail || '', done: Boolean(entry.done), ok: Boolean(entry.ok), start: entry.start, end: entry.end, output: entry.output, expanded: entry.expanded};
         const call: ActionCall = {summary: row.summary, start: row.start, end: row.end, done: row.done, ok: row.ok, output: row.output};
         // Collapse consecutive same-name calls into one row ("Called N times"),
         // matching Claude Code's dedup behaviour for repeated tool calls. Each
@@ -152,4 +154,49 @@ export function buildSections(entries: Entry[]): Section[] {
     });
   }
   return out;
+}
+
+// 数据层 fold：agent_end 时把本回合已完成的过程行（thinking/tool/subagent）
+// 物理并入回合总结，锚定到最终回答之前。仍在运行的 subagent 保持独立行以
+// 继续接收 live 更新；files 行的路径已并入 summary.paths，不再单独成步。
+// 展开状态由调用方设置（当前契约为默认折叠）：回合完成时过程行从独立行
+// 收成总结的一行，点击/Enter 展开后以步骤列表回看。
+export function foldTurnIntoSummary(entries: readonly Entry[], summary: Entry): Entry[] {
+  let boundary = -1;
+  for (let i = entries.length - 1; i >= 0; i--) {
+    if (entries[i].kind === 'prompt') { boundary = i; break; }
+  }
+  const folded: Entry[] = [];
+  // boundary 之前的元素全部保留，索引在 filter 后对 prompt 仍成立。
+  const remaining = entries.filter((entry, index) => {
+    if (index <= boundary) return true;
+    const foldable = (entry.kind === 'action' && entry.done)
+      || entry.kind === 'intent'
+      || entry.kind === 'files'
+      || (entry.kind === 'subagent' && entry.status !== 'running');
+    if (foldable && entry.kind !== 'files') folded.push(entry);
+    return !foldable;
+  });
+  // 锚定到最终回答（边界后最后一个 response）之前；无回答时追加末尾。
+  let anchor = remaining.length;
+  for (let i = remaining.length - 1; i > boundary; i--) {
+    if (remaining[i].kind === 'response') { anchor = i; break; }
+  }
+  const next = [...remaining];
+  next.splice(anchor, 0, {...summary, folded});
+  return next;
+}
+
+// 新回合 prompt 到来时收起上一回合的总结：总结默认折叠，这里处理的是用户在
+// 回合间隙手动展开了它的情形。只动最后一个 summary，且仅在它处于展开状态时。
+export function collapseLatestSummary(entries: readonly Entry[]): Entry[] {
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const entry = entries[i];
+    if (entry.kind !== 'summary') continue;
+    if (!entry.expanded) return [...entries];
+    const next = [...entries];
+    next[i] = {...entry, expanded: false};
+    return next;
+  }
+  return [...entries];
 }

@@ -1,1 +1,0 @@
-Error: Agent 'explore' references unknown model 'mimo-v2.5-pro'. Add it to config/models.json before using this agent.

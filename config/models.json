@@ -1,5 +1,5 @@
 {
-  "default": "deepseek-v4-flash",
+  "default": "mimo-v2.6-flash",
   "models": [
     {
       "id": "deepseek-v4-flash",
@@ -11,17 +11,34 @@
       "effort_options": ["low", "high", "max"]
     },
     {
-      "id": "mimo-v2.5",
+      "id": "mimo-v2.6-pro",
       "provider": "xiaomi-mimo",
-      "label": "Xiaomi MiMo V2.5 (long-context explorer)",
-      "api_model": "mimo-v2.5",
+      "label": "mimo-v2.6-pro (long-context explorer)",
+      "api_model": "mimo-v2.6-pro",
       "context_window": 1000000
+    },
+    {
+      "id": "mimo-v2.6-flash",
+      "provider": "xiaomi-mimo",
+      "label": "mimo-v2.6-flash (long-context explorer)",
+      "api_model": "mimo-v2.6-flash",
+      "context_window": 1000000,
+      "effort_options": ["low", "medium", "high"]
     },
     {
       "id": "gpt-5.6-sol",
       "provider": "aijws",
       "label": "GPT-5.6 sol",
       "api_model": "gpt-5.6-sol",
+      "context_window": 1000000,
+      "reasoning_effort": "high",
+      "effort_options": ["medium", "high", "xhigh", "max"]
+    },
+    {
+      "id": "gpt-6-sol",
+      "provider": "aijws",
+      "label": "GPT-6 sol",
+      "api_model": "gpt-6-sol",
       "context_window": 1000000,
       "reasoning_effort": "high",
       "effort_options": ["medium", "high", "xhigh", "max"]
@@ -41,6 +58,23 @@
       "api_model": "xiyu/minimax-m3",
       "context_window": 1000000,
       "effort_options": ["medium", "high", "xhigh", "max"]
+    },
+    {
+      "id": "step-5-preview",
+      "provider": "stepfun",
+      "label": "step-5-preview",
+      "api_model": "step-5-preview",
+      "context_window": 1000000,
+      "effort_options": ["medium", "high", "xhigh", "max"]
+    },
+    {
+      "id": "step-3.7-flash",
+      "provider": "stepfun",
+      "label": "step-3.7-flash",
+      "api_model": "step-3.7-flash",
+      "context_window": 1000000,
+      "reasoning_effort": "medium",
+      "effort_options": ["low", "medium", "high"]
     }
   ]
 }

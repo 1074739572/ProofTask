@@ -62,12 +62,12 @@ test('narrow status line keeps activity and queue visible in compact form', () =
     width: 80, backend: 'connected', running: true, phase: 'working', elapsed: '12s',
     currentTool: 'read_file', toolsDone: 2, toolsTotal: 5, queuedMessages: 2,
     pending: 2, permissionWait: false, completionOpen: false, composerLines: 1,
-    contextUsed: 8000, contextWindow: 16000, contextUsage: 0.5, permissionPrompt: null,
+    contextUsed: 8000, contextWindow: 16000, contextUsage: 0.5,
   });
-  assert.match(text, /working/);
+  assert.match(text, /实现中/);
   assert.match(text, /read_file/);
-  assert.match(text, /q2/);
-  assert.match(text, /Enter queue/);
+  assert.match(text, /队列 2/);
+  assert.match(text, /Enter 排队/);
 });
 
 test('running status line keeps decode rate while the meter stays in the identity row', () => {
@@ -76,7 +76,7 @@ test('running status line keeps decode rate while the meter stays in the identit
     currentTool: 'read_file', toolsDone: 1, toolsTotal: 2, queuedMessages: 0,
     pending: 0, permissionWait: false, completionOpen: false, composerLines: 1,
     contextUsed: 13100, contextWindow: 16000, contextUsage: 13100 / 16000,
-    permissionPrompt: null, tokensPerSecond: 35,
+    tokensPerSecond: 35,
   });
   // Single context meter only: the transient row must not repeat it.
   assert.doesNotMatch(text, /ctx/);
@@ -136,7 +136,7 @@ test('full-screen draft footer exposes an unambiguous exit hint', () => {
     width: 120, backend: 'connected', running: false, phase: 'idle', elapsed: '0s',
     currentTool: undefined, toolsDone: 0, toolsTotal: 0, queuedMessages: 0,
     pending: 0, permissionWait: false, completionOpen: false, composerLines: 1,
-    contextUsed: 0, contextWindow: 0, contextUsage: 0, permissionPrompt: null,
+    contextUsed: 0, contextWindow: 0, contextUsage: 0,
     editorFullscreen: true,
   });
   assert.match(text, /full-screen draft/);

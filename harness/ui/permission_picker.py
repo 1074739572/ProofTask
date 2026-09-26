@@ -8,7 +8,7 @@ from harness.ui.terminal_menu import is_interactive_tty, select_from_list
 
 _LABELS = {
     "default": "默认权限（低风险自动放行）",
-    "auto-review": "自动审查（低、中风险自动放行）",
+    "auto-review": "按风险自动放行（低、中风险）",
     "full-access": "完全访问（低、中、高风险自动放行）",
 }
 

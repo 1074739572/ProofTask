@@ -1,3 +1,5 @@
+import {createEffect, createSignal} from 'solid-js';
+
 export type GoalAcceptanceCase = {id?: string; given?: string; when?: string; then?: string};
 
 export type GoalEvidence = {
@@ -192,6 +194,8 @@ export type GoalDraftSnapshot = {
   planning_review?: {approved?: boolean; summary?: string; findings?: unknown[]};
   clarifications: GoalClarification[];
   question?: string;
+  question_options?: string[];
+  question_default?: string;
   question_index: number;
   question_count: number;
   task_count: number;
@@ -209,15 +213,62 @@ const ACTIVE_GOAL_STATUSES = new Set(['running', 'pausing', 'cancelling']);
 const BUSY_DRAFT_STAGES = new Set(['preflight', 'catalog', 'intake', 'discovering', 'planning']);
 const TERMINAL_DRAFT_STATUSES = new Set(['paused', 'ready', 'approved', 'cancelled', 'failed', 'consumed']);
 
+export type StageMark = {phase: string; at: number};
+
+const STAGE_ALIASES: Record<string, string> = {
+  initialize: 'intake',
+  catalog: 'prepare_tests',
+  preflight: 'prepare_tests',
+  working: 'act',
+  select_task: 'act',
+  prepare_execution: 'act',
+  claim: 'act',
+  rollover: 'act',
+  repair_plan: 'act',
+  verification: 'verify',
+  evaluate: 'verify',
+  clean_check: 'verify',
+  impact_review: 'verify',
+  full_verify: 'verify',
+  done: 'completed',
+};
+
+/** 归一化后端阶段名到展示轨道键（intake/prepare_tests/planning/discovering/act/verify/completed）。
+ * 阶段时钟按轨道键聚合耗时，执行期的小阶段（select_task/claim/rollover 等）计入「实现」。 */
+export function normalizeGoalStage(raw: string): string {
+  return STAGE_ALIASES[raw] || raw;
+}
+
+/** 阶段耗时的紧凑显示：12s / 3m / 1h05m。 */
+export function formatStageElapsed(seconds: number): string {
+  if (seconds < 60) return `${seconds}s`;
+  if (seconds < 3600) return `${Math.round(seconds / 60)}m`;
+  return `${Math.floor(seconds / 3600)}h${String(Math.round((seconds % 3600) / 60)).padStart(2, '0')}m`;
+}
+
+export function goalPhaseOf(goal: GoalSnapshot | GoalDraftSnapshot | null | undefined): string {
+  if (!goal) return '';
+  const raw = 'phase' in goal ? goal.phase : goal.stage;
+  return String(raw || '');
+}
+
 /**
- * 归一化 GoalDetails 的会话级展开意图。
- *
- * 缺省意图始终回到折叠；只有显式的 `toggle` 才读取当前会话值并翻转。
- * 该谓词不接触 GoalSnapshot，也不执行任何持久化操作，因此调用方可以安全地
- * 将返回值放入会话级状态，而不会写回用户或默认配置。
+ * 客户端阶段时钟：phase 每次变化记录一次时间戳（追加式）。
+ * 阶段耗时 = 本段起点到下一段起点（当前阶段则为到现在）。
+ * 只反映本次会话内观察到的切换；跨会话恢复不含历史阶段耗时。
  */
-export function goalDetailsExpanded(currentExpanded: boolean, intent?: 'toggle'): boolean {
-  return intent === 'toggle' ? !currentExpanded : false;
+export function createStageClock(phase: () => string): () => StageMark[] {
+  const [marks, setMarks] = createSignal<StageMark[]>([]);
+  createEffect(() => {
+    const current = phase();
+    if (!current) return;
+    setMarks(previous => {
+      const last = previous[previous.length - 1];
+      if (last && last.phase === current) return previous;
+      return [...previous, {phase: current, at: Date.now()}];
+    });
+  });
+  return marks;
 }
 
 function has(object: any, key: string): boolean {
@@ -481,6 +532,10 @@ export function goalDraftSnapshotFromEvent(event: any, current: GoalDraftSnapsho
     intake_assumptions: assumptions,
     clarifications,
     question: has(event, 'question') ? stringValue(event.question) : base?.question,
+    question_options: has(event, 'question_options') && Array.isArray(event.question_options)
+      ? event.question_options.map(stringValue).filter(Boolean)
+      : base?.question_options,
+    question_default: has(event, 'question_default') ? stringValue(event.question_default) : base?.question_default,
     question_index: has(event, 'question_index') ? finiteNumber(event.question_index) : (base?.question_index ?? 0),
     question_count: has(event, 'question_count') ? finiteNumber(event.question_count) : (base?.question_count ?? 0),
     task_count: has(event, 'task_count') ? finiteNumber(event.task_count) : (base?.task_count ?? 0),

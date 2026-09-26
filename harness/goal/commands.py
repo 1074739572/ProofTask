@@ -431,6 +431,17 @@ def _handle_approve(runner, history: list, context: dict, binding: Any) -> str:
         return note
     try:
         state = runner.start_goal(request, history=history, context=context, binding=binding)
+    except runner.GoalBusyError as exc:
+        note = (
+            f"Cannot start the ready Goal draft because an earlier Goal is still active: {exc}\n"
+            "The new draft remains ready. To replace the earlier Goal, run /goal cancel, then /goal approve. "
+            "To continue the earlier Goal instead, run /goal resume."
+        )
+        mark_draft_start_failed(note)
+        # Return the conflict as ordinary command output. Re-raising here can
+        # make event-stream clients show no response even though the durable
+        # Draft correctly returned to ``ready``.
+        return note
     except BaseException as exc:
         mark_draft_start_failed(f"Goal start failed: {type(exc).__name__}: {exc}")
         raise

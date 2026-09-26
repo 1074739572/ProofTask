@@ -10,14 +10,39 @@ import {
   goalDraftStageRail,
   goalDraftSnapshotFromEvent,
   goalEventShouldFocus,
-  goalNextActionPresentation,
+  goalPhaseOf,
   goalSnapshotFromEvent,
+  formatStageElapsed,
   mergeGoalDiscoveryEvent,
   mergeGoalDraftAgentEvent,
   mergeGoalSupervisorEvent,
+  normalizeGoalStage,
   type GoalDraftSnapshot,
   type GoalSnapshot,
 } from '../src-open/GoalView.tsx';
+
+test('normalizeGoalStage 将后端阶段别名映射到展示轨道键', () => {
+  assert.equal(normalizeGoalStage('catalog'), 'prepare_tests');
+  assert.equal(normalizeGoalStage('preflight'), 'prepare_tests');
+  assert.equal(normalizeGoalStage('working'), 'act');
+  assert.equal(normalizeGoalStage('verification'), 'verify');
+  assert.equal(normalizeGoalStage('act'), 'act');
+  assert.equal(normalizeGoalStage('unknown_phase'), 'unknown_phase');
+});
+
+test('formatStageElapsed 输出紧凑的阶段耗时', () => {
+  assert.equal(formatStageElapsed(0), '0s');
+  assert.equal(formatStageElapsed(59), '59s');
+  assert.equal(formatStageElapsed(90), '2m');
+  assert.equal(formatStageElapsed(3600), '1h00m');
+  assert.equal(formatStageElapsed(7500), '2h05m');
+});
+
+test('goalPhaseOf 分别读取运行快照与草稿的阶段', () => {
+  assert.equal(goalPhaseOf(goal({phase: 'verify'})), 'verify');
+  assert.equal(goalPhaseOf(draft({stage: 'discovering'})), 'discovering');
+  assert.equal(goalPhaseOf(null), '');
+});
 
 function draft(overrides: Partial<GoalDraftSnapshot> = {}): GoalDraftSnapshot {
   return {
@@ -210,11 +235,4 @@ test('supervisor startup failure is visible without changing Goal execution stat
   assert.equal(next.status, 'running');
   assert.equal(next.supervision?.status, 'unavailable');
   assert.equal(next.supervision?.error, 'provider route is unavailable');
-});
-
-test('paused stop reasons expose actionable commands', () => {
-  assert.equal(goalNextActionPresentation(goal({status: 'paused', stop_reason: 'user_approval_required'})).command, '/goal run');
-  assert.match(goalNextActionPresentation(goal({status: 'paused', stop_reason: 'permission_wait'})).command, /resume/);
-  assert.equal(goalNextActionPresentation(goal({status: 'paused', stop_reason: 'task_failed'})).command, '/goal resume');
-  assert.equal(goalNextActionPresentation(goal({status: 'done'})).command, '开始新的 /goal');
 });

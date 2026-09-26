@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 
 from harness.agent.compact.layers import keep_tail, snip_compact
-from harness.agent.compact.messages import ensure_latest_user_focus
+from harness.agent.compact.messages import ensure_latest_user_focus, find_latest_user_text
 from harness.agent.compact.sizing import (
     estimate_size,
     estimate_tokens,
@@ -15,6 +15,51 @@ from harness.agent.compact.sizing import (
 )
 from harness.agent.compact.summarize import is_summary_unusable, summarize_history
 from harness.settings import TRANSCRIPT_DIR, compact_tail_count
+
+
+def collect_resume_state(messages: list, transcript: Path) -> str:
+    """Deterministic resume state for compacted history.
+
+    The summary model must not have to guess these fields; they come from
+    runtime state (latest user request, session todos, active Goal/Task and
+    its bound verification) plus the transcript path. Each source is
+    best-effort — an unavailable store never blocks compaction.
+    """
+    lines = [
+        "## Resume State (deterministic — trust over the summary above)",
+    ]
+    latest = find_latest_user_text(messages)
+    if latest:
+        lines.append(f"- Latest user request: {latest}")
+    try:
+        from harness.todos.state import get_todos
+
+        pending = [
+            todo for todo in get_todos() if todo.get("status") != "completed"
+        ]
+        if pending:
+            lines.append("- Session todos (unfinished):")
+            for todo in pending[:10]:
+                lines.append(f"  - [{todo.get('status', '?')}] {todo.get('content', '')}")
+    except Exception:
+        pass
+    try:
+        from harness.goal.store import load_goal
+
+        state = load_goal()
+        if state is not None:
+            lines.append(
+                f"- Active Goal: {state.id} — {state.target} "
+                f"(status={state.status}, phase={state.phase})"
+            )
+            if state.current_task_id:
+                lines.append(f"- Current Task: {state.current_task_id}")
+            if state.verification:
+                lines.append(f"- Goal verification: {state.verification}")
+    except Exception:
+        pass
+    lines.append(f"- Full pre-compact transcript: {transcript}")
+    return "\n".join(lines)
 
 
 def write_transcript(messages: list) -> Path:
@@ -28,16 +73,16 @@ def write_transcript(messages: list) -> Path:
     return path
 
 
-def _build_compacted(label: str, summary: str, messages: list) -> list:
+def _build_compacted(label: str, summary: str, messages: list, transcript: Path) -> list:
     tail = keep_tail(messages, count=compact_tail_count())
     compacted = [
-        {"role": "user", "content": f"[{label}]\n\n{summary}"},
+        {"role": "user", "content": f"[{label}]\n\n{summary}\n\n{collect_resume_state(messages, transcript)}"},
         *tail,
     ]
     return ensure_latest_user_focus(compacted, messages)
 
 
-def _degraded_compact(label: str, messages: list) -> list:
+def _degraded_compact(label: str, messages: list, transcript: Path) -> list:
     """When LLM summary is empty/unusable: keep recent turns, never empty summary.
 
     Prefer a lossy snip + tail over ``(empty summary)`` amnesia (GAIA Pie Menus /
@@ -52,8 +97,9 @@ def _degraded_compact(label: str, messages: list) -> list:
         "kept instead — do NOT assume prior facts were verified; re-read the "
         "retained tool results / user question before answering or searching again."
     )
+    head = f"{notice}\n\n{collect_resume_state(messages, transcript)}"
     return ensure_latest_user_focus(
-        [{"role": "user", "content": notice}, *keep_tail(reduced, count=compact_tail_count())],
+        [{"role": "user", "content": head}, *keep_tail(reduced, count=compact_tail_count())],
         messages,
     )
 
@@ -72,9 +118,9 @@ def compact_history(messages: list, *, binding=None) -> list:
                 "  \033[33m[compact] summary unusable — keeping recent "
                 "messages (no empty summary)\033[0m"
             )
-        compacted = _degraded_compact("Compacted — summary unavailable", messages)
+        compacted = _degraded_compact("Compacted — summary unavailable", messages, transcript)
     else:
-        compacted = _build_compacted("Compacted", summary, messages)
+        compacted = _build_compacted("Compacted", summary, messages, transcript)
     if binding is not None:
         record_compact_boundary("auto", estimate_size(messages), transcript, compacted, binding=binding)
     return compacted
@@ -94,9 +140,9 @@ def reactive_compact(messages: list, *, binding=None) -> list:
                 "  \033[33m[reactive compact] summary unusable — keeping "
                 "recent messages\033[0m"
             )
-        compacted = _degraded_compact("Reactive compact — summary unavailable", messages)
+        compacted = _degraded_compact("Reactive compact — summary unavailable", messages, transcript)
     else:
-        compacted = _build_compacted("Reactive compact", summary, messages)
+        compacted = _build_compacted("Reactive compact", summary, messages, transcript)
     if binding is not None:
         record_compact_boundary("reactive", estimate_size(messages), transcript, compacted, binding=binding)
     return compacted

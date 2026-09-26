@@ -47,15 +47,8 @@ def _timeout_seconds(timeout: int | None) -> float:
     return max(1.0, min(MAX_BASH_TIMEOUT_MS, value) / 1000.0)
 
 
-def _assign_windows_job(process: subprocess.Popen):
-    """Windows: place the child in a kill-on-close Job Object.
-
-    `taskkill /T` is unreliable for grandchildren (cmd -> python -> child),
-    which is exactly the orphan-process problem observed in practice. A Job
-    Object with JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE guarantees the whole tree
-    dies with the shell. Returns the job handle, or None if unavailable
-    (e.g. nested-job restrictions), in which case callers fall back to
-    taskkill."""
+def _create_job_object(kill_on_close: bool, breakaway_ok: bool = False):
+    """Windows: create a Job Object handle, or None if unavailable."""
     if sys.platform != "win32":
         return None
 
@@ -93,19 +86,20 @@ def _assign_windows_job(process: subprocess.Popen):
         ]
 
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
+    JOB_OBJECT_LIMIT_BREAKAWAY_OK = 0x0800
     kernel32 = ctypes.windll.kernel32
     try:
         job = kernel32.CreateJobObjectW(None, None)
         if not job:
             return None
         info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
-        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if kill_on_close:
+            info.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if breakaway_ok:
+            info.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_BREAKAWAY_OK
         if not kernel32.SetInformationJobObject(
             job, 9, ctypes.byref(info), ctypes.sizeof(info)
         ):
-            kernel32.CloseHandle(job)
-            return None
-        if not kernel32.AssignProcessToJobObject(job, int(process._handle)):
             kernel32.CloseHandle(job)
             return None
         return job
@@ -115,6 +109,82 @@ def _assign_windows_job(process: subprocess.Popen):
         except Exception:
             pass
         return None
+
+
+def _assign_process_to_job(job, process: subprocess.Popen) -> bool:
+    if sys.platform != "win32" or not job:
+        return False
+    try:
+        return bool(
+            ctypes.windll.kernel32.AssignProcessToJobObject(job, int(process._handle))
+        )
+    except Exception:
+        return False
+
+
+_SESSION_JOB = None
+_SESSION_JOB_LOCK = threading.Lock()
+
+
+def _session_job():
+    """Process-wide kill-on-close Job Object shared by every bash child.
+
+    Members die with the harness process itself: the OS closes the last job
+    handle on process exit (including hard kills) and the kernel reaps the
+    whole tree. Per-tool-call kill-on-close jobs killed any process a
+    command intentionally left behind (dev servers, `start ...` windows,
+    background tasks) the moment the tool call returned; the session job
+    gives them Claude-Code-style lifetime: alive after the tool call,
+    reaped when the agent exits. BREAKAWAY_OK lets a member spawn children
+    with CREATE_BREAKAWAY_FROM_JOB (installers and bootstrappers do this);
+    without it their CreateProcess fails with access denied. A failed
+    creation is cached as 0 so it is retried at most once per process."""
+    global _SESSION_JOB
+    if sys.platform != "win32":
+        return None
+    if _SESSION_JOB is None:
+        with _SESSION_JOB_LOCK:
+            if _SESSION_JOB is None:
+                _SESSION_JOB = _create_job_object(
+                    kill_on_close=True, breakaway_ok=True
+                ) or 0
+                if not _SESSION_JOB:
+                    print(
+                        "[bash] session job object unavailable; falling back "
+                        "to per-call kill-on-close (background processes die "
+                        "with the tool call)",
+                        file=sys.stderr,
+                    )
+    return _SESSION_JOB or None
+
+
+def _assign_windows_job(
+    process: subprocess.Popen,
+    *,
+    kill_on_close: bool = True,
+    breakaway_ok: bool = False,
+):
+    """Windows: place the child in a fresh Job Object and return its handle.
+
+    `taskkill /T` is unreliable for grandchildren (cmd -> python -> child),
+    which is exactly the orphan-process problem observed in practice. With
+    kill_on_close=True the whole tree dies when the handle closes (used by
+    the verification runner, where anything left behind is an orphan). With
+    kill_on_close=False the job only scopes explicit TerminateJobObject
+    calls (bash timeout tree-kill) so intentional survivors are untouched.
+    breakaway_ok must be set when the process also belongs to a job that
+    allows breakaway: nested jobs intersect their limits, so a per-call job
+    without BREAKAWAY_OK would silently veto CREATE_BREAKAWAY_FROM_JOB even
+    when the session job permits it. Returns the job handle, or None if
+    unavailable (e.g. nested-job restrictions), in which case callers fall
+    back to taskkill."""
+    job = _create_job_object(kill_on_close, breakaway_ok=breakaway_ok)
+    if job is None:
+        return None
+    if not _assign_process_to_job(job, process):
+        ctypes.windll.kernel32.CloseHandle(job)
+        return None
+    return job
 
 
 def _kill_process_tree(process: subprocess.Popen, *, graceful: float = _GRACE_SECONDS) -> None:
@@ -297,7 +367,15 @@ def _run_bash_unlocked(
     if sys.platform != "win32":
         kwargs["start_new_session"] = True
     proc = subprocess.Popen(command, **kwargs)
-    job = _assign_windows_job(proc) if sys.platform == "win32" else None
+    # Session job first: the child tree dies with the harness process, not
+    # with this tool call, so commands may intentionally leave long-running
+    # work behind (dev servers, `start ...`, background tasks). The per-call
+    # job only scopes timeout termination; it must also allow breakaway or it
+    # would veto the session job's BREAKAWAY_OK (nested jobs intersect).
+    job = None
+    if sys.platform == "win32":
+        in_session = _assign_process_to_job(_session_job(), proc)
+        job = _assign_windows_job(proc, kill_on_close=not in_session, breakaway_ok=True)
 
     collected: list[str] = []
     lock = threading.Lock()
@@ -371,7 +449,12 @@ def _run_bash_streaming_unlocked(
     if sys.platform != "win32":
         kwargs["start_new_session"] = True
     proc = subprocess.Popen(command, **kwargs)
-    job = _assign_windows_job(proc) if sys.platform == "win32" else None
+    # Session job first: see run_bash(). The per-call job only scopes
+    # timeout termination and must allow breakaway too.
+    job = None
+    if sys.platform == "win32":
+        in_session = _assign_process_to_job(_session_job(), proc)
+        job = _assign_windows_job(proc, kill_on_close=not in_session, breakaway_ok=True)
 
     collected: list[str] = []
     lock = threading.Lock()

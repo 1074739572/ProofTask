@@ -1,9 +1,23 @@
-import {Show} from 'solid-js';
-import type {GoalDraftSnapshot, GoalDraftTaskSummary, GoalSnapshot, GoalTaskSnapshot} from './goal-state.ts';
+import {For, Show, createMemo} from 'solid-js';
+import {formatStageElapsed, goalPhaseOf, normalizeGoalStage, type GoalDraftTaskSummary, type GoalTaskSnapshot, type StageMark} from './goal-state.ts';
+import {
+  GOAL_TRACK,
+  fallbackGoal,
+  goalPhaseLabel,
+  goalPhaseTrackIndex,
+  goalStatusColor,
+  goalStatusIcon,
+  goalStatusLabel,
+  goalTaskColor,
+  goalTaskIcon,
+  goalTaskState,
+  isSnapshot,
+  readSource,
+  type GoalLike,
+} from './goal-presentation.ts';
 import {C} from './theme.ts';
-import {clipTerminalText, layoutMode, type LayoutMode} from './layout.ts';
+import {clipTerminalText, layoutMode, terminalColumns, type LayoutMode} from './layout.ts';
 
-type GoalLike = GoalSnapshot | GoalDraftSnapshot;
 type TaskLike = GoalTaskSnapshot | GoalDraftTaskSummary;
 type GoalSource = GoalLike | (() => GoalLike | null | undefined);
 type DecisionsSource = readonly DecisionLike[] | (() => readonly DecisionLike[] | undefined);
@@ -18,7 +32,6 @@ type DecisionLike = {
 export type GoalSummaryProps = {
   goal: GoalSource;
   decisions?: DecisionsSource;
-  onExpandDetails?: () => void;
   /** Terminal width used to keep the first screen readable on narrow TTYs. */
   width?: number | (() => number);
   /** Available main-view height; short terminals need a stricter summary. */
@@ -26,72 +39,25 @@ export type GoalSummaryProps = {
   /** Animation frame counter (~80ms). Drives the progress-bar head pulse;
    * optional so off-screen previews stay static. */
   tick?: () => number;
+  /** 客户端阶段时钟的切换记录；用于执行链路的每阶段耗时。 */
+  stageMarks?: StageMark[] | (() => StageMark[]);
+  /** 当前时间；缺省 Date.now()。调试预览传入固定值以得到确定性耗时。 */
+  now?: number | (() => number);
 };
+
+type TaskBoardRow = {icon: string; color: string; subject: string; note: string};
 
 function safeText(value: unknown, fallback = '暂无'): string {
   const text = value == null ? fallback : String(value).trim();
   return text || fallback;
 }
 
-function readSource<T>(source: T | (() => T) | undefined): T | undefined {
-  return typeof source === 'function' ? (source as () => T)() : source;
-}
-
-function fallbackGoal(): GoalDraftSnapshot {
-  return {
-    id: 'goal',
-    target: '暂无 Goal',
-    status: 'ready',
-    stage: 'intake',
-    intake_assumptions: [],
-    clarifications: [],
-    question_index: 0,
-    question_count: 0,
-    task_count: 0,
-    tasks: [],
-    agents: [],
-    discovery_jobs: [],
-  };
-}
-
 function clip(value: unknown, width: number): string {
   return clipTerminalText(safeText(value), width);
 }
 
-function isSnapshot(goal: GoalLike): goal is GoalSnapshot {
-  return 'phase' in goal;
-}
-
-function statusLabel(status: string): string {
-  switch (status) {
-    case 'running': return '执行中';
-    case 'paused': return '已暂停';
-    case 'failed': return '失败';
-    case 'permission_wait': return '已暂停（等待权限批准）';
-    case 'pausing': return '正在暂停';
-    case 'cancelling': return '正在取消';
-    case 'ready': return '待开始';
-    case 'approved': return '已批准';
-    case 'completed': return '已完成';
-    default: return safeText(status, '未知状态');
-  }
-}
-
-function phaseLabel(phase: string): string {
-  const labels: Record<string, string> = {
-    intake: '需求', catalog: '测试准备', prepare_tests: '测试准备', planning: '规划',
-    preflight: '预检', discovering: '发现', act: '实现', working: '实现',
-    verify: '验证', verification: '验证', completed: '完成', paused: '暂停', failed: '失败',
-  };
-  return labels[phase] || safeText(phase, '准备');
-}
-
 function statusOf(goal: GoalLike): string {
   return safeText(goal.status, 'unknown');
-}
-
-function phaseOf(goal: GoalLike): string {
-  return isSnapshot(goal) ? safeText(goal.phase, 'intake') : safeText(goal.stage, 'intake');
 }
 
 function taskFor(goal: GoalLike): TaskLike | undefined {
@@ -124,26 +90,12 @@ function permissionIsWaiting(goal: GoalLike): boolean {
 
 function nextAction(goal: GoalLike): string {
   const status = statusOf(goal);
-  if (permissionIsWaiting(goal)) return '/goal resume（批准后继续）';
-  if (status === 'paused') return '/goal resume';
-  if (status === 'failed') return '/goal status（查看失败详情）';
-  if (status === 'ready') return '/goal start';
-  if (status === 'completed' || status === 'consumed') return '/goal status（查看结果）';
-  return '/goal pause';
-}
-
-function statusColor(status: string): string {
-  if (status === 'done' || status === 'completed') return C.success;
-  if (status === 'failed') return C.error;
-  if (status === 'paused' || status === 'pausing' || status === 'permission_wait') return C.warning;
-  return C.primary;
-}
-
-function statusIcon(status: string): string {
-  if (status === 'done' || status === 'completed') return '✓';
-  if (status === 'failed') return '×';
-  if (status === 'paused' || status === 'pausing' || status === 'permission_wait') return 'Ⅱ';
-  return '●';
+  if (permissionIsWaiting(goal)) return '批准后继续（/goal resume）';
+  if (status === 'paused') return '恢复当前 Goal（/goal resume）';
+  if (status === 'failed') return '查看失败详情（/goal status）';
+  if (status === 'ready') return '开始执行（/goal start）';
+  if (status === 'completed' || status === 'consumed') return '查看结果（/goal status）';
+  return '暂停以调整（/goal pause）';
 }
 
 function progressFor(goal: GoalLike): {done: number; total: number; percent: number} {
@@ -157,28 +109,38 @@ function progressFilled(percent: number, width: number): number {
   return Math.max(0, Math.min(width, Math.round(percent / 100 * width)));
 }
 
-const TRACK: readonly [string, string][] = [
-  ['intake', '需求'], ['prepare_tests', '测试准备'], ['planning', '规划'],
-  ['discovering', '发现'], ['act', '实现'], ['verify', '验证'], ['completed', '完成'],
-];
-
-function phaseIndex(phase: string): number {
-  const index = TRACK.findIndex(([key]) => key === phase);
-  if (index >= 0) return index;
-  if (phase === 'catalog' || phase === 'preflight') return 1;
-  if (phase === 'working') return 4;
-  if (phase === 'verification' || phase === 'failed' || phase === 'paused') return 5;
-  return 0;
+function taskBoardFor(goal: GoalLike): TaskBoardRow[] {
+  if (!isSnapshot(goal)) return [];
+  return goal.tasks.map(task => {
+    const state = goalTaskState(task, goal.current_task_id);
+    const blocked = state === 'pending' && (task.blocked_by || []).length > 0;
+    const note = state === 'done'
+      ? (task.evidence_count ? `证据 ${task.evidence_count}` : '完成')
+      : state === 'failed' ? '失败'
+        : state === 'active' ? '进行中'
+          : blocked ? '等前序完成'
+            : '';
+    return {
+      icon: goalTaskIcon(state),
+      color: goalTaskColor(state),
+      subject: safeText(task.subject),
+      note,
+    };
+  });
 }
 
 export function GoalSummary(props: GoalSummaryProps) {
   const goal = () => readSource(props.goal) || fallbackGoal();
   const decisions = () => readSource(props.decisions) || [];
   const status = () => statusOf(goal());
-  const phase = () => phaseOf(goal());
-  const currentDecision = () => decisions().find(item => item.status === 'active') || decisions()[0];
+  const phase = () => goalPhaseOf(goal()) || 'intake';
   const currentTask = () => taskFor(goal());
-  const activePhase = () => phaseIndex(phase());
+  // paused/failed/cancelled 时轨道索引为 -1：时间线不高亮任何阶段，
+  // 避免把「需求」或「验证」错标为活动阶段（resume_phase 能定位时除外）。
+  const activePhase = () => {
+    const current = goal();
+    return goalPhaseTrackIndex(phase(), isSnapshot(current) ? current.resume_phase : undefined);
+  };
   const permissionWaiting = () => permissionIsWaiting(goal());
   const displayStatus = () => permissionWaiting() ? 'permission_wait' : status();
   const showRecovery = () => status() === 'paused' || status() === 'failed';
@@ -187,7 +149,6 @@ export function GoalSummary(props: GoalSummaryProps) {
   const mode = (): LayoutMode => layoutMode(width(), height());
   const narrow = () => mode() !== 'wide';
   const short = () => mode() === 'short';
-  const track = () => TRACK.map(([key, label], index) => `${index <= activePhase() ? '●' : '○'}${label}`).join(' → ');
   const taskLabel = () => {
     const task = currentTask();
     const tasks = goal().tasks;
@@ -201,6 +162,7 @@ export function GoalSummary(props: GoalSummaryProps) {
   };
   const progress = () => progressFor(goal());
   const metricWidth = () => short() ? 34 : narrow() ? 52 : 68;
+  const taskBoard = () => taskBoardFor(goal());
   // Progress light-band: the bar renders in three segments — done (success),
   // a pulsing head cell at the frontier (primary), and the remainder (muted).
   // The head breathes on the animation clock while the goal is incomplete.
@@ -213,59 +175,151 @@ export function GoalSummary(props: GoalSummaryProps) {
     return t % 6 < 3 ? '╸' : '─';
   };
   const barRest = () => '─'.repeat(Math.max(0, barWidth() - barFilled() - (barHasHead() ? 1 : 0)));
+  const nowValue = () => {
+    const source = readSource(props.now);
+    return typeof source === 'number' ? source : Date.now();
+  };
+  // 阶段耗时：取该阶段最后一次进入的时间戳，到下一阶段切换（或现在）。
+  // marks 来自客户端时钟，未观察到的阶段不显示耗时。
+  // 归一化与末次索引只随 stageMarks 变化（动画时钟 12fps 下不再每帧重扫数组）；
+  // 耗时本身随 now 走，留在查找时计算。
+  const stageIndex = createMemo(() => {
+    const marks = (readSource(props.stageMarks) || [])
+      .map(mark => ({phase: normalizeGoalStage(mark.phase), at: mark.at}));
+    const lastIndex = new Map<string, number>();
+    marks.forEach((mark, index) => lastIndex.set(mark.phase, index));
+    return {marks, lastIndex};
+  });
+  const stageElapsed = (key: string): string => {
+    const {marks, lastIndex} = stageIndex();
+    const idx = lastIndex.get(key);
+    if (idx == null) return '';
+    const start = marks[idx].at;
+    const end = marks[idx + 1]?.at ?? nowValue();
+    return formatStageElapsed(Math.max(0, Math.round((end - start) / 1000)));
+  };
+  const roundsInfo = createMemo(() => {
+    const current = goal();
+    if (!isSnapshot(current)) return null;
+    const used = current.total_llm_rounds || 0;
+    const max = current.max_total_rounds || 0;
+    const cycles = current.task_cycles || 0;
+    const rollovers = current.worker_rollovers || 0;
+    if (!used && !max && !cycles && !rollovers) return null;
+    return {used, max, cycles, rollovers};
+  });
+  const roundCells = () => roundsInfo() && (roundsInfo()?.max || 0) > 0
+    ? Math.max(0, Math.min(10, Math.round((roundsInfo()?.used || 0) / (roundsInfo()?.max || 1) * 10)))
+    : 0;
+  // 执行链路的分段视图。耗时是加分项：超出预算时按
+  // 「最旧已完成阶段 → 全部已完成 → 仅活动阶段 → 无」逐级丢弃，保证不溢出卡片。
+  const timelineCells = (): {text: string; color: string}[] => {
+    const cells = GOAL_TRACK.map(([key, label], index) => ({
+      key, label, elapsed: stageElapsed(key),
+      state: index < activePhase() ? 'done' as const : index === activePhase() ? 'active' as const : 'pending' as const,
+    }));
+    const icon = (state: string) => state === 'active' ? '◉' : state === 'done' ? '●' : '○';
+    const color = (state: string) => state === 'active' ? C.primary : state === 'done' ? C.success : C.textMuted;
+    const budget = Math.max(24, Math.floor(width() * (mode() === 'wide' ? 0.64 : 1)) - 6);
+    const overhead = terminalColumns('执行链路 ') + Math.max(0, cells.length - 1) * 3
+      + cells.reduce((sum, cell) => sum + terminalColumns(`${icon(cell.state)}${cell.label}`), 0);
+    const elapsedWidth = (keep: (cell: typeof cells[number]) => boolean) => overhead + cells.reduce(
+      (sum, cell) => keep(cell) && cell.elapsed ? sum + 1 + cell.elapsed.length : sum, 0);
+    const doneWithElapsed = cells.filter(cell => cell.state === 'done' && cell.elapsed);
+    let keep: (cell: typeof cells[number]) => boolean = () => true;
+    if (elapsedWidth(keep) > budget) {
+      const dropped: string[] = [];
+      while (doneWithElapsed.length && elapsedWidth(cell => !dropped.includes(cell.key)) > budget) {
+        dropped.push(doneWithElapsed.shift()!.key);
+      }
+      const droppedSet = new Set(dropped);
+      keep = cell => !droppedSet.has(cell.key);
+      if (elapsedWidth(keep) > budget) {
+        keep = cell => cell.state === 'active';
+        if (elapsedWidth(keep) > budget) keep = () => false;
+      }
+    }
+    return cells.map(cell => ({
+      text: `${icon(cell.state)}${cell.label}${keep(cell) && cell.elapsed ? ` ${cell.elapsed}` : ''}`,
+      color: color(cell.state),
+    }));
+  };
 
-  const statusText = () => `${statusIcon(displayStatus())} ${statusLabel(displayStatus())}`;
-  const progressText = () => progress().total ? `${progress().done}/${progress().total} Tasks · ${progress().percent}%` : '任务图准备中';
-  const decisionText = () => clip(currentDecision()?.text, short() ? 52 : narrow() ? 78 : 120);
+  const statusText = () => `${goalStatusIcon(displayStatus())} ${goalStatusLabel(displayStatus())}`;
+  const progressText = () => progress().total ? `${progress().done}/${progress().total} 任务 · ${progress().percent}%` : '任务图准备中';
   // The compact shell renders its own one-line details affordance directly
   // below the summary.  Keep the extra hint only where it adds information:
   // short terminals need the explicit key, while wide terminals benefit from
   // the longer mouse/keyboard wording beside the inspector.
-  const detailsHint = () => short() ? '[d] 查看任务 / Agent / 证据' : mode() === 'wide' ? '详情 · Enter / Space 或 d 查看任务、Agent 与机器证据' : '';
+  const detailsHint = () => short() ? '[Enter] 查看任务 / Agent / 证据' : '';
 
   // A compact execution summary replaces the former three-card row.  The
   // fields are ordered by actionability so short terminals lose IDs and
   // decoration before they lose the current action or recovery command.
   return <box flexDirection="column" flexGrow={0} flexShrink={0} minWidth={0} paddingX={1} paddingTop={short() ? 0 : 1}>
-    <box border={!short()} borderStyle="rounded" borderColor={statusColor(displayStatus())} flexDirection="column" flexShrink={0} paddingX={short() ? 0 : 1} minWidth={0}>
+    <box border={!short()} borderStyle="rounded" borderColor={goalStatusColor(displayStatus())} flexDirection="column" flexShrink={0} paddingX={short() ? 0 : 1} minWidth={0}>
       <box flexDirection={mode() === 'wide' ? 'row' : 'column'} justifyContent="space-between" minWidth={0} flexShrink={1}>
         <text fg={C.primary} wrapMode="none" truncate flexGrow={1} flexShrink={1}>{short() ? 'GOAL' : `GOAL · ${clip(goal().target, mode() === 'wide' ? 74 : 54)}`}</text>
-        <text fg={statusColor(displayStatus())} wrapMode="none" truncate flexShrink={0}>{statusText()}</text>
+        <text fg={goalStatusColor(displayStatus())} wrapMode="none" truncate flexShrink={0}>{statusText()}</text>
       </box>
       <Show when={!short()} fallback={<box />}>
-        <text fg={C.textMuted} wrapMode="none" truncate flexShrink={1}>{mode() === 'wide' ? `ID ${clip(goal().id, 52)} · ` : ''}阶段 {phaseLabel(phase())}</text>
+        <text fg={C.textMuted} wrapMode="none" truncate flexShrink={1}>{mode() === 'wide' ? `ID ${clip(goal().id, 52)} · ` : ''}阶段 {goalPhaseLabel(phase())}</text>
       </Show>
       <Show when={short()} fallback={<box />}><text fg={C.text} wrapMode="none" truncate>{clip(goal().target, 48)}</text></Show>
-      <box flexDirection="row" minWidth={0} marginTop={short() ? 0 : 1}>
+      <box flexDirection="row" minWidth={0} marginTop={narrow() ? 0 : 1}>
         <text fg={C.success} wrapMode="none" flexShrink={0}>{'━'.repeat(barFilled())}</text>
         <text fg={C.primary} wrapMode="none" flexShrink={0}>{barHead()}</text>
         <text fg={C.textMuted} wrapMode="none" flexShrink={0}>{barRest()}</text>
         <text fg={C.text} wrapMode="none" truncate flexGrow={1} flexShrink={1}>  {progressText()}</text>
       </box>
-      <Show when={!short()} fallback={<box />}><text fg={C.secondary} wrapMode="none" truncate flexShrink={1}>执行链路  {track()}</text></Show>
-    </box>
-
-    <box flexDirection="column" minWidth={0} flexShrink={0} marginTop={short() ? 0 : 1}>
-      <text fg={C.info} wrapMode="none" truncate>Task  {clip(taskLabel(), metricWidth())}</text>
-      <text fg={C.secondary} wrapMode="none" truncate>Agent {clip(currentAgentFor(goal(), decisions()), metricWidth())}</text>
-      <Show when={!short() || currentDecision()?.text} fallback={<box />}>
-        <text fg={C.textMuted} wrapMode="word" truncate>动作  {decisionText() || (status() === 'running' ? '正在准备下一步' : '暂无活动')}</text>
+      <Show when={roundsInfo()} fallback={<box />}>
+        <box flexDirection="row" minWidth={0} marginTop={narrow() ? 0 : 1}>
+          <text fg={C.textMuted} wrapMode="none" flexShrink={0}>轮次 </text>
+          <Show when={(roundsInfo()?.max || 0) > 0} fallback={<box />}>
+            <text fg={(roundsInfo()?.used || 0) >= (roundsInfo()?.max || 0) ? C.error : C.primary} wrapMode="none" flexShrink={0}>{'█'.repeat(roundCells())}</text>
+            <text fg={C.textMuted} wrapMode="none" flexShrink={0}>{'░'.repeat(Math.max(0, 10 - roundCells()))}</text>
+          </Show>
+          <text fg={C.text} wrapMode="none" truncate flexShrink={1}>{` ${roundsInfo()?.used || 0}${(roundsInfo()?.max || 0) > 0 ? `/${roundsInfo()?.max}` : ''} 轮`}</text>
+          <Show when={(roundsInfo()?.cycles || 0) > 0} fallback={<box />}><text fg={C.textMuted} wrapMode="none" truncate> · 循环 {roundsInfo()?.cycles}</text></Show>
+          <Show when={(roundsInfo()?.rollovers || 0) > 0} fallback={<box />}><text fg={C.warning} wrapMode="none" truncate> · worker 重置 {roundsInfo()?.rollovers}</text></Show>
+        </box>
       </Show>
-      <text fg={permissionWaiting() ? C.warning : C.success} wrapMode="none" truncate>下一步 {clip(nextAction(goal()), metricWidth())}</text>
+      <Show when={!short()} fallback={<box />}>
+        <box flexDirection="row" minWidth={0} marginTop={narrow() ? 0 : 1}>
+          <text fg={C.secondary} wrapMode="none" flexShrink={0}>执行链路 </text>
+          <For each={timelineCells()}>{(cell, index) => <>
+            <Show when={index() > 0} fallback={<box />}>
+              <text fg={C.textMuted} wrapMode="none" flexShrink={0}>{' › '}</text>
+            </Show>
+            <text fg={cell.color} wrapMode="none" flexShrink={0} selectable={false}>{cell.text}</text>
+          </>}</For>
+        </box>
+      </Show>
     </box>
 
-    <Show when={currentDecision()?.text && !short()} fallback={<box />}>
-      {/* OpenTUI treats a supplied borderStyle/borderColor as an implicit
-       * border (even when `border={false}`).  Keep those props conditional so
-       * compact layouts do not gain an accidental four-row card whose bottom
-       * edge collides with the details affordance. */}
-      <box border={mode() === 'wide'} borderStyle={mode() === 'wide' ? 'rounded' : undefined} borderColor={mode() === 'wide' ? C.textMuted : undefined} flexDirection="column" minWidth={0} marginTop={1} paddingX={mode() === 'wide' ? 1 : 0}>
-        <text fg={C.secondary} wrapMode="none" truncate>LIVE ACTION · Agent 正在做什么</text>
-        <text fg={C.text} wrapMode="word" truncate>{decisionText()}</text>
+    <Show when={taskBoard().length > 0} fallback={
+      <box flexDirection="column" minWidth={0} flexShrink={0} marginTop={narrow() ? 0 : 1}>
+        <text fg={C.info} wrapMode="none" truncate>Task  {clip(taskLabel(), metricWidth())}</text>
+        <text fg={C.secondary} wrapMode="none" truncate>Agent {clip(currentAgentFor(goal(), decisions()), metricWidth())}</text>
+      </box>
+    }>
+      <box flexDirection="column" minWidth={0} flexShrink={0} marginTop={narrow() ? 0 : 1}>
+        <text fg={C.secondary} wrapMode="none" truncate>任务看板 {progress().done}/{progress().total} 完成</text>
+        <For each={taskBoard()}>{row => <box flexDirection="row" minWidth={0}>
+          <text fg={row.color} wrapMode="none" flexShrink={0} selectable={false}>{`${row.icon} `}</text>
+          <text fg={row.color} wrapMode="none" truncate flexGrow={1} flexShrink={1}>{row.subject}</text>
+          <Show when={row.note} fallback={<box />}>
+            <text fg={C.textMuted} wrapMode="none" truncate flexShrink={0}> · {row.note}</text>
+          </Show>
+        </box>}</For>
       </box>
     </Show>
-    <Show when={!short() && (mode() === 'wide' || permissionWaiting() || showRecovery())} fallback={<box />}>
-      <text fg={permissionWaiting() ? C.warning : C.textMuted} wrapMode="none" truncate>权限：{permissionWaiting() ? '等待工具权限批准，可批准后恢复' : '无需批准'}</text>
+    <text fg={permissionWaiting() ? C.warning : C.success} wrapMode="none" truncate marginTop={narrow() ? 0 : 1}>下一步 {clip(nextAction(goal()), metricWidth())}</text>
+
+    <Show when={permissionWaiting() || showRecovery()} fallback={<box />}>
+      <Show when={permissionWaiting()} fallback={<box />}>
+        <text fg={C.warning} wrapMode="none" truncate>权限：等待工具权限批准，批准后可恢复</text>
+      </Show>
       <Show when={showRecovery()} fallback={<box />}><text fg={C.warning} wrapMode="word" truncate>状态说明：{permissionWaiting() ? '等待批准后可恢复执行' : clip(errorFor(goal()), 80)}</text></Show>
     </Show>
     <Show when={detailsHint()} fallback={<box />}><text fg={C.textMuted} wrapMode="none" truncate selectable={false}>{detailsHint()}</text></Show>

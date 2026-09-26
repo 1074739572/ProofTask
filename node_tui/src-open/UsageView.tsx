@@ -2,7 +2,7 @@ import {existsSync, readdirSync, readFileSync} from 'node:fs';
 import {join} from 'node:path';
 import {createMemo, For, Show} from 'solid-js';
 import {C} from './theme.ts';
-import {layoutMode} from './layout.ts';
+import {formatTokens, layoutMode} from './layout.ts';
 
 export type UsageRange = 7 | 30 | 90;
 
@@ -28,12 +28,6 @@ type ProviderConfig = {id: string; label: string};
 
 const repoRoot = process.cwd().replace(/[\\/]node_tui$/, '');
 const usageDir = join(repoRoot, '.project', 'usage');
-
-function formatTokens(value: number): string {
-  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`;
-  if (value >= 1_000) return `${(value / 1_000).toFixed(1)}k`;
-  return String(Math.round(value));
-}
 
 function formatPercent(hit: number, total: number): string {
   return total > 0 ? `${(hit / total * 100).toFixed(1)}%` : '--';

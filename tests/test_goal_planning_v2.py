@@ -122,6 +122,22 @@ def test_v2_plan_streams_the_planner_response():
     assert calls[0]["max_request_attempts"] == 2
 
 
+def test_agent_result_header_does_not_bypass_independent_review():
+    reviewer_calls = []
+
+    result = plan_tasks(
+        "add a rate limit", "pytest -q",
+        planner_runner=lambda **_: "[goal_planner] completed\n" + json.dumps(_plan()),
+        reviewer_runner=lambda **kwargs: reviewer_calls.append(kwargs) or '{"approved":true,"summary":"ready","findings":[]}',
+        discovery_manifest=MANIFEST,
+        test_catalog=TestCatalog(),
+    )
+
+    assert result.tasks
+    assert reviewer_calls[0]["agent_type"] == "goal_plan_reviewer"
+    assert result.review["summary"] == "ready"
+
+
 def test_plan_prompt_shows_a_selector_example_shaped_by_the_adapter():
     from harness.verification.maven_adapter import MavenTestCatalog
 
@@ -183,6 +199,44 @@ def test_v2_planner_continues_truncated_json_even_without_max_token_stop_reason(
     assert result.tasks
     assert len(calls) == 2
     assert calls[1]["max_tokens"] == 12_000
+
+
+def test_initial_contract_repair_reuses_conversation_without_replaying_discovery():
+    calls = []
+
+    def planner(**kwargs):
+        calls.append(kwargs)
+        return "{}" if len(calls) == 1 else json.dumps(_plan())
+
+    result = plan_tasks(
+        "add a rate limit", "pytest -q", planner_runner=planner,
+        reviewer_runner=lambda **_: '{"approved":true,"summary":"executable","findings":[]}',
+        discovery_manifest=MANIFEST, test_catalog=TestCatalog(),
+    )
+
+    assert result.tasks
+    assert len(calls) == 2
+    assert calls[0]["conversation"] is calls[1]["conversation"]
+    assert "src/app.py" in calls[0]["prompt"]
+    assert "src/app.py" not in calls[1]["prompt"]
+    assert "Contract error:" in calls[1]["prompt"]
+    assert len(calls[1]["prompt"]) < len(calls[0]["prompt"])
+
+
+def test_contract_repair_provider_failure_reports_initial_contract_error():
+    responses = iter(("{}", "[goal_planner] failed: InternalServerError: 524"))
+
+    with pytest.raises(GoalPlanningError) as captured:
+        plan_tasks(
+            "add a rate limit", "pytest -q", planner_runner=lambda **_: next(responses),
+            reviewer_runner=lambda **_: pytest.fail("invalid plan must not reach review"),
+            discovery_manifest=MANIFEST, test_catalog=TestCatalog(),
+        )
+
+    message = str(captured.value)
+    assert "after initial contract rejection" in message
+    assert "524" in message
+    assert "unknown contract error" not in message
 
 
 def test_execution_replan_repair_uses_compact_prompt():

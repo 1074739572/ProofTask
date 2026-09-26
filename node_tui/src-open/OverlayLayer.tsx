@@ -133,6 +133,9 @@ type OverlayPanelRow = {
   color: string;
   wrapMode: 'char' | 'none';
   truncate: boolean;
+  /** Absolute option index; -1 marks non-option rows such as group headers. */
+  optionIndex: number;
+  selected: boolean;
 };
 
 function optionRowText(option: OverlayOptionRow): string {
@@ -159,8 +162,27 @@ function OverlayPanel(props: {
   bottomRows?: Accessor<number>;
   maxOptions?: Accessor<number>;
   tick?: Accessor<number>;
+  /** Mouse click on an option row: index is the absolute option index. */
+  onSelectOption?: (index: number) => void;
 }) {
-  const panelWidth = createMemo(() => Math.max(1, Math.min(props.width(), 72)));
+  /** 宽度测量用的纯文本行预览（不含分组头）。 */
+  const optionRowsPreview = createMemo<string[]>(() => {
+    const panel = props.panel();
+    if (panel.kind === 'completion') return [];
+    return (panel.options as OverlayOptionRow[])
+      .map(option => optionRowText(option).trim())
+      .filter(text => text.length > 0);
+  });
+  // 权限/Picker 选项少时按最长行自适应收窄（上限 72），避免三行选项
+  // 撑满整板显得空旷；补全菜单保持原宽度策略。
+  const panelWidth = createMemo(() => {
+    const cap = Math.max(1, Math.min(props.width(), 72));
+    const kind = props.panel().kind;
+    if (kind !== 'permission' && kind !== 'picker') return cap;
+    let longest = 0;
+    for (const row of optionRowsPreview()) longest = Math.max(longest, row.length + 4);
+    return Math.max(28, Math.min(cap, longest));
+  });
   const normalizedOptions = createMemo<OverlayOptionRow[]>(() => {
     const current = props.panel();
     if (current.kind === 'completion') {
@@ -201,25 +223,27 @@ function OverlayPanel(props: {
   const visibleOptions = createMemo(() => {
     const options = normalizedOptions();
     const visibleCount = Math.min(Math.max(0, props.maxOptions?.() ?? 2), options.length);
-    if (visibleCount === 0) return [];
+    if (visibleCount === 0) return [] as {option: OverlayOptionRow; index: number}[];
 
     const selectedIndex = options.findIndex(option => option.selected);
     const start = Math.max(
       0,
       Math.min(selectedIndex - Math.floor(visibleCount / 2), options.length - visibleCount),
     );
-    return options.slice(start, start + visibleCount);
+    return options
+      .slice(start, start + visibleCount)
+      .map((option, offset) => ({option, index: start + offset}));
   });
   const panelRows = createMemo<OverlayPanelRow[]>(() => {
     const panel = props.panel();
     const options = visibleOptions();
     const rows: OverlayPanelRow[] = [];
     let lastGroup = '';
-    for (const option of options) {
+    for (const {option, index} of options) {
       if (panel.kind === 'completion' && option.label.trim().startsWith('/')) {
         const group = commandGroup(option.label);
         if (group !== lastGroup) {
-          rows.push({text: `▸ ${group}`, color: C.primary, wrapMode: 'none', truncate: true});
+          rows.push({text: `▸ ${group}`, color: C.primary, wrapMode: 'none', truncate: true, optionIndex: -1, selected: false});
           lastGroup = group;
         }
       }
@@ -230,12 +254,20 @@ function OverlayPanel(props: {
         color: option.selected ? C.text : C.textMuted,
         wrapMode: panel.kind === 'completion' ? 'char' : 'none',
         truncate: panel.kind !== 'completion',
+        optionIndex: index,
+        selected: option.selected,
       });
     }
     return rows;
   });
   const title = createMemo(() => textValue(props.panel().title));
   const showHint = createMemo(() => title().length > 0 && visibleOptions().length > 0);
+  const hintText = createMemo(() => {
+    const kind = props.panel().kind;
+    if (kind === 'history') return 'Enter select · Esc cancel';
+    if (kind === 'permission') return '↑↓ navigate · Tab/Enter apply · Esc deny · click to choose';
+    return '↑↓ navigate · Tab/Enter apply · Esc close';
+  });
   // Permission pulse: the border breathes warning -> primary on the animation
   // clock so a pending approval keeps asking for attention without moving a
   // single row. Other panels keep their steady primary frame.
@@ -254,10 +286,23 @@ function OverlayPanel(props: {
     // small terminal; overflow is clipped rather than spilling into chrome.
     return Math.max(3, Math.min(14, rows + 2));
   });
-  return <box position="absolute" left={Math.max(0, props.width() - panelWidth())} bottom={props.bottomRows ? props.bottomRows() : props.composerRows()} width={panelWidth()} height={panelHeight()} maxHeight={panelHeight()} overflow="hidden" border borderStyle="rounded" borderColor={frameColor()} flexDirection="column" backgroundColor="#111820" paddingX={1} zIndex={20}>
+  return <box position="absolute" left={Math.max(0, props.width() - panelWidth())} bottom={props.bottomRows ? props.bottomRows() : props.composerRows()} width={panelWidth()} height={panelHeight()} maxHeight={panelHeight()} overflow="hidden" border borderStyle="rounded" borderColor={frameColor()} flexDirection="column" backgroundColor={C.panel} paddingX={1} zIndex={20}>
     <Show when={title().length > 0}><text fg={frameColor()} wrapMode="none" truncate>{`⌕ ${title()}`}</text></Show>
-    <For each={panelRows()}>{row => <text fg={row.color} wrapMode={row.wrapMode} truncate={row.truncate}>{row.text}</text>}</For>
-    <Show when={showHint()}><text fg={C.textMuted} wrapMode="none" truncate>{props.panel().kind === 'history' ? 'Enter select · Esc cancel' : '↑↓ navigate · Tab/Enter apply · Esc close'}</text></Show>
+    <For each={panelRows()}>{row => {
+      const clickable = row.optionIndex >= 0 && (props.panel().kind === 'permission' || props.panel().kind === 'picker');
+      if (!clickable) return <text fg={row.color} wrapMode={row.wrapMode} truncate={row.truncate}>{row.text}</text>;
+      // 权限决策属于高风险二选一：选中项用反色背景给出明确的"按钮"感，
+      // 其余类型保持原有的 › 前缀 + 文字变色。
+      const highlighted = row.selected && props.panel().kind === 'permission';
+      return <box
+        width="100%"
+        backgroundColor={highlighted ? C.primary : undefined}
+        onMouseUp={(event: any) => { if (event?.button === 0) props.onSelectOption?.(row.optionIndex); }}
+      >
+        <text fg={highlighted ? '#0b0f14' : row.color} wrapMode={row.wrapMode} truncate={row.truncate} selectable={false}>{row.text}</text>
+      </box>;
+    }}</For>
+    <Show when={showHint()}><text fg={C.textMuted} wrapMode="none" truncate>{hintText()}</text></Show>
   </box>;
 
 }
@@ -333,6 +378,11 @@ export function OverlayLayer(props: OverlayLayerProps) {
     return null;
   });
 
-  return <Show when={activePanel()}>{panel => <OverlayPanel panel={() => panel()} width={props.width} composerRows={props.composerRows} bottomRows={props.bottomRows} maxOptions={props.maxOptions} tick={props.tick}/>}</Show>;
+  return <Show when={activePanel()}>{panel => <OverlayPanel panel={() => panel()} width={props.width} composerRows={props.composerRows} bottomRows={props.bottomRows} maxOptions={props.maxOptions} tick={props.tick} onSelectOption={(index) => {
+    const kind = panel().kind;
+    // 点击即确认：权限与 Picker 的回调直接应用该选项（与 Enter 行为一致）。
+    if (kind === 'permission') props.onSelectPermission?.(index);
+    else if (kind === 'picker') props.onSelectPicker?.(index);
+  }}/>}</Show>;
 }
 
