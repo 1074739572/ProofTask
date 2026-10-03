@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from harness.agent.cancel import is_cancelled
-from harness.agent.recovery import RecoveryState, with_retry
+from harness.agent.recovery import RecoveryState, _is_transient, with_retry
 from harness.agents.registry import get_agent_profile, validate_agent_model
 from harness.hooks import trigger_hooks
 from harness.llm import create_message
@@ -201,8 +201,13 @@ class AgentTaskStats:
     llm_rounds: int = 0
     interrupted: bool = False
     stop_reason: str = "completed"  # completed | cancelled | deadline | max_rounds | max_tokens
+    provider_error: str = ""
+    provider_retryable: bool = False
     tool_count: int = 0
     tool_names: list[str] = field(default_factory=list)
+    # The final tool surface after profile defaults and tools_override are merged.
+    # This is diagnostic metadata only; path guards remain authoritative.
+    effective_tools: tuple[str, ...] = ()
     read_paths: list[str] = field(default_factory=list)
     write_paths: list[str] = field(default_factory=list)
     # Short, content-free acknowledgements from successful write tools.  Goal
@@ -289,12 +294,16 @@ def _tools_for_agent(
     allowed: list[str], cwd: Path | None = None, write_roots: tuple[str, ...] | None = None,
     read_roots: tuple[str, ...] | None = None, read_paths: tuple[str, ...] | None = None,
     debug_test_handler: Callable[..., str] | None = None,
+    extra_tools: dict[str, tuple[dict, Callable[..., str]]] | None = None,
 ) -> tuple[list[dict], dict]:
-    unknown = sorted(set(allowed) - set(_BASE_TOOL_DEFS))
+    extra_tools = extra_tools or {}
+    if set(extra_tools).intersection(_BASE_TOOL_DEFS):
+        raise ValueError("custom agent tools cannot replace built-in tools")
+    unknown = sorted(set(allowed) - set(_BASE_TOOL_DEFS) - set(extra_tools))
     if unknown:
         raise ValueError(f"agent profile declares unknown tools: {', '.join(unknown)}")
     bound_cwd = (cwd or get_workdir()).resolve()
-    tools = [_BASE_TOOL_DEFS[name] for name in allowed]
+    tools = [_BASE_TOOL_DEFS[name] if name in _BASE_TOOL_DEFS else extra_tools[name][0] for name in allowed]
     handlers = {
         "bash": partial(run_bash, cwd=bound_cwd),
         "read_file": partial(run_read, cwd=bound_cwd),
@@ -434,6 +443,7 @@ def _tools_for_agent(
         handlers["debug_test"] = debug_test_handler or (
             lambda **_: '{"error":"debug_test is unavailable outside a bound Goal Task"}'
         )
+    handlers.update({name: handler for name, (_, handler) in extra_tools.items()})
     handlers = {name: handlers[name] for name in allowed}
     return tools, handlers
 
@@ -488,7 +498,12 @@ def run_agent_task(
     max_request_attempts: int | None = None,
     conversation: AgentTaskConversation | None = None,
     debug_test_handler: Callable[..., str] | None = None,
+    extra_tools: dict[str, tuple[dict, Callable[..., str]]] | None = None,
 ) -> str:
+    if extra_tools and (agent_type != "goal_supervisor" or set(extra_tools) - {"start_discovery", "start_replan"}):
+        if stats is not None:
+            stats.stop_reason = "configuration_error"
+        return "Error: only the Goal supervisor may receive recovery domain tools"
     error = validate_agent_model(agent_type, reasoning_effort=reasoning_effort_override)
     if error:
         if stats is not None:
@@ -508,14 +523,19 @@ def run_agent_task(
     try:
         allowed_tools = profile.tools if tools_override is None else tools_override
         tools, handlers = _tools_for_agent(
-            allowed_tools, agent_cwd, write_roots=write_roots,
+            allowed_tools,
+            agent_cwd,
+            write_roots=write_roots,
             read_roots=read_roots, read_paths=read_paths,
             debug_test_handler=debug_test_handler,
+            extra_tools=extra_tools,
         )
     except ValueError as exc:
         if stats is not None:
             stats.stop_reason = "configuration_error"
         return f"Error: {exc}"
+    if stats is not None:
+        stats.effective_tools = tuple(str(tool.get("name")) for tool in tools if tool.get("name"))
     workdir = str(agent_cwd)
     system = f"{profile.system}\n\nWorking directory: {workdir}"
     messages = (
@@ -636,6 +656,10 @@ def run_agent_task(
             detail = _provider_error_detail(exc)
             if stats is not None:
                 stats.stop_reason = "provider_error"
+                stats.provider_error = detail
+                stats.provider_retryable = _is_transient(exc) or any(
+                    token in detail.lower() for token in ("429", "529", "ratelimit", "overloaded")
+                )
             renderer.subagent_end(run_id, f"failed: {detail}", tool_count, time.time() - started, max_len=120)
             return f"[{agent_type}] failed: {detail}"
         response = value
@@ -689,7 +713,10 @@ def run_agent_task(
                     }
                 )
                 continue
-            blocked = trigger_hooks("PreToolUse", block)
+            # Orchestrator-injected domain handlers carry their own bound Goal
+            # authority. The interactive permission registry does not know
+            # these ephemeral tool names and would turn them into user prompts.
+            blocked = None if name in (extra_tools or {}) else trigger_hooks("PreToolUse", block)
             if blocked:
                 output = str(blocked)
                 renderer.subagent_tool(run_id, name, tool_input, tool_use_id=tool_use_id)
@@ -718,7 +745,8 @@ def run_agent_task(
                 output = call_tool_handler(handler, tool_input, name)
                 if stats is not None:
                     stats.record_tool(name, tool_input, output)
-                trigger_hooks("PostToolUse", block, output)
+                if name not in (extra_tools or {}):
+                    trigger_hooks("PostToolUse", block, output)
                 # Nested collapsed tool line: ● tool  args → result
                 renderer.subagent_tool(run_id, name, tool_input, str(output), tool_use_id=tool_use_id)
             results.append(

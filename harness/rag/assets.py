@@ -6,13 +6,22 @@ import hashlib
 import shutil
 from pathlib import Path
 
-from harness.rag.config import ASSETS_DIR
+from harness.rag import config as rag_config
+
+
+# Backward-compatible fixture seam; production resolution remains dynamic.
+ASSETS_DIR: Path | None = None
+
+
+def _assets_dir() -> Path:
+    override = globals().get("ASSETS_DIR")
+    return Path(override) if override is not None else Path(rag_config.ASSETS_DIR)
 
 
 def source_asset_dir(source: str) -> Path:
     """Return the stable, filesystem-safe asset directory for one source."""
     digest = hashlib.sha1(source.encode("utf-8")).hexdigest()[:16]
-    return ASSETS_DIR / digest
+    return _assets_dir() / digest
 
 
 def reset_source_assets(source: str) -> Path:
@@ -44,4 +53,4 @@ def save_asset(
     safe_name = Path(name).name
     target = directory / safe_name
     target.write_bytes(payload)
-    return target.relative_to(ASSETS_DIR.parent).as_posix()
+    return target.relative_to(_assets_dir().parent).as_posix()

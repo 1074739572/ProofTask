@@ -1,4 +1,5 @@
-import {createMemo, For, Show} from 'solid-js';
+import {createMemo, createSignal, For, Match, Show, Switch} from 'solid-js';
+import {GoalDetails} from './GoalDetails.tsx';
 import {GoalSummary} from './GoalSummary.tsx';
 import {createStageClock, formatStageElapsed, goalPhaseOf, normalizeGoalStage, type GoalDraftSnapshot, type GoalSnapshot, type GoalTaskSnapshot, type StageMark} from './goal-state.ts';
 import {
@@ -395,6 +396,7 @@ export function GoalView(props: GoalViewProps) {
   const viewWidth = () => Math.max(1, Number(readSource(props.width)) || 120);
   const viewHeight = () => Math.max(1, Number(readSource(props.height)) || 28);
   const selectedGoal = createMemo<GoalLike>(() => readSource(props.goal) || readSource(props.snapshot) || readSource(props.draft) || fallbackGoal());
+  const [detailsOpen, setDetailsOpen] = createSignal(false);
   const internalClock = createStageClock(() => goalPhaseOf(selectedGoal()));
   const resolvedStageMarks = createMemo<StageMark[]>(() =>
     (readSource(props.stageMarks) as StageMark[] | undefined) ?? internalClock());
@@ -479,27 +481,54 @@ export function GoalView(props: GoalViewProps) {
   const taskBoardPanel = <GoalTaskBoardPanel goal={selectedGoal} short={() => isShort()} />;
   const stats = <GoalStatsPanel goal={selectedGoal} stageMarks={resolvedStageMarks} now={now} short={() => isShort()} />;
   const supervisionPanel = <GoalSupervisionPanel goal={selectedGoal} now={now} short={() => isShort()} />;
-  return <box flexDirection={isWide() ? 'row' : 'column'} flexGrow={1} flexShrink={1} minHeight={0} minWidth={0} height="100%">
-    <box flexDirection="column" width={isWide() ? `${GOAL_MAIN_COLUMN_RATIO * 100}%` : '100%'} flexGrow={1} flexShrink={1} minHeight={0} minWidth={0}>
-      {summary}
-      <Show when={flowVariant() !== 'none'} fallback={<box />}>
-        {executionFlow}
-      </Show>
-      <Show when={testCheckVariant() !== 'none'} fallback={<box />}>
-        {testPanel}
-        {checkPanel}
-      </Show>
-      {!isWide() && <>
+  const statusBar = <box flexDirection="row" minWidth={0} flexShrink={0} paddingX={1}>
+    <text fg={C.primary} wrapMode="none" truncate flexGrow={1} flexShrink={1}>GOAL · {clipTerminalText(selectedGoal().target, Math.max(16, viewWidth() - 32))}</text>
+    <text fg={goalStatusColor(isSnapshot(selectedGoal()) ? selectedGoal().status : 'draft')} wrapMode="none" flexShrink={0}>{isSnapshot(selectedGoal()) ? selectedGoal().status : 'draft'}</text>
+  </box>;
+  const detailsToggle = () => <GoalDetails
+    goal={selectedGoal}
+    expanded={false}
+    onToggle={() => setDetailsOpen(true)}
+    interactionTrace={props.interactionTrace}
+    width={viewWidth}
+    height={viewHeight}
+  />;
+  const details = () => <GoalDetails
+    goal={selectedGoal}
+    expanded={true}
+    onToggle={() => setDetailsOpen(false)}
+    interactionTrace={props.interactionTrace}
+    width={viewWidth}
+    height={viewHeight}
+  />;
+  const homeContent = () => <box flexDirection={isWide() ? 'row' : 'column'} flexGrow={1} flexShrink={1} minHeight={0} minWidth={0}>
+      <box flexDirection="column" width={isWide() ? `${GOAL_MAIN_COLUMN_RATIO * 100}%` : '100%'} flexGrow={1} flexShrink={1} minHeight={0} minWidth={0}>
+        {summary}
+        <Show when={flowVariant() !== 'none'} fallback={<box />}>
+          {executionFlow}
+        </Show>
+        <Show when={testCheckVariant() !== 'none'} fallback={<box />}>
+          {testPanel}
+          {checkPanel}
+        </Show>
+        {!isWide() && <>
+          {taskBoardPanel}
+          {stats}
+          {supervisionPanel}
+        </>}
+        {detailsToggle()}
+      </box>
+      {isWide() && <box flexDirection="column" width={`${GOAL_SIDE_COLUMN_RATIO * 100}%`} flexGrow={0} flexShrink={0} minHeight={0} minWidth={0}>
         {taskBoardPanel}
         {stats}
         {supervisionPanel}
-      </>}
-    </box>
-    {isWide() && <box flexDirection="column" width={`${GOAL_SIDE_COLUMN_RATIO * 100}%`} flexGrow={0} flexShrink={0} minHeight={0} minWidth={0}>
-      {taskBoardPanel}
-      {stats}
-      {supervisionPanel}
-    </box>}
+      </box>}
+    </box>;
+  return <box flexDirection="column" flexGrow={1} flexShrink={1} minHeight={0} minWidth={0} height="100%">
+    {statusBar}
+    <Switch fallback={homeContent()}>
+      <Match when={detailsOpen()}>{details()}</Match>
+    </Switch>
   </box>;
 }
 

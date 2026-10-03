@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import os
+import shutil
 import threading
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -52,18 +54,22 @@ class WorkspacePaths:
 
 
 def _derive_paths(root: Path) -> WorkspacePaths:
+    # 统一目录：所有运行时系统数据都归属该工作区自己的 ``.project``，
+    # 不再在工作区根目录平铺；``project_dir`` 自身保持 ``<root>/.project``
+    # 不变，避免 ``.project/.project`` 嵌套。
+    project = root / ".project"
     return WorkspacePaths(
         root=root,
-        transcript_dir=root / ".transcripts",
-        tool_results_dir=root / ".task_outputs" / "tool-results",
-        tasks_dir=root / ".tasks",
-        worktrees_dir=root / ".worktrees",
-        mailbox_dir=root / ".mailboxes",
-        memory_dir=root / ".memory",
-        memory_index=root / ".memory" / "MEMORY.md",
-        project_dir=root / ".project",
-        durable_cron_path=root / ".scheduled_tasks.json",
-        features_dir=root / ".features",
+        transcript_dir=project / ".transcripts",
+        tool_results_dir=project / ".task_outputs" / "tool-results",
+        tasks_dir=project / ".tasks",
+        worktrees_dir=project / ".worktrees",
+        mailbox_dir=project / ".mailboxes",
+        memory_dir=project / ".memory",
+        memory_index=project / ".memory" / "MEMORY.md",
+        project_dir=project,
+        durable_cron_path=project / ".scheduled_tasks.json",
+        features_dir=project / ".features",
     )
 
 
@@ -82,8 +88,9 @@ PROJECT_DIR = _ws.project_dir
 MEMORY_INDEX = _ws.memory_index
 DURABLE_CRON_PATH = _ws.durable_cron_path
 
-for path in (TASKS_DIR, WORKTREES_DIR, MAILBOX_DIR, PROJECT_DIR):
-    path.mkdir(exist_ok=True)
+# ``PROJECT_DIR`` 先建（其余派生目录位于其下），再用 ``parents=True`` 兜底。
+for path in (PROJECT_DIR, TASKS_DIR, WORKTREES_DIR, MAILBOX_DIR):
+    path.mkdir(parents=True, exist_ok=True)
 
 
 def get_workdir() -> Path:
@@ -114,6 +121,52 @@ _RESERVED_WORKSPACE_NAMES = frozenset({
 })
 
 
+def _discard_publish_staging(staging: Path) -> None:
+    """Remove a staging replica; best-effort so cleanup never blocks migration."""
+    try:
+        if staging.exists():
+            staging.unlink()
+    except OSError:
+        pass
+
+
+def _migrate_legacy_tasks(root: Path, unified_tasks: Path) -> list[str]:
+    """Publish legacy flat ``<root>/.tasks/*.json`` tasks into *unified_tasks*.
+
+    Existence is judged per item, not per directory: a missing unified target is
+    copied as a full replica, an existing target is left untouched (no override),
+    and a per-item failure is isolated so remaining items still publish.  Legacy
+    copies stay in place (copy, not move).  Returns failure strings (empty when
+    everything published).
+
+    Each item is first fully replicated under a staging name that deliberately
+    differs from the final name, then published with a rename.  A failure while
+    forming the replica can therefore never leave a partial file under the
+    final unified name; the staging residue is discarded and the legacy item
+    stays readable from its old location until a later retry publishes it.
+    """
+    legacy = root / ".tasks"
+    if not legacy.is_dir():
+        return []
+    failures: list[str] = []
+    for src in sorted(legacy.glob("*.json")):
+        dst = unified_tasks / src.name
+        if dst.exists():
+            continue
+        staging = unified_tasks / f".{src.name}.{uuid.uuid4().hex}.staging"
+        try:
+            shutil.copy2(src, staging)
+            # 无覆盖发布：目标一旦已存在（并发/重试竞态）就保留既有统一目录项。
+            if dst.exists():
+                _discard_publish_staging(staging)
+                continue
+            os.rename(staging, dst)
+        except Exception as exc:  # noqa: BLE001 - 单项失败不得阻断其他项目
+            failures.append(f"{src.name}: {exc}")
+            _discard_publish_staging(staging)
+    return failures
+
+
 def switch_workspace(root: Path) -> int:
     """Atomically switch the active workspace root.
 
@@ -129,8 +182,21 @@ def switch_workspace(root: Path) -> int:
     with _WORKSPACE_LOCK:
         _workspace = root
         _workspace_generation += 1
-        for path in (root / ".tasks", root / ".worktrees", root / ".mailboxes", root / ".project", root / ".features"):
+        # 初始化只创建统一目录（<root>/.project）及其内部运行时子目录，
+        # 不再在根目录创建平铺数据目录；切换仅更新进程内活跃路径。
+        paths = _derive_paths(root)
+        for path in (
+            paths.project_dir,
+            paths.tasks_dir,
+            paths.worktrees_dir,
+            paths.mailbox_dir,
+            paths.features_dir,
+        ):
             path.mkdir(parents=True, exist_ok=True)
+        # 逐项迁移旧式根目录平铺任务（<root>/.tasks）到统一目录。单项发布失败
+        # 不阻断工作区切换：失败项保持未发布、经任务入口回退读取兜底；已发布项
+        # 与旧位置副本均不受影响。
+        _migrate_legacy_tasks(root, paths.tasks_dir)
         return _workspace_generation
 
 FALLBACK_MODEL = os.getenv("FALLBACK_MODEL_ID")

@@ -1,9 +1,4 @@
-"""Parallel, read-only supervision for a running Goal.
-
-The sidecar observes bounded snapshots while the normal Goal state machine
-continues.  Its output is advisory; deterministic runner code is the only
-component allowed to mutate Task scope or Goal state.
-"""
+"""Parallel observation and bounded recovery orchestration for a Goal."""
 
 from __future__ import annotations
 
@@ -16,13 +11,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from harness.agents.runner import AgentTaskStats, run_agent_task
+from harness.agents.runner import AgentTaskConversation, AgentTaskStats, run_agent_task
 
 
 SUPERVISOR_AGENT = "goal_supervisor"
 SUPERVISOR_MAX_OUTPUT_TOKENS = 1_500
 SUPERVISOR_MAX_OBSERVATION_CHARS = 12_000
+SUPERVISOR_MAX_ROUNDS = 4
 SUPERVISOR_TIMEOUT_SECONDS = 120
+SUPERVISOR_RECOVERY_MAX_ROUNDS = 10
+SUPERVISOR_RECOVERY_TIMEOUT_SECONDS = 1_800
 SUPERVISOR_CORRECTION_TIMEOUT_SECONDS = 45
 SUPERVISOR_ACTIONS = frozenset({
     "continue",
@@ -32,8 +30,39 @@ SUPERVISOR_ACTIONS = frozenset({
     "amend_scope",
     "replan",
     "retry",
+    "request_evidence",
+    "request_replan",
     "pause_user",
 })
+SUPERVISOR_READ_TOOLS = ("read_file", "search_text", "glob")
+SUPERVISOR_RECOVERY_TOOLS = {
+    "start_discovery": {
+        "name": "start_discovery",
+        "description": "Run bounded discovery agents on exact existing files; persist validated evidence before returning.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "paths": {"type": "array", "items": {"type": "string"}},
+                "question": {"type": "string"},
+                "roles": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["paths", "question", "roles"],
+        },
+    },
+    "start_replan": {
+        "name": "start_replan",
+        "description": "Run the frozen-contract planner and independent reviewer, persist an accepted replacement plan, and continue the Goal.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "reason": {"type": "string"},
+                "evidence": {"type": "array", "items": {"type": "string"}},
+                "affected_task_ids": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["reason", "evidence", "affected_task_ids"],
+        },
+    },
+}
 
 
 @dataclass(frozen=True)
@@ -44,6 +73,10 @@ class SupervisorDecision:
     next_step: str = ""
     scope_paths: tuple[str, ...] = ()
     evidence: tuple[str, ...] = ()
+    evidence_paths: tuple[str, ...] = ()
+    evidence_question: str = ""
+    roles: tuple[str, ...] = ()
+    affected_task_ids: tuple[str, ...] = ()
     confidence: str = "medium"
     unavailable: bool = False
     error: str = ""
@@ -56,6 +89,10 @@ class SupervisorDecision:
             "next_step": self.next_step,
             "scope_paths": list(self.scope_paths),
             "evidence": list(self.evidence),
+            "evidence_paths": list(self.evidence_paths),
+            "evidence_question": self.evidence_question,
+            "roles": list(self.roles),
+            "affected_task_ids": list(self.affected_task_ids),
             "confidence": self.confidence,
             "unavailable": self.unavailable,
             "error": self.error,
@@ -69,6 +106,7 @@ class SupervisorRun:
     decision: SupervisorDecision
     llm_rounds: int = 0
     stop_reason: str = ""
+    retryable: bool = False
 
 
 def _json_object(raw: str) -> dict[str, Any] | None:
@@ -113,6 +151,9 @@ def parse_supervisor_decision(raw: str) -> SupervisorDecision:
         )
     paths = data.get("scope_paths") if isinstance(data.get("scope_paths"), list) else []
     evidence = data.get("evidence") if isinstance(data.get("evidence"), list) else []
+    evidence_paths = data.get("evidence_paths") if isinstance(data.get("evidence_paths"), list) else []
+    roles = data.get("roles") if isinstance(data.get("roles"), list) else []
+    affected_task_ids = data.get("affected_task_ids") if isinstance(data.get("affected_task_ids"), list) else []
     confidence = str(data.get("confidence") or "medium").strip().lower()
     if confidence not in {"low", "medium", "high"}:
         confidence = "medium"
@@ -123,16 +164,28 @@ def parse_supervisor_decision(raw: str) -> SupervisorDecision:
         next_step=str(data.get("next_step") or "").strip()[:1_500],
         scope_paths=tuple(dict.fromkeys(str(item).strip().replace("\\", "/") for item in paths if str(item).strip())),
         evidence=tuple(str(item).strip()[:500] for item in evidence if str(item).strip()),
+        evidence_paths=tuple(dict.fromkeys(str(item).strip().replace("\\", "/") for item in evidence_paths if str(item).strip())),
+        evidence_question=str(data.get("evidence_question") or "").strip()[:2_000],
+        roles=tuple(dict.fromkeys(str(item).strip().lower() for item in roles if str(item).strip())),
+        affected_task_ids=tuple(dict.fromkeys(str(item).strip() for item in affected_task_ids if str(item).strip())),
         confidence=confidence,
     )
 
 
-def build_supervisor_prompt(observation: dict[str, Any]) -> str:
+def build_supervisor_prompt(observation: dict[str, Any], *, can_orchestrate: bool = False) -> str:
     return (
-        "You are the read-only global supervisor for one coding Goal. Other agents continue independently while "
-        "you inspect this bounded event snapshot. Never edit files, call tools, grant yourself authority, weaken "
-        "tests, or change the frozen Goal contract. Return ONLY one JSON object with keys action, summary, reason, "
-        "next_step, scope_paths, evidence, confidence.\n\n"
+        "You are the global supervisor for one coding Goal. Other agents continue independently while "
+        "you inspect this bounded event snapshot and may use the supplied read-only tools only within read_paths/read_roots. "
+        "Never edit source files, run shell commands, grant yourself authority, weaken tests, or change the frozen Goal contract. "
+        + ("At this recovery boundary you can call start_discovery to persist cited evidence, then start_replan to run "
+           "the planner and independent reviewer and write back a valid plan. Inspect tool results before deciding; "
+           "do not claim success if either tool fails. These tools have bounded role, path and budget authority. "
+           "For a retryable transport, deadline, or review_format failure with a saved replan candidate, call "
+           "start_replan to resume its checkpoint; do not request discovery or change task ownership just to repair JSON. "
+           "A paused recoverable failure requires an attempted recovery, not a watch decision alone.\n"
+           if can_orchestrate else "") +
+        "Return ONLY one JSON object with keys action, summary, reason, next_step, scope_paths, evidence, "
+        "evidence_paths, evidence_question, roles, affected_task_ids, confidence.\n\n"
         "Actions:\n"
         "- continue: evidence shows the current direction is healthy.\n"
         "- watch: note a risk but do not interrupt work.\n"
@@ -142,14 +195,21 @@ def build_supervisor_prompt(observation: dict[str, Any]) -> str:
         "use only for that exact requested source path inside the execution workspace, with high confidence.\n"
         "- replan: Task ownership or dependencies are wrong but the Goal contract remains valid.\n"
         "- retry: a transient or format failure should retry from its durable checkpoint.\n"
+        "- request_evidence: evidence remains insufficient after available investigation. "
+        "Include exact evidence_paths when known, a concrete evidence_question, and only relevant discovery roles.\n"
+        "- request_replan: the current Task ownership, dependency, or direction is wrong and a replan is still pending. "
+        "Include affected_task_ids when known.\n"
         "- pause_user: genuinely new authority is required, such as external paths, secrets, destructive actions, "
         "deployment, cost, or changing the Goal contract.\n\n"
         "For expand_scope, include only exact requested paths supported by the supplied Goal scope envelope. "
         "For amend_scope, include only an exact requested path that the supplied evidence proves is directly imported by "
         "an unchanged, Task-bound test; do not use it for a guessed dependency, a test file, config, secrets, or any path "
-        "outside the execution workspace. Do not approve arbitrary shell commands. Explain the failure and the next action "
+        "outside the execution workspace. Do not approve arbitrary shell commands. "
+        "For request_evidence, never treat evidence_paths as write authority and never request an unbounded directory. "
+        "For request_replan, do not alter goal_contract, acceptance cases, or authority. Explain the failure and the next action "
         "in the Goal language.\n\n"
-        f"Observation:\n{json.dumps(observation, ensure_ascii=False, sort_keys=True)[:SUPERVISOR_MAX_OBSERVATION_CHARS]}"
+        f"Assigned read_paths:\n{json.dumps(observation.get('read_paths', []), ensure_ascii=False)}\n"
+        f"Observation:\n{json.dumps({key: value for key, value in observation.items() if key not in {'read_paths', 'read_roots'}}, ensure_ascii=False, sort_keys=True)[:SUPERVISOR_MAX_OBSERVATION_CHARS]}"
     )
 
 
@@ -160,26 +220,37 @@ def analyze_goal_observation(
     deadline: float | None,
     cancel_check: Callable[[], bool] | None = None,
     runner=None,
+    orchestration_tools: dict[str, Callable[..., str]] | None = None,
 ) -> SupervisorRun:
     stats = AgentTaskStats()
     invoke = runner or run_agent_task
     observation_id = str(observation.get("observation_id") or "")
     revision = int(observation.get("revision") or 0)
-    prompt = build_supervisor_prompt(observation)
+    active_tools = {
+        name: (SUPERVISOR_RECOVERY_TOOLS[name], handler)
+        for name, handler in (orchestration_tools or {}).items()
+        if name in SUPERVISOR_RECOVERY_TOOLS
+    }
+    conversation = AgentTaskConversation() if active_tools else None
+    prompt = build_supervisor_prompt(observation, can_orchestrate=bool(active_tools))
     try:
+        kwargs = {"extra_tools": active_tools, "conversation": conversation} if active_tools else {}
         raw = invoke(
             description=f"supervise Goal event {observation.get('event') or 'update'}",
             prompt=prompt,
             agent_type=SUPERVISOR_AGENT,
             cwd=cwd,
-            max_rounds=1,
+            max_rounds=SUPERVISOR_RECOVERY_MAX_ROUNDS if active_tools else SUPERVISOR_MAX_ROUNDS,
             cancel_check=cancel_check,
             deadline=deadline,
             stats=stats,
-            tools_override=(),
+            tools_override=(*SUPERVISOR_READ_TOOLS, *active_tools),
+            read_roots=tuple(str(item) for item in observation.get("read_roots", ()) if str(item).strip()),
+            read_paths=tuple(str(item) for item in observation.get("read_paths", ()) if str(item).strip()),
             max_tokens=SUPERVISOR_MAX_OUTPUT_TOKENS,
             stream_response=True,
-            max_request_attempts=1,
+            max_request_attempts=2 if active_tools else 1,
+            **kwargs,
         )
     except Exception as exc:
         decision = SupervisorDecision(
@@ -194,11 +265,49 @@ def analyze_goal_observation(
                 "watch",
                 "Global supervisor was unavailable; deterministic Goal rules remain active.",
                 unavailable=True,
-                error=f"goal supervisor stopped: {stats.stop_reason}",
+                error=f"goal supervisor stopped: {stats.stop_reason}; {stats.provider_error or str(raw)[-1_000:]}",
             )
         else:
             decision = parse_supervisor_decision(raw)
-            if decision.unavailable:
+            required_tool = {
+                "request_evidence": "start_discovery",
+                "request_replan": "start_replan",
+                "replan": "start_replan",
+            }.get(decision.action)
+            if required_tool in active_tools and required_tool not in stats.tool_names:
+                correction_stats = AgentTaskStats()
+                try:
+                    corrected = invoke(
+                        description=f"complete Goal recovery {observation.get('event') or 'update'}",
+                        prompt=(f"Your {decision.action} decision did not call {required_tool}. "
+                                "At this recovery boundary, call the domain tool and inspect its result. "
+                                "If the tool is rejected, return a JSON decision explaining the actual blocker. "
+                                "Do not merely request that another component call the tool."),
+                        agent_type=SUPERVISOR_AGENT, cwd=cwd, max_rounds=3,
+                        cancel_check=cancel_check, deadline=deadline, stats=correction_stats,
+                        tools_override=(*SUPERVISOR_READ_TOOLS, *active_tools),
+                        read_roots=tuple(str(item) for item in observation.get("read_roots", ()) if str(item).strip()),
+                        read_paths=tuple(str(item) for item in observation.get("read_paths", ()) if str(item).strip()),
+                        max_tokens=SUPERVISOR_MAX_OUTPUT_TOKENS, stream_response=True,
+                        max_request_attempts=2, **kwargs,
+                    )
+                except Exception as exc:
+                    corrected = ""
+                    correction_stats.stop_reason = "provider_error"
+                    correction_error = f"{type(exc).__name__}: {exc}"
+                else:
+                    correction_error = correction_stats.stop_reason
+                stats.llm_rounds += correction_stats.llm_rounds
+                if correction_stats.stop_reason in {"provider_error", "configuration_error", "deadline", "cancelled"}:
+                    decision = SupervisorDecision(
+                        "watch", "Goal recovery session could not finish its child operation.",
+                        unavailable=True, error=f"goal supervisor recovery stopped: {correction_error}",
+                    )
+                    stats.stop_reason = correction_stats.stop_reason
+                    stats.provider_retryable = correction_stats.provider_retryable
+                else:
+                    decision = parse_supervisor_decision(corrected)
+            if decision.unavailable and stats.stop_reason not in {"provider_error", "configuration_error", "deadline", "cancelled"}:
                 retry_stats = AgentTaskStats()
                 try:
                     corrected = invoke(
@@ -220,6 +329,8 @@ def analyze_goal_observation(
                         deadline=time.monotonic() + SUPERVISOR_CORRECTION_TIMEOUT_SECONDS,
                         stats=retry_stats,
                         tools_override=(),
+                        read_roots=tuple(str(item) for item in observation.get("read_roots", ()) if str(item).strip()),
+                        read_paths=tuple(str(item) for item in observation.get("read_paths", ()) if str(item).strip()),
                         max_tokens=SUPERVISOR_MAX_OUTPUT_TOKENS,
                         stream_response=True,
                         max_request_attempts=1,
@@ -249,7 +360,8 @@ def analyze_goal_observation(
                 stats.llm_rounds += retry_stats.llm_rounds
                 if retry_stats.stop_reason != "completed":
                     stats.stop_reason = retry_stats.stop_reason
-    return SupervisorRun(observation_id, revision, decision, stats.llm_rounds, stats.stop_reason)
+                    stats.provider_retryable = retry_stats.provider_retryable
+    return SupervisorRun(observation_id, revision, decision, stats.llm_rounds, stats.stop_reason, stats.provider_retryable)
 
 
 class ParallelGoalSupervisor:
@@ -262,11 +374,14 @@ class ParallelGoalSupervisor:
         operation_timeout_seconds: int,
         cancel_check: Callable[[], bool] | None = None,
         analyzer=analyze_goal_observation,
+        orchestration_tools: Callable[[dict[str, Any]], dict[str, Callable[..., str]]] | None = None,
     ):
         self.cwd = str(Path(cwd).resolve())
         self.timeout_seconds = max(1, min(int(operation_timeout_seconds), SUPERVISOR_TIMEOUT_SECONDS))
+        self.recovery_timeout_seconds = max(1, min(int(operation_timeout_seconds), SUPERVISOR_RECOVERY_TIMEOUT_SECONDS))
         self._cancel_check = cancel_check
         self._analyzer = analyzer
+        self._orchestration_tools = orchestration_tools
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="goal-supervisor")
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -280,11 +395,16 @@ class ParallelGoalSupervisor:
         return self._stop.is_set() or bool(self._cancel_check and self._cancel_check())
 
     def _run(self, observation: dict[str, Any]) -> SupervisorRun:
+        kwargs = {}
+        if observation.get("boundary") and self._orchestration_tools is not None:
+            kwargs["orchestration_tools"] = self._orchestration_tools(observation)
+        timeout = self.recovery_timeout_seconds if kwargs.get("orchestration_tools") else self.timeout_seconds
         return self._analyzer(
             observation,
             cwd=self.cwd,
-            deadline=time.monotonic() + self.timeout_seconds,
+            deadline=time.monotonic() + timeout,
             cancel_check=self._cancelled,
+            **kwargs,
         )
 
     def _submit_locked(self, observation: dict[str, Any]) -> None:

@@ -9,8 +9,9 @@ import threading
 from functools import lru_cache
 from pathlib import Path
 
-from harness.rag.config import INDEX_DIR, MANIFEST_PATH
+from harness.rag import config as rag_config
 from harness.rag.ingest import load_chunks_for_source, load_manifest, save_manifest
+from harness.settings import workspace_generation
 from harness.rag.parents import (
     is_searchable,
     replace_parents,
@@ -24,8 +25,28 @@ _doc_freq: dict[str, int] = {}
 _avg_dl = 1.0
 _k1 = 1.5
 _b = 0.75
+_corpus_generation = -1
 
-CORPUS_PATH = INDEX_DIR / "corpus.json"
+# Backward-compatible fixture seams; production resolution remains dynamic.
+INDEX_DIR: Path | None = None
+MANIFEST_PATH: Path | None = None
+CORPUS_PATH: Path | None = None
+
+def _index_dir() -> Path:
+    override = globals().get("INDEX_DIR")
+    return Path(override) if override is not None else Path(rag_config.INDEX_DIR)
+
+
+def _manifest_path() -> Path:
+    override = globals().get("MANIFEST_PATH")
+    return Path(override) if override is not None else Path(rag_config.MANIFEST_PATH)
+
+
+def _corpus_path() -> Path:
+    override = globals().get("CORPUS_PATH")
+    return Path(override) if override is not None else _index_dir() / "corpus.json"
+
+
 TOKEN_RE = re.compile(r"[\u4e00-\u9fff]+|[a-z0-9_]+(?:[.-][a-z0-9_]+)*", re.IGNORECASE)
 CHINESE_RE = re.compile(r"^[\u4e00-\u9fff]+$")
 
@@ -69,7 +90,7 @@ def tokenize(text: str) -> list[str]:
 
 
 def _build_index(chunks: list[dict]) -> None:
-    global _corpus, _idf, _doc_freq, _avg_dl
+    global _corpus, _idf, _doc_freq, _avg_dl, _corpus_generation
     _corpus = chunks
     _doc_freq = {}
     doc_lens = []
@@ -87,6 +108,7 @@ def _build_index(chunks: list[dict]) -> None:
         token: math.log(1 + (n_docs - freq + 0.5) / (freq + 0.5))
         for token, freq in _doc_freq.items()
     }
+    _corpus_generation = workspace_generation()
 
 
 def _score(query_tokens: list[str], chunk: dict) -> float:
@@ -110,17 +132,25 @@ def _score(query_tokens: list[str], chunk: dict) -> float:
 
 
 def _persist(chunks: list[dict]) -> None:
-    INDEX_DIR.mkdir(parents=True, exist_ok=True)
-    CORPUS_PATH.write_text(json.dumps(chunks, ensure_ascii=False), encoding="utf-8")
+    _index_dir().mkdir(parents=True, exist_ok=True)
+    _corpus_path().write_text(json.dumps(chunks, ensure_ascii=False), encoding="utf-8")
 
 
 def _ensure_loaded() -> None:
-    global _corpus
+    global _corpus, _corpus_generation
+    generation = workspace_generation()
+    if _corpus_generation != generation:
+        _corpus = []
+        _corpus_generation = generation
     if _corpus:
         return
-    if not CORPUS_PATH.exists():
-        return
-    _corpus = json.loads(CORPUS_PATH.read_text(encoding="utf-8"))
+    corpus_path = _corpus_path()
+    if not corpus_path.exists():
+        legacy = rag_config.legacy_path("INDEX_DIR") / "corpus.json"
+        if not legacy.exists():
+            return
+        corpus_path = legacy
+    _corpus = json.loads(corpus_path.read_text(encoding="utf-8"))
     _build_index(_corpus)
 
 
@@ -239,6 +269,6 @@ def rag_status_dict() -> dict:
         "child_count": manifest.get("child_count", len(_corpus)),
         "corpus_root": manifest.get("corpus_root"),
         "sources": manifest.get("sources", {}),
-        "manifest_path": str(MANIFEST_PATH),
-        "index_path": str(INDEX_DIR),
+        "manifest_path": str(_manifest_path()),
+        "index_path": str(_index_dir()),
     }

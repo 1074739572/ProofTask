@@ -1,5 +1,7 @@
 import subprocess
 
+import pytest
+
 from harness.goal.discovery import (
     DISCOVERY_MAX_ROUNDS,
     DiscoverySupervisor,
@@ -91,11 +93,88 @@ def test_discovery_supervisor_merges_only_assigned_hashed_evidence(tmp_path):
     )
 
     assert len(calls) == 1
-    assert calls[0]["tools_override"] == ("read_file",)
+    assert calls[0]["tools_override"] == ("read_file", "search_text")
     assert calls[0]["max_rounds"] == DISCOVERY_MAX_ROUNDS
     assert manifest.evidence[0].path == "app.py"
     assert len(manifest.evidence[0].sha256) == 64
     assert all(item.path != "secret.py" for item in manifest.evidence)
+
+
+def test_targeted_discovery_merges_evidence_without_losing_previous_jobs(tmp_path):
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "app.py").write_text("def app(): pass\n", encoding="utf-8")
+    (tmp_path / "src" / "owner.py").write_text("def owner(): pass\n", encoding="utf-8")
+
+    def inspect(**kwargs):
+        path = kwargs["read_paths"][0]
+        symbol = "owner" if path.endswith("owner.py") else "app"
+        return ('{"evidence":[{"path":"%s","lines":[1,1],'
+                '"claim":"%s owns behavior"}],"gaps":[]}' % (path, symbol))
+
+    supervisor = DiscoverySupervisor(runner=inspect, request_interval_s=0)
+    first = supervisor.run(
+        goal_id="goal-refresh", target="app", workspace=tmp_path,
+        roles=("implementation",), target_paths=("src/app.py",),
+    )
+    refreshed = supervisor.run(
+        goal_id="goal-refresh", target="app", workspace=tmp_path,
+        roles=("architecture",), target_paths=("src/owner.py",),
+        discovery_guidance="inspect ownership",
+    )
+
+    assert first.revision == 1
+    assert refreshed.revision == 2
+    assert {item.path for item in refreshed.evidence} == {"src/app.py", "src/owner.py"}
+    assert {job.id for job in refreshed.jobs} == {"implementation-1", "architecture-2"}
+    assert len({item.id for item in refreshed.evidence}) == 2
+    assert load_manifest(tmp_path, "goal-refresh")["revision"] == 2
+
+
+def test_targeted_discovery_keeps_existing_evidence_ids_when_source_changes(tmp_path):
+    source = tmp_path / "src"
+    source.mkdir()
+    app = source / "app.py"
+    owner = source / "owner.py"
+    app.write_text("def app(): pass\n", encoding="utf-8")
+    owner.write_text("def owner(): pass\n", encoding="utf-8")
+
+    def inspect(**kwargs):
+        items = [
+            '{"path":"%s","lines":[1,1],"claim":"source checked"}' % path
+            for path in kwargs["read_paths"]
+        ]
+        return '{"evidence":[' + ",".join(items) + '],"gaps":[]}'
+
+    supervisor = DiscoverySupervisor(runner=inspect, request_interval_s=0)
+    first = supervisor.run(
+        goal_id="goal-stable-refs", target="app", workspace=tmp_path,
+        roles=("implementation",), target_paths=("src/app.py", "src/owner.py"),
+    )
+    old_ids = {item.path: item.id for item in first.evidence}
+    app.write_text("def app(): return 2\n", encoding="utf-8")
+    refreshed = supervisor.run(
+        goal_id="goal-stable-refs", target="app", workspace=tmp_path,
+        roles=("implementation",), target_paths=("src/app.py",),
+    )
+    ids = {item.path: item.id for item in refreshed.evidence}
+
+    assert ids["src/owner.py"] == old_ids["src/owner.py"]
+    assert ids["src/app.py"] != old_ids["src/app.py"]
+
+
+@pytest.mark.parametrize("target", (".env", "node_modules/secret.py", "src"))
+def test_targeted_discovery_rejects_unbounded_or_secret_path(tmp_path, target):
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "app.py").write_text("def app(): pass\n", encoding="utf-8")
+    (tmp_path / "node_modules").mkdir()
+    (tmp_path / "node_modules" / "secret.py").write_text("secret\n", encoding="utf-8")
+    (tmp_path / ".env").write_text("TOKEN=secret\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="distinct, permitted existing source files"):
+        DiscoverySupervisor(runner=lambda **_: pytest.fail("reader should not run")).run(
+            goal_id="goal-reject", target="app", workspace=tmp_path,
+            roles=("architecture",), target_paths=(target,),
+        )
 
 
 def test_discovery_derives_excerpt_when_compact_report_omits_it(tmp_path):

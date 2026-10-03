@@ -72,8 +72,10 @@ def _run_evaluator(
     cancel_check: Callable[[], bool] | None,
     deadline: float | None,
     stats,
+    read_paths: tuple[str, ...] = (),
 ) -> tuple[Findings, dict[str, Any]]:
     """Run once, then make one JSON-only correction attempt when needed."""
+    tools = ("read_file", "search_text", "glob", "load_skill") if read_paths else ("load_skill",)
     raw = run_agent_task(
         description=description,
         prompt=prompt,
@@ -82,6 +84,9 @@ def _run_evaluator(
         cancel_check=cancel_check,
         deadline=deadline,
         stats=stats,
+        tools_override=tools,
+        read_roots=(),
+        read_paths=read_paths,
     )
     parsed = parse_findings(raw)
     attempts = 1
@@ -101,6 +106,9 @@ def _run_evaluator(
             cancel_check=cancel_check,
             deadline=deadline,
             stats=stats,
+            tools_override=(),
+            read_roots=(),
+            read_paths=read_paths,
         )
         parsed = parse_findings(raw)
         stop_reason = str(getattr(stats, "stop_reason", "") or "")
@@ -273,6 +281,12 @@ def run_task_evaluation(
     if error is not None:
         return record_task_evaluation(task_id, {"passed": None, "summary": "", "findings": [], "evaluated_by": EVALUATOR_AGENT, "evaluated_at": evaluated_at, "error": f"evaluator agent unavailable: {error}"})
     profile = get_agent_profile(EVALUATOR_AGENT)
+    from harness.goal.read_scope import bounded_read_paths
+
+    read_paths = bounded_read_paths(workspace, (
+        *task.primary_write, *task.planned_new, *task.conditional_write, *task.read_envelope,
+        *((task.verification_spec or {}).get("test_files") or []),
+    ))
     parsed, diagnostics = _run_evaluator(
         description=f"evaluate task {task_id} ({task.subject})",
         prompt=build_evaluation_prompt(inputs),
@@ -280,6 +294,7 @@ def run_task_evaluation(
         cancel_check=cancel_check,
         deadline=deadline,
         stats=stats,
+        read_paths=read_paths,
     )
     payload = parsed.to_dict()
     payload.update(diagnostics)

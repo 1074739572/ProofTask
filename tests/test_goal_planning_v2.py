@@ -103,6 +103,38 @@ def test_v2_plan_compiles_scope_classes_and_independent_review():
     assert result.review["approved"] is True
 
 
+def test_planner_and_reviewer_inspect_only_bounded_source(tmp_path):
+    from harness.agents.runner import _tools_for_agent
+
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "app.py").write_text("def limit(): pass\n", encoding="utf-8")
+    (tmp_path / ".env").write_text("SECRET=value\n", encoding="utf-8")
+    calls = []
+
+    def inspect(**kwargs):
+        calls.append(kwargs)
+        _, handlers = _tools_for_agent(
+            list(kwargs["tools_override"]), cwd=tmp_path,
+            read_paths=kwargs["read_paths"], read_roots=kwargs["read_roots"],
+        )
+        assert "limit" in handlers["read_file"](path="src/app.py")
+        assert handlers["read_file"](path=".env").startswith("Read blocked:")
+        return (json.dumps(_plan()) if kwargs["agent_type"] == "goal_planner"
+                else '{"approved":true,"summary":"checked source","findings":[]}')
+
+    result = plan_tasks(
+        "add a rate limit", "pytest -q", tmp_path,
+        planner_runner=inspect, reviewer_runner=inspect,
+        discovery_manifest=MANIFEST, test_catalog=TestCatalog(),
+        read_paths=("src", ".env"),
+    )
+
+    assert result.review["approved"] is True
+    assert [call["agent_type"] for call in calls] == ["goal_planner", "goal_plan_reviewer"]
+    assert all(call["read_paths"] == ("src/app.py",) for call in calls)
+    assert all(call["read_roots"] == () and call["max_rounds"] > 1 for call in calls)
+
+
 def test_v2_plan_streams_the_planner_response():
     calls = []
 
@@ -120,6 +152,68 @@ def test_v2_plan_streams_the_planner_response():
     assert calls[0]["stream_response"] is True
     assert calls[0]["request_read_timeout_seconds"] == 300.0
     assert calls[0]["max_request_attempts"] == 2
+
+
+@pytest.mark.parametrize("stop_reason", ("max_tokens", "max_rounds", "completed"))
+def test_reviewer_completes_format_in_same_session_without_replanning(stop_reason):
+    from harness.agents.runner import AgentTaskStats
+
+    planner_calls, review_calls = [], []
+    stats = AgentTaskStats()
+
+    def reviewer(**kwargs):
+        review_calls.append(kwargs)
+        kwargs["stats"].llm_rounds += 1
+        if len(review_calls) == 1:
+            kwargs["stats"].stop_reason = stop_reason
+            return '{"approved":'
+        return '{"approved":true,"summary":"source checked","findings":[]}'
+
+    result = plan_tasks(
+        "add a rate limit", "pytest -q",
+        planner_runner=lambda **kwargs: planner_calls.append(kwargs) or json.dumps(_plan()),
+        reviewer_runner=reviewer, stats=stats,
+        discovery_manifest=MANIFEST, test_catalog=TestCatalog(),
+    )
+
+    assert result.review["approved"] is True
+    assert len(planner_calls) == 1 and len(review_calls) == 2
+    assert review_calls[0]["conversation"] is review_calls[1]["conversation"]
+    assert review_calls[0]["stream_response"] is True
+    assert review_calls[0]["max_request_attempts"] == 2
+    assert review_calls[1]["tools_override"] == ()
+    assert review_calls[1]["max_rounds"] == 1
+    assert stats.llm_rounds == 2 and stats.stop_reason == "completed"
+
+
+def test_reviewer_format_exhaustion_is_not_a_plan_rejection():
+    calls = []
+    with pytest.raises(GoalPlanningError) as failure:
+        plan_tasks(
+            "add a rate limit", "pytest -q",
+            planner_runner=lambda **_: json.dumps(_plan()),
+            reviewer_runner=lambda **kwargs: calls.append(kwargs) or "not a verdict",
+            discovery_manifest=MANIFEST, test_catalog=TestCatalog(),
+        )
+    assert len(calls) == 2
+    assert failure.value.failure_kind == "review_format"
+
+
+@pytest.mark.parametrize("stop_reason", ("provider_error", "configuration_error", "deadline", "cancelled"))
+def test_reviewer_unavailable_is_not_retried_as_json_correction(stop_reason):
+    calls = []
+
+    def reviewer(**kwargs):
+        calls.append(kwargs)
+        kwargs["stats"].stop_reason = stop_reason
+        return "unavailable"
+
+    with pytest.raises(GoalPlanningError, match="reviewer is unavailable"):
+        plan_tasks(
+            "add a rate limit", "pytest -q", planner_runner=lambda **_: json.dumps(_plan()),
+            reviewer_runner=reviewer, discovery_manifest=MANIFEST, test_catalog=TestCatalog(),
+        )
+    assert len(calls) == 1
 
 
 def test_agent_result_header_does_not_bypass_independent_review():

@@ -93,6 +93,21 @@ def test_supervisor_provider_failure_degrades_to_watch():
     assert "provider_error" in run.decision.error
 
 
+def test_supervisor_preserves_transport_detail_and_retryability():
+    def unavailable(**kwargs):
+        kwargs["stats"].stop_reason = "provider_error"
+        kwargs["stats"].provider_retryable = True
+        kwargs["stats"].provider_error = "APIConnectionError: upstream connection reset"
+        return "provider unavailable"
+
+    run = analyze_goal_observation(
+        {"observation_id": "obs-1", "revision": 1, "event": "terminal_failure"},
+        cwd=".", deadline=time.monotonic() + 10, runner=unavailable,
+    )
+    assert run.retryable is True
+    assert "upstream connection reset" in run.decision.error
+
+
 def test_supervisor_requests_are_short_streaming_and_not_retried():
     calls = []
 
@@ -110,7 +125,101 @@ def test_supervisor_requests_are_short_streaming_and_not_retried():
     assert run.decision.action == "watch"
     assert calls[0]["max_tokens"] == 1_500
     assert calls[0]["stream_response"] is True
+
+
+def test_supervisor_can_inspect_assigned_files_and_request_bounded_discovery(tmp_path):
+    from harness.agents.runner import _tools_for_agent
+
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "app.py").write_text("def run(): pass\n", encoding="utf-8")
+    calls = []
+
+    def inspect(**kwargs):
+        calls.append(kwargs)
+        _, handlers = _tools_for_agent(
+            list(kwargs["tools_override"]), cwd=tmp_path,
+            read_paths=kwargs["read_paths"], read_roots=kwargs["read_roots"],
+        )
+        assert "def run" in handlers["read_file"](path="src/app.py")
+        assert handlers["read_file"](path=".env").startswith("Read blocked:")
+        return ('{"action":"request_evidence","summary":"need dependency ownership",'
+                '"evidence_paths":["src/app.py"],"evidence_question":"inspect call sites",'
+                '"roles":["architecture"],"confidence":"high"}')
+
+    run = analyze_goal_observation(
+        {"observation_id": "obs-1", "revision": 1, "event": "verify",
+         "read_paths": ["src/app.py"], "read_roots": []},
+        cwd=str(tmp_path), deadline=time.monotonic() + 10, runner=inspect,
+    )
+
+    assert run.decision.action == "request_evidence"
+    assert run.decision.evidence_paths == ("src/app.py",)
+    assert run.decision.roles == ("architecture",)
+    assert calls[0]["max_rounds"] > 1
     assert calls[0]["max_request_attempts"] == 1
+
+
+def test_recovery_tools_only_exposed_for_boundary_review():
+    from harness.goal.coordinator import SUPERVISOR_RECOVERY_TOOLS
+
+    calls = []
+
+    def analyzer(observation, **kwargs):
+        calls.append(kwargs.get("orchestration_tools"))
+        return SupervisorRun(observation["observation_id"], observation["revision"], SupervisorDecision("watch", "observed"))
+
+    supervisor = ParallelGoalSupervisor(
+        cwd=".", operation_timeout_seconds=5, analyzer=analyzer,
+        orchestration_tools=lambda _: {"start_discovery": lambda **__: "ok"},
+    )
+    try:
+        supervisor.review({"observation_id": "routine", "revision": 1, "event": "verify"})
+        supervisor.review({"observation_id": "recovery", "revision": 2, "boundary": True, "event": "terminal_failure"})
+    finally:
+        supervisor.close()
+    assert calls[0] is None
+    assert set(calls[1]) == {"start_discovery"}
+    assert "start_replan" in SUPERVISOR_RECOVERY_TOOLS
+
+
+def test_supervisor_receives_domain_handlers_without_broadening_read_scope(tmp_path):
+    calls = []
+
+    def fake_runner(**kwargs):
+        calls.append(kwargs)
+        return '{"action":"watch","summary":"investigation persisted"}'
+
+    analyze_goal_observation(
+        {"event": "terminal_failure", "observation_id": "obs", "revision": 1},
+        cwd=str(tmp_path), deadline=time.monotonic() + 10, runner=fake_runner,
+        orchestration_tools={"start_discovery": lambda **_: "written"},
+    )
+    assert calls[0]["tools_override"] == ("read_file", "search_text", "glob", "start_discovery")
+    assert set(calls[0]["extra_tools"]) == {"start_discovery"}
+    assert "start_discovery" in calls[0]["prompt"]
+
+
+def test_recovery_request_without_child_call_gets_one_in_session_correction(tmp_path):
+    calls = []
+
+    def fake_runner(**kwargs):
+        calls.append(kwargs)
+        kwargs["stats"].llm_rounds = 1
+        if len(calls) == 1:
+            return '{"action":"request_replan","summary":"ownership wrong","evidence":["failing test"]}'
+        kwargs["stats"].tool_names.append("start_replan")
+        return '{"action":"watch","summary":"reviewed plan written"}'
+
+    result = analyze_goal_observation(
+        {"event": "terminal_failure", "observation_id": "obs", "revision": 1},
+        cwd=str(tmp_path), deadline=time.monotonic() + 10, runner=fake_runner,
+        orchestration_tools={"start_replan": lambda **_: "written"},
+    )
+
+    assert result.decision.summary == "reviewed plan written"
+    assert result.llm_rounds == 2
+    assert len(calls) == 2
+    assert calls[0]["conversation"] is calls[1]["conversation"]
 
 
 def test_parallel_supervisor_coalesces_pending_observations_to_latest():

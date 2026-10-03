@@ -28,5 +28,11 @@
     "type": "openai",
     "base_url": "https://api.stepfun.com/step_plan/v1",
     "api_key_env": "stepfun_API_KEY"
+  },
+  "NecoApi": {
+    "label": "NecoApi",
+    "type": "openai",
+    "base_url": "https://api.sbbbbbbbbb.xyz/v1",
+    "api_key_env": "NecoApi_API_KEY"
   }
 }

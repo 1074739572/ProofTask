@@ -4,11 +4,29 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
+from pathlib import Path
 
-from harness.rag.config import RAG_DIR
+from harness.rag import config as rag_config
 from harness.rag.ingest import load_manifest
 
-SELECTION_PATH = RAG_DIR / "selection.json"
+
+# Backward-compatible fixture seams; production resolution remains dynamic.
+SELECTION_PATH: Path | None = None
+RAG_DIR: Path | None = None
+
+
+def _selection_path() -> Path:
+    override = globals().get("SELECTION_PATH")
+    return (
+        Path(override)
+        if override is not None
+        else Path(rag_config.RAG_DIR / "selection.json")
+    )
+
+
+def _rag_dir() -> Path:
+    override = globals().get("RAG_DIR")
+    return Path(override) if override is not None else Path(rag_config.RAG_DIR)
 
 SCOPE_ALL = "all"
 SCOPE_SELECTED = "selected"
@@ -16,21 +34,26 @@ SCOPE_UNSET = "unset"
 
 
 def _read_payload() -> dict:
-    if not SELECTION_PATH.exists():
-        return {}
+    path = _selection_path()
+    if not path.exists():
+        legacy = rag_config.legacy_path("RAG_DIR") / "selection.json"
+        if not legacy.exists():
+            return {}
+        path = legacy
     try:
-        return json.loads(SELECTION_PATH.read_text(encoding="utf-8"))
+        return json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return {}
 
 
 def _write_payload(payload: dict) -> None:
-    RAG_DIR.mkdir(parents=True, exist_ok=True)
+    path = _selection_path()
+    _rag_dir().mkdir(parents=True, exist_ok=True)
     payload = {
         **payload,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
-    SELECTION_PATH.write_text(
+    path.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )

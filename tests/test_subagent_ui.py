@@ -88,6 +88,46 @@ def test_run_agent_task_emits_scoped_events(event_sink):
     assert end["summary"]
 
 
+@pytest.mark.parametrize("detail,retryable", (("connection reset", True), ("HTTP 401 unauthorized", False),
+                                             ("WinError 10013 permission denied", False)))
+def test_agent_preserves_provider_failure_classification(event_sink, detail, retryable):
+    from harness.agents.runner import AgentTaskStats, run_agent_task
+
+    stats = AgentTaskStats()
+    with mock.patch("harness.agents.runner.with_retry", side_effect=RuntimeError(detail)):
+        result = run_agent_task("review", "check source", "goal_plan_reviewer", tools_override=(), stats=stats)
+    assert stats.stop_reason == "provider_error"
+    assert detail in stats.provider_error and detail in result
+    assert stats.provider_retryable is retryable
+
+
+def test_supervisor_domain_tool_uses_bound_handler_without_interactive_permission(event_sink):
+    from harness.agents.runner import AgentTaskStats, run_agent_task
+
+    called = []
+    schema = {
+        "name": "start_discovery",
+        "input_schema": {"type": "object", "properties": {"question": {"type": "string"}}, "required": ["question"]},
+    }
+    responses = [
+        _response([{"type": "tool_use", "id": "call-1", "name": "start_discovery", "input": {"question": "owner?"}}]),
+        _response([{"type": "text", "text": '{"action":"watch","summary":"evidence persisted"}'}]),
+    ]
+    stats = AgentTaskStats()
+    with mock.patch("harness.agents.runner.create_message", side_effect=responses), mock.patch(
+        "harness.agents.runner.trigger_hooks", side_effect=AssertionError("interactive hook must not receive domain tool")
+    ):
+        result = run_agent_task(
+            "recover goal", "investigate", "goal_supervisor", max_rounds=2, stats=stats,
+            tools_override=("start_discovery",),
+            extra_tools={"start_discovery": (schema, lambda *, question: called.append(question) or "written")},
+        )
+
+    assert "evidence persisted" in result
+    assert called == ["owner?"]
+    assert stats.tool_names == ["start_discovery"]
+
+
 def test_run_agent_task_stops_while_waiting_for_a_model_response():
     from harness.agents.runner import AgentTaskStats, run_agent_task
 

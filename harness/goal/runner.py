@@ -11,7 +11,7 @@ import threading
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from harness.agent.cancel import clear_cancel, request_cancel
 from harness.change_session import ChangeSession, ChangeSessionError
@@ -20,11 +20,12 @@ from harness.evaluation import run_task_evaluation
 from harness.goal.engine import GoalEngine
 from harness.goal.authority import goal_authority
 from harness.goal.budget import add_usage, exhausted as budget_exhausted, refresh_active_seconds, remaining as budget_remaining
-from harness.goal.coordinator import ParallelGoalSupervisor, SupervisorRun
+from harness.goal.coordinator import ParallelGoalSupervisor, SupervisorDecision, SupervisorRun
 from harness.goal.language import human_language_label
 from harness.goal.models import GoalPhase, GoalStatus, GoalState, StopReason
-from harness.goal.planner import GoalPlan, TaskPlan, VerificationSpec, plan_tasks
+from harness.goal.planner import GoalPlan, GoalPlanningError, TaskPlan, VerificationSpec, plan_tasks
 from harness.goal.policy import MAX_REPAIR_ATTEMPTS_PER_TASK, validate_limits
+from harness.goal.read_scope import bounded_read_paths
 from harness.goal.supervision import StagePolicy, StageProgress, StageSupervisor, emit_stage_supervision
 from harness.goal.store import (
     GoalLeaseError,
@@ -37,7 +38,7 @@ from harness.goal.store import (
     release_goal_lease,
     save_goal,
 )
-from harness.settings import get_workdir, workspace_generation
+from harness.settings import ESCALATED_MAX_TOKENS, get_workdir, workspace_generation
 from harness.verification import (
     VerificationContext, build_pytest_command, collect_pytest_catalog,
     debug_task_selector, reverify_task_command, run_verification, select_adapter, verify_task_command,
@@ -66,6 +67,9 @@ EXECUTION_REPLAN_CHECKPOINT_VERSION = 2
 # A malformed or reviewer-rejected replacement plan may be retried after a
 # pause, but the same checkpoint must not become an automatic hot loop.
 MAX_EXECUTION_REPLAN_ATTEMPTS = 2
+MAX_AUTOMATIC_RECOVERIES = 3
+MAX_SUPERVISOR_BOUNDARY_ATTEMPTS = 3
+MAX_CHECKPOINT_TRANSPORT_RECOVERIES = 2
 # One evaluator-requested coverage repair may add focused proof. If the
 # evaluator still asks for more coverage afterwards, stop for contract review
 # instead of cycling through test generation indefinitely.
@@ -851,6 +855,14 @@ def _resume_target(state: GoalState) -> str:
     # waiting for their dependencies.  Otherwise a review pause on Task A is
     # incorrectly routed through test generation for Task B and returns to ACT.
     current = tasks.get(state.current_task_id or "")
+    directive = (state.supervision or {}).get("recovery") if isinstance(state.supervision, dict) else None
+    if (
+        candidate == GoalPhase.REPAIR_PLAN.value and isinstance(directive, dict)
+        and directive.get("action") == "request_replan"
+        and _supervisor_recovery_target(state) is not None
+        and current is not None and current.status == "in_progress"
+    ):
+        return candidate
     # A contract-review pause may predate the second machine observation. On
     # resume, collect that missing evidence first instead of re-entering the
     # planner and immediately pausing on the repetition guard.
@@ -1010,7 +1022,9 @@ def _supervisor_recovery_target(state: GoalState) -> str | None:
         return None
     action = str(directive.get("action") or "")
     target = str(directive.get("target_phase") or "")
-    if action not in {"retry", "redirect", "replan"}:
+    if action not in {"retry", "redirect", "replan", "request_replan"}:
+        return None
+    if directive.get("task_id") != state.current_task_id:
         return None
     if target not in {
         GoalPhase.PREPARE_TESTS.value,
@@ -1241,6 +1255,7 @@ class GoalRunner(threading.Thread):
                 cwd=_execution_workspace(self._state),
                 operation_timeout_seconds=self._state.operation_timeout_seconds,
                 cancel_check=self._interrupted,
+                orchestration_tools=self._supervisor_orchestration_tools,
             )
             profile = get_agent_profile("goal_supervisor")
             current = self._state.supervision if isinstance(self._state.supervision, dict) else {}
@@ -1877,6 +1892,8 @@ class GoalRunner(threading.Thread):
                     "latest_evidence": (
                         dict(task.evidence[-1]) if task.evidence and isinstance(task.evidence[-1], dict) else None
                     ),
+                    "evaluation": dict(task.evaluation) if isinstance(task.evaluation, dict) else {},
+                    "repair_history": list(task.repair_history[-3:]),
                 }
             except (FileNotFoundError, OSError, TypeError, ValueError):
                 task_payload = {"id": state.current_task_id, "error": "Task state unavailable"}
@@ -1891,6 +1908,34 @@ class GoalRunner(threading.Thread):
             "observation_revision": revision,
         }
         history = supervision.get("history") if isinstance(supervision.get("history"), list) else []
+        root = _execution_workspace(state)
+        candidates: list[str] = []
+        if task_payload and "error" not in task_payload:
+            candidates.extend(
+                str(path) for path in (
+                    *task.primary_write, *task.conditional_write, *task.read_envelope,
+                    *((task.verification_spec or {}).get("test_files") or []),
+                )
+            )
+        for entry in state.execution_trace[-8:]:
+            if entry.get("task_id") == state.current_task_id:
+                candidates.extend(str(path) for path in (entry.get("detail") or {}).get("write_paths", []))
+        from harness.goal.discovery_store import load_manifest
+
+        manifest = load_manifest(state.workspace, state.draft_id or state.id) or {}
+        candidates.extend(
+            str(item.get("path") or "") for item in manifest.get("evidence", [])
+            if isinstance(item, dict)
+        )
+        checkpoint = state.execution_replan_checkpoint if isinstance(state.execution_replan_checkpoint, dict) else {}
+        checkpoint_candidate = checkpoint.get("candidate") if isinstance(checkpoint.get("candidate"), dict) else {}
+        checkpoint_review = checkpoint.get("review") if isinstance(checkpoint.get("review"), dict) else {}
+        for candidate in (checkpoint_candidate.get("tasks") or [])[:6]:
+            if not isinstance(candidate, dict):
+                continue
+            for field in ("primary_write", "planned_new", "conditional_write", "read_envelope"):
+                if isinstance(candidate.get(field), list):
+                    candidates.extend(str(path) for path in candidate[field])
         return {
             "event": str(event),
             "boundary": bool(boundary),
@@ -1910,8 +1955,195 @@ class GoalRunner(threading.Thread):
             "task": task_payload,
             "recent_transitions": list(state.transition_log[-10:]),
             "prior_supervision": list(history[-6:]),
+            "execution_trace": list(state.execution_trace[-8:]),
+            "replan_checkpoint": {
+                "failure_count": checkpoint.get("failure_count"),
+                "failure_kind": checkpoint.get("failure_kind"),
+                "retryable": checkpoint.get("retryable"),
+                "stage": checkpoint.get("stage"),
+                "last_error": str(checkpoint.get("last_error") or "")[:1_500],
+                "discovery_guidance": str(checkpoint.get("discovery_guidance") or "")[:2_000],
+                "candidate_tasks": (checkpoint_candidate.get("tasks") or [])[:6],
+                "review": checkpoint_review,
+            } if checkpoint else {},
+            "read_paths": list(bounded_read_paths(root, candidates)),
+            "read_roots": [],
             "detail": dict(detail or {}),
         }
+
+    def _refresh_goal_evidence(
+        self, paths: tuple[str, ...], *, question: str, roles: tuple[str, ...] = (),
+    ) -> bool:
+        """Let discovery inspect exact existing files without adding write authority."""
+        from harness.goal.discovery import DISCOVERY_ROLES, DiscoverySupervisor
+
+        state = self._state
+        if budget_exhausted(state):
+            return False
+        root = Path(_execution_workspace(state))
+        if not paths or len(paths) > 12 or any(not str(path).strip() for path in paths):
+            return False
+        selected: list[str] = []
+        for path in paths:
+            candidate = root / path
+            if not candidate.is_file():
+                return False
+            resolved = bounded_read_paths(root, (path,), limit=1)
+            if len(resolved) != 1 or resolved[0] in selected:
+                return False
+            selected.append(resolved[0])
+        if roles and (len(roles) > 3 or any(role not in DISCOVERY_ROLES for role in roles)):
+            return False
+        try:
+            manifest = DiscoverySupervisor().run(
+                goal_id=state.draft_id or state.id, target=state.target,
+                workspace=root, storage_workspace=state.workspace,
+                target_paths=tuple(selected), roles=roles or ("implementation", "tests"),
+                discovery_guidance=question[:2_000],
+                human_language=human_language_label((state.goal_contract or {}).get("language")),
+                deadline=self._deadline(state), cancel_check=self._interrupted,
+            )
+        except Exception as exc:
+            self._record_execution_trace(state, "evidence_refresh_failed", route="blocked", summary=str(exc))
+            save_goal(state)
+            return False
+        new_jobs = {
+            job.id: job for job in manifest.jobs
+            if job.id.endswith(f"-{manifest.revision}")
+        }
+        discovery_rounds = sum(max(0, job.llm_rounds) for job in new_jobs.values())
+        state.total_llm_rounds += discovery_rounds
+        add_usage(state, llm_requests=discovery_rounds)
+        save_goal(state)
+        new_jobs = {
+            job.id for job in new_jobs.values()
+            if job.status == "done"
+            and job.read_paths == tuple(selected)
+        }
+        if not any(item.source_job in new_jobs for item in manifest.evidence):
+            self._record_execution_trace(state, "evidence_refresh_failed", route="blocked", summary="Targeted discovery returned no new validated evidence")
+            save_goal(state)
+            return False
+        self._record_execution_trace(
+            state, "evidence_refreshed", route="review", summary=question[:1_500],
+            detail={"paths": selected, "revision": manifest.revision},
+        )
+        state.supervision = {
+            **(state.supervision if isinstance(state.supervision, dict) else {}),
+            "evidence_revision": manifest.revision,
+        }
+        save_goal(state)
+        return True
+
+    def _supervisor_orchestration_tools(self, observation: dict[str, Any]) -> dict[str, Callable[..., str]]:
+        """Bind recovery capabilities to this exact paused Goal observation."""
+        if observation.get("event") != "terminal_failure":
+            return {}
+        state = self._state
+        task_id = state.current_task_id
+        transition_revision = len(state.transition_log)
+        calls = {"discovery": 0, "replan": 0}
+
+        def valid_boundary() -> bool:
+            return (
+                state.status == GoalStatus.PAUSED.value
+                and state.execution_approved
+                and state.current_task_id == task_id
+                and len(state.transition_log) == transition_revision
+                and (state.supervision or {}).get("observation_revision") == observation.get("revision")
+                and not self._interrupted()
+                and not budget_exhausted(state)
+                and state.stop_reason not in {
+                    StopReason.user_approval_required.value,
+                    StopReason.cancelled_by_user.value,
+                    StopReason.permission_wait.value,
+                    StopReason.budget_exhausted.value,
+                    StopReason.workspace_changed.value,
+                    StopReason.change_session_unavailable.value,
+                    StopReason.verification_contract_review.value,
+                }
+                and (state.stop_reason != StopReason.provider_unavailable.value or bool(
+                    (state.execution_replan_checkpoint or {}).get("retryable")
+                ))
+            )
+
+        def start_discovery(*, paths: list[str], question: str, roles: list[str]) -> str:
+            if not valid_boundary() or calls["discovery"] >= 1:
+                return '{"error":"stale boundary, exhausted budget, or discovery limit"}'
+            calls["discovery"] += 1
+            if not isinstance(paths, list) or not isinstance(roles, list) or not isinstance(question, str):
+                return '{"error":"invalid discovery arguments"}'
+            if not self._refresh_goal_evidence(tuple(paths), question=question, roles=tuple(roles)):
+                return '{"error":"discovery returned no validated evidence or paths were rejected"}'
+            from harness.goal.discovery_store import load_manifest
+
+            manifest = load_manifest(state.workspace, state.draft_id or state.id) or {}
+            revision = manifest.get("revision")
+            state.supervision = {
+                **(state.supervision or {}),
+                "recovery": {},
+                "orchestration_pending": {},
+                "orchestrated_discovery": {"observation_id": observation.get("observation_id"), "revision": revision},
+            }
+            save_goal(state)
+            evidence = [
+                item for item in manifest.get("evidence", [])
+                if isinstance(item, dict) and str(item.get("source_job") or "").endswith(f"-{revision}")
+            ]
+            return json.dumps({"status": "written", "revision": revision, "evidence": evidence[:24]}, ensure_ascii=False)[:12_000]
+
+        def start_replan(*, reason: str, evidence: list[str], affected_task_ids: list[str]) -> str:
+            if not valid_boundary() or calls["replan"] >= 1:
+                return '{"error":"stale boundary, exhausted budget, or replan limit"}'
+            calls["replan"] += 1
+            if (not isinstance(reason, str) or not reason.strip() or not isinstance(evidence, list)
+                or not evidence or not all(isinstance(item, str) and item.strip() for item in evidence)
+                or not isinstance(affected_task_ids, list)
+                or len(evidence) > 8 or len(affected_task_ids) > 12
+                or any(task_id not in state.task_ids for task_id in affected_task_ids)):
+                return '{"error":"replan needs a reason, failure evidence, and active Task ids"}'
+            from harness.tasks import load_task
+
+            try:
+                task = load_task(state.current_task_id)
+            except (FileNotFoundError, OSError, TypeError, ValueError):
+                return '{"error":"current Task unavailable"}'
+            if task.status != "in_progress" or (task.evaluation or {}).get("passed") is True:
+                return '{"error":"current Task is not a failing in-progress Task"}'
+            technical_retry = (state.execution_replan_checkpoint or {}).get("failure_kind") in {
+                "review_format", "provider_error", "deadline",
+            }
+            run = SupervisorRun(
+                str(observation.get("observation_id") or ""), int(observation.get("revision") or 0),
+                SupervisorDecision(
+                    "retry" if technical_retry else "request_replan", "Supervisor started an independently reviewed replan.",
+                    reason=reason[:2_000], evidence=tuple(item[:500] for item in evidence),
+                    affected_task_ids=tuple(affected_task_ids),
+                ),
+            )
+            self._record_supervisor_run(run, event="terminal_failure")
+            if not self._auto_recover(run):
+                current = state.supervision if isinstance(state.supervision, dict) else {}
+                state.supervision = {**current, "recovery": {}}
+                save_goal(state)
+                return '{"error":"replan rejected by deterministic recovery guard"}'
+            state.supervision = {**(state.supervision or {}), "orchestration_pending": {}}
+            save_goal(state)
+            try:
+                self._repair_plan(state)
+            except Exception as exc:
+                detail = f"Supervisor replan failed unexpectedly: {type(exc).__name__}: {exc}"
+                self._record_execution_trace(state, "supervisor_replan_failed", route="blocked", summary=detail)
+                self._pause(state, "supervisor_replan_failed", stop_reason=StopReason.internal_error.value)
+            return json.dumps({
+                "status": "written" if state.phase == GoalPhase.SELECT_TASK.value else "blocked",
+                "phase": state.phase, "stop_reason": state.stop_reason,
+                "task_id": state.current_task_id,
+                "review": (state.planning_review or {}).get("execution_replan"),
+                "error": state.last_error if state.phase != GoalPhase.SELECT_TASK.value else "",
+            }, ensure_ascii=False, default=str)[:8_000]
+
+        return {"start_discovery": start_discovery, "start_replan": start_replan}
 
     def _observe_supervisor(self, event: str, *, detail: dict[str, Any] | None = None) -> None:
         if self._supervisor is None or event not in ROUTINE_SUPERVISION_EVENTS:
@@ -1969,12 +2201,16 @@ class GoalRunner(threading.Thread):
             "history": history[-12:],
             "updated_at": record["at"],
         }
-        if event == "terminal_failure" and not stale and not run.decision.unavailable:
-            directive = self._terminal_recovery_directive(run)
+        if (event in {"terminal_failure", "evidence_refreshed"}
+            and self._state.status == GoalStatus.PAUSED.value
+            and not stale and not run.decision.unavailable):
+            directive = self._terminal_recovery_directive(run, event=event)
             if directive is not None:
                 updated_supervision["recovery"] = directive
         self._state.supervision = updated_supervision
-        self._state.total_llm_rounds += max(0, int(run.llm_rounds))
+        supervisor_rounds = max(0, int(run.llm_rounds))
+        self._state.total_llm_rounds += supervisor_rounds
+        add_usage(self._state, llm_requests=supervisor_rounds)
         save_goal(self._state)
         _emit(
             "goal_supervisor",
@@ -1983,13 +2219,80 @@ class GoalRunner(threading.Thread):
             **record,
         )
 
-    def _terminal_recovery_directive(self, run: SupervisorRun) -> dict[str, Any] | None:
-        """Translate only safe terminal advice into a one-shot resume route."""
+    def _execution_replan_evidence_paths(self, run: SupervisorRun) -> tuple[str, ...]:
+        """Find exact existing files needed to escape an exhausted replan checkpoint.
+
+        A reviewer can identify a structural problem without naming every file in
+        the replacement candidate.  The saved candidate is the durable source of
+        truth here, so use its declared read/write envelope plus paths mentioned
+        in the reviewer text as a bounded, read-only discovery request.
+        """
+        state = self._state
+        checkpoint = state.execution_replan_checkpoint
+        if not isinstance(checkpoint, dict):
+            return ()
+        candidates: list[str] = list(run.decision.evidence_paths)
+        review = checkpoint.get("review") if isinstance(checkpoint.get("review"), dict) else {}
+        candidate = checkpoint.get("candidate") if isinstance(checkpoint.get("candidate"), dict) else {}
+        for task_data in candidate.get("tasks", []):
+            if not isinstance(task_data, dict):
+                continue
+            for field in ("primary_write", "planned_new", "conditional_write", "read_envelope", "forbidden"):
+                values = task_data.get(field)
+                if isinstance(values, list):
+                    candidates.extend(str(value) for value in values)
+        text = json.dumps({
+            "review": review, "evidence": list(run.decision.evidence),
+            "discovery_guidance": checkpoint.get("discovery_guidance"),
+        }, ensure_ascii=False)
+        candidates.extend(re.findall(
+            r"(?<![\w./-])(?:[\w.+-]+[/\\])*[\w.+-]+\.(?:py|ts|tsx|js|jsx|md|json|toml)",
+            text,
+        ))
+        root = Path(_execution_workspace(state))
+        existing = []
+        for path in dict.fromkeys(str(path).replace("\\", "/").removeprefix("./") for path in candidates):
+            if path and (root / path).is_file():
+                existing.append(path)
+        return tuple(bounded_read_paths(root, existing, limit=12))
+
+    def _terminal_recovery_directive(self, run: SupervisorRun, *, event: str = "terminal_failure") -> dict[str, Any] | None:
+        """Translate safe terminal advice into a bounded one-shot resume route."""
         action = run.decision.action
-        if action not in {"retry", "redirect", "replan"}:
+        if action == "retry":
+            checkpoint = self._state.execution_replan_checkpoint
+            if (
+                self._state.stop_reason == StopReason.task_blocked.value
+                and isinstance(checkpoint, dict)
+                and int(checkpoint.get("failure_count") or 0) >= MAX_EXECUTION_REPLAN_ATTEMPTS
+            ):
+                return None
+        if action not in {"retry", "redirect", "replan", "request_replan", "request_evidence"}:
             return None
-        if action == "replan":
-            target = GoalPhase.REPAIR_PLAN.value if self._state.current_task_id else GoalPhase.SELECT_TASK.value
+        if action == "request_evidence":
+            paths = self._execution_replan_evidence_paths(run)
+            if not paths:
+                return None
+            return {
+                "action": action,
+                "target_phase": self._state.resume_phase or GoalPhase.REPAIR_PLAN.value,
+                "guidance": (run.decision.evidence_question or run.decision.reason or run.decision.summary)[:4_000],
+                "evidence": list(run.decision.evidence[:8]),
+                "evidence_paths": list(paths),
+                "evidence_question": run.decision.evidence_question or run.decision.reason or run.decision.summary,
+                "roles": list(run.decision.roles[:3]),
+                "affected_task_ids": list(run.decision.affected_task_ids[:12]),
+                "task_id": self._state.current_task_id,
+                "observation_id": run.observation_id,
+                "revision": run.revision,
+                "transition_revision": len(self._state.transition_log),
+                "created_at": time.time(),
+            }
+        if action in {"replan", "request_replan"}:
+            if not self._state.current_task_id:
+                return None
+            target = GoalPhase.REPAIR_PLAN.value
+            action = "request_replan"
         else:
             target = self._state.resume_phase or self._state.last_phase or GoalPhase.SELECT_TASK.value
         guidance = run.decision.next_step or run.decision.reason or run.decision.summary
@@ -1997,6 +2300,8 @@ class GoalRunner(threading.Thread):
             "action": action,
             "target_phase": target,
             "guidance": guidance[:4_000],
+            "evidence": list(run.decision.evidence[:8]),
+            "affected_task_ids": list(run.decision.affected_task_ids[:12]),
             "task_id": self._state.current_task_id,
             "observation_id": run.observation_id,
             "revision": run.revision,
@@ -2025,7 +2330,7 @@ class GoalRunner(threading.Thread):
         self._record_supervisor_run(result, event=event)
         return result
 
-    def _review_terminal_supervision(self) -> None:
+    def _review_terminal_supervision(self) -> SupervisorRun | None:
         state = self._state
         if state.status not in {GoalStatus.PAUSED.value, GoalStatus.FAILED.value}:
             return
@@ -2033,7 +2338,12 @@ class GoalRunner(threading.Thread):
         if state.stop_reason in {
             StopReason.user_approval_required.value,
             StopReason.cancelled_by_user.value,
+            StopReason.budget_exhausted.value,
         } or last_transition.get("reason") == "user_pause":
+            return
+        if state.stop_reason == StopReason.provider_unavailable.value and not (
+            state.execution_replan_checkpoint or {}
+        ).get("retryable"):
             return
         terminal_boundary_revision = (
             state.supervision.get("terminal_boundary_revision")
@@ -2046,14 +2356,186 @@ class GoalRunner(threading.Thread):
             reviewed_revision = -1
         if reviewed_revision == len(state.transition_log):
             return
-        self._review_supervisor_boundary(
-            "terminal_failure",
-            detail={
-                "phase": state.resume_phase or state.last_phase or state.phase,
-                "stop_reason": state.stop_reason,
-                "error": state.last_error,
-            },
-        )
+        boundary_revision = len(state.transition_log)
+        run = None
+        for attempt in range(MAX_SUPERVISOR_BOUNDARY_ATTEMPTS):
+            if self._interrupted() or budget_exhausted(state):
+                break
+            run = self._review_supervisor_boundary(
+                "terminal_failure",
+                detail={
+                    "phase": state.resume_phase or state.last_phase or state.phase,
+                    "stop_reason": state.stop_reason,
+                    "error": state.last_error,
+                    "supervisor_attempt": attempt + 1,
+                },
+            )
+            if (run is None or not run.decision.unavailable or not run.retryable
+                or run.stop_reason != "provider_error"
+                or state.status != GoalStatus.PAUSED.value
+                or len(state.transition_log) != boundary_revision):
+                break
+            if attempt + 1 < MAX_SUPERVISOR_BOUNDARY_ATTEMPTS:
+                self._record_execution_trace(
+                    state, "supervisor_transport_retry", route="retry",
+                    summary=run.decision.error,
+                    detail={"attempt": attempt + 1, "limit": MAX_SUPERVISOR_BOUNDARY_ATTEMPTS},
+                )
+                if self._cancel_event.wait(min(2 ** attempt, 4)):
+                    break
+        state.supervision = {
+            **(state.supervision if isinstance(state.supervision, dict) else {}),
+            "terminal_boundary_revision": boundary_revision,
+        }
+        save_goal(state)
+        return run
+
+    def _auto_recover(self, run: SupervisorRun | None) -> bool:
+        state = self._state
+        if (
+            state.status != GoalStatus.PAUSED.value or not state.execution_approved
+            or self._pause_event.is_set() or self._cancel_event.is_set()
+        ):
+            return False
+        if state.stop_reason in {
+            StopReason.user_approval_required.value, StopReason.permission_wait.value,
+            StopReason.budget_exhausted.value, StopReason.workspace_changed.value,
+            StopReason.change_session_unavailable.value, StopReason.verification_contract_review.value,
+        } or (state.transition_log and state.transition_log[-1].get("reason") == "user_pause"):
+            return False
+        if budget_exhausted(state):
+            return False
+        supervision = state.supervision if isinstance(state.supervision, dict) else {}
+        latest = supervision.get("latest") if isinstance(supervision.get("latest"), dict) else {}
+        if run is None or (
+            run.decision.unavailable or run.revision != supervision.get("observation_revision")
+            or latest.get("observation_id") != run.observation_id
+        ):
+            return False
+        attempts = dict(supervision.get("automatic_recovery") or {})
+        if int(attempts.get("total") or 0) >= MAX_AUTOMATIC_RECOVERIES:
+            return False
+        directive = supervision.get("recovery") if isinstance(supervision.get("recovery"), dict) else None
+        if run.decision.action == "request_evidence" or (
+            isinstance(directive, dict) and directive.get("action") == "request_evidence"
+        ):
+            return False
+        if _supervisor_recovery_target(state) is None or directive is None:
+            return False
+        if directive.get("observation_id") != run.observation_id:
+            return False
+        if state.stop_reason == StopReason.repair_limit_reached.value and directive["action"] != "request_replan":
+            return False
+        if directive["action"] == "request_replan":
+            from harness.tasks import load_task, record_task_evaluation
+
+            try:
+                task = load_task(state.current_task_id)
+            except (FileNotFoundError, OSError, TypeError, ValueError):
+                return False
+            affected = directive.get("affected_task_ids") or []
+            if task.status != "in_progress" or (task.evaluation or {}).get("passed") is True or not directive.get("evidence") or any(
+                task_id not in state.task_ids for task_id in affected
+            ):
+                return False
+            if not task.last_error and not task.evidence and (task.evaluation or {}).get("passed") is not False:
+                return False
+        fingerprint = hashlib.sha256(json.dumps({
+            "task": state.current_task_id, "phase": state.resume_phase,
+            "stop": state.stop_reason, "error": str(state.last_error or "")[:1_000],
+            "action": directive["action"],
+            "candidate": (state.execution_replan_checkpoint or {}).get("key"),
+            "evidence_revision": supervision.get("evidence_revision"),
+        }, sort_keys=True).encode("utf-8")).hexdigest()
+        per_error = dict(attempts.get("failures") or {})
+        if int(per_error.get(fingerprint) or 0) >= 2:
+            return False
+        target = _resume_target(state)
+        if state.stop_reason == StopReason.repair_limit_reached.value and target != GoalPhase.REPAIR_PLAN.value:
+            return False
+        if directive["action"] == "request_replan":
+            if target != GoalPhase.REPAIR_PLAN.value:
+                return False
+            record_task_evaluation(task.id, {
+                **(task.evaluation or {}),
+                "passed": False, "route": "replan", "replan_trigger": "supervisor_review",
+                "summary": directive["guidance"],
+                "findings": [{"issue": directive["guidance"], "evidence": str(item)[:500], "severity": "high"}
+                             for item in directive["evidence"][:8]],
+                "supervisor_evidence": list(directive["evidence"][:8]),
+                "affected_task_ids": list(affected),
+            })
+        _consume_supervisor_recovery(state)
+        per_error[fingerprint] = int(per_error.get(fingerprint) or 0) + 1
+        current = state.supervision if isinstance(state.supervision, dict) else {}
+        state.supervision = {
+            **current,
+            "automatic_recovery": {"total": int(attempts.get("total") or 0) + 1, "failures": per_error},
+        }
+        if directive["action"] == "redirect" and state.current_task_id:
+            from harness.tasks import load_task, save_task
+
+            task = load_task(state.current_task_id)
+            task.last_error = f"Supervisor redirect: {directive['guidance']}"[:4_000]
+            save_task(task)
+        if state.paused_at is not None:
+            state.started_at += max(0.0, time.time() - state.paused_at)
+            state.paused_at = None
+        self.engine.transition(state, target, "supervisor_auto_recovery")
+        state.stop_reason = None
+        self._record_execution_trace(state, "supervisor_auto_recovery", route=directive["action"], summary=directive["guidance"])
+        save_goal(state)
+        _emit_goal("goal_phase", state)
+        return True
+
+    def _retry_saved_replan_after_outage(self, run: SupervisorRun | None) -> bool:
+        """Resume a saved review after supervisor transport failure, without granting plan authority."""
+        state = self._state
+        checkpoint = state.execution_replan_checkpoint
+        if (run is None or not run.decision.unavailable
+            or state.status != GoalStatus.PAUSED.value or not state.execution_approved
+            or state.resume_phase != GoalPhase.REPAIR_PLAN.value
+            or state.stop_reason not in {StopReason.execution_preflight_failed.value, StopReason.provider_unavailable.value}
+            or self._interrupted() or budget_exhausted(state)
+            or not isinstance(checkpoint, dict)
+            or checkpoint.get("version") != EXECUTION_REPLAN_CHECKPOINT_VERSION
+            or checkpoint.get("goal_id") != state.id or checkpoint.get("task_id") != state.current_task_id
+            or checkpoint.get("stage") != "review" or not checkpoint.get("key")
+            or not isinstance(checkpoint.get("candidate"), dict)
+            or not checkpoint["candidate"].get("tasks")
+            or checkpoint.get("failure_kind") not in {"review_format", "provider_error", "deadline"}
+            or not checkpoint.get("retryable")):
+            return False
+        attempts = dict((state.supervision or {}).get("automatic_recovery") or {})
+        failures = dict(attempts.get("checkpoint_failures") or {})
+        fingerprint = str(checkpoint["key"]) + ":" + str(checkpoint["failure_kind"])
+        if (int(failures.get(fingerprint) or 0) >= MAX_CHECKPOINT_TRANSPORT_RECOVERIES
+            or int(attempts.get("total") or 0) >= MAX_AUTOMATIC_RECOVERIES):
+            return False
+        from harness.tasks import load_task
+
+        try:
+            task = load_task(state.current_task_id)
+        except (FileNotFoundError, OSError, TypeError, ValueError):
+            return False
+        if task.status != "in_progress" or (task.evaluation or {}).get("passed") is True:
+            return False
+        failures[fingerprint] = int(failures.get(fingerprint) or 0) + 1
+        state.supervision = {
+            **(state.supervision or {}),
+            "automatic_recovery": {**attempts, "total": int(attempts.get("total") or 0) + 1,
+                                   "checkpoint_failures": failures},
+        }
+        if state.paused_at is not None:
+            state.started_at += max(0.0, time.time() - state.paused_at)
+            state.paused_at = None
+        self.engine.transition(state, GoalPhase.REPAIR_PLAN.value, "saved_replan_transport_retry")
+        state.stop_reason = None
+        self._record_execution_trace(state, "saved_replan_transport_retry", route="review",
+                                     summary="Retrying the saved candidate with independent review.")
+        save_goal(state)
+        _emit_goal("goal_phase", state)
+        return True
 
     def _close_supervisor(self) -> None:
         supervisor, self._supervisor = self._supervisor, None
@@ -2063,7 +2545,38 @@ class GoalRunner(threading.Thread):
     def run(self) -> None:
         self._start_supervisor()
         try:
-            self._drive()
+            while True:
+                self._drive()
+                self._poll_supervisor()
+                review = self._review_terminal_supervision()
+                if self._state.status == GoalStatus.RUNNING.value:
+                    continue
+                # A child planner may have rejected its candidate and paused
+                # again while the supervisor was still in the same session.
+                # That is a new boundary with fresh reviewer evidence.
+                if (review is not None and self._state.status == GoalStatus.PAUSED.value
+                    and len(self._state.transition_log) > int((self._state.supervision or {}).get("terminal_boundary_revision") or 0)
+                    and not budget_exhausted(self._state)):
+                    continue
+                if (review is not None and not review.decision.unavailable
+                    and review.decision.action in {"request_evidence", "request_replan", "replan"}
+                    and self._state.status == GoalStatus.PAUSED.value):
+                    # Recovery sessions have domain tools. A request alone is
+                    # not a child result; leave the Goal paused, never forward
+                    # the request through the legacy runner recovery path.
+                    supervision = self._state.supervision if isinstance(self._state.supervision, dict) else {}
+                    self._state.supervision = {
+                        **supervision, "recovery": {},
+                        "orchestration_pending": {
+                            "action": review.decision.action,
+                            "reason": review.decision.reason or review.decision.summary,
+                            "observation_id": review.observation_id,
+                        },
+                    }
+                    save_goal(self._state)
+                    break
+                if not self._auto_recover(review) and not self._retry_saved_replan_after_outage(review):
+                    break
         except Exception as exc:
             self._fail(self._state, StopReason.internal_error, f"{type(exc).__name__}: {exc}")
         finally:
@@ -4089,6 +4602,7 @@ class GoalRunner(threading.Thread):
                     agent_type="goal_worker",
                     cwd=_execution_workspace(state),
                     max_rounds=state.worker_round_limit,
+                    max_tokens=ESCALATED_MAX_TOKENS,
                     cancel_check=self._interrupted,
                     deadline=self._deadline(state),
                     stats=stats,
@@ -4830,6 +5344,14 @@ class GoalRunner(threading.Thread):
                 return None, "Stalled-Task replan has not reached the local-repair threshold."
             if int(stalled.get("failed_verification_count") or 0) < 2:
                 return None, "Stalled-Task replan lacks repeated failed bound-verification evidence."
+        elif trigger == "supervisor_review":
+            if not evaluation.get("supervisor_evidence") or not findings:
+                return None, "Supervisor replan needs concrete findings and failure evidence."
+            if any(task_id not in known_tasks for task_id in (evaluation.get("affected_task_ids") or [])):
+                return None, "Supervisor replan named a Task outside the active Goal."
+            prior_evaluation = getattr(task, "evaluation", None) or {}
+            if not getattr(task, "evidence", None) and not getattr(task, "last_error", None) and prior_evaluation.get("passed") is not False:
+                return None, "Supervisor replan lacks an observed Task failure."
         else:
             return None, f"Unsupported automatic replan trigger: {trigger or '(empty)'}"
         request = {
@@ -4854,6 +5376,8 @@ class GoalRunner(threading.Thread):
         selected_ids: set[str],
         replacement_scope: tuple[dict[str, Any], ...],
         execution_workspace_paths: tuple[str, ...],
+        evidence_revision: int = 0,
+        failure_signature: str = "",
     ) -> str:
         """Fingerprint the facts that make a saved replacement plan reusable."""
         payload = {
@@ -4862,7 +5386,15 @@ class GoalRunner(threading.Thread):
             "selected_task_ids": sorted(selected_ids),
             "replacement_scope": list(replacement_scope),
             "goal_contract": dict(state.goal_contract or {}),
+            # The writable envelope is a planning fact: once it changes, a
+            # previously rejected candidate and its reviewer verdict no longer
+            # describe this Goal. Fingerprint it so a repaired contract starts a
+            # fresh replan instead of reusing the stale rejection (and its
+            # exhausted failure counter).
+            "scope_envelope": list(self._goal_scope_envelope(state)),
             "workspace_snapshot": getattr(task, "start_snapshot", "") or "",
+            "evidence_revision": evidence_revision,
+            "failure_signature": failure_signature,
         }
         encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
         return hashlib.sha256(encoded.encode("utf-8", errors="replace")).hexdigest()
@@ -4939,6 +5471,8 @@ class GoalRunner(threading.Thread):
         )
         if request is None:
             detail = request_error or "Execution replan request has insufficient evidence."
+            task.last_error = detail[:4_000]
+            save_task(task)
             self._record_execution_trace(
                 state, "execution_replan_rejected", task_id=task.id, route="blocked", summary=detail,
                 detail={"evaluation_route": evaluation.get("route"), "reason": str(reason or "")[:1_500]},
@@ -5057,6 +5591,11 @@ class GoalRunner(threading.Thread):
             selected_ids=selected_ids,
             replacement_scope=replacement_scope,
             execution_workspace_paths=execution_workspace_paths,
+            evidence_revision=int(manifest.get("revision") or 0),
+            failure_signature=json.dumps({
+                "trigger": request["trigger_type"], "findings": request["findings"],
+                "required_write_paths": request["required_write_paths"],
+            }, ensure_ascii=False, sort_keys=True, default=str),
         )
         checkpoint_state = state.execution_replan_checkpoint
         if (
@@ -5166,20 +5705,34 @@ class GoalRunner(threading.Thread):
                 candidate_callback=checkpoint_candidate,
                 review_feedback=review_feedback,
                 review_callback=checkpoint_review,
+                read_paths=bounded_read_paths(root, [
+                    *replan_scope_paths,
+                    *(str(item.get("path") or "") for item in manifest.get("evidence", []) if isinstance(item, dict)),
+                    *((task.verification_spec or {}).get("test_files") or []),
+                ]),
             )
         except Exception as exc:
+            self._record_agent_usage(state, stats)
             state.total_llm_rounds += stats.llm_rounds
             detail = f"Execution replan was not accepted: {type(exc).__name__}: {exc}"
+            state.last_error = detail
+            task.last_error = detail[:4_000]
+            save_task(task)
             checkpoint = state.execution_replan_checkpoint
             if not isinstance(checkpoint, dict):
                 checkpoint = {}
             previous_failures = int(checkpoint.get("failure_count") or 0)
+            failure_kind = getattr(exc, "failure_kind", "") or stats.stop_reason
             checkpoint.update({
                 "version": EXECUTION_REPLAN_CHECKPOINT_VERSION,
                 "goal_id": state.id,
                 "task_id": task.id,
                 "key": checkpoint_key,
-                "failure_count": previous_failures + 1,
+                "failure_count": previous_failures + (0 if failure_kind in {
+                    "provider_error", "configuration_error", "deadline", "cancelled", "review_format",
+                } else 1),
+                "failure_kind": failure_kind,
+                "retryable": stats.provider_retryable if failure_kind == "provider_error" else failure_kind in {"review_format", "deadline"},
                 "last_error": detail[:4_000],
                 "last_failed_at": time.time(),
             })
@@ -5189,6 +5742,14 @@ class GoalRunner(threading.Thread):
                 detail=self._agent_stats_detail("goal_planner", stats, summary=detail, extra={"stage": "execution_replan"}),
             )
             self._record_execution_trace(state, "execution_replan", task_id=task.id, route="blocked", summary=detail)
+            exhausted_key = budget_exhausted(state)
+            if exhausted_key:
+                state.last_error = f"Goal budget exhausted: {exhausted_key}"
+                self._pause(state, "budget_exhausted", stop_reason=StopReason.budget_exhausted.value)
+                return
+            if isinstance(exc, GoalPlanningError) and exc.requires_discovery_refresh:
+                state.execution_replan_checkpoint["discovery_guidance"] = (exc.discovery_guidance or str(exc))[:2_000]
+                save_goal(state)
             self._pause(
                 state,
                 "execution_replan_unavailable",
@@ -5220,6 +5781,19 @@ class GoalRunner(threading.Thread):
             self._record_execution_trace(state, "execution_replan", task_id=task.id, route="blocked", summary=detail)
             self._pause(state, "execution_replan_name_conflict", stop_reason=StopReason.execution_preflight_failed.value)
             return
+
+        if request["trigger_type"] == "supervisor_review":
+            approved_paths = set(self._goal_scope_envelope(state))
+            proposed_paths = {
+                str(path) for item in compiled.tasks
+                for path in (*item.primary_write, *item.planned_new, *item.conditional_write)
+            }
+            if proposed_paths - approved_paths:
+                detail = "Supervisor replan proposed write paths outside the frozen Goal scope: " + ", ".join(sorted(proposed_paths - approved_paths))
+                self._record_execution_trace(state, "execution_replan_rejected", task_id=task.id, route="blocked", summary=detail)
+                state.last_error = detail
+                self._pause(state, "supervisor_replan_scope_rejected", stop_reason=StopReason.permission_wait.value)
+                return
 
         # The new contracts were fully validated before any existing Task is
         # superseded. Completed and retained unfinished Tasks remain active
@@ -5510,6 +6084,10 @@ class GoalRunner(threading.Thread):
             cancel_check=self._interrupted,
             deadline=self._deadline(state),
             stats=stats,
+            read_paths=bounded_read_paths(_execution_workspace(state), [
+                *task.primary_write, *task.conditional_write, *task.read_envelope,
+                *((task.verification_spec or {}).get("test_files") or []),
+            ]),
         )
         self._record_agent_usage(state, stats)
         state.total_llm_rounds += stats.llm_rounds

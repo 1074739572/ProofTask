@@ -23,6 +23,7 @@ from typing import Any, Callable
 
 from harness.goal.language import detect_goal_language, human_language_label
 from harness.goal.planner import GoalPlan, GoalPlanningError, TaskPlan, discovery_readiness_error, plan_tasks, planning_error_requires_discovery
+from harness.goal.read_scope import bounded_read_paths
 from harness.settings import get_workdir
 from harness.verification import ALLOWED_PROGRAMS, VerificationContext, check_verification_command, select_adapter
 from harness.workspace_lock import WorkspaceMutationLock
@@ -150,6 +151,10 @@ class GoalDraft:
     input_hash: str = ""
     discovery_path: str = ""
     last_error: str | None = None
+    # Reviewer feedback that the current discovery manifest couldn't resolve.
+    # Set by _plan when a GoalPlanningError carries discovery_guidance, then
+    # passed back to DiscoverySupervisor when discovery is re-run.
+    discovery_guidance: str = ""
     # The durable checkpoint used by /goal resume.  The visible stage becomes
     # "paused" after an error, so it cannot by itself tell us whether the
     # expensive Discovery work needs to be repeated.
@@ -1037,6 +1042,12 @@ def _plan(
         save_draft(draft, storage_workspace or workspace, event="checkpoint", message="Planner candidate saved; awaiting independent review")
 
     candidate_plan = _load_planning_candidate(draft, catalog, discovery_manifest)
+    manifest = discovery_manifest if isinstance(discovery_manifest, dict) else {}
+    read_candidates = [
+        *(str(item.get("path") or "") for item in manifest.get("evidence", []) if isinstance(item, dict)),
+        *(str(item.get("path") or "") for item in manifest.get("shards", []) if isinstance(item, dict)),
+        *(str(item) for item in manifest.get("repo_files", [])),
+    ]
     plan = plan_tasks(
         _planner_target(draft),
         draft.verification,
@@ -1049,6 +1060,7 @@ def _plan(
         human_language=human_language_label(draft.language),
         candidate_plan=candidate_plan,
         candidate_callback=checkpoint,
+        read_paths=bounded_read_paths(workspace, read_candidates),
     )
     draft.goal_contract = dict(plan.contract)
     draft.goal_contract["language"] = draft.language
@@ -1057,6 +1069,69 @@ def _plan(
     draft.planning_stage = "accepted"
     draft.status = "ready"
     _set_stage(draft, "ready")
+
+
+def _plan_with_evidence_refresh(
+    draft: GoalDraft, workspace: Path, storage_workspace: Path, catalog, adapter,
+    manifest: dict[str, Any] | None, *, planner_runner=None, reviewer_runner=None,
+    discovery_runner=None,
+) -> None:
+    from harness.goal.discovery import DiscoverySupervisor, _explicit_target_paths
+
+    try:
+        _plan(
+            draft, workspace, catalog, planner_runner=planner_runner,
+            reviewer_runner=reviewer_runner, discovery_manifest=manifest,
+            verification_adapter=adapter, storage_workspace=storage_workspace,
+        )
+        return
+    except GoalPlanningError as exc:
+        if not exc.requires_discovery_refresh:
+            raise
+        guidance = exc.discovery_guidance or str(exc)
+        draft.discovery_guidance = guidance[:2_000]
+        paths = bounded_read_paths(workspace, _explicit_target_paths(workspace, guidance))
+        if not paths and not isinstance(manifest, dict):
+            raise
+        # A new evidence revision invalidates the saved planner candidate;
+        # reviewer-only resume is safe only against the original manifest.
+        draft.planning_candidate = {}
+        draft.planning_candidate_meta = {}
+        draft.planning_stage = "compile"
+        draft.status = "discovering"
+        _set_stage(draft, "discovering")
+        save_draft(draft, storage_workspace, event="stage_started", message="Refreshing missing planning evidence")
+        if discovery_runner is None:
+            discovery_kwargs = dict(
+                goal_id=draft.id, target=_planner_target(draft), workspace=workspace,
+                storage_workspace=storage_workspace, target_paths=paths,
+                discovery_guidance=guidance,
+                human_language=human_language_label(draft.language),
+                deadline=time.monotonic() + max(1, int(draft.limits.get("operation_timeout_seconds", 1800))),
+            )
+            if not paths:
+                # No exact path was supplied; the normal Discovery waves are
+                # already bounded and can use reviewer feedback as their focus.
+                discovery_kwargs.pop("target_paths")
+            refreshed = DiscoverySupervisor().run(**discovery_kwargs).to_dict()
+        else:
+            try:
+                discovery_kwargs = {"draft": draft, "workspace": workspace}
+                if paths:
+                    discovery_kwargs.update(target_paths=paths, discovery_guidance=guidance)
+                refreshed = discovery_runner(**discovery_kwargs)
+            except TypeError as callback_error:
+                if "target_paths" not in str(callback_error) and "discovery_guidance" not in str(callback_error):
+                    raise
+                raise exc from callback_error
+        draft.status = "planning"
+        _set_stage(draft, "planning")
+        save_draft(draft, storage_workspace, event="stage_started", message="Reviewing plan with refreshed evidence")
+        _plan(
+            draft, workspace, catalog, planner_runner=planner_runner,
+            reviewer_runner=reviewer_runner, discovery_manifest=refreshed,
+            verification_adapter=adapter, storage_workspace=storage_workspace,
+        )
 
 
 def _planning_resume_stage(exc: Exception, draft: GoalDraft) -> str:
@@ -1258,6 +1333,7 @@ def create_draft(
                             storage_workspace=root,
                             deadline=time.monotonic() + operation_timeout,
                             human_language=human_language_label(draft.language),
+                            discovery_guidance=draft.discovery_guidance,
                         ).to_dict()
                 else:
                     with _draft_heartbeat(draft, root):
@@ -1282,7 +1358,10 @@ def create_draft(
         save_draft(draft, root, event="stage_started", message="Planning verifiable tasks")
         try:
             with _draft_heartbeat(draft, root):
-                _plan(draft, project_root, catalog, planner_runner=planner_runner, discovery_manifest=discovery_manifest, verification_adapter=adapter, storage_workspace=root)
+                _plan_with_evidence_refresh(
+                    draft, project_root, root, catalog, adapter, discovery_manifest,
+                    planner_runner=planner_runner, discovery_runner=discovery_runner,
+                )
         except Exception as exc:
             draft.status = "paused"
             draft.resume_from = _planning_resume_stage(exc, draft)
@@ -1314,6 +1393,7 @@ def _run_discovery_and_plan(draft: GoalDraft, root: Path, catalog, adapter, *, p
                     storage_workspace=root,
                     deadline=time.monotonic() + operation_timeout,
                     human_language=human_language_label(draft.language),
+                    discovery_guidance=draft.discovery_guidance,
                 ).to_dict()
         else:
             with _draft_heartbeat(draft, root):
@@ -1338,11 +1418,17 @@ def _run_discovery_and_plan(draft: GoalDraft, root: Path, catalog, adapter, *, p
     save_draft(draft, root, event="stage_started", message="Planning verifiable tasks")
     try:
         with _draft_heartbeat(draft, root):
-            _plan(draft, project_root, catalog, planner_runner=planner_runner, discovery_manifest=manifest, verification_adapter=adapter, storage_workspace=root)
+            _plan_with_evidence_refresh(
+                draft, project_root, root, catalog, adapter, manifest,
+                planner_runner=planner_runner, reviewer_runner=reviewer_runner,
+                discovery_runner=discovery_runner,
+            )
     except Exception as exc:
         draft.status = "paused"
         draft.resume_from = _planning_resume_stage(exc, draft)
         draft.last_error = f"Goal planning failed: {type(exc).__name__}: {exc}"
+        if isinstance(exc, GoalPlanningError) and exc.discovery_guidance:
+            draft.discovery_guidance = exc.discovery_guidance
         _set_stage(draft, "paused")
         save_draft(draft, root, event="failed", message="Goal planning failed")
         raise GoalDraftError(draft.last_error) from exc
@@ -1356,6 +1442,7 @@ def _run_plan_from_manifest(
     manifest: dict[str, Any],
     *,
     planner_runner=None,
+    discovery_runner=None,
 ) -> None:
     """Resume a Planner-only failure without paying for Discovery again."""
     operation_timeout = max(1, int(draft.limits.get("operation_timeout_seconds", 1800)))
@@ -1371,19 +1458,16 @@ def _run_plan_from_manifest(
     save_draft(draft, root, event="stage_started", message="Resuming task planning from saved discovery evidence")
     try:
         with _draft_heartbeat(draft, root):
-            _plan(
-                draft,
-                project_root,
-                catalog,
-                planner_runner=planner_runner,
-                discovery_manifest=manifest,
-                verification_adapter=adapter,
-                storage_workspace=root,
+            _plan_with_evidence_refresh(
+                draft, project_root, root, catalog, adapter, manifest,
+                planner_runner=planner_runner, discovery_runner=discovery_runner,
             )
     except Exception as exc:
         draft.status = "paused"
         draft.resume_from = _planning_resume_stage(exc, draft)
         draft.last_error = f"Goal planning failed: {type(exc).__name__}: {exc}"
+        if isinstance(exc, GoalPlanningError) and exc.discovery_guidance:
+            draft.discovery_guidance = exc.discovery_guidance
         _set_stage(draft, "paused")
         save_draft(draft, root, event="failed", message="Goal planning failed")
         raise GoalDraftError(draft.last_error) from exc
@@ -1599,6 +1683,7 @@ def resume_draft(*, workspace: Path | None = None, planner_runner=None, discover
                 adapter,
                 manifest,
                 planner_runner=planner_runner,
+                discovery_runner=discovery_runner,
             )
             save_draft(draft, root, event="completed" if draft.status == "ready" else "updated")
             return draft

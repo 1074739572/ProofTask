@@ -2931,6 +2931,42 @@ def test_repair_planner_runs_tool_free():
     assert calls[0]["tools_override"] == ()
 
 
+def test_repair_planner_reads_bounded_code_before_responding(tmp_path):
+    from harness.agents.runner import _tools_for_agent
+    from harness.goal.repair import plan_task_repair
+
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "app.py").write_text("def fix(): pass\n", encoding="utf-8")
+    (tmp_path / ".env").write_text("TOKEN=private\n", encoding="utf-8")
+    state = GoalState.new(target="repair", verification="pytest -q", workspace=str(tmp_path))
+    task = SimpleNamespace(
+        id="task_demo", subject="repair", description="repair behavior",
+        primary_write=["src/app.py"], planned_new=[], conditional_write=[], read_envelope=[],
+        acceptance_cases=[], verification_spec={}, last_error="failed", start_snapshot="", start_diff="",
+    )
+    calls = []
+
+    def inspect(**kwargs):
+        calls.append(kwargs)
+        _, handlers = _tools_for_agent(
+            list(kwargs["tools_override"]), cwd=tmp_path,
+            read_paths=kwargs["read_paths"], read_roots=kwargs["read_roots"],
+        )
+        assert "def fix" in handlers["read_file"](path="src/app.py")
+        assert handlers["read_file"](path=".env").startswith("Read blocked:")
+        return '{"action":"implementation_fix","instructions":"fix the failing branch"}'
+
+    decision = plan_task_repair(
+        state, task, {"passed": False, "route": "implementation_fix"},
+        cwd=str(tmp_path), read_paths=("src/app.py", ".env"), runner=inspect,
+    )
+
+    assert decision.action == "implementation_fix"
+    assert calls[0]["read_paths"] == ("src/app.py",)
+    assert calls[0]["read_roots"] == ()
+    assert calls[0]["max_rounds"] > 1
+
+
 def test_goal_worker_context_excludes_stale_cli_state():
     state = GoalState.new(target="x", verification="pytest -q", workspace=".")
     runner = GoalRunner(

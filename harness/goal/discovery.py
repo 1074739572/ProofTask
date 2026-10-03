@@ -17,7 +17,7 @@ from typing import Iterable
 
 from harness.agents.runner import AgentTaskConversation, AgentTaskStats, run_agent_task
 from harness.goal.discovery_models import DiscoveryJob, DiscoveryManifest, Evidence
-from harness.goal.discovery_store import save_job_state, save_manifest, save_report
+from harness.goal.discovery_store import load_manifest, save_job_state, save_manifest, save_report
 from harness.goal.supervision import StagePolicy, StageProgress, StageSupervisor
 
 
@@ -25,6 +25,7 @@ EXCLUDED_DIRS = frozenset({
     ".git", ".project", ".venv", "venv", "node_modules", "dist", "build",
     "coverage", "__pycache__", ".mypy_cache", ".pytest_cache", ".worktrees",
     ".task_outputs", ".local", ".goal-smoke", ".playwright-mcp", ".rag",
+    ".features", ".agents", ".codex", "secrets", "secret", "cache",
 })
 EXCLUDED_NAMES = frozenset({".env", ".env.local", ".env.production", "id_rsa"})
 TEXT_SUFFIXES = frozenset({".py", ".js", ".jsx", ".ts", ".tsx", ".json", ".md", ".txt", ".toml", ".yaml", ".yml", ".css", ".html"})
@@ -121,7 +122,7 @@ def iter_readable_files(root: str | Path, paths: Iterable[str | Path] | None = N
         if not _safe_path(base, path) or not path.is_file():
             continue
         relative = path.relative_to(base)
-        if not explicit_paths and any(part in EXCLUDED_DIRS for part in relative.parts):
+        if any(part.casefold() in EXCLUDED_DIRS or part.casefold().startswith(".env") for part in relative.parts):
             continue
         if path.name in EXCLUDED_NAMES or path.name.startswith(".env"):
             continue
@@ -414,6 +415,7 @@ def _prompt(
     prior_reports: Iterable[dict] = (),
     retry: bool = False,
     human_language: str = "English",
+    discovery_guidance: str = "",
 ) -> str:
     index = {item.path: item for item in shards}
     outline = [index[path].to_dict() for path in paths if path in index]
@@ -423,9 +425,13 @@ def _prompt(
         "Reply with the compact schema only.\n"
         if retry else ""
     )
+    guidance_block = ""
+    if discovery_guidance.strip():
+        guidance_block = f"Previous plan rejected — investigate with this focus:\n{discovery_guidance.strip()}\n\n"
     return (
         "Collect repository evidence for a verified coding Goal.\n"
         f"Goal: {target}\nRole: {role}\nBase revision: {base_revision}\n"
+        f"{guidance_block}"
         f"Earlier validated findings: {json.dumps(handoff, ensure_ascii=False)}\n"
         f"Assigned files: {json.dumps(outline, ensure_ascii=False)}\n\n"
         f"Read only assigned files (at most {len(paths)}). {correction}"
@@ -461,15 +467,40 @@ class DiscoverySupervisor:
         cancel_check=None,
         roles: tuple[str, ...] = DISCOVERY_ROLES,
         human_language: str = "English",
+        discovery_guidance: str = "",
+        target_paths: tuple[str, ...] = (),
     ) -> DiscoveryManifest:
         root = Path(workspace).expanduser().resolve()
         storage_root = Path(storage_workspace).expanduser().resolve() if storage_workspace is not None else root
         # Git-ignored files never enter automatic discovery. A file path named
         # directly in the user's Goal is deliberate scope, so include that one
         # bounded file without reopening an ignored directory tree.
-        shards = build_repo_map(root, include_paths=_explicit_target_paths(root, target))
+        explicit_paths = _explicit_target_paths(root, target)
+        from harness.goal.read_scope import bounded_read_paths
+
+        focus_paths = list(bounded_read_paths(root, target_paths, limit=DISCOVERY_FILE_LIMIT))
+        if target_paths and (
+            len(target_paths) > DISCOVERY_FILE_LIMIT
+            or len(focus_paths) != len(target_paths)
+            or any(not (root / path).resolve().is_file() for path in target_paths)
+        ):
+            raise ValueError("Targeted discovery requires distinct, permitted existing source files")
+        shards = build_repo_map(
+            root, paths=focus_paths if target_paths else None,
+            include_paths=explicit_paths if not target_paths else (),
+        )
         revision = git_revision(root)
-        jobs = [DiscoveryJob(id=f"{role}-1", role=role, read_paths=_assigned_paths(role, shards, target=target)) for role in roles]
+        prior_manifest = load_manifest(storage_root, goal_id)
+        wave_revision = int(prior_manifest.get("revision") or 0) + 1 if isinstance(prior_manifest, dict) else 1
+        jobs = []
+        for role in roles:
+            assigned = _assigned_paths(role, shards, target=target)
+            if focus_paths:
+                # A targeted refresh is deliberately exact. Dependency
+                # expansion is the planner's job; discovery must not turn a
+                # request for one missing file into a repository-wide scan.
+                assigned = tuple(path for path in focus_paths if path in {item.path for item in shards})
+            jobs.append(DiscoveryJob(id=f"{role}-{wave_revision}", role=role, read_paths=assigned))
         for job in jobs:
             save_job_state(storage_root, goal_id, job.to_dict())
             _emit_discovery_job(goal_id, job, event="queued")
@@ -498,7 +529,7 @@ class DiscoverySupervisor:
                     description=description,
                     prompt=active_prompt,
                     agent_type=f"goal_discovery_{job.role}", cwd=str(root),
-                    max_rounds=DISCOVERY_MAX_ROUNDS, tools_override=("read_file",),
+                    max_rounds=DISCOVERY_MAX_ROUNDS, tools_override=("read_file", "search_text"),
                     read_paths=job.read_paths, deadline=deadline, cancel_check=cancel_check, stats=stats,
                     conversation=discovery_conversation,
                 )
@@ -546,6 +577,7 @@ class DiscoverySupervisor:
                     initial_prompt=_prompt(
                         target, job.role, revision, shards, job.read_paths,
                         prior_reports=prior_reports, human_language=human_language,
+                        discovery_guidance=discovery_guidance,
                     ),
                     initial_description=f"discover {job.role} evidence",
                     continuation_prompt=lambda _slice, progress, _idle: (
@@ -582,7 +614,7 @@ class DiscoverySupervisor:
                             prior_reports=prior_reports, retry=True, human_language=human_language,
                         ),
                         agent_type=f"goal_discovery_{job.role}", cwd=str(root),
-                        max_rounds=1, tools_override=("read_file",),
+                        max_rounds=1, tools_override=("read_file", "search_text"),
                         read_paths=job.read_paths, deadline=deadline, cancel_check=cancel_check, stats=retry_stats,
                     )
                     report = _parse_report(retry_raw)
@@ -646,7 +678,7 @@ class DiscoverySupervisor:
         )
         # Architecture gets requirement evidence to dynamically expand its file list
         architecture_job = jobs_by_role.get("architecture")
-        if architecture_job is not None:
+        if architecture_job is not None and not focus_paths:
             architecture_paths = _assigned_paths(
                 "architecture", shards, target=target,
                 prior_evidence=requirement_reports,
@@ -663,7 +695,7 @@ class DiscoverySupervisor:
         )
         # Implementation gets architecture evidence + requirement evidence to expand its file list
         implementation_job = jobs_by_role.get("implementation")
-        if implementation_job is not None:
+        if implementation_job is not None and not focus_paths:
             implementation_paths = _assigned_paths(
                 "implementation", shards, target=target,
                 prior_evidence=requirement_reports + architecture_reports,
@@ -719,11 +751,69 @@ class DiscoverySupervisor:
                     base_revision=revision, source_job=job.id,
                     excerpt_sha256=hashlib.sha256(actual_excerpt.encode("utf-8")).hexdigest(),
                 ))
-        manifest = DiscoveryManifest(
+        current_manifest = DiscoveryManifest(
             goal_id=goal_id, base_revision=revision, repo_files=tuple(item.path for item in shards),
             shards=tuple(item.to_dict() for item in shards), evidence=tuple(evidence),
             jobs=tuple(job for job, _ in sorted(completed, key=lambda item: item[0].id)), gaps=tuple(dict.fromkeys(gaps)),
         )
+        # Targeted refreshes append validated facts to the prior checkpoint.
+        # Keep the latest shard for a path, but preserve historical jobs and
+        # evidence so planner/reviewer context remains auditable.
+        if focus_paths and isinstance(prior_manifest, dict):
+            old_shards = {
+                str(item.get("path") or ""): dict(item)
+                for item in prior_manifest.get("shards", [])
+                if isinstance(item, dict) and str(item.get("path") or "")
+            }
+            changed = {
+                item.path for item in shards
+                if item.path in old_shards and old_shards[item.path].get("sha256") != item.sha256
+            }
+            old_shards.update({item.path: item.to_dict() for item in shards})
+            old_evidence = [
+                dict(item) for item in prior_manifest.get("evidence", [])
+                if isinstance(item, dict) and item.get("path") not in changed
+            ]
+            used_ids = {
+                str(item.get("id") or "") for item in prior_manifest.get("evidence", [])
+                if isinstance(item, dict)
+            }
+            next_id = 1
+            evidence_keys = {
+                (str(item.get("path") or ""), tuple(item.get("lines") or ()), str(item.get("claim") or ""), str(item.get("source_job") or ""))
+                for item in old_evidence
+            }
+            merged_evidence = old_evidence[:]
+            for item in evidence:
+                payload = item.to_dict()
+                key = (payload["path"], tuple(payload.get("lines") or ()), payload.get("claim", ""), payload.get("source_job", ""))
+                if key not in evidence_keys:
+                    while f"E{next_id}" in used_ids:
+                        next_id += 1
+                    payload["id"] = f"E{next_id}"
+                    used_ids.add(payload["id"])
+                    merged_evidence.append(payload)
+                    evidence_keys.add(key)
+            old_jobs = [dict(item) for item in prior_manifest.get("jobs", []) if isinstance(item, dict)]
+            merged_jobs = old_jobs + [job.to_dict() for job, _ in sorted(completed, key=lambda item: item[0].id)]
+            old_gaps = [str(item) for item in prior_manifest.get("gaps", []) if str(item).strip()]
+            merged_evidence = [
+                Evidence(**{**item, "lines": tuple(item.get("lines") or (0, 0))})
+                for item in merged_evidence if item.get("id")
+            ]
+            manifest = DiscoveryManifest(
+                goal_id=goal_id,
+                base_revision=revision,
+                revision=max(int(prior_manifest.get("revision") or 0) + 1, current_manifest.revision),
+                repo_files=tuple(sorted(old_shards)),
+                shards=tuple(old_shards[path] for path in sorted(old_shards)),
+                evidence=tuple(merged_evidence),
+                jobs=tuple(DiscoveryJob(**item) for item in merged_jobs if item.get("id") and item.get("role")),
+                gaps=tuple(dict.fromkeys([*old_gaps, *current_manifest.gaps])),
+                conflicts=tuple(str(item) for item in prior_manifest.get("conflicts", []) if str(item).strip()),
+            )
+        else:
+            manifest = current_manifest
         save_manifest(storage_root, goal_id, manifest.to_dict())
         _emit_discovery_job(goal_id, None, event="wave_completed", completed=len(completed), total=len(jobs))
         return manifest

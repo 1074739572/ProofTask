@@ -8,13 +8,8 @@ from pathlib import Path
 
 from harness.rag.assets import remove_source_assets, reset_source_assets
 from harness.rag.chunking import chunk_docx, chunk_markdown, chunk_pdf, merge_short_chunk_dicts
-from harness.rag.config import (
-    CHUNKS_DIR,
-    DEFAULT_CORPUS,
-    MANIFEST_PATH,
-    RAG_DIR,
-    SUPPORTED_SUFFIXES,
-)
+from harness.rag import config as rag_config
+from harness.rag.config import DEFAULT_CORPUS, SUPPORTED_SUFFIXES
 from harness.rag.enrichment import (
     configured_vlm_model,
     pdf_ocr_mode,
@@ -27,10 +22,12 @@ from harness.settings import PACKAGE_ROOT, get_workdir
 # Current workspace root as a module attribute so tests can monkeypatch it and
 # workspace switching can re-point it without restarting the process.
 WORKDIR = get_workdir()
+_INITIAL_WORKDIR = WORKDIR
 
 
 def _workdir() -> Path:
-    return WORKDIR if WORKDIR is not None else get_workdir()
+    # Keep explicit test overrides, but follow the active workspace in production.
+    return WORKDIR if WORKDIR != _INITIAL_WORKDIR else get_workdir()
 
 
 def resolve_path(path: str | None) -> Path:
@@ -85,9 +82,17 @@ def parse_file(path: Path, source: str) -> list[dict]:
     return []
 
 
-def load_chunks_for_source(source: str) -> list[dict]:
-    safe_name = source.replace("/", "__").replace("\\", "__")
-    path = CHUNKS_DIR / f"{safe_name}.chunks.jsonl"
+def _paths() -> tuple[Path, Path, Path, Path]:
+    """Resolve active paths at call time; tolerate legacy test overrides."""
+    return (
+        Path(globals().get("CHUNKS_DIR", rag_config.CHUNKS_DIR)),
+        Path(globals().get("RAG_DIR", rag_config.RAG_DIR)),
+        Path(globals().get("MANIFEST_PATH", rag_config.MANIFEST_PATH)),
+        Path(rag_config.legacy_path("CHUNKS_DIR")),
+    )
+
+
+def _read_chunks(path: Path) -> list[dict]:
     if not path.exists():
         return []
     chunks = []
@@ -99,10 +104,26 @@ def load_chunks_for_source(source: str) -> list[dict]:
     return chunks
 
 
-def write_chunks_jsonl(source: str, chunks: list[dict]) -> Path:
-    CHUNKS_DIR.mkdir(parents=True, exist_ok=True)
+def load_chunks_for_source(source: str) -> list[dict]:
+    rag_config.ensure_legacy_migrated()
+    chunks_dir, _, _, legacy_dir = _paths()
     safe_name = source.replace("/", "__").replace("\\", "__")
-    out = CHUNKS_DIR / f"{safe_name}.chunks.jsonl"
+    filename = f"{safe_name}.chunks.jsonl"
+
+    path = chunks_dir / filename
+    if path.exists():
+        return _read_chunks(path)
+
+    return _read_chunks(legacy_dir / filename)
+
+
+def write_chunks_jsonl(source: str, chunks: list[dict]) -> Path:
+    chunks_dir, _, _, _ = _paths()
+    chunks_dir.mkdir(parents=True, exist_ok=True)
+
+    safe_name = source.replace("/", "__").replace("\\", "__")
+    out = chunks_dir / f"{safe_name}.chunks.jsonl"
+
     with out.open("w", encoding="utf-8") as handle:
         for chunk in chunks:
             handle.write(json.dumps(chunk, ensure_ascii=False) + "\n")
@@ -110,19 +131,32 @@ def write_chunks_jsonl(source: str, chunks: list[dict]) -> Path:
 
 
 def remove_chunks_for_source(source: str) -> None:
+    chunks_dir, _, _, _ = _paths()
     safe_name = source.replace("/", "__").replace("\\", "__")
-    (CHUNKS_DIR / f"{safe_name}.chunks.jsonl").unlink(missing_ok=True)
+    (chunks_dir / f"{safe_name}.chunks.jsonl").unlink(missing_ok=True)
 
 
 def load_manifest() -> dict:
-    if not MANIFEST_PATH.exists():
-        return {"schema_version": 2, "sources": {}, "embedding_model": None}
-    return json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+    rag_config.ensure_legacy_migrated()
+    _, _, manifest_path, _ = _paths()
+
+    if manifest_path.exists():
+        return json.loads(manifest_path.read_text(encoding="utf-8"))
+
+    legacy = rag_config.legacy_path("MANIFEST_PATH")
+    if legacy.exists():
+        return json.loads(legacy.read_text(encoding="utf-8"))
+
+    return {"schema_version": 2, "sources": {}, "embedding_model": None}
 
 
 def save_manifest(manifest: dict) -> None:
-    RAG_DIR.mkdir(parents=True, exist_ok=True)
-    MANIFEST_PATH.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+    _, rag_dir, manifest_path, _ = _paths()
+    rag_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
 
 
 def ingest_path(path: str | None = None) -> dict:

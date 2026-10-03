@@ -23,9 +23,8 @@ PLANNER_AGENT = "goal_planner"
 PLAN_REVIEWER_AGENT = "goal_plan_reviewer"
 # Planning turns a confirmed requirement plus a machine-collected test catalog
 # into a contract. Deep repository inspection belongs to the test writer and
-# implementation worker; keeping planning tool-free prevents an invisible,
-# unbounded explore loop before a draft can be saved.
-PLANNER_MAX_ROUNDS = 1
+# Three bounded inspection turns plus one complete plan/review response.
+PLANNER_MAX_ROUNDS = 4
 PLANNER_MAX_OUTPUT_TOKENS = 8_000
 PLANNER_ESCALATED_OUTPUT_TOKENS = 12_000
 PLANNER_REASONING_EFFORT = "medium"
@@ -42,7 +41,8 @@ PLANNER_READ_TIMEOUT_SECONDS = 300.0
 # bounded while avoiding a paused Draft for a single transient proxy timeout.
 PLANNER_MAX_REQUEST_ATTEMPTS = 2
 PLANNER_FORMAT_RETRY_MAX_ROUNDS = 1
-PLAN_REVIEW_MAX_ROUNDS = 1
+PLAN_REVIEW_MAX_ROUNDS = 4
+PLANNING_READ_TOOLS = ("read_file", "search_text", "glob")
 PLANNER_REPAIR_INPUT_LIMIT = 12_000
 MAX_BEHAVIOR_CHARS = 600
 MAX_ACCEPTANCE_CASES = 8
@@ -56,9 +56,11 @@ _AGENT_HEADER = re.compile(r"^\[[^\]]+\] [^\n]*\n*")
 class GoalPlanningError(ValueError):
     """Raised when a Goal cannot be decomposed into valid Task contracts."""
 
-    def __init__(self, message: str, *, requires_discovery_refresh: bool = False):
+    def __init__(self, message: str, *, requires_discovery_refresh: bool = False, discovery_guidance: str = "", failure_kind: str = ""):
         super().__init__(message)
         self.requires_discovery_refresh = requires_discovery_refresh
+        self.discovery_guidance = discovery_guidance
+        self.failure_kind = failure_kind
 
 
 def _strip_agent_header(text: str) -> str:
@@ -596,8 +598,16 @@ def build_plan_prompt(
     plan_example = _plan_example(str(getattr(test_catalog, "adapter", "pytest") or "pytest"))
     manifest_text = "No Discovery Manifest supplied. Do not guess repository paths."
     if isinstance(discovery_manifest, dict):
+        discovered_paths: set[str] = set()
+        for raw in (discovery_manifest.get("evidence") or []):
+            if isinstance(raw, dict) and raw.get("path"):
+                discovered_paths.add(str(raw["path"]).replace("\\", "/"))
+        path_list = sorted(discovered_paths)
         manifest_text = (
-            "Discovery evidence view (machine-collected; cite evidence IDs exactly). "
+            "Discovered file paths — use ONLY these exact paths for primary_write, read_envelope, "
+            "conditional_write, and planned_new parents. Do not rename, relocate, or invent any path:\n"
+            + json.dumps(path_list, ensure_ascii=False)
+            + "\n\nDiscovery evidence view (machine-collected; cite evidence IDs exactly). "
             "The full repository map remains available only for local validation:\n"
             + json.dumps(_planner_manifest_view(discovery_manifest), ensure_ascii=False)
         )
@@ -905,6 +915,64 @@ def planning_error_requires_discovery(error: str | None) -> bool:
             "unresolved decisions",
         )
     )
+
+
+_CONTEXT_GAP_KEYWORDS: tuple[str, ...] = (
+    "归属", "边界", "不确定", "未确认", "消费者", "写入者", "调用方",
+    "undiscovered", "not found", "missing from manifest", "cannot determine",
+    "unclear ownership", "unknown consumer", "没有确定", "缺少",
+)
+_PLAN_FIX_KEYWORDS: tuple[str, ...] = (
+    "primary_write", "read_envelope", "planned_new", "conditional_write",
+    "test_selectors", "coverage", "contract", "verification",
+    "must contain", "should be", "missing field",
+)
+
+
+def _classify_review_findings(review: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str]:
+    """Split reviewer findings into context gaps (need rediscovery) vs plan fixes (repair planner).
+
+    Returns (context_gaps, plan_fixes, discovery_guidance).
+    """
+    findings: list[dict[str, Any]] = review.get("findings", []) if isinstance(review, dict) else []
+    context_gaps: list[dict[str, Any]] = []
+    plan_fixes: list[dict[str, Any]] = []
+    gap_issues: list[str] = []
+    gap_repairs: list[str] = []
+
+    for f in findings:
+        if not isinstance(f, dict):
+            continue
+        issue = str(f.get("issue", ""))
+        repair = str(f.get("repair", ""))
+        combined = (issue + " " + repair).lower()
+
+        is_context_gap = any(kw in combined for kw in _CONTEXT_GAP_KEYWORDS)
+        is_plan_fix = any(kw in combined for kw in _PLAN_FIX_KEYWORDS)
+
+        if is_context_gap and not is_plan_fix:
+            context_gaps.append(f)
+            if issue.strip():
+                gap_issues.append(f"[{f.get('task', '?')}] {issue.strip()}")
+            if repair.strip():
+                gap_repairs.append(repair.strip())
+        else:
+            plan_fixes.append(f)
+
+    guidance = ""
+    if context_gaps:
+        guidance = (
+            "The previous plan was rejected because the planner lacked evidence for:\n"
+            + "\n".join(f"  - {i}" for i in gap_issues)
+        )
+        if gap_repairs:
+            guidance += (
+                "\n\nInvestigate these specific areas during discovery:\n"
+                + "\n".join(f"  - {r}" for r in gap_repairs)
+            )
+        guidance += "\n\nFocus on file ownership, write consumers, and path boundaries that were previously unclear."
+
+    return context_gaps, plan_fixes, guidance
 
 
 def _parse_goal_contract(raw: Any, evidence_ids: set[str]) -> tuple[dict[str, Any] | None, list[str]]:
@@ -1404,12 +1472,16 @@ def _format_repair_prompt(
             f"Candidate response (possibly truncated):\n{previous}"
         )
     # The planner conversation already contains ``original_prompt``. Replaying
-    # the discovery manifest and schema here can more than double the repair
-    # request and exhaust relays with a fixed read window before JSON arrives.
+    # the full discovery manifest here can exhaust relays before JSON arrives,
+    # but listing discovered source paths is critical so the planner can fix
+    # hallucinated file references instead of repeating the same mistake.
+    paths_hint = ""
+    if execution_workspace_paths:
+        paths_hint = f"Discovered source files (only use these exact paths): {json.dumps(list(execution_workspace_paths), ensure_ascii=False)}\n"
     return (
-        "Repair the previously supplied GoalPlan JSON. The original requirement, Discovery evidence, "
-        "schema, and planning rules remain authoritative in this conversation. Return ONLY one COMPLETE "
+        "Repair the previously supplied GoalPlan JSON. Return ONLY one COMPLETE "
         "corrected GoalPlan JSON object.\n"
+        f"{paths_hint}"
         f"Contract error: {error}.\n"
         "Preserve valid planning intent and fix only the listed error. Do not explain, call tools, or omit "
         "required fields.\n"
@@ -1530,6 +1602,8 @@ def plan_tasks(
     candidate_callback: Callable[[GoalPlan], None] | None = None,
     review_feedback: dict[str, Any] | None = None,
     review_callback: Callable[[GoalPlan, dict[str, Any]], None] | None = None,
+    read_paths: tuple[str, ...] = (),
+    read_roots: tuple[str, ...] = (),
 ) -> GoalPlan:
     """Compile, validate, and independently review a GoalPlan v2."""
     from harness.agents.runner import AgentTaskConversation, AgentTaskStats, run_agent_task as default_runner
@@ -1542,6 +1616,11 @@ def plan_tasks(
     reviewer = reviewer_runner or default_runner
     planner_stats = stats if stats is not None else AgentTaskStats()
     planner_conversation = AgentTaskConversation()
+    from harness.goal.read_scope import bounded_read_paths as resolve_read_paths
+
+    bounded_read_paths = resolve_read_paths(root, (*read_paths, *read_roots))
+    bounded_read_roots: tuple[str, ...] = ()
+    planning_tools = PLANNING_READ_TOOLS if (bounded_read_paths or bounded_read_roots) else ()
     output_upgrade_tokens = 32_000 if discovery_manifest is None else PLANNER_ESCALATED_OUTPUT_TOKENS
     prompt = build_plan_prompt(
         target, full_verification, catalog, discovery_manifest,
@@ -1552,12 +1631,19 @@ def plan_tasks(
         replan_reason=replan_reason,
         execution_workspace_paths=execution_workspace_paths,
     )
+    if planning_tools:
+        prompt += (
+            "\n\nBounded repository inspection is available through read-only tools. "
+            "Use only these exact paths and roots; do not infer permission from a tool result:\n"
+            f"read_paths={json.dumps(list(bounded_read_paths), ensure_ascii=False)}\n"
+            f"read_roots={json.dumps(list(bounded_read_roots), ensure_ascii=False)}"
+        )
     planner_call = {
         "description": "decompose goal into verifiable tasks",
         "prompt": prompt,
         "agent_type": PLANNER_AGENT,
         "cwd": str(root),
-        "max_rounds": PLANNER_MAX_ROUNDS,
+        "max_rounds": PLANNER_MAX_ROUNDS if planning_tools else 1,
         # Keep the historical 32k allowance for bare v1 callbacks. Native v2
         # plans use the bounded first attempt and an explicit continuation.
         "max_tokens": 32_000 if discovery_manifest is None else PLANNER_MAX_OUTPUT_TOKENS,
@@ -1566,7 +1652,9 @@ def plan_tasks(
         # is returned, so planning uses a bounded effort and relies on the
         # independent reviewer for contract quality.
         "reasoning_effort_override": PLANNER_REASONING_EFFORT,
-        "tools_override": (),
+        "tools_override": planning_tools,
+        "read_paths": bounded_read_paths,
+        "read_roots": bounded_read_roots,
         # Goal planning returns a potentially large JSON contract. Stream it
         # even when no interactive event sink is active so relay read timeouts
         # measure idle time between chunks rather than whole-response time.
@@ -1731,6 +1819,7 @@ def plan_tasks(
                 )
 
     def review_plan(current: GoalPlan) -> tuple[bool, dict[str, Any], str | None]:
+        review_conversation = AgentTaskConversation()
         review_call = {
             "description": "review GoalPlan v2 for execution readiness",
             "prompt": build_plan_review_prompt(
@@ -1741,20 +1830,54 @@ def plan_tasks(
                 execution_workspace_paths=execution_workspace_paths,
             ),
             "agent_type": PLAN_REVIEWER_AGENT,
-            "cwd": str(root), "max_rounds": PLAN_REVIEW_MAX_ROUNDS,
-            "max_tokens": PLANNER_MAX_OUTPUT_TOKENS, "tools_override": (),
+            "cwd": str(root), "max_rounds": PLAN_REVIEW_MAX_ROUNDS if planning_tools else 1,
+            "max_tokens": PLANNER_MAX_OUTPUT_TOKENS,
+            "reasoning_effort_override": PLANNER_REASONING_EFFORT,
+            "stream_response": True,
+            "request_read_timeout_seconds": PLANNER_READ_TIMEOUT_SECONDS,
+            "max_request_attempts": PLANNER_MAX_REQUEST_ATTEMPTS,
+            "conversation": review_conversation,
+            "tools_override": planning_tools,
+            "read_paths": bounded_read_paths,
+            "read_roots": bounded_read_roots,
             "cancel_check": cancel_check, "deadline": deadline, "stats": planner_stats,
         }
-        try:
-            review_raw = reviewer(**review_call)
-        except Exception as exc:
-            raise GoalPlanningError(f"Goal plan reviewer request failed: {type(exc).__name__}: {exc}") from exc
-        if review_raw.startswith(f"[{PLAN_REVIEWER_AGENT}] failed:") or review_raw.startswith(f"[{PLAN_REVIEWER_AGENT}] stopped:"):
-            raise GoalPlanningError(f"Goal plan reviewer is unavailable: {review_raw}")
-        approved, result, error = _review_result(review_raw)
-        if approved is None or result is None:
-            raise GoalPlanningError(f"Goal plan reviewer returned invalid JSON: {error}")
-        return approved, result, None
+        review_call["prompt"] += (
+            "\n\nAssigned repository read_paths=" + json.dumps(list(bounded_read_paths), ensure_ascii=False)
+            + ". Inspect only these exact files. Reserve your final response for the complete verdict JSON."
+        )
+        for attempt in range(2):
+            planner_stats.stop_reason = "completed"
+            try:
+                review_raw = reviewer(**review_call)
+            except Exception as exc:
+                raise GoalPlanningError(f"Goal plan reviewer request failed: {type(exc).__name__}: {exc}") from exc
+            if planner_stats.stop_reason in {"provider_error", "configuration_error", "deadline", "cancelled"} or review_raw.startswith((
+                f"[{PLAN_REVIEWER_AGENT}] failed:", f"[{PLAN_REVIEWER_AGENT}] stopped:",
+            )):
+                raise GoalPlanningError(f"Goal plan reviewer is unavailable: {review_raw}")
+            approved, result, error = _review_result(review_raw)
+            if approved is not None and result is not None:
+                return approved, result, None
+            if attempt:
+                raise GoalPlanningError(
+                    f"Goal plan reviewer returned invalid JSON after format correction: {error}",
+                    failure_kind="review_format",
+                )
+            # Retain source inspection and the candidate, but reserve a final
+            # tool-free turn for the verdict after truncation or tool exhaustion.
+            review_call.update({
+                "description": "complete independent GoalPlan review JSON",
+                "prompt": (
+                    "Your review did not contain a valid verdict JSON object: " + str(error)
+                    + ". Using the SAME candidate and retained source inspection, return one COMPLETE JSON object "
+                    "with approved (boolean), summary, and findings. Do not call tools or rewrite the plan. "
+                    "Do not approve merely to repair the format. Previous response:\n" + review_raw[-4_000:]
+                ),
+                "tools_override": (), "max_rounds": 1,
+                "max_tokens": PLANNER_ESCALATED_OUTPUT_TOKENS,
+                "deadline": max(deadline or 0.0, time.monotonic() + PLANNER_CONTINUATION_TIMEOUT_SECONDS),
+            })
 
     if candidate_callback is not None:
         candidate_callback(GoalPlan(
@@ -1788,8 +1911,19 @@ def plan_tasks(
             "GoalPlan was rejected after its one permitted correction: " + detail,
             requires_discovery_refresh=planning_error_requires_discovery(detail),
         )
+    context_gaps, plan_fixes, discovery_guidance = _classify_review_findings(review)
+    if context_gaps and not plan_fixes:
+        raise GoalPlanningError(
+            "GoalPlan rejected: the planner lacks enough context to fix structural reviewer feedback. "
+            "Re-running discovery with targeted guidance.",
+            requires_discovery_refresh=True,
+            discovery_guidance=discovery_guidance,
+        )
     repair_call = dict(planner_call)
     repair_call["description"] = "repair GoalPlan v2 after independent review"
+    # A reviewer rejection can require checking source again before revising
+    # the Task graph; it is not merely a JSON-format correction.
+    repair_call["max_rounds"] = PLANNER_MAX_ROUNDS
     repair_call["prompt"] = _format_repair_prompt(
         prompt,
         raw,
@@ -1798,7 +1932,6 @@ def plan_tasks(
         replacement_scope=replacement_scope,
         execution_workspace_paths=execution_workspace_paths,
     )
-    repair_call["max_rounds"] = PLANNER_FORMAT_RETRY_MAX_ROUNDS
     try:
         repaired_raw = runner(**repair_call)
     except Exception as exc:

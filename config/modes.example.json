@@ -4,7 +4,7 @@
     "my-review": {
       "label": "自定义 · 只读审查",
       "summary": "示例：只读代码并写审查意见，不改仓库",
-      "lead_model_hint": "deepseek-v4-pro",
+      "lead_model_hint": "deepseek-flash",
       "enable_task": false,
       "disable_tools": [
         "write_file",

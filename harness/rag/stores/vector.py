@@ -6,9 +6,11 @@ import threading
 from typing import Any
 
 from harness.rag.config import COLLECTION_NAME
+from harness.settings import workspace_generation
 
 _lock = threading.Lock()
 _store: VectorStore | None = None
+_store_generation = -1
 
 
 class VectorStore:
@@ -183,14 +185,17 @@ def _build_where(
 
 
 def get_vector_store() -> VectorStore:
-    global _store
+    global _store, _store_generation
+    generation = workspace_generation()
     with _lock:
-        if _store is None:
+        if _store is None or _store_generation != generation:
             _store = VectorStore()
+            _store_generation = generation
         return _store
 
 
 def reset_vector_store() -> None:
-    global _store
+    global _store, _store_generation
     with _lock:
         _store = None
+        _store_generation = -1

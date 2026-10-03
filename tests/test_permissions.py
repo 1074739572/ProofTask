@@ -359,6 +359,37 @@ def test_goal_bash_request_is_deferred_and_never_scope_approved():
     request.assert_not_called()
 
 
+def test_goal_debug_test_is_allowed_and_never_deferred(tmp_path):
+    from harness.goal.authority import goal_authority
+    from harness.permissions.config import load_permission_rules
+
+    rules = load_permission_rules()
+    assert rules.get("debug_test") == "allow"
+    decision = evaluate_permission(
+        "debug_test",
+        {"selector": "tests/test_a.py::test_b"},
+        rules=rules,
+        include_saved=False,
+    )
+    assert decision.effect == "allow"
+    block = {"name": "debug_test", "input": {"selector": "tests/test_a.py::test_b"}}
+    with goal_authority(
+        goal_id="goal-1",
+        task_id="task-1",
+        phase="act",
+        workspace=tmp_path,
+        write_roots=(),
+    ), mock.patch("harness.hooks.evaluate_permission", return_value=decision), mock.patch(
+        "harness.goal.runner.is_goal_noninteractive", return_value=True
+    ), mock.patch("harness.goal.runner.mark_goal_permission_pending") as pending, mock.patch(
+        "harness.hooks.audit_permission"
+    ):
+        result = permission_hook(block)
+
+    assert result is None
+    pending.assert_not_called()
+
+
 def test_permission_hook_persists_always_approval():
     response = mock.Mock(decision="always", allowed=True, remember_session=False, remember_always=True, value="")
     block = {"name": "bash", "input": {"command": "npm test"}}

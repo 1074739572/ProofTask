@@ -12,7 +12,7 @@
     "plan": {
       "label": "规划 Plan",
       "summary": "只读分析 + 出计划；不改文件、不跑破坏性命令",
-      "lead_model_hint": "deepseek-v4-flash",
+      "lead_model_hint": "deepseek-flash",
       "enable_task": false,
       "disable_tools": [
         "write_file",

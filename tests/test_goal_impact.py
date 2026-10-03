@@ -47,6 +47,33 @@ def test_impact_review_retries_non_json_output_once(tmp_path, monkeypatch):
     assert not decision.format_error
 
 
+def test_impact_review_reads_only_relevant_task_paths(tmp_path, monkeypatch):
+    import harness.goal.impact as impact
+
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "shared.py").write_text("def shared(): pass\n", encoding="utf-8")
+    (tmp_path / "src" / "unrelated.py").write_text("PRIVATE = True\n", encoding="utf-8")
+    monkeypatch.setattr(impact, "load_test_map", lambda _state: [])
+    completed = _task("done")
+    completed.primary_write = ["src/shared.py"]
+    calls = []
+
+    def invoke(**kwargs):
+        calls.append(kwargs)
+        return "invalid JSON" if len(calls) == 1 else '{"action":"none"}'
+
+    review_test_impact(
+        SimpleNamespace(goal_contract={}, id="goal-test"), completed, [_task("next")],
+        cwd=str(tmp_path), stats=AgentTaskStats(), runner=invoke,
+    )
+
+    assert calls[0]["tools_override"] == ("read_file", "search_text", "glob")
+    assert calls[0]["read_paths"] == ("src/shared.py",)
+    assert calls[0]["read_roots"] == ()
+    assert calls[1]["tools_override"] == ()
+    assert calls[1]["max_rounds"] == 1
+
+
 def test_impact_review_reports_format_error_after_correction(tmp_path, monkeypatch):
     import harness.goal.impact as impact
 

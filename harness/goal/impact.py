@@ -8,6 +8,7 @@ from typing import Any, Callable
 
 from harness.agents.runner import run_agent_task
 from harness.goal.memory import load_test_map
+from harness.goal.read_scope import bounded_read_paths
 from harness.goal.repair import _extract_json
 
 IMPACT_AGENT = "goal_test_impact"
@@ -73,6 +74,15 @@ def review_test_impact(
         }
         for task in pending_tasks
     ]
+    read_candidates: list[str] = []
+    for task in (completed_task, *pending_tasks):
+        read_candidates.extend(str(path) for path in (
+            *getattr(task, "primary_write", ()), *getattr(task, "planned_new", ()),
+            *getattr(task, "conditional_write", ()), *getattr(task, "read_envelope", ()),
+            *((getattr(task, "verification_spec", None) or {}).get("test_files") or []),
+        ))
+    read_paths = bounded_read_paths(cwd, read_candidates, limit=48)
+    read_tools = ("read_file", "search_text", "glob") if read_paths else ()
     prompt = (
         "Review whether a completed Task requires additional cross-Task coverage before a pending Task starts. "
         "Return ONLY JSON: {\"action\":\"none|add_tests\",\"task_id\":\"pending task id or null\",\"reason\":\"...\"}.\n"
@@ -82,6 +92,7 @@ def review_test_impact(
         f"Completed task: {json.dumps({'id': completed_task.id, 'subject': completed_task.subject, 'behavior': completed_task.description, 'acceptance_cases': completed_task.acceptance_cases}, ensure_ascii=False)}\n"
         f"Pending tasks: {json.dumps(candidates, ensure_ascii=False)}\n"
         f"TestMap: {json.dumps(load_test_map(state)[-24:], ensure_ascii=False)}"
+        f"\nAssigned read-only files: {json.dumps(read_paths, ensure_ascii=False)}"
     )
     invoke = runner or run_agent_task
     try:
@@ -94,6 +105,9 @@ def review_test_impact(
             cancel_check=cancel_check,
             deadline=deadline,
             stats=stats,
+            tools_override=read_tools,
+            read_roots=(),
+            read_paths=read_paths,
         )
     except Exception as exc:
         return ImpactDecision(reason=f"impact reviewer unavailable: {type(exc).__name__}", unavailable=True)
@@ -117,10 +131,13 @@ def review_test_impact(
             ),
             agent_type=IMPACT_AGENT,
             cwd=cwd,
-            max_rounds=16,
+            max_rounds=1,
             cancel_check=cancel_check,
             deadline=deadline,
             stats=stats,
+            tools_override=(),
+            read_roots=(),
+            read_paths=read_paths,
         )
     except Exception as exc:
         return ImpactDecision(reason=f"impact reviewer unavailable: {type(exc).__name__}", unavailable=True)

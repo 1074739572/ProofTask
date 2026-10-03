@@ -390,3 +390,29 @@ def test_task_evaluation_downgrades_unqualified_replan_to_task_repair(monkeypatc
 
     assert updated.evaluation["route"] == "implementation_fix"
     assert "lacked an explicit" in updated.evaluation["findings"][-1]["issue"]
+
+
+def test_evaluator_inspects_only_assigned_task_files(monkeypatch, tmp_path):
+    import harness.evaluation.runner as evaluation_runner
+
+    source = tmp_path / "src"
+    source.mkdir()
+    (source / "owner.py").write_text("def owner(): pass\n", encoding="utf-8")
+    (source / "unrelated.py").write_text("PRIVATE = True\n", encoding="utf-8")
+    calls = []
+
+    def invoke(**kwargs):
+        calls.append(kwargs)
+        return '{"passed":true,"route":"pass","summary":"covered","findings":[]}'
+
+    monkeypatch.setattr(evaluation_runner, "run_agent_task", invoke)
+    evaluation_runner._run_evaluator(
+        description="evaluate", prompt="review", cwd=str(tmp_path),
+        cancel_check=None, deadline=None, stats=None,
+        read_paths=("src/owner.py",),
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["tools_override"] == ("read_file", "search_text", "glob", "load_skill")
+    assert calls[0]["read_paths"] == ("src/owner.py",)
+    assert calls[0]["read_roots"] == ()

@@ -575,7 +575,7 @@ def test_resume_planner_failure_reuses_saved_discovery_manifest(tmp_path, monkey
     assert planner_calls == [paused.id, paused.id]
 
 
-def test_resume_path_grounding_failure_refreshes_discovery(tmp_path, monkeypatch):
+def test_path_grounding_failure_refreshes_discovery_without_manual_resume(tmp_path, monkeypatch):
     import harness.goal.draft as draft_module
     from harness.goal.planner import GoalPlanningError
 
@@ -602,23 +602,18 @@ def test_resume_path_grounding_failure_refreshes_discovery(tmp_path, monkeypatch
         draft.status = "ready"
 
     monkeypatch.setattr(draft_module, "_plan", planner)
-    with pytest.raises(ValueError, match="Goal planning failed"):
-        draft_module.create_draft(
-            "add rate limits",
-            workspace=tmp_path,
-            verification="python -m pytest -q",
-            intake_runner=lambda **_: '{"questions":[]}',
-            discovery_runner=discovery,
-        )
+    ready = draft_module.create_draft(
+        "add rate limits",
+        workspace=tmp_path,
+        verification="python -m pytest -q",
+        intake_runner=lambda **_: '{"questions":[]}',
+        discovery_runner=discovery,
+    )
 
-    paused = draft_module.load_draft(tmp_path)
-    assert paused is not None
-    assert paused.resume_from == "discovering"
-
-    resumed = draft_module.resume_draft(workspace=tmp_path, discovery_runner=discovery)
-
-    assert resumed.status == "ready"
-    assert discovery_calls == [paused.id, paused.id]
+    assert ready.status == "ready"
+    assert discovery_calls == [ready.id, ready.id]
+    assert plan_calls == [ready.id, ready.id]
+    assert "undiscovered read_envelope" in ready.discovery_guidance
 
 
 def test_resume_routes_unresolved_decisions_back_to_discovery(tmp_path, monkeypatch):

@@ -43,6 +43,9 @@ DEFAULT_PERMISSIONS: dict[str, PermissionRule] = {
     "rag_search": "allow",
     "rag_status": "allow",
     "project_status": "allow",
+    # Goal workers may run one frozen Task selector as advisory diagnostics;
+    # the runner bounds it to the frozen contract and a per-worker call cap.
+    "debug_test": "allow",
     "web_search": "allow",
     "mcp__fetch__fetch": "allow",
     "mcp__playwright__browser_navigate": "allow",
@@ -125,6 +128,9 @@ SANDBOX_PERMISSIONS: dict[str, PermissionRule] = {
     # Verification has its own structural policy and runs without a model
     # permission prompt. Keep it explicit so the sandbox cannot deadlock Goal.
     "verify_command": "allow",
+    # debug_test is the worker's advisory diagnostic path; without an explicit
+    # allow the catch-all ``*`` rule yields ``ask`` and Goal authority defers it.
+    "debug_test": "allow",
     "write_file": {
         "*": "ask",
         ".features": "deny",

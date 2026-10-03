@@ -1,5 +1,7 @@
 """Execution-v2 state machine and terminal-task regression tests."""
 
+import pytest
+
 from harness.goal.engine import GoalEngine
 from harness.goal.models import GoalPhase, GoalState
 from harness.goal.planner import GoalPlan, GoalPlanningError, TaskPlan, VerificationSpec
@@ -233,6 +235,238 @@ def test_execution_replan_resumes_saved_candidate_with_reviewer_findings(tmp_pat
 
     assert len(calls) == 2
     assert state.execution_replan_checkpoint == {}
+
+
+def test_execution_replan_reports_missing_evidence_for_supervisor(tmp_path, monkeypatch):
+    import json
+    import harness.goal.discovery_store as discovery_store
+    import harness.goal.runner as runner_module
+    import harness.tasks as task_module
+
+    monkeypatch.setattr(task_module, "TASKS_DIR", tmp_path / ".tasks")
+    monkeypatch.setattr(runner_module, "save_goal", lambda *_: None)
+    owner = tmp_path / "src" / "owner.py"
+    owner.parent.mkdir()
+    owner.write_text("def owner(): pass\n", encoding="utf-8")
+    manifest = {"revision": 1, "repo_files": [], "evidence": []}
+    monkeypatch.setattr(discovery_store, "load_manifest", lambda *_: dict(manifest))
+
+    active = create_task("old implementation", "outdated task", primary_write=["src/owner.py"])
+    active.status = "in_progress"
+    save_task(active)
+    state = GoalState.new(target="x", verification="pytest -q", workspace=str(tmp_path))
+    state.execution_workspace = str(tmp_path)
+    state.phase = GoalPhase.REPAIR_PLAN.value
+    state.current_task_id = active.id
+    state.task_ids = [active.id]
+    state.task_name_ids = {active.subject: active.id}
+    state.task_plan = [{"name": active.subject, "primary_write": ["src/owner.py"]}]
+    state.initialization_complete = True
+    state.execution_approved = True
+    state.goal_contract = {"summary": "x"}
+    candidate = GoalPlan(
+        contract={"summary": "x"},
+        tasks=(TaskPlan(
+            name="replacement implementation", behavior="fix ownership",
+            acceptance_cases=(), verification_spec=VerificationSpec(),
+            primary_write=("src/owner.py",),
+        ),),
+        review={"approved": True},
+    )
+    calls = []
+
+    def plan_remaining(*_args, **kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            kwargs["candidate_callback"](candidate)
+            raise GoalPlanningError(
+                "missing owner evidence", requires_discovery_refresh=True,
+                discovery_guidance="inspect src/owner.py ownership",
+            )
+        assert kwargs["discovery_manifest"]["revision"] == 2
+        assert kwargs["candidate_plan"] is None
+        assert "src/owner.py" in kwargs["read_paths"]
+        return candidate
+
+    def refresh(paths, *, question, roles):
+        assert paths == ("src/owner.py",)
+        assert "ownership" in question
+        assert roles == ("architecture", "implementation")
+        manifest.update(revision=2, evidence=[{
+            "id": "E1", "path": "src/owner.py", "claim": "owner", "source_job": "architecture-2",
+        }])
+        return True
+
+    monkeypatch.setattr(runner_module, "plan_tasks", plan_remaining)
+    runner = runner_module.GoalRunner(state=state, history=[], context={}, binding=None)
+    monkeypatch.setattr(runner, "_refresh_goal_evidence", refresh)
+    runner._replan_remaining_tasks(
+        state, task=active,
+        evaluation={"route": "replan", "replan_trigger": "execution_preflight",
+                    "findings": [{"issue": "ownership", "evidence": "preflight"}]},
+        reason="ownership changed",
+    )
+
+    assert len(calls) == 1
+    assert state.phase == GoalPhase.PAUSED.value
+    assert state.execution_replan_checkpoint["discovery_guidance"] == "inspect src/owner.py ownership"
+    assert manifest["revision"] == 1
+    assert runner._phase_in_flight is False
+
+    state.supervision = {"observation_revision": 1}
+    tools = runner._supervisor_orchestration_tools({
+        "event": "terminal_failure", "observation_id": "obs", "revision": 1,
+    })
+    discovered = json.loads(tools["start_discovery"](
+        paths=["src/owner.py"], question="inspect src/owner.py ownership",
+        roles=["architecture", "implementation"],
+    ))
+    assert discovered["evidence"][0]["id"] == "E1"
+    result = json.loads(tools["start_replan"](
+        reason="ownership changed", evidence=["src/owner.py: owner"],
+        affected_task_ids=[active.id],
+    ))
+    assert result["status"] == "written"
+    assert len(calls) == 2
+    assert state.phase == GoalPhase.SELECT_TASK.value
+    assert state.execution_replan_checkpoint == {}
+
+
+def test_execution_replan_does_not_retry_without_supervisor_evidence(tmp_path, monkeypatch):
+    import harness.goal.discovery_store as discovery_store
+    import harness.goal.runner as runner_module
+    import harness.tasks as task_module
+
+    monkeypatch.setattr(task_module, "TASKS_DIR", tmp_path / ".tasks")
+    monkeypatch.setattr(runner_module, "save_goal", lambda *_: None)
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "owner.py").write_text("def owner(): pass\n", encoding="utf-8")
+    manifest = {"revision": 1, "repo_files": [], "evidence": []}
+    monkeypatch.setattr(discovery_store, "load_manifest", lambda *_: dict(manifest))
+    active = create_task("old implementation", "outdated task")
+    active.status = "in_progress"
+    save_task(active)
+    state = GoalState.new(target="x", verification="pytest -q", workspace=str(tmp_path))
+    state.execution_workspace = str(tmp_path)
+    state.phase = GoalPhase.REPAIR_PLAN.value
+    state.current_task_id = active.id
+    state.task_ids = [active.id]
+    state.task_name_ids = {active.subject: active.id}
+    calls = []
+
+    def rejected_plan(*_args, **_kwargs):
+        calls.append(True)
+        raise GoalPlanningError(
+            "missing owner evidence", requires_discovery_refresh=True,
+            discovery_guidance="inspect src/owner.py ownership",
+        )
+
+    def refresh(*_args, **_kwargs):
+        manifest["revision"] = 2
+        return True
+
+    monkeypatch.setattr(runner_module, "plan_tasks", rejected_plan)
+    runner = runner_module.GoalRunner(state=state, history=[], context={}, binding=None)
+    monkeypatch.setattr(runner, "_refresh_goal_evidence", refresh)
+    runner._replan_remaining_tasks(
+        state, task=active,
+        evaluation={"route": "replan", "replan_trigger": "execution_preflight",
+                    "findings": [{"issue": "ownership", "evidence": "preflight"}]},
+        reason="ownership changed",
+    )
+
+    assert len(calls) == 1
+    assert manifest["revision"] == 1
+    assert state.execution_replan_checkpoint["discovery_guidance"] == "inspect src/owner.py ownership"
+    assert state.phase == GoalPhase.PAUSED.value
+    assert runner._phase_in_flight is False
+
+
+def test_execution_replan_failure_charges_budget_before_rediscovery(tmp_path, monkeypatch):
+    import harness.goal.discovery_store as discovery_store
+    import harness.goal.runner as runner_module
+    import harness.tasks as task_module
+
+    monkeypatch.setattr(task_module, "TASKS_DIR", tmp_path / ".tasks")
+    monkeypatch.setattr(discovery_store, "load_manifest", lambda *_: {"revision": 1, "repo_files": [], "evidence": []})
+    monkeypatch.setattr(runner_module, "save_goal", lambda *_: None)
+    active = create_task("old implementation", "outdated task")
+    active.status = "in_progress"
+    save_task(active)
+    state = GoalState.new(target="x", verification="pytest -q", workspace=str(tmp_path))
+    state.execution_workspace = str(tmp_path)
+    state.phase = GoalPhase.REPAIR_PLAN.value
+    state.current_task_id = active.id
+    state.task_ids = [active.id]
+    state.task_name_ids = {active.subject: active.id}
+    state.budget_limits = {"llm_requests": 1}
+    monkeypatch.setattr(
+        runner_module, "plan_tasks",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(GoalPlanningError(
+            "missing evidence", requires_discovery_refresh=True,
+            discovery_guidance="src/owner.py",
+        )),
+    )
+    runner = runner_module.GoalRunner(state=state, history=[], context={}, binding=None)
+    monkeypatch.setattr(runner, "_refresh_goal_evidence", lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        AssertionError("exhausted budget must stop before rediscovery")
+    ))
+    runner._replan_remaining_tasks(
+        state, task=active,
+        evaluation={"route": "replan", "replan_trigger": "execution_preflight",
+                    "findings": [{"issue": "ownership", "evidence": "preflight"}]},
+        reason="ownership changed",
+    )
+
+    assert state.usage_ledger["llm_requests"] == 1
+    assert state.stop_reason == "budget_exhausted"
+    assert runner._phase_in_flight is False
+
+
+@pytest.mark.parametrize("failure_kind", ("provider_error", "review_format"))
+def test_execution_replan_provider_failure_does_not_exhaust_review_retries(tmp_path, monkeypatch, failure_kind):
+    import harness.goal.discovery_store as discovery_store
+    import harness.goal.runner as runner_module
+    import harness.tasks as task_module
+
+    monkeypatch.setattr(task_module, "TASKS_DIR", tmp_path / ".tasks")
+    monkeypatch.setattr(discovery_store, "load_manifest", lambda *_: {"repo_files": [], "evidence": []})
+    monkeypatch.setattr(runner_module, "save_goal", lambda *_: None)
+    active = create_task("old implementation", "outdated task")
+    active.status = "in_progress"
+    save_task(active)
+    state = GoalState.new(target="x", verification="pytest -q", workspace=str(tmp_path))
+    state.execution_workspace = str(tmp_path)
+    state.phase = GoalPhase.REPAIR_PLAN.value
+    state.current_task_id = active.id
+    state.task_ids = [active.id]
+    state.task_name_ids = {active.subject: active.id}
+    state.goal_contract = {"summary": "x"}
+    calls = []
+
+    def unavailable(*_args, **kwargs):
+        calls.append(True)
+        kwargs["stats"].stop_reason = "provider_error" if failure_kind == "provider_error" else "completed"
+        kwargs["stats"].provider_retryable = failure_kind == "provider_error"
+        raise GoalPlanningError("technical failure: connection unavailable or invalid JSON", failure_kind=failure_kind)
+
+    monkeypatch.setattr(runner_module, "plan_tasks", unavailable)
+    runner = runner_module.GoalRunner(state=state, history=[], context={}, binding=None)
+    for _ in range(3):
+        state.phase = GoalPhase.REPAIR_PLAN.value
+        state.status = "running"
+        runner._replan_remaining_tasks(
+            state, task=active,
+            evaluation={"route": "replan", "replan_trigger": "execution_preflight",
+                        "findings": [{"issue": "scope", "evidence": "preflight"}]},
+            reason="scope changed",
+        )
+        assert state.execution_replan_checkpoint["failure_count"] == 0
+        assert state.stop_reason == ("provider_unavailable" if failure_kind == "provider_error" else "execution_preflight_failed")
+        assert state.execution_replan_checkpoint["failure_kind"] == failure_kind
+        assert state.execution_replan_checkpoint["retryable"] is True
+        assert "technical failure" in state.last_error
+    assert len(calls) == 3
 
 
 def test_execution_replan_discards_a_versionless_checkpoint(tmp_path, monkeypatch):

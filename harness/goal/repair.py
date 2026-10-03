@@ -14,6 +14,7 @@ from harness.goal.planner import PLANNER_MAX_ROUNDS
 
 REPAIR_AGENT = "goal_repair_planner"
 REPAIR_ACTIONS = frozenset({"implementation_fix", "test_gap", "replan", "blocked"})
+REPAIR_READ_TOOLS = ("read_file", "search_text", "glob")
 GOAL_REGRESSION_ACTIONS = frozenset({"reopen_existing", "create_repair_task", "pause"})
 MAX_REPAIR_RAW_OUTPUT_TAIL = 2_000
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL | re.IGNORECASE)
@@ -307,6 +308,17 @@ def build_repair_prompt(state, task, evaluation: dict[str, Any]) -> str:
     )
 
 
+def _bounded_read_envelope(
+    cwd: str,
+    read_paths: tuple[str, ...] = (),
+    read_roots: tuple[str, ...] = (),
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Expand caller hints only into permitted, finite source files."""
+    from harness.goal.read_scope import bounded_read_paths
+
+    return bounded_read_paths(cwd, (*read_paths, *read_roots)), ()
+
+
 def plan_task_repair(
     state,
     task,
@@ -317,9 +329,20 @@ def plan_task_repair(
     deadline: float | None = None,
     stats=None,
     runner=None,
+    read_paths: tuple[str, ...] = (),
+    read_roots: tuple[str, ...] = (),
 ) -> RepairDecision:
     invoke = runner or run_agent_task
+    bounded_paths, bounded_roots = _bounded_read_envelope(cwd, read_paths, read_roots)
     prompt = build_repair_prompt(state, task, evaluation)
+    if bounded_paths or bounded_roots:
+        prompt += (
+            "\n\nBounded repository inspection is available through read-only tools. "
+            "Use only these exact paths and roots; never infer write authority from them:\n"
+            f"read_paths={json.dumps(list(bounded_paths), ensure_ascii=False)}\n"
+            f"read_roots={json.dumps(list(bounded_roots), ensure_ascii=False)}"
+        )
+    repair_tools = REPAIR_READ_TOOLS if (bounded_paths or bounded_roots) else ()
     try:
         raw = invoke(
             description=f"repair plan for task {task.id}",
@@ -327,7 +350,9 @@ def plan_task_repair(
             agent_type=REPAIR_AGENT,
             cwd=cwd,
             max_rounds=PLANNER_MAX_ROUNDS,
-            tools_override=(),
+            tools_override=repair_tools,
+            read_paths=bounded_paths,
+            read_roots=bounded_roots,
             cancel_check=cancel_check,
             deadline=deadline,
             stats=stats,
@@ -368,8 +393,10 @@ def plan_task_repair(
             ),
             agent_type=REPAIR_AGENT,
             cwd=cwd,
-            max_rounds=PLANNER_MAX_ROUNDS,
+            max_rounds=1,
             tools_override=(),
+            read_paths=bounded_paths,
+            read_roots=bounded_roots,
             cancel_check=cancel_check,
             deadline=deadline,
             stats=correction_stats,

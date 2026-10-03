@@ -7,12 +7,28 @@ import os
 import threading
 from pathlib import Path
 
-from harness.rag.config import INDEX_DIR
+from harness.rag import config as rag_config
+from harness.settings import workspace_generation
 
-PARENTS_PATH = INDEX_DIR / "parents.json"
+
+def _index_dir() -> Path:
+    override = globals().get("INDEX_DIR")
+    return Path(override) if override is not None else Path(rag_config.INDEX_DIR)
+
+
+def _parents_path() -> Path:
+    override = globals().get("PARENTS_PATH")
+    return Path(override) if override is not None else _index_dir() / "parents.json"
+
+
+# Backward-compatible fixture seam; production resolution remains dynamic.
+PARENTS_PATH: Path | None = None
+INDEX_DIR: Path | None = None
+
 
 _lock = threading.Lock()
 _parent_map: dict[str, dict] = {}
+_parent_generation = -1
 
 
 def is_parent(chunk: dict) -> bool:
@@ -38,33 +54,38 @@ def build_parent_map(chunks: list[dict]) -> dict[str, dict]:
 
 
 def persist_parents(parents: list[dict]) -> None:
-    global _parent_map
-    INDEX_DIR.mkdir(parents=True, exist_ok=True)
+    global _parent_map, _parent_generation
+    generation = workspace_generation()
+    _index_dir().mkdir(parents=True, exist_ok=True)
     merged = load_parent_map()
     merged.update(build_parent_map(parents))
-    PARENTS_PATH.write_text(
+    _parents_path().write_text(
         json.dumps(merged, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
     with _lock:
         _parent_map = merged
+        _parent_generation = generation
 
 
 def replace_parents(parents: list[dict]) -> None:
     """Atomically replace parent context with the active index snapshot."""
-    global _parent_map
+    global _parent_map, _parent_generation
+    generation = workspace_generation()
     payload = build_parent_map(parents)
-    INDEX_DIR.mkdir(parents=True, exist_ok=True)
-    PARENTS_PATH.write_text(
+    _index_dir().mkdir(parents=True, exist_ok=True)
+    _parents_path().write_text(
         json.dumps(payload, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
     with _lock:
         _parent_map = payload
+        _parent_generation = generation
 
 
 def remove_sources_from_parents(sources: set[str]) -> None:
-    global _parent_map
+    global _parent_map, _parent_generation
+    generation = workspace_generation()
     if not sources:
         return
     merged = load_parent_map()
@@ -73,32 +94,43 @@ def remove_sources_from_parents(sources: set[str]) -> None:
         for chunk_id, chunk in merged.items()
         if chunk.get("source") not in sources
     }
-    INDEX_DIR.mkdir(parents=True, exist_ok=True)
-    PARENTS_PATH.write_text(
+    _index_dir().mkdir(parents=True, exist_ok=True)
+    _parents_path().write_text(
         json.dumps(merged, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
     with _lock:
         _parent_map = merged
+        _parent_generation = generation
 
 
 def load_parent_map() -> dict[str, dict]:
-    global _parent_map
+    global _parent_map, _parent_generation
+    generation = workspace_generation()
     with _lock:
+        if _parent_generation != generation:
+            _parent_map = {}
+            _parent_generation = generation
         if _parent_map:
             return dict(_parent_map)
-    if not PARENTS_PATH.exists():
-        return {}
-    data = json.loads(PARENTS_PATH.read_text(encoding="utf-8"))
+    path = _parents_path()
+    if not path.exists():
+        legacy = rag_config.legacy_path("INDEX_DIR") / "parents.json"
+        if not legacy.exists():
+            return {}
+        path = legacy
+    data = json.loads(path.read_text(encoding="utf-8"))
     with _lock:
         _parent_map = data
+        _parent_generation = generation
     return dict(data)
 
 
 def reset_parent_cache() -> None:
-    global _parent_map
+    global _parent_map, _parent_generation
     with _lock:
         _parent_map = {}
+        _parent_generation = -1
 
 
 def _parent_char_limit() -> int:

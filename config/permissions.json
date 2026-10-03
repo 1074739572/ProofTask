@@ -40,6 +40,7 @@
     "rag_status": "allow",
     "project_status": "allow",
     "verify_command": "allow",
+    "debug_test": "allow",
     "web_search": "allow",
     "write_file": {
       "*": "ask",
@@ -168,6 +169,7 @@
     "list_features": "low",
     "project_status": "low",
     "verify_command": "low",
+    "debug_test": "low",
     "load_skill": "low",
     "todo_write": "low",
     "web_search": "low",
