@@ -7,6 +7,7 @@ import {
 } from './interaction.ts';
 import type {Overlay} from './App.tsx';
 import {C} from './theme.ts';
+import {terminalColumns} from './layout.ts';
 
 type Source<T> = Accessor<T> | T;
 
@@ -180,7 +181,7 @@ function OverlayPanel(props: {
     const kind = props.panel().kind;
     if (kind !== 'permission' && kind !== 'picker') return cap;
     let longest = 0;
-    for (const row of optionRowsPreview()) longest = Math.max(longest, row.length + 4);
+    for (const row of optionRowsPreview()) longest = Math.max(longest, terminalColumns(row) + 4);
     return Math.max(28, Math.min(cap, longest));
   });
   const normalizedOptions = createMemo<OverlayOptionRow[]>(() => {
@@ -252,8 +253,8 @@ function OverlayPanel(props: {
       rows.push({
         text,
         color: option.selected ? C.text : C.textMuted,
-        wrapMode: panel.kind === 'completion' ? 'char' : 'none',
-        truncate: panel.kind !== 'completion',
+        wrapMode: panel.kind === 'completion' || panel.kind === 'permission' ? 'char' : 'none',
+        truncate: panel.kind !== 'completion' && panel.kind !== 'permission',
         optionIndex: index,
         selected: option.selected,
       });
@@ -268,19 +269,22 @@ function OverlayPanel(props: {
     if (kind === 'permission') return '↑↓ navigate · Tab/Enter apply · Esc deny · click to choose';
     return '↑↓ navigate · Tab/Enter apply · Esc close';
   });
-  // Permission pulse: the border breathes warning -> primary on the animation
-  // clock so a pending approval keeps asking for attention without moving a
-  // single row. Other panels keep their steady primary frame.
+  // Keep approval state visually clear without a fast color pulse. The amber
+  // frame and selected option already provide a stable attention cue.
   const frameColor = () => {
     if (props.panel().kind !== 'permission') return C.primary;
-    const t = props.tick?.() ?? 0;
-    return t % 6 < 4 ? C.warning : C.primary;
+    return C.warning;
   };
   const panelHeight = createMemo(() => {
     // A popup is an opaque, bounded card.  Its bottom edge is always above
     // the complete footer, so neither completion rows nor their hint can
     // overwrite the textarea or status line.
-    const rows = panelRows().length + (showHint() ? 1 : 0) + (title().length > 0 ? 1 : 0);
+    const contentWidth = Math.max(1, panelWidth() - 4);
+    const rows = panelRows().reduce((total, row) => total + (
+      props.panel().kind === 'permission'
+        ? Math.max(1, Math.ceil(terminalColumns(row.text) / contentWidth))
+        : 1
+    ), 0) + (showHint() ? 1 : 0) + (title().length > 0 ? 1 : 0);
     // Two extra rows account for the rounded border.  Keep enough room for
     // every row in the bounded completion window while still respecting a
     // small terminal; overflow is clipped rather than spilling into chrome.

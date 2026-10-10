@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {footerHint} from '../src-open/interaction.ts';
-import {statusLineText, contextMeterCells, contextMeterColor} from '../src-open/StatusLine.tsx';
+import {statusLineText, runningPhaseTrail, contextMeterCells, contextMeterColor} from '../src-open/StatusLine.tsx';
 import {contextBreakdownRows} from '../src-open/ContextBreakdown.tsx';
 import {C} from '../src-open/theme.ts';
 
@@ -81,6 +81,13 @@ test('running status line keeps decode rate while the meter stays in the identit
   // Single context meter only: the transient row must not repeat it.
   assert.doesNotMatch(text, /ctx/);
   assert.match(text, /35 t\/s/);
+});
+
+test('wide running status shows the current turn stage and preserves Goal stages', () => {
+  assert.equal(runningPhaseTrail('calling_model'), '▶思考 › ○工具 › ○回复');
+  assert.equal(runningPhaseTrail('tool_running'), '✓思考 › ▶工具 › ○回复');
+  assert.equal(runningPhaseTrail('streaming_response'), '✓思考 › ✓工具 › ▶回复');
+  assert.equal(runningPhaseTrail('goal: act'), null);
 });
 
 test('context meter is a single fill whose length matches the percentage', () => {

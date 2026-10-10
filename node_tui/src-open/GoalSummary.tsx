@@ -184,16 +184,14 @@ export function GoalSummary(props: GoalSummaryProps) {
   const progress = () => progressFor(goal());
   const metricWidth = () => short() ? 34 : narrow() ? 52 : 68;
   const taskBoard = () => taskBoardFor(goal());
-  // Progress light-band: the bar renders in three segments — done (success),
-  // a pulsing head cell at the frontier (primary), and the remainder (muted).
-  // The head breathes on the animation clock while the goal is incomplete.
+  // Progress light-band: done (success), a stable frontier marker (primary),
+  // and the remaining work (muted). The bar changes only when progress does.
   const barWidth = () => short() ? 12 : narrow() ? 22 : 34;
   const barFilled = () => progressFilled(progress().percent, barWidth());
   const barHasHead = () => progress().total > 0 && barFilled() < barWidth();
   const barHead = () => {
     if (!barHasHead()) return '';
-    const t = props.tick?.() ?? 0;
-    return t % 6 < 3 ? '╸' : '─';
+    return '╸';
   };
   const barRest = () => '─'.repeat(Math.max(0, barWidth() - barFilled() - (barHasHead() ? 1 : 0)));
   const nowValue = () => {

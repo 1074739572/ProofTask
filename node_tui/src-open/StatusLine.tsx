@@ -37,6 +37,7 @@ export function statusLineText(status: UiStatus): string {
     // 避免页脚漏出英文原文。
     const stripped = status.phase.startsWith('goal: ') ? status.phase.slice(6) : status.phase;
     const phase = PHASE_LABELS[status.phase] || PHASE_LABELS[stripped] || stripped || '实现中';
+    const phaseTrail = status.width >= 110 ? runningPhaseTrail(status.phase) : '';
     const spin = status.spinner ? `${status.spinner} ` : '';
     const tool = status.currentTool ? ` · ${status.currentTool}` : '';
     const progress = status.toolsTotal > 0 ? ` · ${status.toolsDone}/${status.toolsTotal} 工具` : '';
@@ -47,7 +48,7 @@ export function statusLineText(status: UiStatus): string {
     if (status.width < 90) {
       return `${connection} ${spin}${phase}${tool} · ${status.elapsed}${progress}${queued} · Enter 排队 · Ctrl+K 打断${tps}`;
     }
-    return `${connection} ${spin}${phase}${tool} · ${status.elapsed}${progress}${queued}${tps} · Enter 排队 · Ctrl+K 打断`;
+    return `${connection} ${spin}${phaseTrail || phase}${tool} · ${status.elapsed}${progress}${queued}${tps} · Enter 排队 · Ctrl+K 打断`;
   }
   if (status.toast) return `✓ ${status.toast}`;
   // Keep the narrow form useful while avoiding the old multi-clause context
@@ -57,6 +58,18 @@ export function statusLineText(status: UiStatus): string {
     : status.width < 100
       ? 'Enter 发送 · Shift+Enter 换行 · /effort 推理强度 · /usage 用量'
       : 'Enter 发送 · Shift+Enter 换行 · /effort 推理强度 · /usage 用量 · Ctrl+R 历史';
+}
+
+/** Compact turn trajectory for wide terminals; narrow terminals keep the
+ * existing single phase label so the actionable hints remain visible. */
+export function runningPhaseTrail(phaseValue: string): string | null {
+  const phase = String(phaseValue || '').toLowerCase().replace(/^goal:\s*/, '');
+  let active = 0;
+  if (/tool|running tool/.test(phase)) active = 1;
+  else if (/stream|respond|answer/.test(phase)) active = 2;
+  else if (/goal|discover|planning|act|verify|working/.test(phase)) return null;
+  const labels = ['思考', '工具', '回复'];
+  return labels.map((label, index) => `${index < active ? '✓' : index === active ? '▶' : '○'}${label}`).join(' › ');
 }
 
 export type ContextMeterCells = {
@@ -115,11 +128,18 @@ function IdentityRow(props: {status: () => UiStatus; onEffortClick?: () => void;
     const parts = cwd.replace(/[\\/]+$/, '').split(/[\\/]/);
     return parts[parts.length - 1] || cwd;
   };
+  const permissionLabel = () => {
+    const mode = status().permissionMode;
+    if (!mode) return '';
+    const labels: Record<string, string> = {default: '默认', 'auto-review': '自动审核', 'full-access': '完全访问'};
+    return `权限 ${labels[mode] || mode}`;
+  };
   return <box height={1} flexShrink={0} minWidth={0} paddingX={2} flexDirection="row">
     <text fg={conn().color} wrapMode="none" selectable={false}>{`${conn().icon} `}</text>
     <text fg={C.primary} wrapMode="none" selectable={false}>{status().model || 'model'}</text>
     <text fg={C.textMuted} wrapMode="none" selectable={false}>{' · '}</text>
     <text fg={C.secondary} wrapMode="none" selectable={false}>{status().mode || 'direct'}</text>
+    {permissionLabel() ? <><text fg={C.textMuted} wrapMode="none" selectable={false}>{' · '}</text><text fg={status().permissionMode === 'full-access' ? C.warning : C.textMuted} wrapMode="none" selectable={false}>{permissionLabel()}</text></> : null}
     <text fg={C.textMuted} wrapMode="none" selectable={false}>{' · '}</text>
     <box minWidth={0} flexShrink={0} onMouseUp={(event: any) => { if (event?.button === 0) props.onEffortClick?.(); }}>
       <text fg={C.textMuted} wrapMode="none" selectable={false}>{`${status().effort || 'Default'}▾`}</text>

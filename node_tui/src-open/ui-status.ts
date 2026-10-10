@@ -33,6 +33,7 @@ export type UiStatus = {
   queuedMessages: number;
   model?: string;
   mode?: string;
+  permissionMode?: string;
   effort?: string;
   spinner?: string;
   /** 当前工作目录（basename 显示在身份行）。 */
@@ -89,6 +90,7 @@ export function deriveUiStatus(input: UiStatusInput): UiStatus {
     contextMessages: Math.max(0, Number(input.contextMessages) || 0),
     model: input.model ? String(input.model) : undefined,
     mode: input.mode ? String(input.mode) : undefined,
+    permissionMode: input.permissionMode ? String(input.permissionMode) : undefined,
     effort: input.effort ? String(input.effort) : undefined,
     spinner: input.spinner ? String(input.spinner) : undefined,
     cwd: input.cwd ? String(input.cwd) : undefined,

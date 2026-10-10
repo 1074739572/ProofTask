@@ -133,10 +133,8 @@ const CHECKMARK: readonly string[] = (() => {
   return rows;
 })();
 
-// Sweep timing: dsh's banner reveal used 24 steps x 15ms (~60fps, ~360ms) —
-// short enough that nobody needs a skip key. One-shot timer, separate from
-// the 80ms animation clock, and every line sits in a fixed-width box so the
-// reveal never participates in layout (no flashing).
+// Three short beats give the mark, wordmark, and quote a clear reading order.
+// The full reveal remains under half a second and never changes layout.
 const REVEAL_STEPS = 24;
 const REVEAL_INTERVAL_MS = 15;
 
@@ -154,8 +152,8 @@ const WORDMARK = 'ProofTask';
 const WORDMARK_GRADIENT_CHARS = 5; // "Proof" is gradient, "Task" stays bold
 
 /**
- * Launch panel: brand checkmark + gradient wordmark that sweep in from the
- * left over ~360ms, then today's quote (same store/format as the CLI). Shows
+ * Launch panel: mark, wordmark, then today's quote (same store/format as CLI)
+ * reveal in short staggered beats. Shows
  * as soon as the TUI starts and disappears on first submit. `animate={false}`
  * renders the final frame immediately (debug snapshots stay deterministic).
  */
@@ -173,9 +171,12 @@ export function WelcomeView(props: {width: number; height: number; quote?: strin
     }, REVEAL_INTERVAL_MS);
     onCleanup(() => clearInterval(timer));
   }
-  // Fractional reveal per line: every line wipes from its own left edge and
-  // all lines finish together, anchored at their final centered position.
-  const revealCols = (cols: number) => Math.round((step() / REVEAL_STEPS) * cols);
+  // Keep each element anchored at its final position while revealing it in
+  // sequence: mark → wordmark → quote.
+  const revealCols = (cols: number, start: number, end: number) => {
+    const progress = Math.max(0, Math.min(1, (step() - start) / (end - start)));
+    return Math.round(progress * cols);
+  };
 
   const index = dayIndex();
   const stored = cliDailyQuote();
@@ -195,8 +196,8 @@ export function WelcomeView(props: {width: number; height: number; quote?: strin
         <For each={CHECKMARK}>{(row) => {
           const chars = [...row];
           return <box height={1} flexShrink={0} width={CHECKMARK_WIDTH}>
-            <text wrapMode="none" selectable={false}>
-              <For each={chars.slice(0, revealCols(CHECKMARK_WIDTH))}>{(ch, i) => (
+          <text wrapMode="none" selectable={false}>
+            <For each={chars.slice(0, revealCols(CHECKMARK_WIDTH, 0, 8))}>{(ch, i) => (
                 ch === ' ' ? ' ' : <Sp fg={brandColorAt(i() / (CHECKMARK_WIDTH - 1))}>{ch}</Sp>
               )}</For>
             </text>
@@ -205,7 +206,7 @@ export function WelcomeView(props: {width: number; height: number; quote?: strin
         <Spacer />
         <box height={1} flexShrink={0} width={WORDMARK.length}>
           <text fg={C.text} wrapMode="none" selectable={false}>
-            <For each={[...WORDMARK.slice(0, revealCols(WORDMARK.length))]}>{(ch, i) => (
+            <For each={[...WORDMARK.slice(0, revealCols(WORDMARK.length, 7, 15))]}>{(ch, i) => (
               i() < WORDMARK_GRADIENT_CHARS
                 ? <Sp fg={brandColorAt(i() / (WORDMARK_GRADIENT_CHARS - 1))}>{ch}</Sp>
                 : <b>{ch}</b>
@@ -214,7 +215,7 @@ export function WelcomeView(props: {width: number; height: number; quote?: strin
         </box>
         <Spacer />
         <box height={1} flexShrink={0} width={quoteCols()}>
-          <text fg={BRIGHT.yellow} wrapMode="none" truncate>{cut(quoteLine(), revealCols(quoteCols()))}</text>
+          <text fg={BRIGHT.yellow} wrapMode="none" truncate>{cut(quoteLine(), revealCols(quoteCols(), 14, REVEAL_STEPS))}</text>
         </box>
       </box>
     </box>

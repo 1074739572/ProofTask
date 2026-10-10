@@ -809,16 +809,15 @@ function TranscriptEntryView(props: {entry: Entry; liveEntry?: (id: string) => E
     };
     // Give each assistant segment a clear visual breath after the user's
     // prompt. Tool rows intentionally do not inherit this spacing.
-    // Streaming gutter pulse: while tokens are flowing the rail breathes
-    // between ▌ and │ on the animation clock, then settles back to the plain
-    // rail once the stream finalizes. Single cell, zero layout impact.
-    const gutterChar = () => liveStreaming() ? (props.tick() % 5 < 4 ? '▌' : '│') : '│';
-    const gutterColor = () => liveStreaming() && props.tick() % 5 < 4 ? C.primary : C.info;
+    // Keep a steady live marker. Rapid pulsing made the transcript feel busy
+    // without carrying any additional progress information.
+    const gutterChar = () => liveStreaming() ? '▌' : '│';
+    const gutterColor = () => liveStreaming() ? C.primary : C.info;
     return text === null ? <box /> : shell(<box flexDirection="row" minWidth={0} paddingTop={1} paddingLeft={1} paddingRight={1}>
       {/* Keep the compact role rail fixed-width.  Both role labels occupy two
        * cells; the streaming rail is represented by the pulsing AI color so
        * the reply body starts on the same column as the user's text. */}
-      <text fg={props.compactRole ? (liveStreaming() && props.tick() % 5 < 4 ? C.primary : C.info) : gutterColor()} wrapMode="none" selectable={false}>{props.compactRole ? 'AI' : gutterChar()}</text>
+      <text fg={gutterColor()} wrapMode="none" selectable={false}>{props.compactRole ? 'AI' : gutterChar()}</text>
       <box flexGrow={1} minWidth={0} paddingLeft={props.compactRole ? 0 : 1}>
         {props.plainResponse ? <SafeText fg={C.text} wrapMode="word" value={text} /> : <StreamingClamp active={liveStreaming}><markdown syntaxStyle={getMarkdownSyntax()} streaming={liveStreaming()} internalBlockMode="top-level" tableOptions={{style: 'grid'}} content={liveText() ?? ''} fg={C.text} conceal /></StreamingClamp>}
       </box>
@@ -866,7 +865,9 @@ function TranscriptEntryView(props: {entry: Entry; liveEntry?: (id: string) => E
     const name = (normalizeTranscriptText(entry.name) || text || 'action').replace(/_/g, ' ');
     const status = normalizeTranscriptText(entry.summary) || detail;
     const summary = status !== null ? `  ${status}` : '';
-    const marker = () => props.focusId() === entry.id ? '▶' : entry.done ? (entry.ok ? '✓' : '✕') : '◌';
+    const marker = () => entry.done
+      ? (entry.ok ? '✓' : '✕')
+      : BRAILLE_SPINNER[props.tick() % BRAILLE_SPINNER.length];
     // Keep the collapsed state to one compact, actionable row. Mouse click and
     // the existing focused Enter binding both use the same toggle callback.
     const head = () => `${expanded() ? '▾' : '▸'} ${marker()} ${name}${summary}`;
@@ -1172,7 +1173,7 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
     setEntries(debugEntriesAccessor() as Entry[]);
   });
   const startupWorkspace = initialWorkspace() || '';
-  const [model, setModel] = createSignal(readDefaultModel()); const [mode, setMode] = createSignal(readDefaultMode()); const [cwd, setCwd] = createSignal(startupWorkspace); const [session, setSession] = createSignal(''); const [gitBranch, setGitBranch] = createSignal('');
+  const [model, setModel] = createSignal(readDefaultModel()); const [mode, setMode] = createSignal(readDefaultMode()); const [permissionMode, setPermissionMode] = createSignal(''); const [cwd, setCwd] = createSignal(startupWorkspace); const [session, setSession] = createSignal(''); const [gitBranch, setGitBranch] = createSignal('');
   // 启动与 workspace 切换时读一次 .git/HEAD；分支切换不频繁，无需监听。
   const refreshGitBranch = (workspace: string) => {
     try {
@@ -1847,13 +1848,14 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
         break;
       }
       case 'session_status': {
-        setModel(value(event, 'model') || 'model'); setMode(value(event, 'mode') || 'mode'); setCwd(value(event, 'cwd', 'working_dir')); setSession(value(event, 'session', 'session_id'));
+        setModel(value(event, 'model') || 'model'); setMode(value(event, 'mode') || 'mode'); setPermissionMode(value(event, 'permission_mode') || 'default'); setCwd(value(event, 'cwd', 'working_dir')); setSession(value(event, 'session', 'session_id'));
         setEffort(value(event, 'reasoning_effort') || 'off'); setEffortLabel(value(event, 'reasoning_effort_label') || 'Model default');
         setEffortOptions((event.reasoning_effort_options || []).map((x: any) => ({name: x.label || x.id, description: x.detail || '', value: x.id || 'off'})));
         setTodayInput(Number(event.today_input_tokens || 0)); setTodayOutput(Number(event.today_output_tokens || 0)); setTodayCacheRead(Number(event.today_cache_read_tokens || 0));
         setContextUsed(Number(event.ctx_tokens || 0)); setContextWindow(Number(event.ctx_window || 0));
         setContextSystem(Number(event.ctx_system || 0)); setContextTools(Number(event.ctx_tools || 0)); setContextMessages(Number(event.ctx_messages || 0));
         if (event.running) { setRunning(true); setPhase(value(event, 'phase') || 'running'); if (!startedAt()) setStartedAt(Date.now()); }
+        else { setRunning(false); setPhase('idle'); setStartedAt(0); setCurrentTool(null); }
         break;
       }
       case 'welcome': {
@@ -2059,7 +2061,24 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
       case 'assistant_message': clearDeltas(); begin('responding'); if (!responseId) { responseId = `response-${Date.now()}`; add({id: responseId, kind: 'response', text: value(event, 'text'), streaming: false}); } else update(responseId, x => ({...x, text: value(event, 'text'), streaming: false})); break;
       case 'tool_start': { promoteResponseToIntent(); begin('running tool'); setCurrentTool(value(event, 'name') || 'tool'); setToolTotal(total => total + 1); turnToolCount += 1; const id = value(event, 'id', 'call_id', 'tool_call_id') || `action-${++actionCounter}`; const ts = Number(event.ts || 0) * 1000 || Date.now(); add({id, kind: 'action', text: value(event, 'name') || 'tool', detail: value(event, 'summary') || 'running…', start: ts, output: []}); break; }
       case 'tool_output': { const id = value(event, 'id', 'call_id', 'tool_call_id'); const line = value(event, 'line'); if (!line) break; queueOutput(id || 'unknown', line); break; }
-      case 'tool_end': { const id = value(event, 'id', 'call_id', 'tool_call_id'); const ts = Number(event.ts || 0) * 1000 || Date.now(); flushLiveBuffers(); setCurrentTool(null); setToolDone(done => done + 1); const target = (id ? entries().find(x => x.id === id) : [...entries()].reverse().find(x => x.kind === 'action' && !x.done)); if (target) update(target.id, x => ({...x, detail: value(event, 'summary') || (event.ok ? 'completed' : 'failed'), done: true, ok: Boolean(event.ok), end: ts})); break; }
+      case 'tool_end': {
+        const id = value(event, 'id', 'call_id', 'tool_call_id');
+        const ts = Number(event.ts || 0) * 1000 || Date.now();
+        const preview = value(event, 'preview');
+        flushLiveBuffers(); setCurrentTool(null); setToolDone(done => done + 1);
+        const target = (id ? entries().find(x => x.id === id) : [...entries()].reverse().find(x => x.kind === 'action' && !x.done));
+        if (target) update(target.id, x => ({
+          ...x,
+          detail: value(event, 'summary') || (event.ok ? 'completed' : 'failed'),
+          // Bash already streams its full output through tool_output. The
+          // final preview is for tools whose result has no live output event.
+          output: preview && event.ok && !/^bash$/i.test(x.text) ? preview.split(/\r?\n/).slice(0, 12) : x.output,
+          done: true,
+          ok: Boolean(event.ok),
+          end: ts,
+        }));
+        break;
+      }
       case 'background_task': {
         const taskId = value(event, 'task_id') || 'background';
         const phase = value(event, 'phase') || 'running';
@@ -2207,6 +2226,7 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
   };
   const startBackendClient = () => {
     if (process.env.DEBUG_SKIP_BACKEND === '1') return;
+    setRunning(false); setPhase('idle'); setStartedAt(0); setCurrentTool(null);
     const generation = ++backendGeneration;
     setBackendState('reconnecting');
     backendClient = startBackend(handleBackendEvent, reportDiagnostic, {
@@ -2519,6 +2539,7 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
     contextMessages: contextMessages(),
     model: model(),
     mode: mode(),
+    permissionMode: permissionMode(),
     effort: effortShortLabel(effortLabel(), effort()),
     spinner: spinner(),
     cwd: cwd() || repoRoot,
@@ -2556,7 +2577,7 @@ export function App(props?: {debugEntries?: DebugEntries; debugGoal?: DebugGoal;
     </Match>
 
     <Match when={showDraftPage()}>
-      {(_matched: unknown) => <GoalDraftView draft={draftStatus} now={now} width={() => dims().width} height={() => dims().height} />}
+      {(_matched: unknown) => <GoalDraftView draft={draftStatus} now={now} tick={tick} width={() => dims().width} height={() => dims().height} />}
     </Match>
 
     <Match when={fullscreenEditor()}>

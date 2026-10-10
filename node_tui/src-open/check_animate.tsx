@@ -1,6 +1,6 @@
 // Verify the animation suite on the live clock:
 //   1) running tool: braille spinner advances within ~2 ticks; elapsed ticks on the 500ms clock
-//   2) streaming response: the gutter rail breathes ▌ -> │ while tokens flow
+//   2) streaming response: the gutter stays on a steady live marker while tokens flow
 //   3) latest Thinking row: the ∴ marker spins; older Thinking rows stay static
 //   4) status line: running phase carries the braille spinner glyph
 process.env.DEBUG_SKIP_BACKEND = '1';
@@ -50,7 +50,7 @@ expect(Boolean(elapsedB && elapsedC && elapsedB !== elapsedC), `elapsed counter 
 
 // 2) streaming response gutter breathes ▌ -> │. The row also carries a
 // TimelineRail │ at its left edge on wide terminals, so sample several
-// frames and require the ▌ glyph to both appear and disappear.
+// frames and require the active marker to stay stable.
 const gutterStates: boolean[] = [];
 for (let i = 0; i < 8; i++) {
   await new Promise(r => setTimeout(r, 110));
@@ -59,8 +59,7 @@ for (let i = 0; i < 8; i++) {
   gutterStates.push(row.includes('▌'));
 }
 console.log('gutter ▌ presence over 8 samples:', gutterStates.map(b => b ? '▌' : '│').join(' '));
-expect(gutterStates.some(Boolean), 'streaming gutter shows the ▌ pulse glyph');
-expect(gutterStates.some(b => !b), 'streaming gutter falls back to │ between pulses');
+expect(gutterStates.every(Boolean), 'streaming gutter keeps the steady ▌ marker');
 
 // 3) latest Thinking row spins; the older one keeps the static ∴.
 const oldThink = findRow(frameB, '先分析日志来源');
@@ -70,8 +69,8 @@ const thinkGlyphA = glyphOf(newThinkA), thinkGlyphB = glyphOf(newThinkB);
 expect(thinkGlyphA !== null && thinkGlyphB !== null && thinkGlyphA !== thinkGlyphB, `latest Thinking marker spins (${thinkGlyphA} -> ${thinkGlyphB})`);
 
 // 4) status line carries the braille spinner while running.
-const statusA = frameA[frameA.length - 2] ?? frameA[frameA.length - 1] ?? '';
-const statusB = frameB[frameB.length - 2] ?? frameB[frameB.length - 1] ?? '';
+const statusA = findRow(frameA, 'Ctrl+K 打断');
+const statusB = findRow(frameB, 'Ctrl+K 打断');
 console.log('status A:', statusA.trimEnd());
 const statusGlyphA = glyphOf(statusA), statusGlyphB = glyphOf(statusB);
 expect(statusGlyphA !== null, 'status line shows the braille spinner while running');

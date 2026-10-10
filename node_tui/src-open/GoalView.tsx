@@ -96,7 +96,7 @@ function GoalExecutionFlow(props: {
   fullWidth: () => boolean;
 }) {
   const spinner = () => SPINNER_FRAMES[Math.abs(props.frame()) % SPINNER_FRAMES.length];
-  const labelWidth = () => Math.max(16, Math.floor(props.width() * (props.fullWidth() ? 0.96 : GOAL_MAIN_COLUMN_RATIO)) - 4);
+  const labelWidth = () => Math.max(16, Math.floor(props.width() * (props.fullWidth() ? 0.96 : GOAL_SIDE_COLUMN_RATIO)) - 4);
   const toolRows = (tools: readonly unknown[]): FlowTool[] => (
     props.compact() ? [] : (tools as FlowTool[]).slice(-3)
   );
@@ -504,7 +504,7 @@ export function GoalView(props: GoalViewProps) {
   const homeContent = () => <box flexDirection={isWide() ? 'row' : 'column'} flexGrow={1} flexShrink={1} minHeight={0} minWidth={0}>
       <box flexDirection="column" width={isWide() ? `${GOAL_MAIN_COLUMN_RATIO * 100}%` : '100%'} flexGrow={1} flexShrink={1} minHeight={0} minWidth={0}>
         {summary}
-        <Show when={flowVariant() !== 'none'} fallback={<box />}>
+        <Show when={!isWide() && flowVariant() !== 'none'} fallback={<box />}>
           {executionFlow}
         </Show>
         <Show when={testCheckVariant() !== 'none'} fallback={<box />}>
@@ -519,6 +519,9 @@ export function GoalView(props: GoalViewProps) {
         {detailsToggle()}
       </box>
       {isWide() && <box flexDirection="column" width={`${GOAL_SIDE_COLUMN_RATIO * 100}%`} flexGrow={0} flexShrink={0} minHeight={0} minWidth={0}>
+        <box border borderStyle="rounded" borderColor={C.secondary} flexDirection="column" flexGrow={1} flexShrink={1} minHeight={0} minWidth={0} marginTop={1}>
+          {executionFlow}
+        </box>
         {taskBoardPanel}
         {stats}
         {supervisionPanel}
@@ -532,7 +535,7 @@ export function GoalView(props: GoalViewProps) {
   </box>;
 }
 
-export function GoalDraftView(props: {draft: DraftSource; now?: number | (() => number); width: number | (() => number); height: number | (() => number)}) {
+export function GoalDraftView(props: {draft: DraftSource; now?: number | (() => number); tick?: () => number; width: number | (() => number); height: number | (() => number)}) {
   // The parent keeps this branch mounted across draft updates (Switch/Match),
   // so the snapshot must be read reactively instead of captured once.
   const draft = () => readSource(props.draft) || fallbackGoal();
@@ -555,7 +558,7 @@ export function GoalDraftView(props: {draft: DraftSource; now?: number | (() => 
     const text = String(value ?? '').replace(/\s+/g, ' ').trim();
     return clipTerminalText(text, max);
   };
-  const stageRail = () => goalDraftStageRail(draft()).map(item => `${item.status === 'done' ? '●' : item.status === 'active' ? '◉' : '○'}${stageLabels[item.id] || item.id}`).join(' → ');
+  const stageRail = () => goalDraftStageRail(draft()).map(item => `${item.status === 'done' ? '●' : item.status === 'active' ? SPINNER_FRAMES[Math.abs(props.tick?.() || 0) % SPINNER_FRAMES.length] : '○'}${stageLabels[item.id] || item.id}`).join(' → ');
   const now = () => Number(readSource(props.now)) || Date.now();
   const heartbeat = () => goalDraftHeartbeatPresentation(draft(), now());
   const agents = () => goalDraftAgentRows(draft());
@@ -607,7 +610,7 @@ export function GoalDraftView(props: {draft: DraftSource; now?: number | (() => 
         <Show when={agents().length > 0} fallback={<text fg={C.textMuted}>尚未收到 Agent 现场事件</text>}>
           <For each={agents()}>{agent => <box flexDirection="column" minWidth={0} marginTop={short() ? 0 : 1}>
             <box flexDirection="row" minWidth={0}>
-              <text fg={statusColor(agent.status)} wrapMode="none" flexShrink={0}>{/^(done|completed)$/i.test(agent.status) ? '✓' : /failed|error/i.test(agent.status) ? '×' : agent.status === 'queued' ? '○' : '●'} </text>
+              <text fg={statusColor(agent.status)} wrapMode="none" flexShrink={0}>{/^(done|completed)$/i.test(agent.status) ? '✓' : /failed|error/i.test(agent.status) ? '×' : agent.status === 'queued' ? '○' : SPINNER_FRAMES[Math.abs(props.tick?.() || 0) % SPINNER_FRAMES.length]} </text>
               <text fg={C.text} wrapMode="none" truncate flexGrow={1}>{agent.label}</text>
               <text fg={C.textMuted} wrapMode="none" truncate>{statusLabel(agent.status)}</text>
             </box>
@@ -616,7 +619,7 @@ export function GoalDraftView(props: {draft: DraftSource; now?: number | (() => 
           </box>}</For>
           <Show when={!short() && orphanJobs().length > 0} fallback={<box />}>
             <For each={orphanJobs()}>{job => <box flexDirection="row" minWidth={0} marginTop={1}>
-              <text fg={statusColor(job.status)} wrapMode="none" flexShrink={0}>{job.status === 'done' ? '✓' : job.status === 'running' ? '●' : job.status === 'failed' ? '×' : '○'} </text>
+              <text fg={statusColor(job.status)} wrapMode="none" flexShrink={0}>{job.status === 'done' ? '✓' : job.status === 'running' ? SPINNER_FRAMES[Math.abs(props.tick?.() || 0) % SPINNER_FRAMES.length] : job.status === 'failed' ? '×' : '○'} </text>
               <text fg={C.text} wrapMode="none" truncate flexGrow={1}>{job.role} · {statusLabel(job.status)}</text>
               <text fg={C.textMuted} wrapMode="none" truncate>{job.read_path_count || 0} 个文件</text>
             </box>}</For>
