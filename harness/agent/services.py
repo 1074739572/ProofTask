@@ -5,6 +5,7 @@ Session-independent service lifecycle with PID tracking, health probes, and log 
 
 import json
 import subprocess
+import sys
 import threading
 import time
 from datetime import datetime, timezone
@@ -209,20 +210,28 @@ def start_service(service_id: str, health_probe_retries: int = 10) -> str:
         stdout_log = _get_log_file(service_id, "stdout")
         stderr_log = _get_log_file(service_id, "stderr")
         
-        # Launch process (detached from current session)
+        # Launch process detached from the agent's console and job lifetime.
         with open(stdout_log, "a", encoding="utf-8") as stdout_file, \
              open(stderr_log, "a", encoding="utf-8") as stderr_file:
-            
-            # Windows: CREATE_NEW_PROCESS_GROUP + DETACHED_PROCESS
-            # This prevents the child from being killed when parent dies
-            creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
-            
+            if sys.platform == "win32":
+                # The agent may itself run inside a kill-on-close Job Object.
+                # CREATE_NEW_PROCESS_GROUP/DETACHED_PROCESS only detach the
+                # console; BREAKAWAY is required to survive agent shutdown.
+                creationflags = (
+                    subprocess.CREATE_NEW_PROCESS_GROUP
+                    | subprocess.DETACHED_PROCESS
+                    | subprocess.CREATE_BREAKAWAY_FROM_JOB
+                )
+            else:
+                creationflags = 0
+
             process = subprocess.Popen(
                 metadata["command"],
                 cwd=metadata.get("cwd"),
                 stdout=stdout_file,
                 stderr=stderr_file,
                 stdin=subprocess.DEVNULL,
+                close_fds=True,
                 creationflags=creationflags,
             )
             
